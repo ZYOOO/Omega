@@ -1,0 +1,762 @@
+openapi: 3.1.0
+info:
+  title: Omega Local Server API
+  version: 0.1.0
+  description: >
+    Local Product Layer + Execution Layer API for Omega DevFlow Engine.
+servers:
+  - url: http://127.0.0.1:3888
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Local server is running
+  /workspace:
+    get:
+      summary: Load current workspace snapshot
+      responses:
+        '200':
+          description: Workspace database returned
+        '404':
+          description: Workspace not found
+    put:
+      summary: Persist current workspace snapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workspace saved
+  /events:
+    get:
+      summary: List mission events
+      responses:
+        '200':
+          description: Mission events returned
+  /requirements:
+    get:
+      summary: List first-class requirements
+      description: >
+        Returns persisted Requirement records. A Requirement is the source need that owns one
+        or more Omega Items. GitHub issues and future Feishu messages are represented as
+        requirement sources through `source` and `sourceExternalRef`.
+      responses:
+        '200':
+          description: Requirement records returned
+  /pipelines:
+    get:
+      summary: List pipelines
+      responses:
+        '200':
+          description: Pipelines returned
+  /attempts:
+    get:
+      summary: List run attempts
+      description: >
+        Returns one record for each concrete pipeline execution attempt, including
+        status, runner, repository target, workspace path, branch, PR URL, stage
+        snapshots, and error summaries.
+      responses:
+        '200':
+          description: Attempt records returned
+  /checkpoints:
+    get:
+      summary: List checkpoints
+      responses:
+        '200':
+          description: Checkpoints returned
+  /missions:
+    get:
+      summary: List mission records
+      responses:
+        '200':
+          description: Missions returned
+  /operations:
+    get:
+      summary: List operation records
+      responses:
+        '200':
+          description: Operations returned
+  /proof-records:
+    get:
+      summary: List structured proof records
+      responses:
+        '200':
+          description: Proof records returned
+  /migrations:
+    get:
+      summary: List applied local database migrations
+      responses:
+        '200':
+          description: Migration records returned
+  /execution-locks:
+    get:
+      summary: List local execution locks
+      description: >
+        Returns persisted execution locks used by the local orchestrator to prevent duplicate
+        claiming/running of the same repository issue or work item across local App instances.
+      responses:
+        '200':
+          description: Execution locks returned
+  /execution-locks/{id}/release:
+    post:
+      summary: Release a local execution lock
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Released execution lock returned
+        '404':
+          description: Execution lock not found
+  /pipeline-templates:
+    get:
+      summary: List pipeline templates
+      description: Returns templates compiled from the default workflow markdown plus built-in compatibility templates.
+      responses:
+        '200':
+          description: Pipeline templates returned
+  /workflow-templates:
+    get:
+      summary: List workflow templates
+      description: Returns workflow-backed templates, including source path, markdown body, stage definitions, review rounds, and prompt template.
+      responses:
+        '200':
+          description: Workflow templates returned
+  /pipelines/from-template:
+    post:
+      summary: Create a pipeline from a work item and template
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Pipeline returned
+  /llm-providers:
+    get:
+      summary: List configurable LLM providers
+      responses:
+        '200':
+          description: Provider list returned
+  /llm-provider-selection:
+    get:
+      summary: Read current runtime LLM provider selection
+      responses:
+        '200':
+          description: Provider selection returned
+    put:
+      summary: Update runtime LLM provider selection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Provider selection persisted
+  /agent-definitions:
+    get:
+      summary: List stage agent definitions and IO contracts
+      responses:
+        '200':
+          description: Agent definitions returned
+  /local-capabilities:
+    get:
+      summary: Inspect locally available execution tools
+      description: Reports whether local commands such as codex, opencode, git, gh, and lark-cli are installed and runnable.
+      responses:
+        '200':
+          description: Local capability list returned
+  /local-workspace-root:
+    get:
+      summary: Read the local runner workspace root
+      description: Returns the directory where Omega creates isolated operation workspaces.
+      responses:
+        '200':
+          description: Local workspace root returned
+    put:
+      summary: Update the local runner workspace root
+      description: Persists the directory where Omega creates isolated operation workspaces. `~` is expanded on the local machine.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - workspaceRoot
+              properties:
+                workspaceRoot:
+                  type: string
+                  example: ~/Omega/workspaces
+      responses:
+        '200':
+          description: Local workspace root updated
+        '400':
+          description: Invalid workspace root
+  /observability:
+    get:
+      summary: Return pipeline, checkpoint, operation, proof, and attention summary
+      responses:
+        '200':
+          description: Observability summary returned
+  /work-items:
+    post:
+      summary: Create an executable item from a requirement source
+      description: >
+        Creates an Omega Item and ensures it is linked to a Requirement through `requirementId`.
+        Manual App intake creates `source = manual`; imported GitHub issues create
+        `source = github_issue` requirements before the item is persisted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workspace snapshot after creation
+  /work-items/{itemId}:
+    patch:
+      summary: Patch a work item status or priority
+      parameters:
+        - in: path
+          name: itemId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workspace snapshot after patch
+  /requirements/decompose:
+    post:
+      summary: Decompose a raw requirement into structured artifacts and suggested stage work
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                description:
+                  type: string
+                repositoryTarget:
+                  type: string
+                source:
+                  type: string
+      responses:
+        '200':
+          description: Structured requirement artifact returned
+        '400':
+          description: Missing requirement title or description
+  /orchestrator/tick:
+    post:
+      summary: Claim the next eligible GitHub issue for Omega execution
+      description: >
+        Reads open issues from a bound repository target, skips issues already imported into Omega,
+        skips issues that do not carry an execution-ready label (`omega-ready`, `devflow-ready`,
+        `agent-ready`, or `omega-run`), creates or links a `source = github_issue` Requirement,
+        creates a repository-scoped Item for that Requirement, and creates a `devflow-pr`
+        Pipeline for that item. The `devflow-pr` stages and review rounds come from the default
+        workflow markdown when present.
+        When `autoRun` is true, the tick also runs the DevFlow cycle with the same repository and
+        workspace safety checks as the manual pipeline run endpoint. Background scheduling still
+        requires runner supervisor handoff and retry policy before it should be enabled by default.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repositoryTargetId:
+                  type: string
+                limit:
+                  type: string
+                  default: "20"
+                autoRun:
+                  type: boolean
+                  default: false
+                autoApproveHuman:
+                  type: boolean
+                  default: false
+                autoMerge:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Claimed work item and pipeline, or idle status when no eligible issue exists
+        '400':
+          description: Repository target is missing or invalid
+  /missions/from-work-item:
+    post:
+      summary: Build a mission from a work item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Mission returned
+  /operations/run:
+    post:
+      summary: Run an operation and persist resulting events
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - mission
+                - operationId
+              properties:
+                mission:
+                  type: object
+                operationId:
+                  type: string
+                runner:
+                  type: string
+                  enum:
+                    - local-proof
+                    - demo-code
+                    - codex
+      responses:
+        '200':
+          description: Runner result returned
+  /run-operation:
+    post:
+      summary: Compatibility runner endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - mission
+                - operationId
+              properties:
+                mission:
+                  type: object
+                operationId:
+                  type: string
+                runner:
+                  type: string
+                  enum:
+                    - local-proof
+                    - demo-code
+                    - codex
+      responses:
+        '200':
+          description: Runner result returned
+  /pipelines/from-work-item:
+    post:
+      summary: Create a pipeline from a work item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Pipeline returned
+  /pipelines/{pipelineId}/start:
+    post:
+      summary: Start pipeline execution
+      parameters:
+        - in: path
+          name: pipelineId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pipeline updated
+  /pipelines/{pipelineId}/pause:
+    post:
+      summary: Pause pipeline execution
+      parameters:
+        - in: path
+          name: pipelineId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pipeline updated
+  /pipelines/{pipelineId}/resume:
+    post:
+      summary: Resume pipeline execution
+      parameters:
+        - in: path
+          name: pipelineId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pipeline updated
+  /pipelines/{pipelineId}/terminate:
+    post:
+      summary: Terminate pipeline execution
+      parameters:
+        - in: path
+          name: pipelineId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pipeline updated
+  /pipelines/{pipelineId}/complete-stage:
+    post:
+      summary: Complete the current running stage
+      parameters:
+        - in: path
+          name: pipelineId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pipeline updated
+  /pipelines/{pipelineId}/run-current-stage:
+    post:
+      summary: Run the current pipeline stage with a local runner
+      description: Starts the current ready/running stage if needed, runs the stage operation locally, persists mission, operation, proof records, and advances the pipeline to the next stage or human checkpoint.
+      parameters:
+        - in: path
+          name: pipelineId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                runner:
+                  type: string
+                  enum:
+                    - local-proof
+                    - demo-code
+                    - codex
+      responses:
+        '200':
+          description: Pipeline and operation result returned
+        '409':
+          description: Pipeline has no runnable stage
+  /pipelines/{pipelineId}/run-devflow-cycle:
+    post:
+      summary: Run a Omega DevFlow PR delivery cycle
+      description: >
+        Starts the default `devflow-pr` workflow template for the pipeline's repository-scoped work item.
+        By default this endpoint creates an attempt, returns 202 Accepted immediately, and continues
+        execution in a background job. The background job clones the bound repository target into
+        the configured local workspace root, creates a branch, commits changes, pushes, creates a
+        GitHub pull request, runs review agents, records proof files, and stops at a human
+        checkpoint. Merge/delivery only continues after the checkpoint is explicitly approved.
+      parameters:
+        - in: path
+          name: pipelineId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                autoApproveHuman:
+                  type: boolean
+                  default: false
+                  description: Reserved compatibility flag. The product path does not auto-approve human checkpoints.
+                autoMerge:
+                  type: boolean
+                  default: false
+                  description: Reserved compatibility flag. Merge requires an approved human checkpoint.
+                wait:
+                  type: boolean
+                  default: false
+                  description: Synchronous compatibility mode for tests or scripts. The product UI should leave this false.
+      responses:
+        '202':
+          description: Attempt accepted and background job started
+        '200':
+          description: DevFlow cycle result, proof files, and updated pipeline returned when wait is true
+        '400':
+          description: Work item is not bound to a repository target
+        '409':
+          description: Pipeline is not using the devflow-pr template
+  /checkpoints/{checkpointId}/approve:
+    post:
+      summary: Approve checkpoint
+      parameters:
+        - in: path
+          name: checkpointId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Checkpoint updated
+  /checkpoints/{checkpointId}/request-changes:
+    post:
+      summary: Reject checkpoint and request changes
+      parameters:
+        - in: path
+          name: checkpointId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Checkpoint updated
+  /github/status:
+    get:
+      summary: Inspect local gh and GitHub OAuth authentication status
+      responses:
+        '200':
+          description: GitHub CLI status
+  /github/oauth/config:
+    get:
+      summary: Read the product-configured GitHub OAuth app settings without exposing the client secret
+      responses:
+        '200':
+          description: Sanitized OAuth configuration returned
+    put:
+      summary: Persist GitHub OAuth app settings from the App into local SQLite settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - clientId
+                - redirectUri
+              properties:
+                clientId:
+                  type: string
+                clientSecret:
+                  type: string
+                  description: Optional when a secret is already saved
+                redirectUri:
+                  type: string
+                tokenUrl:
+                  type: string
+      responses:
+        '200':
+          description: Sanitized OAuth configuration returned
+  /github/oauth/start:
+    post:
+      summary: Create a GitHub OAuth authorization URL through the local service
+      responses:
+        '200':
+          description: Authorization URL, redirect URI, scopes, and state
+  /github/cli-login/start:
+    post:
+      summary: Start local GitHub CLI browser sign-in as the no-OAuth-app fallback
+      responses:
+        '200':
+          description: Started flag, GitHub device verification URL, command hint, and user-facing sign-in message
+  /auth/github/callback:
+    get:
+      summary: Handle GitHub OAuth callback, store token locally, and mark the GitHub connection as connected
+      parameters:
+        - in: query
+          name: code
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: GitHub connection result
+  /github/repositories:
+    get:
+      summary: List repositories visible to the locally authenticated GitHub CLI user
+      responses:
+        '200':
+          description: Repository list returned from gh repo list
+  /github/repo-info:
+    post:
+      summary: Read GitHub repository metadata through gh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Repository info returned
+  /github/bind-repository-target:
+    post:
+      summary: Bind a GitHub repository as a repository target on the current Omega project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                owner:
+                  type: string
+                repo:
+                  type: string
+                nameWithOwner:
+                  type: string
+                defaultBranch:
+                  type: string
+                url:
+                  type: string
+      responses:
+        '200':
+          description: Workspace updated with the repository target
+  /github/repository-targets/{id}:
+    delete:
+      summary: Delete a repository workspace and its linked Omega work items from the local app database
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Workspace updated after removing the repository target and linked local records
+        '404':
+          description: Repository target not found
+  /github/import-issues:
+    post:
+      summary: Import GitHub issues into Omega work items
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workspace updated with imported issues
+  /github/create-pr:
+    post:
+      summary: Create a GitHub pull request from runner branch, commit, and proof summary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - branchName
+              properties:
+                workspacePath:
+                  type: string
+                  description: Omega operation workspace; defaults repositoryPath to workspacePath/repo and reads .omega/proof/change-summary.md
+                repositoryPath:
+                  type: string
+                  description: Local git repository path where gh pr create should run
+                repositoryOwner:
+                  type: string
+                repositoryName:
+                  type: string
+                title:
+                  type: string
+                body:
+                  type: string
+                branchName:
+                  type: string
+                baseBranch:
+                  type: string
+                  default: main
+                draft:
+                  type: boolean
+                changedFiles:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Pull request creation result
+        '502':
+          description: gh pr create failed
+  /github/pr-status:
+    post:
+      summary: Read GitHub pull request review state and checks through gh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repositoryOwner:
+                  type: string
+                repositoryName:
+                  type: string
+                number:
+                  type: integer
+                url:
+                  type: string
+      responses:
+        '200':
+          description: Pull request status, checks, delivery gate, and proof records
+        '502':
+          description: gh pr view or gh pr checks failed
+  /feishu/notify:
+    post:
+      summary: Send a Feishu text notification through local lark-cli
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - chatId
+                - text
+              properties:
+                chatId:
+                  type: string
+                text:
+                  type: string
+      responses:
+        '200':
+          description: Notification sent
+        '503':
+          description: lark-cli missing or failed
