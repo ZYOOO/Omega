@@ -112,6 +112,10 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.putProviderSelection(response, request)
 	case request.Method == http.MethodGet && path == "/agent-definitions":
 		server.listAgentDefinitions(response, request)
+	case request.Method == http.MethodGet && path == "/agent-profile":
+		server.getAgentProfile(response, request)
+	case request.Method == http.MethodPut && path == "/agent-profile":
+		server.putAgentProfile(response, request)
 	case request.Method == http.MethodGet && path == "/observability":
 		server.observability(response, request)
 	case request.Method == http.MethodGet && path == "/local-capabilities":
@@ -378,6 +382,9 @@ func (server *Server) createPipeline(response http.ResponseWriter, request *http
 		return
 	}
 	pipeline := makePipeline(payload.Item)
+	target := findRepositoryTarget(database, text(payload.Item, "repositoryTargetId"))
+	profile := server.resolveAgentProfile(request.Context(), database, payload.Item, target)
+	pipeline = attachAgentProfileToPipeline(pipeline, profile)
 	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 	touch(&database)
 	if err := server.Repo.Save(request.Context(), database); err != nil {
@@ -407,6 +414,9 @@ func (server *Server) createPipelineFromTemplate(response http.ResponseWriter, r
 		return
 	}
 	pipeline := makePipelineWithTemplate(payload.Item, template)
+	target := findRepositoryTarget(database, text(payload.Item, "repositoryTargetId"))
+	profile := server.resolveAgentProfile(request.Context(), database, payload.Item, target)
+	pipeline = attachAgentProfileToPipeline(pipeline, profile)
 	if pipelineIndex := findByID(database.Tables.Pipelines, text(pipeline, "id")); pipelineIndex >= 0 {
 		database.Tables.Pipelines[pipelineIndex] = pipeline
 	} else {
@@ -456,6 +466,15 @@ func (server *Server) runDevFlowCycle(response http.ResponseWriter, request *htt
 	target := findRepositoryTarget(database, text(stageItem, "repositoryTargetId"))
 	if target == nil {
 		writeError(response, http.StatusBadRequest, fmt.Errorf("work item %s has no repository workspace", text(stageItem, "key")))
+		return
+	}
+	profile := server.resolveAgentProfile(request.Context(), database, stageItem, target)
+	if _, err := preflightAgentRunner("profile", profile, "coding"); err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := preflightAgentRunner("profile", profile, "review"); err != nil {
+		writeError(response, http.StatusBadRequest, err)
 		return
 	}
 	var attempt map[string]any
@@ -1192,10 +1211,21 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 	repoSlug := repositoryTargetLabel(target)
 	baseBranch := stringOr(text(target, "defaultBranch"), "main")
 	branchName := devFlowRunBranchName(text(item, "key"))
+	profile := server.resolveAgentProfile(ctx, WorkspaceDatabase{}, item, target)
+	if database, err := server.Repo.Load(ctx); err == nil {
+		profile = server.resolveAgentProfile(ctx, *database, item, target)
+	}
 	if output, err := ensureDevFlowRepositoryWorkspace(workspace, repoWorkspace, cloneTarget, branchName, baseBranch); err != nil {
 		return map[string]any{"status": "failed", "workspacePath": workspace, "stdout": output}, fmt.Errorf("clone target repository: %w", err)
 	}
-	agentRunner := CodexExecAgentRunner{}
+	if err := writeRunnerPolicyFiles(repoWorkspace, profile, "coding"); err != nil {
+		return nil, err
+	}
+	runnerRegistry := NewAgentRunnerRegistry()
+	codingProfile := agentProfileForRole(profile, "coding")
+	codingRunner, codingRunnerID := runnerRegistry.Resolve(codingProfile.Runner)
+	reviewProfile := agentProfileForRole(profile, "review")
+	reviewRunner, reviewRunnerID := runnerRegistry.Resolve(reviewProfile.Runner)
 
 	proofDir := filepath.Join(workspace, ".omega", "proof")
 	if err := os.MkdirAll(proofDir, 0o755); err != nil {
@@ -1209,7 +1239,11 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		"workspaceRoot":    workspaceRoot,
 		"workspacePath":    workspace,
 		"repositoryTarget": repositoryTargetLabel(target),
+		"agentProfile":     agentRuntimeMetadata(profile, "master"),
 	}); err != nil {
+		return nil, err
+	}
+	if err := writeRunnerPolicyFiles(workspace, profile, "master"); err != nil {
 		return nil, err
 	}
 	agentInvocations := []map[string]any{}
@@ -1296,19 +1330,21 @@ Rules:
 - Keep the diff minimal and reviewable.
 - Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
 - Write a short completion note to %s.
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), text(item, "description"), filepath.Join(proofDir, "coding-agent-note.md"))
+%s
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), text(item, "description"), filepath.Join(proofDir, "coding-agent-note.md"), agentPolicyBlock(profile, "coding"))
 	if err := os.WriteFile(filepath.Join(proofDir, "coding-prompt.md"), []byte(codingPrompt), 0o644); err != nil {
 		return nil, err
 	}
-	recordAgent("in_progress", "coding", "running", codingPrompt, "", "Coding agent is editing the repository workspace.", []string{filepath.Join(proofDir, "coding-prompt.md")}, map[string]any{"runner": "codex", "status": "running"})
-	codingTurn := agentRunner.RunTurn(ctx, AgentTurnRequest{
+	recordAgent("in_progress", "coding", "running", codingPrompt, "", "Coding agent is editing the repository workspace.", []string{filepath.Join(proofDir, "coding-prompt.md")}, map[string]any{"runner": codingRunnerID, "status": "running"})
+	codingTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
 		Role:       "coding",
 		StageID:    "in_progress",
-		Runner:     "codex",
+		Runner:     codingRunnerID,
 		Workspace:  repoWorkspace,
 		Prompt:     codingPrompt,
 		OutputPath: filepath.Join(proofDir, "coding-agent-note.md"),
 		Sandbox:    "workspace-write",
+		Model:      codingProfile.Model,
 	})
 	codingProcess, codingErr := codingTurn.Process, codingTurn.Error
 	if codingErr != nil {
@@ -1409,19 +1445,21 @@ Rules:
 - Keep the diff minimal and reviewable.
 - Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
 - Write a short completion note to %s.
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, text(item, "description"), feedback, notePath)
+%s
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, text(item, "description"), feedback, notePath, agentPolicyBlock(profile, "coding"))
 		if err := os.WriteFile(promptPath, []byte(reworkPrompt), 0o644); err != nil {
 			return err
 		}
-		recordAgent(stageID, "coding", "running", reworkPrompt, "", "Rework agent is applying review feedback in the same workspace.", []string{promptPath}, map[string]any{"runner": "codex", "status": "running", "reviewCycle": cycle})
-		turn := agentRunner.RunTurn(ctx, AgentTurnRequest{
+		recordAgent(stageID, "coding", "running", reworkPrompt, "", "Rework agent is applying review feedback in the same workspace.", []string{promptPath}, map[string]any{"runner": codingRunnerID, "status": "running", "reviewCycle": cycle})
+		turn := codingRunner.RunTurn(ctx, AgentTurnRequest{
 			Role:       "rework",
 			StageID:    stageID,
-			Runner:     "codex",
+			Runner:     codingRunnerID,
 			Workspace:  repoWorkspace,
 			Prompt:     reworkPrompt,
 			OutputPath: notePath,
 			Sandbox:    "workspace-write",
+			Model:      codingProfile.Model,
 		})
 		if turn.Error != nil {
 			recordAgent(stageID, "coding", "failed", reworkPrompt, filepath.Base(notePath), "Rework agent failed before producing an acceptable repository diff.", []string{promptPath, notePath}, turn.Process)
@@ -1497,8 +1535,19 @@ Rules:
 				reviewDiff = prDiff
 				reviewChecks = checksOutput
 			}
-			reviewPrompt := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus)
-			reviewProcess, reviewErr := runDevFlowReviewAgent(repoWorkspace, reviewPrompt, reviewPath)
+			reviewPrompt := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus) + "\n\n" + agentPolicyBlock(profile, "review")
+			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
+				Role:       "review",
+				StageID:    stageID,
+				Runner:     reviewRunnerID,
+				Workspace:  repoWorkspace,
+				Prompt:     reviewPrompt,
+				OutputPath: reviewPath,
+				Sandbox:    "read-only",
+				Model:      reviewProfile.Model,
+				Effort:     "medium",
+			})
+			reviewProcess, reviewErr := reviewTurn.Process, reviewTurn.Error
 			if reviewErr != nil {
 				recordAgent(stageID, "review", "failed", reviewPrompt, artifact, "Review agent failed before issuing a verdict.", []string{reviewPath}, reviewProcess)
 				return map[string]any{"status": "failed", "workspacePath": workspace, "repositoryPath": repoWorkspace, "agentInvocations": agentInvocations, "stageArtifacts": stageArtifacts}, fmt.Errorf("%s failed: %w", stageID, reviewErr)
@@ -1688,15 +1737,21 @@ func (server *Server) runCurrentPipelineStage(response http.ResponseWriter, requ
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
+	target := findRepositoryTarget(database, text(stageItem, "repositoryTargetId"))
+	profile := server.resolveAgentProfile(request.Context(), database, stageItem, target)
 	stageItem["stageId"] = stage["id"]
 	stageItem["assignee"] = stage["ownerAgentId"]
+	if _, err := preflightAgentRunner(payload.Runner, profile, text(stage, "ownerAgentId")); err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
 	mission := makeMission(stageItem)
 	operationID := fmt.Sprintf("operation_%s", text(stage, "id"))
 	attempt := makeAttemptRecord(stageItem, pipeline, "manual", payload.Runner, text(stage, "id"))
 	database.Tables.Attempts = appendOrReplace(database.Tables.Attempts, attempt)
 
 	upsertMissionAndOperation(&database, mission, text(pipeline, "id"))
-	result, err := server.runLocalProof(mission, operationID, payload.Runner)
+	result, err := server.runLocalProof(mission, operationID, payload.Runner, profile)
 	if err != nil {
 		database, _ = failAttemptRecord(database, text(attempt, "id"), pipeline, err.Error(), nil)
 		touch(&database)
@@ -1875,7 +1930,14 @@ func (server *Server) runOperation(response http.ResponseWriter, request *http.R
 		return
 	}
 	server.WorkspaceRoot = server.localWorkspaceRoot(request.Context())
-	result, err := server.runLocalProof(mission, payload.OperationID, payload.Runner)
+	profile := server.resolveAgentProfileForMission(request.Context(), mission)
+	if operation := findOperation(mission, payload.OperationID); operation != nil {
+		if _, err := preflightAgentRunner(payload.Runner, profile, text(operation, "agentId")); err != nil {
+			writeError(response, http.StatusBadRequest, err)
+			return
+		}
+	}
+	result, err := server.runLocalProof(mission, payload.OperationID, payload.Runner, profile)
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
@@ -1902,11 +1964,12 @@ func (server *Server) runOperation(response http.ResponseWriter, request *http.R
 	writeJSON(response, http.StatusOK, result)
 }
 
-func (server *Server) runLocalProof(mission map[string]any, operationID string, runner string) (OperationResult, error) {
+func (server *Server) runLocalProof(mission map[string]any, operationID string, runner string, profile ProjectAgentProfile) (OperationResult, error) {
 	operation := findOperation(mission, operationID)
 	if operation == nil {
 		return OperationResult{}, fmt.Errorf("unknown operation: %s", operationID)
 	}
+	agentID := text(operation, "agentId")
 	workspace, err := workspaceChildPath(server.WorkspaceRoot, text(mission, "sourceIssueKey"), text(operation, "stageId"))
 	if err != nil {
 		return OperationResult{}, err
@@ -1923,14 +1986,18 @@ func (server *Server) runLocalProof(mission map[string]any, operationID string, 
 	}
 	if err := writeAgentRuntimeSpec(filepath.Join(workspace, ".omega", "agent-runtime.json"), map[string]any{
 		"runner":             runner,
-		"agentId":            text(operation, "agentId"),
+		"agentId":            agentID,
 		"missionId":          text(mission, "id"),
 		"operationId":        operationID,
 		"workspaceRoot":      server.WorkspaceRoot,
 		"workspacePath":      workspace,
 		"repositoryTargetId": text(mission, "repositoryTargetId"),
 		"repositoryTarget":   text(mission, "repositoryTargetLabel"),
+		"agentProfile":       agentRuntimeMetadata(profile, agentID),
 	}); err != nil {
+		return OperationResult{}, err
+	}
+	if err := writeRunnerPolicyFiles(workspace, profile, agentID); err != nil {
 		return OperationResult{}, err
 	}
 	if err := os.WriteFile(filepath.Join(workspace, ".omega", "prompt.md"), []byte(text(operation, "prompt")), 0o644); err != nil {
@@ -1956,15 +2023,15 @@ func (server *Server) runLocalProof(mission map[string]any, operationID string, 
 			runnerProcess["status"] = "failed"
 			runnerProcess["exitCode"] = -1
 		}
-	} else if runner == "codex" {
-		codexResult, err := server.runCodexChange(mission, operation, workspace, proofDir)
-		stdout = codexResult.stdout
-		stderr = codexResult.stderr
-		branchName = codexResult.branchName
-		commitSha = codexResult.commitSha
-		changedFiles = codexResult.changedFiles
-		if codexResult.runnerProcess != nil {
-			runnerProcess = codexResult.runnerProcess
+	} else if isAIRunnerID(runner) {
+		agentResult, err := server.runAgentRepositoryChange(mission, operation, workspace, proofDir, profile, runner)
+		stdout = agentResult.stdout
+		stderr = agentResult.stderr
+		branchName = agentResult.branchName
+		commitSha = agentResult.commitSha
+		changedFiles = agentResult.changedFiles
+		if agentResult.runnerProcess != nil {
+			runnerProcess = agentResult.runnerProcess
 		}
 		if err != nil {
 			status = "failed"
@@ -2103,33 +2170,57 @@ func (server *Server) runDemoCodeChange(mission map[string]any, operation map[st
 	return demoCodeRunResult{stdout: stdout, branchName: branchName, commitSha: strings.TrimSpace(commitSha), changedFiles: []string{changedFile}}, nil
 }
 
-func (server *Server) runCodexChange(mission map[string]any, operation map[string]any, workspace string, proofDir string) (demoCodeRunResult, error) {
+func (server *Server) runAgentRepositoryChange(mission map[string]any, operation map[string]any, workspace string, proofDir string, profile ProjectAgentProfile, requestedRunner string) (demoCodeRunResult, error) {
+	agentID := text(operation, "agentId")
+	agent := agentProfileForRole(profile, agentID)
+	runnerID := effectiveAgentRunnerID(requestedRunner, profile, agentID)
+	agentRunner, resolvedRunnerID := NewAgentRunnerRegistry().Resolve(runnerID)
 	targetRepo := strings.TrimSpace(text(mission, "target"))
 	if targetRepo == "" || targetRepo == "No target" {
-		process, err := runSupervisedCommand(workspace, text(operation, "prompt"), "codex", "--ask-for-approval", "never", "exec", "--model", "gpt-5.4-mini", "--skip-git-repo-check", "--sandbox", "workspace-write", "--output-last-message", filepath.Join(proofDir, "codex-last-message.txt"), "-")
-		if err != nil {
-			return demoCodeRunResult{stdout: text(process, "stdout"), stderr: text(process, "stderr"), runnerProcess: process}, err
-		}
-		return demoCodeRunResult{stdout: text(process, "stdout"), stderr: text(process, "stderr"), runnerProcess: process}, nil
+		prompt := text(operation, "prompt") + "\n\n" + agentPolicyBlock(profile, agentID)
+		turn := agentRunner.RunTurn(context.Background(), AgentTurnRequest{
+			Role:       agentID,
+			StageID:    text(operation, "stageId"),
+			Runner:     resolvedRunnerID,
+			Workspace:  workspace,
+			Prompt:     prompt,
+			OutputPath: filepath.Join(proofDir, resolvedRunnerID+"-last-message.txt"),
+			Sandbox:    "workspace-write",
+			Model:      stringOr(agent.Model, "gpt-5.4-mini"),
+		})
+		return demoCodeRunResult{stdout: text(turn.Process, "stdout"), stderr: text(turn.Process, "stderr"), runnerProcess: turn.Process}, turn.Error
 	}
 
 	repoWorkspace := filepath.Join(workspace, "repo")
 	if output, err := cloneTargetRepository(workspace, targetRepo, repoWorkspace); err != nil {
 		return demoCodeRunResult{stdout: output}, fmt.Errorf("clone target repository: %w", err)
 	}
-	branchName := "omega/" + safeSegment(text(mission, "sourceIssueKey")) + "-" + safeSegment(text(operation, "stageId")) + "-codex"
+	if err := writeRunnerPolicyFiles(repoWorkspace, profile, agentID); err != nil {
+		return demoCodeRunResult{}, err
+	}
+	branchName := "omega/" + safeSegment(text(mission, "sourceIssueKey")) + "-" + safeSegment(text(operation, "stageId")) + "-" + safeSegment(resolvedRunnerID)
 	if _, err := runCommand(repoWorkspace, "git", "checkout", "-b", branchName); err != nil {
 		return demoCodeRunResult{branchName: branchName}, fmt.Errorf("create branch: %w", err)
 	}
 	_, _ = runCommand(repoWorkspace, "git", "config", "user.email", "omega-codex@example.local")
 	_, _ = runCommand(repoWorkspace, "git", "config", "user.name", "Omega Codex Runner")
 
-	prompt := fmt.Sprintf("%s\n\nRepository target: %s\nCreate the requested code change in this repository. Leave generated proof in %s.", text(operation, "prompt"), targetRepo, proofDir)
-	process, err := runSupervisedCommand(repoWorkspace, prompt, "codex", "--ask-for-approval", "never", "exec", "--model", "gpt-5.4-mini", "--skip-git-repo-check", "--sandbox", "workspace-write", "--output-last-message", filepath.Join(proofDir, "codex-last-message.txt"), "-")
+	prompt := fmt.Sprintf("%s\n\nRepository target: %s\nCreate the requested code change in this repository. Leave generated proof in %s.\n\n%s", text(operation, "prompt"), targetRepo, proofDir, agentPolicyBlock(profile, agentID))
+	turn := agentRunner.RunTurn(context.Background(), AgentTurnRequest{
+		Role:       agentID,
+		StageID:    text(operation, "stageId"),
+		Runner:     resolvedRunnerID,
+		Workspace:  repoWorkspace,
+		Prompt:     prompt,
+		OutputPath: filepath.Join(proofDir, resolvedRunnerID+"-last-message.txt"),
+		Sandbox:    "workspace-write",
+		Model:      stringOr(agent.Model, "gpt-5.4-mini"),
+	})
+	process := turn.Process
 	stdout := text(process, "stdout")
 	stderr := text(process, "stderr")
-	if err != nil {
-		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, err
+	if turn.Error != nil {
+		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, turn.Error
 	}
 
 	changed, err := runCommand(repoWorkspace, "git", "status", "--short")
@@ -2169,11 +2260,11 @@ func (server *Server) runCodexChange(mission map[string]any, operation map[strin
 		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, err
 	}
 	changedFiles := compactLines(changedNames)
-	summary := fmt.Sprintf("# Omega Codex Code Change\n\n- Work item: %s\n- Stage: %s\n- Branch: `%s`\n- Commit: `%s`\n- Changed files:\n%s\n```diffstat\n%s```\n", text(mission, "sourceIssueKey"), text(operation, "stageId"), branchName, strings.TrimSpace(commitSha), markdownFileList(changedFiles), stat)
+	summary := fmt.Sprintf("# Omega Agent Code Change\n\n- Work item: %s\n- Stage: %s\n- Runner: `%s`\n- Branch: `%s`\n- Commit: `%s`\n- Changed files:\n%s\n```diffstat\n%s```\n", text(mission, "sourceIssueKey"), text(operation, "stageId"), resolvedRunnerID, branchName, strings.TrimSpace(commitSha), markdownFileList(changedFiles), stat)
 	if err := os.WriteFile(filepath.Join(proofDir, "change-summary.md"), []byte(summary), 0o644); err != nil {
 		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, err
 	}
-	stdout += fmt.Sprintf("\ncodex repository change committed\nbranch: %s\ncommit: %s\n", branchName, strings.TrimSpace(commitSha))
+	stdout += fmt.Sprintf("\n%s repository change committed\nbranch: %s\ncommit: %s\n", resolvedRunnerID, branchName, strings.TrimSpace(commitSha))
 	return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, commitSha: strings.TrimSpace(commitSha), changedFiles: changedFiles, runnerProcess: process}, nil
 }
 
@@ -2298,8 +2389,8 @@ Verdict: NEEDS_HUMAN_INFO
 `, repoSlug, prURL, text(item, "key"), text(item, "title"), text(item, "description"), markdownAnyList(item["acceptanceCriteria"]), markdownFileList(changedFiles), focus, truncateForProof(testOutput, 4000), truncateForProof(checksOutput, 4000), truncateForProof(diffText, 12000))
 }
 
-func runDevFlowReviewAgent(repoWorkspace string, prompt string, outputPath string) (map[string]any, error) {
-	process, err := runSupervisedCommand(repoWorkspace, prompt, "codex", "--ask-for-approval", "never", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"medium\"", "--skip-git-repo-check", "--sandbox", "read-only", "--output-last-message", outputPath, "-")
+func runDevFlowReviewAgent(repoWorkspace string, prompt string, outputPath string, model string) (map[string]any, error) {
+	process, err := runSupervisedCommand(repoWorkspace, prompt, "codex", "--ask-for-approval", "never", "exec", "--model", stringOr(model, "gpt-5.4-mini"), "-c", "model_reasoning_effort=\"medium\"", "--skip-git-repo-check", "--sandbox", "read-only", "--output-last-message", outputPath, "-")
 	ensureAgentOutputFile(outputPath, process)
 	return process, err
 }

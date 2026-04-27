@@ -2,6 +2,27 @@
 
 本文记录当前 v0Beta 已完成的关键工程节点，方便后续整理仓库和演示材料。
 
+## 2026-04-27
+
+### 门户首页与功能页 SPA 结构
+
+完成：
+
+- React SPA 增加门户首页，默认从 `http://localhost:5173/` 进入。
+- Workboard 保留为真实功能页，可通过首页 CTA 或 `#workboard` 打开。
+- 首页参考飞书工作台门户：顶部导航、左侧应用入口、中部应用宫格和模板推荐、右侧信息卡，文案聚焦 Requirement -> Pipeline -> Agent -> GitHub PR -> Human Review。
+- 功能页保留现有本地执行、GitHub workspace、Agent trace、human gate 和 proof 展示能力。
+- 门户首页从 `App.tsx` 拆分为 `apps/web/src/components/PortalHome.tsx`，为后续继续拆 Workboard 子模块做准备。
+- Workboard 视觉系统更新为浅色工作台风格，保持原功能不变：左侧 workspace、GitHub Issues、Work item 分组、状态 pill、右侧 rail 和主要卡片统一到白色 / 浅蓝体系。
+
+验证：
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx
+npm run lint
+npm run build
+```
+
 ## 2026-04-26
 
 ### Workflow 状态机与 Rework 回流
@@ -28,7 +49,7 @@ npm run lint
 
 - 移除 `devflow-pr` 中为了表面跑通而默认生成的人工审批 / merge proof。
 - Implementation 后会启动两轮只读 Review Agent，审查 PR diff、changed files、测试结果和验收标准。
-- Review Agent 必须输出明确 verdict；`APPROVED` 才能进入人工审核，`CHANGES_REQUESTED` / blocked / failed 会让 Attempt 失败并保留错误。
+- Review Agent 必须输出明确 verdict；`APPROVED` 才能进入人工审核，`CHANGES_REQUESTED` 会进入 Rework 并回到 Code Review，blocked / failed 才会让 Attempt 失败并保留错误。
 - `human_review` 变成真实 checkpoint：Pipeline 停在 `waiting-human`，Work item 进入 `In Review`，不会自动 merge。
 - 用户调用 checkpoint Approve 后，后端继续执行 merge / delivery，生成 `human-review.md`、`merge.md`，更新 `handoff-bundle.json` 并将 Pipeline / Attempt / Item 标记完成。
 - 前端 Run / AutoRun 默认发送 `autoApproveHuman=false`、`autoMerge=false`。

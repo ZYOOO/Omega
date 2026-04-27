@@ -16,7 +16,9 @@ Omega 是一个 local-first 的 AI 研发流程引擎。它把需求、任务、
 ## 当前架构
 
 ```text
-React Workboard
+React SPA
+  -> Feishu-style Portal Home
+  -> Workboard
   -> Go Local Service
       -> SQLite
       -> Pipeline / Agent orchestration
@@ -27,7 +29,7 @@ React Workboard
 
 主要模块：
 
-- 前端 SPA：`apps/web/src/App.tsx`、`apps/web/src/core/*`、`apps/web/src/omegaControlApiClient.ts`、`apps/web/src/workspaceApiClient.ts`
+- 前端 SPA：`apps/web/src/App.tsx`、`apps/web/src/components/PortalHome.tsx`、`apps/web/src/core/*`、`apps/web/src/omegaControlApiClient.ts`、`apps/web/src/workspaceApiClient.ts`
 - Desktop shell：`apps/desktop`
 - 本地服务：`services/local-runtime/cmd/omega-local-runtime`
 - Go 核心：`services/local-runtime/internal/omegalocal`
@@ -38,7 +40,7 @@ React Workboard
 仓库结构：
 
 ```text
-apps/web                  # TS + React SPA，包含 Workboard、Pipeline、Proof UI
+apps/web                  # TS + React SPA，包含门户首页、Workboard、Pipeline、Proof UI
 apps/desktop              # Electron shell 预留，用于最终桌面 App 打包
 services/local-runtime    # Go local runtime，包含 API、SQLite、编排、本地 runner、GitHub 交付
 packages/shared           # 共享类型和 API schema 预留
@@ -94,6 +96,12 @@ npm run web:dev
 
 ```text
 http://localhost:5173/
+```
+
+默认页面是参考飞书工作台结构的门户首页，功能页入口是首页 CTA 或：
+
+```text
+http://localhost:5173/#workboard
 ```
 
 Go local service 默认监听：
@@ -231,6 +239,14 @@ ZYOOO/TestRepo
 - `docs/competition-requirements-matrix.md`：赛题要求对照。
 - `docs/manual-testing-guide.md`：手动测试指南。
 - `docs/todo.md`：任务清单。
+- `HANDOFF.md`：当前接手说明、启动方式、验证路径和已知缺口。
+
+## 当前 UI 状态
+
+- `http://localhost:5173/` 默认进入门户首页。
+- `http://localhost:5173/#workboard` 进入真实功能页。
+- 门户首页已经从 `App.tsx` 拆到 `apps/web/src/components/PortalHome.tsx`。
+- Workboard 保持原功能，但已统一为浅色工作台风格：左侧 workspace、GitHub Issues、Work item 列表、右侧 rail 和状态卡片保持同一视觉体系。
 
 ## 当前重点缺口
 

@@ -103,6 +103,13 @@ func (server *Server) runOrchestratorTick(ctx context.Context, payload orchestra
 			return nil, http.StatusInternalServerError, err
 		}
 		if payload.AutoRun {
+			profile := server.resolveAgentProfile(ctx, database, item, target)
+			if _, err := preflightAgentRunner("profile", profile, "coding"); err != nil {
+				return nil, http.StatusBadRequest, err
+			}
+			if _, err := preflightAgentRunner("profile", profile, "review"); err != nil {
+				return nil, http.StatusBadRequest, err
+			}
 			database, pipeline, attempt := beginDevFlowAttempt(database, pipelineIndex, item, pipeline, "orchestrator")
 			lock["runnerProcessState"] = "running"
 			lock["updatedAt"] = nowISO()
@@ -203,11 +210,12 @@ func (server *Server) putOrchestratorWatcher(response http.ResponseWriter, reque
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
+	responseWatcher := cloneMap(watcher)
 	if text(watcher, "status") == "active" {
 		server.ensureOrchestratorWatcherLoop()
-		go server.runOrchestratorWatcher(context.Background(), watcher, true)
+		go server.runOrchestratorWatcher(context.Background(), cloneMap(watcher), true)
 	}
-	writeJSON(response, http.StatusOK, watcher)
+	writeJSON(response, http.StatusOK, responseWatcher)
 }
 
 func orchestratorWatcherID(targetID string) string {

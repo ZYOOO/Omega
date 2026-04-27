@@ -127,6 +127,19 @@ Item
 - [x] 建立 `docs/README.md` 作为当前文档入口，区分 canonical v0Beta 文档与历史工作笔记
 - [x] 移除 `devflow-pr` 的表面自动通过逻辑：Review Agent 必须输出明确 verdict，Human Review checkpoint 会真实阻塞，Approve 后才执行 merge / delivery
 - [x] 把默认 `devflow-pr` 从 Go hardcode 抽成 Markdown workflow：`services/local-runtime/workflows/devflow-pr.md`，并让 Go runtime 从模板读取 stages、agents、artifact、review rounds
+- [x] 按赛题功能二的第一项补齐 TS + React SPA 双页面结构：门户首页 + Workboard 功能页，默认首页，`#workboard` 进入真实功能区
+- [x] 把门户首页从 `App.tsx` 拆到 `apps/web/src/components/PortalHome.tsx`，降低单文件复杂度
+- [x] 将 Workboard 视觉更新为与门户一致的浅色工作台风格，同时保留原有本地执行、GitHub workspace、Agent trace、Human gate、Proof 功能
+- [x] 新增 Workspace Config 入口：Project 页面 `Project config`、Workspace 齿轮和 Workspace subnav 都可进入配置页
+- [x] Workspace Config 支持本地 workspace root 配置 UI：路径输入、默认路径、目录选择器兜底和保存入口
+- [x] Project Agent Profile 配置入口基础版：可编辑 workflow、runner、Skill allowlist、MCP allowlist、stage policy、`.codex` policy，并生成 runtime spec preview
+- [x] Project Agent Profile UI 拆成 Workflow / Agents / Runtime files 三层：支持 workflow markdown 草稿、按 Agent 配置 runner/model/Skills/MCP，以及 `.omega` / `.codex` / `.claude` 运行时文件预览
+- [x] Project Agent Profile 接入 Go API / SQLite：支持 `/agent-profile` 读写、Project / Repository scope 解析、Pipeline run metadata 绑定和 runner runtime bundle 写入
+- [x] Agent Profile runner 配置接入本机 capability 预检：前端阻止保存不可用 runner，Go runtime 在创建 attempt / operation workspace 前拒绝未安装 runner
+- [x] 建立 Agent / Workflow 配置方案文档：`docs/agent-workflow-configuration-plan.md`
+- [x] 建立功能实现记录文档：`docs/feature-implementation-log.md`，后续功能按同一格式记录目标、做法、验证和后续工作
+- [x] Operator Runner processes UI 收敛为摘要列表，stdout/stderr 默认折叠，避免执行记录页面被日志块淹没
+- [x] 使用正式 Omega logo 资产：`apps/web/public/omega-logo.png`
 
 ## 进行中
 
@@ -137,15 +150,17 @@ Item
 - [x] DevFlow 编排重构：抽象 AgentRunner，当前默认 Codex，后续可切换 opencode / Claude Code / local runner
 - [x] DevFlow 编排重构：前端详情页展示真实 Agent turn、输入/输出 artifact、状态流转和 runner telemetry，弱化单纯 proof 数字
 - [ ] DevFlow 编排重构：继续把当前 background goroutine 升级为 JobSupervisor，补齐 heartbeat、stall retry、cancel、timeout、多 turn continuation、worker host 分配
+- [ ] 前端模块化：继续拆分 `App.tsx`，优先拆 Workboard list/detail、Inspector、Operator 面板和 GitHub workspace 组件
 - [x] 把 Requirement Decomposition 建成一等服务端能力：raw requirement / GitHub issue -> structured requirement / acceptance criteria / risks / sub-items / target repo context
 - [x] 把 Agent handoff bundle 建成基础 artifact：每个 stage 有输入/输出 artifact contract，`devflow-pr` 生成 handoff bundle
 - [ ] 把 Agent handoff bundle 从文件 proof 继续升级为可查询的一等表记录
-- [ ] 增加 Agent runtime spec 模板：为 Codex / opencode / Claude Code 等 runner 生成对应的本地约束文件、prompt 文件和工具策略
+- [x] 增加 Agent runtime spec 基础版：每个 operation / DevFlow cycle 写入 `.omega/agent-runtime.json`
+- [ ] 增加 runner-specific runtime 模板：为 Codex / opencode / Claude Code 生成对应 `.codex` / prompt / tool policy 文件，并消费 Project Agent Profile
 - [ ] 扩展 runner process supervisor：为 opencode / Claude Code / demo-code 统一接入 timeout、cancel、retry、exit status、stdout/stderr 持久化
 - [x] `run-devflow-cycle` 产品主路径异步化：点击 Run 先创建 Attempt 并立即返回，后端 background job 继续执行，前端通过轮询更新状态
 - [x] `orchestrator/tick autoRun` 异步化：认领后创建 Attempt，后台 job 执行并在完成/失败后释放 execution lock
 - [x] Human Review checkpoint 产品主路径真实化：默认不 auto approve / auto merge，Review Agent 通过后停在 `waiting-human`
-- [ ] 把 Workflow Template 从文件默认值继续升级为 SQLite 一等记录，并支持 repository workspace 覆盖
+- [ ] 把 Workflow Template 从文件默认值继续升级为 SQLite 一等记录，并支持 Project / Repository Workspace 覆盖
 - [ ] 增加 Workflow Template 编辑 API：读取、保存、校验、恢复默认、导入/导出 Markdown
 - [ ] 把 coding / review / delivery prompt sections 从 Markdown body 渲染到每个 Agent，进一步减少 Go 里的 prompt hardcode
 - [ ] 增加正式 JobSupervisor：扫描 repository open issues / ready work items / runnable stages / failed attempts / human gates，并按模板调度下一步
@@ -153,44 +168,51 @@ Item
 - [ ] 增加 issue/work item preflight checks：repo target、workspace root、branch 权限、dirty state、重复执行锁、必要 CLI 能力检查
 - [ ] 增加 GitHub delivery contract preflight：issue source 可选，但 repository target、branch 权限、PR 创建权限、checks 读取权限必须在运行前验证
 - [x] 增加 orchestrator execution lock：同一个 GitHub issue / Work item / repository target 不能被多个本地 App 重复认领或重复执行
-- [ ] 增加 Agent runner registry：按 stage/agent/runner 选择 Codex、opencode、Claude Code 或 local runner，并注入不同 issue、workspace、prompt、artifact 上下文
+- [x] 增加 Agent runner registry：按 stage/agent/runner 选择 Codex、opencode、Claude Code 或 local runner，并注入不同 issue、workspace、prompt、artifact 上下文
+- [x] 增加 Agent runner availability preflight：按 Agent Profile 配置检查 Codex / opencode / Claude Code / demo-code 所需 CLI，缺失时阻止启动而不是生成假失败流程
 - [ ] 清理遗留外部参考命名：内部文件、类型、测试、历史文档统一使用 Omega Workboard / DevFlow 语言，外部产品名只出现在“参考来源”说明中
-- [ ] 把 Product Layer 持久化从 workspace 快照继续规范到 missions / operations / checkpoints / proof_records 等一等表
+- [x] 把 Product Layer 持久化从 workspace 快照推进到 missions / operations / checkpoints / proof_records 等一等表基础版
 - [ ] 按新的 Work Model 继续把 Project / Repository target / Work item / Pipeline run 的 SQLite 结构从 JSON snapshot 推进为可查询表
 - [x] 先把 Requirement 从 snapshot 中抽成服务端一等表，并在本地 SQLite / 前端本地 fallback SQLite 中持久化
 - [ ] 把 Go Local Service 的 SQLite 写入从 snapshot-first 继续推进为 repository-first
 - [ ] 把 Go 侧 migration metadata 演进成可执行增量迁移
-- [ ] 把旧 Node 本地服务端降级为兼容回退，不再作为主路径
+- [x] 把旧 Node / 前端本地服务路径降级为兼容回退；Go Local Runtime 已是默认主路径
+- [ ] 清理旧 Node / 前端本地服务端兼容代码，减少双实现维护成本
 - [ ] 继续减少前端直接持有的业务逻辑，让服务端成为 Mission Control 的唯一写入者
 - [x] 把 GitHub repo / issue import API 接到前端 UI
 - [x] 把 App 内部需求入口接到 repository workspace：不依赖 GitHub issue 也能创建 Work item 并运行
-- [ ] 把 Checkpoint Reject 的“回退重做”做成更清晰的 stage timeline 可视化
+- [x] Work item 详情页展示 Attempt stages / Agent turns / artifacts / Human Review 基础版，可看到真实状态流转
+- [ ] 把 Checkpoint Reject 的“回退重做”做成更清晰的 stage timeline 可视化，突出 rejected -> rework -> review 回流
 - [x] Operator 视图增加基础 stage timeline，可看到当前 Pipeline 每个阶段的状态
 - [ ] 按赛题要求持续维护 Must-have / Good-to-have 对照与完成度
 
+## 已完成且不再作为独立任务
+
+- [x] `devflow-pr` 从内置模板推进为默认 Markdown 模板：已并入 Workflow markdown 主路径，后续只跟踪模板持久化 / 编辑 API。
+- [x] GitHub PR / checks 读取 API：已并入 GitHub PR lifecycle 能力，后续只跟踪 PR lifecycle UI 和 issue 状态回写。
+- [x] GitHub issue import：Go API 和前端入口均已完成，后续只跟踪 issue 状态回写 / label / comment 同步。
+- [x] Repository target 建模与绑定入口：已并入 Project / Repository Workspace 主模型，后续只跟踪项目创建和 repository target 配置增强。
+- [x] Work item source / external reference / acceptance criteria / repository target 字段：已并入 Workboard 基础模型，后续只跟踪更多一等表和查询能力。
+- [x] App 内部新建需求继承 Repository Workspace：已并入 Work item 创建主路径。
+- [x] Execution lock API 设计：已实现并接入 UI，后续只跟踪 shared sync 下的跨设备协调。
+
 ## 下一步
 
-- [x] 增加 GitHub PR / checks 读取 API：把 review/check 状态作为 Pipeline proof 和 delivery gate
-- [x] 在 Go Local Service 中补齐 GitHub issue import 的真实实现
 - [ ] 增加 App 内可编辑 Workflow Template：在 UI/API 中编辑阶段、Agent、Gate、review rounds、默认 repo/workspace 配置，替代散落的 md/env 文件
-- [x] 把 `devflow-pr` 从内置模板推进为默认 Markdown 模板
+- [x] Project Agent Profile 从 `omega_settings` 继续升级为一等 SQLite 表
+- [ ] Project Agent Profile 继续补充版本历史展示、恢复默认、导入/导出，以及更完整的 workflow/schema 校验
 - [ ] 持久化 connector sync report，而不只是 sync intent
 - [ ] 增加新项目的 workspace bootstrap API
-- [x] 增加 repository target 建模：一个 Project 可绑定一个或多个 GitHub/local repo
-- [x] 增加 Project repository target 绑定入口：选中 GitHub repo 后写入当前 Project
-- [x] 给 Work item 增加 source / external reference / acceptance criteria / repository target 字段
-- [x] APP 内部新建需求时可继承当前 Repository workspace，`source = manual`，与 `source = github_issue` 保持清晰区分
 - [ ] 把 LLM Provider selection 真正映射到 Codex / opencode / compatible provider runner
 - [ ] 把 `run-current-stage` 的 runner 继续扩展为 opencode 和更完整的 provider selection 映射
 - [ ] 设计 shared sync API：本地/远端/GitHub/飞书创建 requirement 后双向同步状态
-- [ ] 设计 execution lock API：多个本地 App 同步同一项目时避免重复执行
 - [ ] 在 Go Local Runtime 中扩展 `lark-cli` adapter，支持发送 checkpoint 卡片通知和 pipeline 结果通知
 
 ## Workboard / 飞书 / GitHub 缺口
 
-- [ ] 把当前轻量 issue list 扩展成更完整的 Omega Workboard（项目 / 视图 / 分组）
-- [ ] 增加更完整的项目级和视图级建模，而不只是单条 work item CRUD
-- [ ] 继续完善 Project 页面：展示目标、health、active work items、linked pipelines
+- [x] 把当前轻量 issue list 扩展成更完整的 Omega Workboard 基础版：Project、Views、Repository Workspace、Work item 分组
+- [x] 增加项目级和视图级 UI 基础版，不再只是单条 work item CRUD
+- [ ] 继续完善 Project 页面：增加 health、active work items、linked PR / checks / pipeline 状态摘要
 - [x] 增加真实 GitHub 仓库信息读取 API
 - [x] 增加 GitHub issue 导入到 Omega Workboard 的 Go API
 - [x] 增加 GitHub repo / issue import 的前端入口
@@ -209,7 +231,7 @@ Item
 
 ## 执行层缺口
 
-- [ ] 增加 requirement decomposition stage artifact，并让 solution/coding/testing/review stages 消费上游 artifact
+- [x] 增加 requirement decomposition stage artifact 基础版，并通过 handoff bundle / stage input contract 串联 solution/coding/testing/review
 - [x] 增加 Requirement -> Item 的持久化归属关系，避免 Agent 只拿到孤立 issue/item 后误判目标仓库或需求上下文
 - [x] 增加 Agent 协作协议基础版：stage input contract、output contract、handoff bundle、reject reason、retry instruction
 - [x] 增加 repository target 安全约束：执行前必须解析 Work item 的 `repositoryTargetId`，避免 Agent 在错误仓库运行
@@ -231,15 +253,16 @@ Item
 - [ ] 增加项目创建与 repository target 配置
 - [ ] 增加由服务端数据驱动的 activity / event timeline 页面
 - [x] 增加 Operator 视图基础版（队列 / waiting-human / proof / runtime model / checkpoint）
-- [ ] 增强 Operator 视图（失败队列 / 重试 / stage timeline / token 耗时）
+- [ ] 增强 Operator 视图（失败队列 / 重试 / token 耗时 / runner cost）
 - [x] 增强 Operator 视图第一版：展示阶段流转、执行锁、Runner 命令/exit code/耗时/stdout-stderr 摘要
-- [ ] 在 UI 中更清晰地展示 Mission / Operation / Checkpoint
+- [x] 在 UI 中更清晰地展示 Mission / Operation / Checkpoint 基础版：Operator 列表、Work item 详情页、Human Review gate
 - [ ] 优化空状态，引导用户导入 GitHub / Feishu / CI 或手动创建
 - [ ] 明确未来多人协作模型
 - [x] 接入本地 GitHub 网页 OAuth 主路径
 - [x] GitHub OAuth App 配置改为 App 内填写并持久化到 SQLite，`.env` 只作为开发 fallback
 - [ ] 继续明确未来 GitHub App / 多人协作授权策略
-- [ ] 增加本地 App 执行器在线状态 / 同步状态 / 当前 execution lock 展示
+- [x] 增加本地 App 执行器能力 / Runner process / 当前 execution lock 展示基础版
+- [ ] 增加本地 App sync loop 在线状态和远端同步状态展示
 - [x] 增加飞书通知状态展示（runner message 基础版）
 
 ## 赛题追踪

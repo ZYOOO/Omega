@@ -15,6 +15,17 @@ describe("App operator view", () => {
     vi.restoreAllMocks();
     vi.resetModules();
     localStorage.clear();
+    window.location.hash = "";
+  });
+
+  it("renders the portal homepage", async () => {
+    window.location.hash = "#home";
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    expect(await screen.findByText("张涌，欢迎回到 Omega")).toBeInTheDocument();
+    expect(screen.getByText("AI DevFlow 工作台")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "进入 Workboard" })).toBeInTheDocument();
   });
 
   it("creates manual work items with a local repository target path", async () => {
@@ -72,9 +83,29 @@ describe("App operator view", () => {
           { id: "requirement", name: "Requirement Agent", outputContract: ["requirements"], defaultModel: { providerId: "openai", model: "gpt-5.4-mini", reasoningEffort: "medium" } }
         ]));
       }
+      if (url.includes("/agent-profile") && !init) {
+        return Promise.resolve(jsonResponse({
+          projectId: "project_omega",
+          workflowTemplate: "devflow-pr",
+          workflowMarkdown: "workflow: devflow-pr",
+          stagePolicy: "Human Review blocks delivery.",
+          skillAllowlist: "browser-use",
+          mcpAllowlist: "github",
+          codexPolicy: "workspace-write",
+          claudePolicy: "repository only",
+          agentProfiles: [
+            { id: "requirement", label: "Requirement", runner: "codex", model: "gpt-5.4-mini", skills: "browser-use", mcp: "github", stageNotes: "Clarify requirement.", codexPolicy: "write artifact", claudePolicy: "summarize" }
+          ],
+          source: "project"
+        }));
+      }
+      if (url.includes("/agent-profile") && init?.method === "PUT") {
+        return Promise.resolve(jsonResponse({ ...JSON.parse(String(init.body)), source: "project", updatedAt: new Date().toISOString() }));
+      }
       if (url.endsWith("/local-capabilities")) {
         return Promise.resolve(jsonResponse([
           { id: "git", command: "git", category: "source-control", available: true, version: "git version 2.45.0", required: true },
+          { id: "codex", command: "codex", category: "ai-runner", available: true, version: "codex 0.98.0", required: false },
           { id: "lark-cli", command: "lark-cli", category: "feishu", available: false, required: false }
         ]));
       }
@@ -96,6 +127,27 @@ describe("App operator view", () => {
     expect(screen.getByText("Local tools")).toBeInTheDocument();
     expect(screen.getByText("git")).toBeInTheDocument();
     expect(screen.getByText("lark-cli")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Projects/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Project config" }));
+    expect(screen.getByText("Workspace folder")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Choose folder" })).toBeInTheDocument();
+    expect(screen.getByText("Project Agent Profile")).toBeInTheDocument();
+    expect(screen.getByText(/Agent orchestration/)).toBeInTheDocument();
+    const editProfileButton = screen.queryByRole("button", { name: "Edit profile" });
+    if (editProfileButton) fireEvent.click(editProfileButton);
+    expect(screen.getByRole("button", { name: "Workflow" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Workflow parser draft")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(screen.getByLabelText("Agent roster")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Runtime files" }));
+    expect(screen.getByRole("button", { name: ".codex/OMEGA.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: ".claude/CLAUDE.md" })).toBeInTheDocument();
+    expect(screen.getByText("Runtime file preview")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved to local runtime"));
+    expect(localStorage.getItem("omega-agent-configuration-draft")).toContain("devflow-pr");
   });
 
   it("renders execution locks, runner process telemetry, and pipeline stages", async () => {
@@ -345,6 +397,7 @@ describe("App operator view", () => {
     render(<App />);
 
     fireEvent.click(await screen.findByText("Provider access"));
+    fireEvent.click(await screen.findByText("OAuth app setup"));
     fireEvent.change(await screen.findByLabelText("Client ID"), { target: { value: "omega-client" } });
     fireEvent.change(screen.getByLabelText("Client secret"), { target: { value: "omega-secret" } });
     fireEvent.change(screen.getByLabelText("Callback URL"), { target: { value: "http://127.0.0.1:3888/auth/github/callback" } });
@@ -449,7 +502,9 @@ describe("App operator view", () => {
     fireEvent.click(await screen.findByText("GitHub"));
 
     await waitFor(() => expect(screen.getByText("Provider access")).toBeInTheDocument());
-    expect(screen.getByText("OAuth app setup")).toBeInTheDocument();
+    const oauthSetupSummary = screen.getByText("OAuth app setup");
+    expect(oauthSetupSummary.closest("details")).not.toHaveAttribute("open");
+    fireEvent.click(oauthSetupSummary);
     expect(screen.getByLabelText("Client ID")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Continue with GitHub" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Continue with GitHub" }));
@@ -669,7 +724,8 @@ describe("App operator view", () => {
     expect(screen.getByText("GitHub issue")).toBeInTheDocument();
     expect(screen.getByText("1 item")).toBeInTheDocument();
 
-    fireEvent.click(within(workspaceNavigation).getByRole("button", { name: "Delete workspace" }));
+    fireEvent.click(within(workspaceNavigation).getByRole("button", { name: "Configure acme/demo" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete workspace" }));
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         "http://127.0.0.1:3888/github/repository-targets/repo_acme_demo",
@@ -1630,10 +1686,9 @@ describe("App operator view", () => {
 
     await screen.findAllByText("Fresh requirement");
     expect(screen.getAllByText("Not started").length).toBeGreaterThan(1);
-    expect(screen.getByText("Requirement intake")).toBeInTheDocument();
-    expect(screen.getByText("Implementation and PR")).toBeInTheDocument();
-    expect(screen.getByText("Done · Code+Test")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Completed" })).toBeDisabled();
+    expect(screen.getByLabelText(/current progress Rev \+ Ship/)).toBeInTheDocument();
+    expect(screen.getAllByText("Rev + Ship")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Completed" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Delivered requirement"));
     expect(await screen.findByText("Current attempt")).toBeInTheDocument();
@@ -1644,7 +1699,8 @@ describe("App operator view", () => {
     fireEvent.click(screen.getByRole("button", { name: /ZYOOO\/TestRepo 2/ }));
     expect(screen.queryByRole("button", { name: "Run ready issue now" })).not.toBeInTheDocument();
 
-    fireEvent.click(await screen.findByRole("switch", { name: "Auto processing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Configure ZYOOO/TestRepo" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Auto scan ready GitHub issues" }));
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
         "http://127.0.0.1:3888/orchestrator/watchers/repo_ZYOOO_TestRepo",
@@ -1792,12 +1848,13 @@ describe("App operator view", () => {
 
     fireEvent.click((await screen.findAllByText("Add registration page"))[0]);
 
-    expect(await screen.findByText("Human gate")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Open PR" })).toHaveAttribute("href", "https://github.com/ZYOOO/TestRepo/pull/18");
-    expect(screen.getByText("Review materials")).toBeInTheDocument();
+    expect(await screen.findByText("Omega review")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "https://github.com/ZYOOO/TestRepo/pull/18" })).toHaveAttribute("href", "https://github.com/ZYOOO/TestRepo/pull/18");
+    expect(screen.getByText("Changed")).toBeInTheDocument();
     expect(screen.getAllByText("code-review-round-2-cycle-3.md").length).toBeGreaterThan(0);
-    expect(screen.getByText("Recent agent decisions")).toBeInTheDocument();
+    expect(screen.getByText("Validation")).toBeInTheDocument();
     expect(screen.getByText("Review approved the current diff.")).toBeInTheDocument();
+    expect(screen.getByLabelText("Human review comment")).toBeInTheDocument();
   });
 
   it("does not overwrite the Go workspace snapshot on initial load", async () => {

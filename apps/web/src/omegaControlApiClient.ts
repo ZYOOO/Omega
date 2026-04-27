@@ -57,6 +57,33 @@ export interface AgentDefinitionInfo {
   defaultModel: LlmProviderSelection;
 }
 
+export interface AgentProfileDraftInfo {
+  id: string;
+  label: string;
+  runner: string;
+  model: string;
+  skills: string;
+  mcp: string;
+  stageNotes: string;
+  codexPolicy: string;
+  claudePolicy: string;
+}
+
+export interface ProjectAgentProfileInfo {
+  projectId: string;
+  repositoryTargetId?: string;
+  workflowTemplate: string;
+  workflowMarkdown: string;
+  stagePolicy: string;
+  skillAllowlist: string;
+  mcpAllowlist: string;
+  codexPolicy: string;
+  claudePolicy: string;
+  agentProfiles: AgentProfileDraftInfo[];
+  source?: string;
+  updatedAt?: string;
+}
+
 export interface LocalCapabilityInfo {
   id: string;
   command: string;
@@ -497,6 +524,26 @@ export async function fetchAgentDefinitions(
   fetchImpl: typeof fetch = fetch
 ): Promise<AgentDefinitionInfo[]> {
   return fetchJson<AgentDefinitionInfo[]>(apiUrl, "/agent-definitions", fetchImpl);
+}
+
+export async function fetchProjectAgentProfile(
+  apiUrl: string,
+  scope: { projectId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<ProjectAgentProfileInfo> {
+  const search = new URLSearchParams();
+  if (scope.projectId) search.set("projectId", scope.projectId);
+  if (scope.repositoryTargetId) search.set("repositoryTargetId", scope.repositoryTargetId);
+  const suffix = search.toString() ? `?${search.toString()}` : "";
+  return fetchJson<ProjectAgentProfileInfo>(apiUrl, `/agent-profile${suffix}`, fetchImpl);
+}
+
+export async function updateProjectAgentProfile(
+  apiUrl: string,
+  profile: ProjectAgentProfileInfo,
+  fetchImpl: typeof fetch = fetch
+): Promise<ProjectAgentProfileInfo> {
+  return putJson<ProjectAgentProfileInfo>(apiUrl, "/agent-profile", profile, fetchImpl);
 }
 
 export async function fetchLocalCapabilities(

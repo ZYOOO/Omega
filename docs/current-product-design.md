@@ -66,10 +66,18 @@ So Omega should not become a cloud runner that directly operates every developer
 
 Omega should present:
 
+- A portal-style Home page that exposes product modules, workflow templates, and entry points into the real Workboard.
 - A Workboard where projects, repository workspaces, requirements, and work items are managed as Omega-owned product state.
 - A Mission Control view showing execution status, proof, gates, and activity.
 - A right-side inspector for properties, provider access, and execution context.
 - A visible pipeline from requirement intake to delivery.
+
+Current UI shape:
+
+- `/` opens a portal-style Home page inspired by a modern productivity suite dashboard.
+- `/#workboard` opens the real functional Workboard.
+- The Home page is implemented in `apps/web/src/components/PortalHome.tsx`.
+- Workboard keeps the existing execution features but now uses the same light blue / white visual system as the portal: repository workspace, GitHub Issues, Work item groups, runner status, and right-side rail are visually aligned.
 
 ### 3.2 What the system does
 

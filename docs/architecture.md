@@ -53,6 +53,7 @@ React Workboard
 当前主要代码：
 
 - `/Users/zyong/Projects/Omega/apps/web/src/App.tsx`
+- `/Users/zyong/Projects/Omega/apps/web/src/components/PortalHome.tsx`
 - `/Users/zyong/Projects/Omega/apps/web/src/core/workboard.ts`
 - `/Users/zyong/Projects/Omega/apps/web/src/workspaceApiClient.ts`
 - `/Users/zyong/Projects/Omega/apps/web/src/omegaControlApiClient.ts`
@@ -314,6 +315,7 @@ OpenAPI 文档位于：
 
 已具备：
 
+- Feishu-style React SPA 门户首页 + Workboard 功能页
 - React Workboard
 - Go Local Service
 - SQLite 持久化
@@ -334,8 +336,9 @@ OpenAPI 文档位于：
 
 仍需继续：
 
+- 继续拆分 `App.tsx`，把 Workboard 列表、详情、inspector、operator 面板拆成更小组件。
 - Pipeline Template 可编辑化。
-- Agent runner registry 完整接入 Codex / opencode / Claude Code。
+- Agent runner registry 已接入 Codex / opencode / Claude Code 的统一分发骨架；仍需补 runner-specific 模板、timeout/cancel/retry 和 provider 映射。
 - JobSupervisor：heartbeat、stall detection、retry、cancel、timeout、多 turn continuation、worker host 分配和崩溃恢复。
 - 更完整的 checkpoint timeline。
 - GitHub issue comment / label 回写。

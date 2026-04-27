@@ -167,6 +167,9 @@ Item
 
 已完成：
 
+- React SPA 已形成双页面结构：门户首页作为默认入口，Workboard 作为真实功能页。
+- 门户首页已拆到 `apps/web/src/components/PortalHome.tsx`，`App.tsx` 后续继续拆 Workboard 子模块。
+- Workboard 已统一到浅色工作台视觉体系，减少旧暗色界面的信息噪声。
 - Work items 列表行内 stage strip。
 - Detail 页面优先展示真实 pipeline stages。
 - Operator 面板展示 stage timeline、execution locks、runner telemetry。
@@ -228,14 +231,16 @@ go test ./...
 5. 创建 repository workspace。
 6. 在 workspace 内新建 Requirement。
 7. 点击 Run。
-8. 检查 Planning -> Running -> Done。
-9. 检查 PR、proof、merge 结果。
+8. 检查 Not started / Running / Human Review / Done 等状态。
+9. 在 Human Review 处检查 PR、Review artifacts、changed files 和 proof。
+10. Approve 后再检查 merge / delivery 结果。
 
 ## 4. 近期优先级
 
 1. Pipeline Template 从内置 Go 模板变成 App 内可编辑配置。
-2. Agent runner registry：Codex / opencode / Claude Code / demo runner 统一协议。
+2. Runner registry 深化：在已接入 Codex / opencode / Claude Code 统一分发骨架后，继续补 runner-specific 模板、timeout/cancel/retry 和 provider 映射。
 3. Attempts 表：每次 Operation 独立记录状态、耗时、错误、输出、重试关系。
 4. GitHub delivery UI：PR、checks、review、merge gate 一屏可见。
 5. Checkpoint timeline：Approve / Reject / redo 更清楚。
 6. Feishu/lark-cli 审核卡片。
+7. 继续拆分 Workboard 前端组件，降低 `App.tsx` 的维护成本。

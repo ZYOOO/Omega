@@ -172,10 +172,38 @@ paths:
       responses:
         '200':
           description: Agent definitions returned
+  /agent-profile:
+    get:
+      summary: Read resolved Project Agent Profile
+      description: Returns the repository override when `repositoryTargetId` is provided, otherwise the project profile or default profile.
+      parameters:
+        - in: query
+          name: projectId
+          schema:
+            type: string
+        - in: query
+          name: repositoryTargetId
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Agent profile returned
+    put:
+      summary: Save Project or Repository Agent Profile
+      description: Persists workflow markdown, per-Agent runner/model/tool config, and runtime file policy into the first-class local SQLite agent_profiles table, with a compatibility mirror in local settings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Agent profile persisted
   /local-capabilities:
     get:
       summary: Inspect locally available execution tools
-      description: Reports whether local commands such as codex, opencode, git, gh, and lark-cli are installed and runnable.
+      description: Reports whether local commands such as codex, opencode, claude, git, gh, and lark-cli are installed and runnable.
       responses:
         '200':
           description: Local capability list returned

@@ -2126,6 +2126,217 @@ func TestLocalWorkspaceRootCanBeConfiguredAndUsedByRuns(t *testing.T) {
 	}
 }
 
+func TestProjectAgentProfilePersistsAndFeedsRuntimeBundle(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"workflowMarkdown": "workflow: devflow-pr\nstages:\n  - requirement",
+		"stagePolicy":      "Human Review blocks delivery.",
+		"skillAllowlist":   "browser-use",
+		"mcpAllowlist":     "github",
+		"codexPolicy":      "workspace-write only",
+		"claudePolicy":     "repository only",
+		"agentProfiles": []map[string]any{{
+			"id":           "requirement",
+			"label":        "Requirement",
+			"runner":       "codex",
+			"model":        "gpt-5.4-mini",
+			"skills":       "browser-use",
+			"mcp":          "github",
+			"stageNotes":   "Clarify acceptance criteria.",
+			"codexPolicy":  "write requirement artifact",
+			"claudePolicy": "summarize requirement",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+	if saved.Source != "project" || saved.WorkflowTemplate != "devflow-pr" {
+		t.Fatalf("saved profile = %+v", saved)
+	}
+	storedProfile, err := repo.GetAgentProfile(context.Background(), "project_omega", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedProfile["workflowTemplate"] != "devflow-pr" {
+		t.Fatalf("first-class profile = %+v", storedProfile)
+	}
+	compatProfile, err := repo.GetSetting(context.Background(), agentProfileSettingKey("project_omega", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatProfile["workflowTemplate"] != "devflow-pr" {
+		t.Fatalf("compat profile = %+v", compatProfile)
+	}
+
+	var loaded ProjectAgentProfile
+	decode(t, mustGet(t, api.URL+"/agent-profile?projectId=project_omega"), &loaded)
+	if loaded.Source != "project" || len(loaded.AgentProfiles) != 1 {
+		t.Fatalf("loaded profile = %+v", loaded)
+	}
+
+	item := map[string]any{
+		"id": "item_manual_profile", "key": "OMG-88", "title": "Profile aware run", "description": "Use the saved profile.",
+		"status": "Ready", "priority": "High", "assignee": "requirement", "labels": []any{"manual"}, "team": "Omega", "stageId": "intake", "target": "No target", "projectId": "project_omega",
+	}
+	var pipeline map[string]any
+	decode(t, postJSON(t, api.URL+"/pipelines/from-template", map[string]any{"templateId": "devflow-pr", "item": item}), &pipeline)
+	runProfile := mapValue(mapValue(pipeline["run"])["agentProfile"])
+	if runProfile["source"] != "project" || runProfile["workflowTemplate"] != "devflow-pr" {
+		t.Fatalf("pipeline profile metadata = %+v", runProfile)
+	}
+
+	mission := map[string]any{
+		"id":               "mission_OMG-88_intake",
+		"sourceIssueKey":   "OMG-88",
+		"sourceWorkItemId": "item_manual_profile",
+		"title":            "Use configured profile",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":            "operation_intake",
+			"stageId":       "intake",
+			"agentId":       "requirement",
+			"status":        "ready",
+			"prompt":        "Collect local proof.",
+			"requiredProof": []any{"local-proof"},
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_intake", "runner": "local-proof"}), &result)
+	raw, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "agent-runtime.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runtimeSpec map[string]any
+	if err := json.Unmarshal(raw, &runtimeSpec); err != nil {
+		t.Fatal(err)
+	}
+	runtimeProfile := mapValue(runtimeSpec["agentProfile"])
+	if runtimeProfile["source"] != "project" || mapValue(runtimeProfile["agent"])["id"] != "requirement" {
+		t.Fatalf("runtime profile = %+v", runtimeProfile)
+	}
+	codexPolicy, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".codex", "OMEGA.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(codexPolicy), "write requirement artifact") {
+		t.Fatalf("codex policy not written: %s", codexPolicy)
+	}
+}
+
+func TestProfileRunnerRegistrySelectsConfiguredAgentRunner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opencode script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	opencode := filepath.Join(bin, "opencode")
+	script := "#!/bin/sh\nprintf '%s\\n' 'opencode profile runner ok'\n"
+	if err := os.WriteFile(opencode, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "opencode",
+			"model":  "gpt-5.4-mini",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+	if saved.AgentProfiles[0].Runner != "opencode" {
+		t.Fatalf("saved profile = %+v", saved)
+	}
+
+	mission := map[string]any{
+		"id":               "mission_OMG-89_coding",
+		"sourceIssueKey":   "OMG-89",
+		"sourceWorkItemId": "item_manual_89",
+		"title":            "Use configured opencode runner",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run using the configured runner.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	if result.RunnerProcess["runner"] != "opencode" || result.RunnerProcess["command"] != "opencode" {
+		t.Fatalf("runner process = %+v", result.RunnerProcess)
+	}
+	if !strings.Contains(result.Stdout, "opencode profile runner ok") {
+		t.Fatalf("stdout = %q", result.Stdout)
+	}
+}
+
+func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "opencode",
+			"model":  "gpt-5.4-mini",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+	bin := t.TempDir()
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		t.Skip("sqlite3 is required for runner preflight test")
+	}
+	if err := os.Symlink(sqlite, filepath.Join(bin, "sqlite3")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+
+	mission := map[string]any{
+		"id":               "mission_OMG-90_coding",
+		"sourceIssueKey":   "OMG-90",
+		"sourceWorkItemId": "item_manual_90",
+		"title":            "Reject unavailable runner",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "This should not start without the configured runner.",
+		}},
+	}
+	response := postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text(body, "error"), "opencode") || !strings.Contains(text(body, "error"), "cannot start") {
+		t.Fatalf("error body = %+v", body)
+	}
+}
+
 func TestWorkspaceChildPathCannotEscapeConfiguredRoot(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "omega-workspaces")
 	workspace, err := workspaceChildPath(root, "../../escape", "../coding")

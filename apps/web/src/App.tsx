@@ -19,6 +19,13 @@ import { runOperationViaMissionControlApi } from "./missionControlApiClient";
 import type { MissionControlRunnerPreset } from "./missionControlApiClient";
 import { navigateToExternalUrl } from "./browserNavigation";
 import { openExternalUrlInNewTab } from "./browserNavigation";
+import { PortalHome } from "./components/PortalHome";
+import {
+  AgentTraceList,
+  ArtifactGrid,
+  AttemptHistory,
+  WorkItemAttemptPanel
+} from "./components/WorkItemDetailPanels";
 import {
   approveCheckpoint,
   createPipelineFromTemplate,
@@ -39,6 +46,7 @@ import {
   fetchPipelines,
   fetchPipelineTemplates,
   fetchProofRecords,
+  fetchProjectAgentProfile,
   fetchRequirements,
   releaseExecutionLock,
   requestCheckpointChanges,
@@ -52,6 +60,7 @@ import {
   updateLocalWorkspaceRoot,
   updateLlmProviderSelection,
   updateOrchestratorWatcher,
+  updateProjectAgentProfile,
   type AgentDefinitionInfo,
   type AttemptRecordInfo,
   type CheckpointRecordInfo,
@@ -67,6 +76,7 @@ import {
   type OrchestratorWatcherInfo,
   type PipelineRecordInfo,
   type PipelineTemplateInfo,
+  type ProjectAgentProfileInfo,
   type ProofRecordInfo,
   type RequirementRecordInfo
 } from "./omegaControlApiClient";
@@ -84,11 +94,234 @@ import {
 import type { ConnectionProvider, ProjectRecord, ProviderId, WorkItem, WorkItemPriority, WorkItemStatus, WorkboardViewSort } from "./core";
 import "./styles.css";
 
-type PrimaryNav = "Projects" | "Views" | "Issues";
+type PrimaryNav = "Projects" | "Views" | "Issues" | "Settings";
 type InspectorPanel = "properties" | "provider";
+type AppSurface = "home" | "workboard";
+type UiTheme = "light" | "dark";
+type AgentConfigTab = "workflow" | "agents" | "runtime";
+type RuntimeConfigTab = "omega" | "codex" | "claude";
+type AgentProfileDraft = {
+  id: string;
+  label: string;
+  runner: MissionControlRunnerPreset | "opencode" | "claude-code";
+  model: string;
+  skills: string;
+  mcp: string;
+  stageNotes: string;
+  codexPolicy: string;
+  claudePolicy: string;
+};
+type AgentConfigurationDraft = {
+  projectId?: string;
+  repositoryTargetId?: string;
+  runner: MissionControlRunnerPreset | "opencode" | "claude-code";
+  workflowTemplate: string;
+  workflowMarkdown: string;
+  stagePolicy: string;
+  skillAllowlist: string;
+  mcpAllowlist: string;
+  codexPolicy: string;
+  claudePolicy: string;
+  agentProfiles: AgentProfileDraft[];
+};
+
+const agentRunnerOptions: Array<{
+  value: AgentProfileDraft["runner"];
+  label: string;
+  capabilityId?: string;
+  setupHint?: string;
+}> = [
+  { value: "codex", label: "Codex", capabilityId: "codex", setupHint: "Install codex or switch this Agent to an available runner." },
+  { value: "opencode", label: "opencode", capabilityId: "opencode", setupHint: "Install opencode or choose Codex." },
+  { value: "claude-code", label: "Claude Code", capabilityId: "claude-code", setupHint: "Install Claude Code CLI or choose Codex." },
+  { value: "demo-code", label: "demo-code", capabilityId: "git", setupHint: "demo-code needs git." },
+  { value: "local-proof", label: "local-proof" }
+];
 
 function primaryNavLabel(nav: PrimaryNav) {
   return nav === "Issues" ? "Work items" : nav;
+}
+
+function InfoIcon() {
+  return (
+    <svg className="info-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 10.8v5.2" />
+      <path d="M12 7.5h.01" />
+    </svg>
+  );
+}
+
+function topbarSearchPlaceholder(nav: PrimaryNav) {
+  if (nav === "Issues") return "Search work items...";
+  if (nav === "Settings") return "Search settings...";
+  return "Search...";
+}
+
+function initialAppSurface(): AppSurface {
+  if (typeof window === "undefined") return "home";
+  if (window.location.hash === "#home") return "home";
+  if (window.location.hash === "#workboard") return "workboard";
+  return import.meta.env.MODE === "test" ? "workboard" : "home";
+}
+
+function initialUiTheme(): UiTheme {
+  if (typeof window === "undefined") return "light";
+  const saved = window.localStorage.getItem("omega-ui-theme");
+  return saved === "dark" ? "dark" : "light";
+}
+
+const agentConfigurationStorageKey = "omega-agent-configuration-draft";
+
+const defaultWorkflowMarkdown = `workflow: devflow-pr
+stages:
+  - requirement: requirement
+  - implementation: architect + coding + testing
+  - code_review: review
+  - rework: coding + testing, then code_review
+  - human_review: human gate
+  - delivery: delivery
+artifacts:
+  - requirement
+  - solution
+  - diff
+  - test-report
+  - review-report
+  - handoff-bundle`;
+
+const defaultAgentProfiles: AgentProfileDraft[] = [
+  {
+    id: "requirement",
+    label: "Requirement",
+    runner: "codex",
+    model: "gpt-5.4-mini",
+    skills: "github:github\nbrowser-use",
+    mcp: "github\nfilesystem:repository-workspace",
+    stageNotes: "Clarify acceptance criteria, repository target, risks, and suggested work items before planning.",
+    codexPolicy: "read requirement source, inspect repository context, write requirement artifact only",
+    claudePolicy: "focus on ambiguity, acceptance criteria, and handoff clarity"
+  },
+  {
+    id: "architect",
+    label: "Architect",
+    runner: "codex",
+    model: "gpt-5.4-mini",
+    skills: "github:github",
+    mcp: "filesystem:repository-workspace",
+    stageNotes: "Map affected files, data flow, integration risks, and verification plan.",
+    codexPolicy: "prefer read-only analysis, generate solution-plan.md, no source edits unless explicitly allowed",
+    claudePolicy: "produce concise architecture notes with file-level impact"
+  },
+  {
+    id: "coding",
+    label: "Coding",
+    runner: "codex",
+    model: "gpt-5.4-mini",
+    skills: "github:gh-fix-ci\nbrowser-use",
+    mcp: "filesystem:repository-workspace\nbrowser:localhost-preview",
+    stageNotes: "Implement inside the locked repository workspace and keep changes scoped to the Work Item.",
+    codexPolicy: "workspace-write only, never write outside repositoryTarget workspace, emit diff and summary",
+    claudePolicy: "apply code edits conservatively and preserve existing project style"
+  },
+  {
+    id: "testing",
+    label: "Testing",
+    runner: "codex",
+    model: "gpt-5.4-mini",
+    skills: "browser-use",
+    mcp: "filesystem:repository-workspace\nbrowser:localhost-preview",
+    stageNotes: "Run focused tests first, then broader checks when shared contracts changed.",
+    codexPolicy: "run configured validation commands, capture test-report.md and failure traces",
+    claudePolicy: "summarize validation evidence and remaining risk"
+  },
+  {
+    id: "review",
+    label: "Review",
+    runner: "codex",
+    model: "gpt-5.4-mini",
+    skills: "github:github\ngithub:gh-fix-ci",
+    mcp: "github\nfilesystem:repository-workspace",
+    stageNotes: "Review correctness, safety, tests, and contract drift. Changes requested routes to Rework.",
+    codexPolicy: "read diff and artifacts, write review report, do not mark attempt failed for changes_requested",
+    claudePolicy: "return clear verdict, required fixes, and evidence"
+  },
+  {
+    id: "delivery",
+    label: "Delivery",
+    runner: "codex",
+    model: "gpt-5.4-mini",
+    skills: "github:yeet\ngithub:github",
+    mcp: "github\nfilesystem:repository-workspace",
+    stageNotes: "After human approval, prepare PR or delivery proof and final handoff bundle.",
+    codexPolicy: "require human gate approval before merge or delivery action",
+    claudePolicy: "summarize shipped changes, verification, and caveats"
+  }
+];
+
+const defaultAgentConfigurationDraft: AgentConfigurationDraft = {
+  runner: "codex",
+  workflowTemplate: "devflow-pr",
+  workflowMarkdown: defaultWorkflowMarkdown,
+  stagePolicy:
+    "Requirement: clarify acceptance criteria and repository target before planning.\nArchitecture: list affected files and risky integration points.\nCoding: only edit inside the bound repository workspace.\nTesting: run focused tests first, then broaden when shared contracts change.\nReview: changes_requested must route to Rework, not fail the attempt.\nHuman Review: stop until explicit approval.",
+  skillAllowlist: "browser-use\ngithub:github\ngithub:gh-fix-ci\ngithub:yeet",
+  mcpAllowlist: "github\nfilesystem:repository-workspace\nbrowser:localhost-preview",
+  codexPolicy:
+    "sandbox: workspace-write\napproval: never inside automated stage\nrepo-scope: require repositoryTargetId match\nartifacts: requirement, solution, diff, test-report, review-report, handoff-bundle",
+  claudePolicy:
+    "workspace: repository target only\nreview: explain assumptions before edits\nhandoff: keep artifact names compatible with Omega workflow",
+  agentProfiles: defaultAgentProfiles
+};
+
+function initialAgentConfigurationDraft(): AgentConfigurationDraft {
+  if (typeof window === "undefined") return defaultAgentConfigurationDraft;
+  const saved = window.localStorage.getItem(agentConfigurationStorageKey);
+  if (!saved) return defaultAgentConfigurationDraft;
+  try {
+    const parsed = JSON.parse(saved) as Partial<AgentConfigurationDraft>;
+    return normalizeAgentConfigurationDraft(parsed);
+  } catch {
+    return defaultAgentConfigurationDraft;
+  }
+}
+
+function normalizeAgentConfigurationDraft(profile: Partial<ProjectAgentProfileInfo> | Partial<AgentConfigurationDraft>): AgentConfigurationDraft {
+  const rawProfile = profile as Partial<ProjectAgentProfileInfo> & Partial<AgentConfigurationDraft>;
+  return {
+    ...defaultAgentConfigurationDraft,
+    ...rawProfile,
+    runner: (rawProfile.runner as AgentConfigurationDraft["runner"]) || defaultAgentConfigurationDraft.runner,
+    agentProfiles: rawProfile.agentProfiles?.length
+      ? rawProfile.agentProfiles.map((agent) => ({
+          ...agent,
+          runner: agent.runner as AgentProfileDraft["runner"]
+        }))
+      : defaultAgentProfiles
+  };
+}
+
+function capabilityAvailable(capabilities: LocalCapabilityInfo[], capabilityId?: string) {
+  if (!capabilityId || capabilities.length === 0) return true;
+  return capabilities.some((capability) => capability.id === capabilityId && capability.available);
+}
+
+function runnerOptionFor(runner: string) {
+  return agentRunnerOptions.find((option) => option.value === runner);
+}
+
+function runnerAvailabilityLabel(runner: string, capabilities: LocalCapabilityInfo[]) {
+  const option = runnerOptionFor(runner);
+  if (!option) return `Unsupported runner: ${runner}`;
+  if (capabilityAvailable(capabilities, option.capabilityId)) return `${option.label} ready`;
+  return option.setupHint ?? `${option.label} is not available.`;
+}
+
+function unavailableAgentProfiles(profile: AgentConfigurationDraft, capabilities: LocalCapabilityInfo[]) {
+  if (capabilities.length === 0) return [];
+  return profile.agentProfiles.filter((agent) => {
+    const option = runnerOptionFor(agent.runner);
+    return !option || !capabilityAvailable(capabilities, option.capabilityId);
+  });
 }
 
 const providerClientIds: Partial<Record<ProviderId, string>> = {
@@ -198,6 +431,29 @@ function sourceLabel(item: WorkItem): string {
   return "Omega";
 }
 
+function issueNumberFromReference(item: WorkItem): string {
+  const sourceNumber = item.sourceExternalRef?.match(/#(\d+)$/)?.[1];
+  if (sourceNumber) return sourceNumber;
+  return item.key.match(/(?:GH|OMG)-(\d+)$/)?.[1] ?? "";
+}
+
+function workItemDisplayLabel(item: WorkItem): string {
+  const number = issueNumberFromReference(item);
+  if (item.source === "github_issue") return number ? `GitHub #${number}` : "GitHub issue";
+  if (item.source === "feishu_message") return number ? `Feishu item ${number}` : "Feishu item";
+  if (item.source === "ai_generated") return number ? `AI item ${number}` : "AI item";
+  return number ? `Work item ${number}` : "Work item";
+}
+
+function runnerMessageSummary(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes("failed")) return "Run needs attention";
+  if (lower.includes("completed") || lower.includes("passed")) return "Run updated";
+  if (lower.includes("pipeline started") || lower.includes("running")) return "Pipeline running";
+  if (lower.includes("sync")) return "Sync updated";
+  return "Status updated";
+}
+
 function displayText(value: string): string {
   return value.replace(/\\n/g, "\n");
 }
@@ -240,6 +496,42 @@ function operationStatusLabel(status: string): string {
     blocked: "Blocked"
   };
   return labels[status] ?? status;
+}
+
+function summarizePipelineProgress(
+  item: WorkItem,
+  stages: NonNullable<PipelineRecordInfo["run"]>["stages"] = [],
+  running: boolean
+) {
+  if (!stages.length) {
+    return {
+      label: running || item.status === "Planning" ? "Preparing pipeline" : workItemStatusLabel(item.status),
+      percent: running || item.status === "Planning" ? 14 : item.status === "Done" ? 100 : 0,
+      status: running || item.status === "Planning" ? "running" : item.status.toLowerCase()
+    };
+  }
+
+  const activeIndex = stages.findIndex((stage) =>
+    ["running", "needs-human", "changes-requested", "failed", "blocked", "ready"].includes(stage.status)
+  );
+  const safeIndex = activeIndex >= 0 ? activeIndex : stages.length - 1;
+  const currentStage = stages[safeIndex];
+  const passedCount = stages.filter((stage) => stage.status === "passed" || stage.status === "done").length;
+  const percent =
+    passedCount >= stages.length
+      ? 100
+      : Math.max(8, Math.round(((passedCount + (currentStage.status === "running" ? 0.55 : 0.25)) / stages.length) * 100));
+  const agentIds = currentStage.agentIds ?? (currentStage.agentId ? [currentStage.agentId] : []);
+
+  return {
+    label: currentStage.status === "passed" || currentStage.status === "done"
+      ? agentIds.length
+        ? agentIds.map(agentShortLabel).join(" + ")
+        : "Complete"
+      : currentStage.title ?? currentStage.id,
+    percent,
+    status: currentStage.status
+  };
 }
 
 interface ProofCard {
@@ -424,6 +716,8 @@ function emptyObservability(): ObservabilitySummary {
 function App() {
   const run = useMemo(() => createSampleRun(), []);
   const persistedSession = useMemo(() => loadWorkspaceSession(run), [run.id]);
+  const [appSurface, setAppSurface] = useState<AppSurface>(() => initialAppSurface());
+  const [uiTheme, setUiTheme] = useState<UiTheme>(() => initialUiTheme());
   const [activeNav, setActiveNav] = useState<PrimaryNav>(persistedSession.activeNav);
   const [connections, setConnections] = useState(persistedSession.connections);
   const [selectedProviderId, setSelectedProviderId] = useState<ProviderId>(persistedSession.selectedProviderId);
@@ -492,6 +786,15 @@ function App() {
   const [runningWorkItemId, setRunningWorkItemId] = useState("");
   const [repositorySyncMessage, setRepositorySyncMessage] = useState("");
   const [feishuChatId, setFeishuChatId] = useState("");
+  const [agentConfigOpen, setAgentConfigOpen] = useState(false);
+  const [agentConfigSavedMessage, setAgentConfigSavedMessage] = useState("");
+  const [agentConfigDraft, setAgentConfigDraft] = useState<AgentConfigurationDraft>(initialAgentConfigurationDraft);
+  const [agentConfigTab, setAgentConfigTab] = useState<AgentConfigTab>("workflow");
+  const [selectedAgentProfileId, setSelectedAgentProfileId] = useState(defaultAgentProfiles[0].id);
+  const [runtimeConfigTab, setRuntimeConfigTab] = useState<RuntimeConfigTab>("codex");
+  const [workspaceFolderPickerMessage, setWorkspaceFolderPickerMessage] = useState("");
+  const [workspaceSectionOpen, setWorkspaceSectionOpen] = useState(true);
+  const [connectionsSectionOpen, setConnectionsSectionOpen] = useState(true);
 
   const primaryProject = projects[0];
   const repositoryTargets = primaryProject?.repositoryTargets ?? [];
@@ -521,6 +824,8 @@ function App() {
     () => new Map(orchestratorWatchers.map((watcher) => [watcher.repositoryTargetId, watcher])),
     [orchestratorWatchers]
   );
+  const activeRepositoryWatcher = activeRepositoryWorkspace ? watcherByRepositoryTargetId.get(activeRepositoryWorkspace.id) : undefined;
+  const activeRepositoryWatcherActive = activeRepositoryWatcher?.status === "active";
   const scopedWorkItems =
     activeNav === "Issues" && activeRepositoryWorkspace ? activeRepositoryWorkspaceItems : workItems;
 
@@ -968,7 +1273,7 @@ function App() {
             workItems,
             missionState: { ...missionState, workItems },
             connections,
-            activeNav,
+            activeNav: activeNav === "Settings" ? "Projects" : activeNav,
             selectedProviderId,
             selectedWorkItemId,
             inspectorOpen,
@@ -1006,7 +1311,7 @@ function App() {
       workItems,
       missionState: { ...missionState, workItems },
       connections,
-      activeNav,
+      activeNav: activeNav === "Settings" ? "Projects" : activeNav,
       selectedProviderId,
       selectedWorkItemId,
       inspectorOpen,
@@ -1038,6 +1343,25 @@ function App() {
     workspaceLoaded,
     workItems
   ]);
+
+  useEffect(() => {
+    if (!missionControlApiUrl || activeNav !== "Settings") return;
+    let cancelled = false;
+    fetchProjectAgentProfile(missionControlApiUrl, {
+      projectId: primaryProject?.id,
+      repositoryTargetId: activeRepositoryWorkspace?.id
+    })
+      .then((profile) => {
+        if (cancelled) return;
+        setAgentConfigDraft(normalizeAgentConfigurationDraft(profile));
+      })
+      .catch((error) => {
+        console.warn("Agent profile load failed", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeNav, activeRepositoryWorkspace?.id, missionControlApiUrl, primaryProject?.id]);
 
   useEffect(() => {
     if (!missionControlApiUrl || !githubDeviceLoginUrl || connections.github.status === "connected") return;
@@ -1658,13 +1982,15 @@ function App() {
     }
   }
 
-  async function rejectPendingCheckpoint(checkpointId: string) {
+  async function rejectPendingCheckpoint(checkpointId: string, note?: string) {
     if (!missionControlApiUrl) return;
-    const reason = window.prompt(
-      "Tell the agent what needs to change before delivery.",
-      "Please address the requested changes before delivery."
-    );
-    if (reason === null) return;
+    const reason =
+      note ??
+      window.prompt(
+        "Tell the agent what needs to change before delivery.",
+        "Please address the requested changes before delivery."
+      );
+    if (reason === null || reason === undefined) return;
     try {
       setRunnerMessage(`Sending checkpoint ${checkpointId} back for changes...`);
       await requestCheckpointChanges(missionControlApiUrl, checkpointId, reason.trim() || "Human requested changes.");
@@ -1678,6 +2004,7 @@ function App() {
   const inspectorAvailable = true;
   const shellClassName = [
     "product-shell",
+    `theme-${uiTheme}`,
     !inspectorAvailable ? "inspector-hidden" : "",
     inspectorAvailable && !inspectorOpen ? "inspector-collapsed" : ""
   ]
@@ -1685,20 +2012,174 @@ function App() {
     .join(" ");
   const selectedProvider =
     visibleConnectionProviders.find((provider) => provider.id === selectedProviderId) ?? visibleConnectionProviders[0];
+  const selectedAgentProfile =
+    agentConfigDraft.agentProfiles.find((profile) => profile.id === selectedAgentProfileId) ??
+    agentConfigDraft.agentProfiles[0] ??
+    defaultAgentProfiles[0];
+  const selectedRunnerReady = capabilityAvailable(
+    localCapabilities,
+    runnerOptionFor(selectedAgentProfile.runner)?.capabilityId
+  );
+  const selectedRunnerAvailability = runnerAvailabilityLabel(selectedAgentProfile.runner, localCapabilities);
+  const workflowStagePreview = [
+    { id: "requirement", title: "Requirement", agents: "requirement", gate: "auto" },
+    { id: "implementation", title: "Implementation", agents: "architect + coding + testing", gate: "auto" },
+    { id: "code_review", title: "Code Review", agents: "review", gate: "changes requested -> rework" },
+    { id: "rework", title: "Rework", agents: "coding + testing", gate: "loops to review" },
+    { id: "human_review", title: "Human Review", agents: "human + review + delivery", gate: "manual gate" },
+    { id: "delivery", title: "Delivery", agents: "delivery", gate: "after approval" }
+  ];
+  const runtimeConfigPreview =
+    runtimeConfigTab === "omega"
+      ? JSON.stringify(
+          {
+            project: primaryProject?.name ?? "Omega",
+            repositoryTarget: activeRepositoryWorkspaceLabel || "project-default",
+            workflow: agentConfigDraft.workflowTemplate,
+            profileSource: agentConfigDraft.repositoryTargetId ? "repository" : "project",
+            agent: selectedAgentProfile.id,
+            runner: selectedAgentProfile.runner,
+            model: selectedAgentProfile.model,
+            skills: selectedAgentProfile.skills.split("\n").filter(Boolean),
+            mcp: selectedAgentProfile.mcp.split("\n").filter(Boolean),
+            sandbox: "repository-workspace"
+          },
+          null,
+          2
+        )
+      : runtimeConfigTab === "codex"
+        ? [
+            `# .codex/OMEGA.md`,
+            `agent: ${selectedAgentProfile.id}`,
+            `runner: ${selectedAgentProfile.runner}`,
+            `model: ${selectedAgentProfile.model}`,
+            "",
+            selectedAgentProfile.codexPolicy || agentConfigDraft.codexPolicy
+          ].join("\n")
+        : [
+            `# .claude/CLAUDE.md`,
+            `agent: ${selectedAgentProfile.id}`,
+            `runner: ${selectedAgentProfile.runner}`,
+            `model: ${selectedAgentProfile.model}`,
+            "",
+            selectedAgentProfile.claudePolicy || agentConfigDraft.claudePolicy
+          ].join("\n");
+
+  function openWorkboard() {
+    setAppSurface("workboard");
+    window.history.replaceState(null, "", "#workboard");
+  }
+
+  function openHome() {
+    setAppSurface("home");
+    window.history.replaceState(null, "", "#home");
+  }
+
+  function toggleUiTheme() {
+    setUiTheme((current) => {
+      const next = current === "light" ? "dark" : "light";
+      window.localStorage.setItem("omega-ui-theme", next);
+      return next;
+    });
+  }
+
+  function updateAgentConfigDraft<Key extends keyof AgentConfigurationDraft>(key: Key, value: AgentConfigurationDraft[Key]) {
+    setAgentConfigDraft((current) => ({ ...current, [key]: value }));
+    setAgentConfigSavedMessage("");
+  }
+
+  function updateAgentProfileDraft<Key extends keyof AgentProfileDraft>(
+    profileId: string,
+    key: Key,
+    value: AgentProfileDraft[Key]
+  ) {
+    setAgentConfigDraft((current) => ({
+      ...current,
+      agentProfiles: current.agentProfiles.map((profile) => (profile.id === profileId ? { ...profile, [key]: value } : profile))
+    }));
+    setAgentConfigSavedMessage("");
+  }
+
+  async function saveAgentConfigurationDraft() {
+    const unavailableProfiles = unavailableAgentProfiles(agentConfigDraft, localCapabilities);
+    if (unavailableProfiles.length > 0) {
+      setAgentConfigOpen(true);
+      setAgentConfigTab("agents");
+      setSelectedAgentProfileId(unavailableProfiles[0].id);
+      setAgentConfigSavedMessage(
+        `Runner unavailable: ${unavailableProfiles.map((profile) => `${profile.label} uses ${profile.runner}`).join(", ")}.`
+      );
+      return;
+    }
+    const profileToSave: ProjectAgentProfileInfo = {
+      ...agentConfigDraft,
+      projectId: primaryProject?.id ?? agentConfigDraft.projectId ?? "project_omega",
+      repositoryTargetId: activeRepositoryWorkspace?.id || agentConfigDraft.repositoryTargetId || undefined,
+      agentProfiles: agentConfigDraft.agentProfiles
+    };
+    window.localStorage.setItem(agentConfigurationStorageKey, JSON.stringify(profileToSave));
+    if (!missionControlApiUrl) {
+      setAgentConfigSavedMessage("Saved as local project draft.");
+      return;
+    }
+    try {
+      const savedProfile = await updateProjectAgentProfile(missionControlApiUrl, profileToSave);
+      setAgentConfigDraft(normalizeAgentConfigurationDraft(savedProfile));
+      setAgentConfigSavedMessage("Saved to local runtime. New pipeline runs will use this profile.");
+    } catch (error) {
+      setAgentConfigSavedMessage(error instanceof Error ? error.message : "Agent profile save failed.");
+    }
+  }
+
+  async function chooseLocalWorkspaceFolder() {
+    setWorkspaceFolderPickerMessage("");
+    const desktopBridge = (window as Window & {
+      omegaDesktop?: { selectDirectory?: () => Promise<string | undefined> };
+    }).omegaDesktop;
+    if (desktopBridge?.selectDirectory) {
+      const selectedPath = await desktopBridge.selectDirectory();
+      if (selectedPath) {
+        setLocalWorkspaceRootDraft(selectedPath);
+        setWorkspaceFolderPickerMessage("Folder selected from desktop picker.");
+      }
+      return;
+    }
+
+    const browserPicker = (window as Window & {
+      showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<{ name: string }>;
+    }).showDirectoryPicker;
+    if (browserPicker) {
+      try {
+        const handle = await browserPicker({ mode: "readwrite" });
+        setWorkspaceFolderPickerMessage(
+          `Selected "${handle.name}". Browser mode cannot expose the absolute local path yet, so keep or paste the path below before saving.`
+        );
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setWorkspaceFolderPickerMessage(error instanceof Error ? error.message : "Folder picker failed.");
+      }
+      return;
+    }
+
+    setWorkspaceFolderPickerMessage("Folder picker is not available in this browser. Paste the absolute path or use the desktop shell picker.");
+  }
+
+  if (appSurface === "home") {
+    return <PortalHome onOpenWorkboard={openWorkboard} onToggleTheme={toggleUiTheme} uiTheme={uiTheme} />;
+  }
 
   return (
     <main className={shellClassName}>
       <aside className="sidebar" aria-label="Workspace navigation">
         <div className="brand-lockup">
-          <div className="brand-mark">O</div>
-          <div>
-            <strong>Omega</strong>
-            <span>Mission Control</span>
-          </div>
+          <img className="brand-logo" src="/omega-logo.png" alt="Omega AI DevFlow Engine" />
+          <button type="button" className="sidebar-home-button" onClick={openHome}>
+            Home
+          </button>
         </div>
 
         <nav className="nav-stack">
-          {(["Projects", "Views", "Issues"] as const).map((item, index) => (
+          {(["Projects", "Views", "Issues"] as const).map((item) => (
             <button
               key={item}
               className={item === activeNav ? "nav-item active" : "nav-item"}
@@ -1715,16 +2196,18 @@ function App() {
               }}
             >
               <span>{primaryNavLabel(item)}</span>
-              <kbd>{index + 1}</kbd>
             </button>
           ))}
         </nav>
 
         {repositoryTargets.length > 0 ? (
-          <details className="sidebar-section workspace-section" open>
+          <details
+            className="sidebar-section workspace-section"
+            open={workspaceSectionOpen}
+            onToggle={(event) => setWorkspaceSectionOpen(event.currentTarget.open)}
+          >
             <summary>
               <span className="section-label">Workspaces</span>
-              <small>{repositoryTargets.length}</small>
             </summary>
             <nav className="workspace-stack" aria-label="Project workspaces">
               {repositoryTargets.map((target) => {
@@ -1732,8 +2215,6 @@ function App() {
                 const targetItems = workItems.filter((item) => item.repositoryTargetId === target.id);
                 const count = targetItems.length;
                 const selected = target.id === activeRepositoryWorkspaceTargetId;
-                const watcher = watcherByRepositoryTargetId.get(target.id);
-                const watcherActive = watcher?.status === "active";
                 return (
                   <div key={target.id} className={selected ? "workspace-entry selected" : "workspace-entry"}>
                     <button
@@ -1752,55 +2233,22 @@ function App() {
                         <strong>{label}</strong>
                         <small>{count} items</small>
                       </span>
-                      <small>{count}</small>
                     </button>
-                    {selected ? (
-                      <div className="workspace-subnav">
-                        <button
-                          onClick={() => {
-                            setSelectedWorkItemId(targetItems[0]?.id ?? "");
-                            setActiveWorkItemDetailId("");
-                            setActiveNav("Issues");
-                          }}
-                        >
-                          Work items
-                        </button>
-                        {target.kind === "github" ? (
-                          <div className="workspace-settings-block">
-                            <span className="workspace-settings-title">Settings</span>
-                            <div className="workspace-setting-row">
-                              <span>
-                                <strong>Auto processing</strong>
-                                <small>Scan ready GitHub issues</small>
-                              </span>
-                              <button
-                                type="button"
-                                role="switch"
-                                aria-checked={watcherActive}
-                                aria-label="Auto processing"
-                                className={watcherActive ? "workspace-switch active" : "workspace-switch"}
-                                disabled={syncingRepositoryKey === label}
-                                onClick={() => {
-                                  void toggleRepositoryAutoProcessing(target.id);
-                                }}
-                              >
-                                <span />
-                              </button>
-                            </div>
-                          </div>
-                        ) : null}
-                        <button disabled>Pull requests</button>
-                        <button disabled>Pipelines</button>
-                        <button
-                          className="danger-action"
-                          onClick={() => {
-                            void deleteRepositoryWorkspace(target.id);
-                          }}
-                        >
-                          Delete workspace
-                        </button>
-                      </div>
-                    ) : null}
+                    <button
+                      type="button"
+                      className="workspace-config-button"
+                      aria-label={`Configure ${label}`}
+                      title="Workspace config"
+                      onClick={() => {
+                        setActiveRepositoryWorkspaceTargetId(target.id);
+                        setActiveWorkItemDetailId("");
+                        setActiveNav("Settings");
+                        setAgentConfigOpen(true);
+                        clearWorkspaceMessages();
+                      }}
+                    >
+                      <span aria-hidden="true">⚙</span>
+                    </button>
                   </div>
                 );
               })}
@@ -1808,12 +2256,13 @@ function App() {
           </details>
         ) : null}
 
-        <details className="sidebar-section" open>
+        <details
+          className="sidebar-section"
+          open={connectionsSectionOpen}
+          onToggle={(event) => setConnectionsSectionOpen(event.currentTarget.open)}
+        >
           <summary>
             <span className="section-label">Connections</span>
-            <small>
-              {visibleConnectionProviders.filter((provider) => connections[provider.id].status === "connected").length} live
-            </small>
           </summary>
           <div className="connection-stack">
             {visibleConnectionProviders.map((provider) => (
@@ -1852,6 +2301,15 @@ function App() {
                 <span>{activeWorkItemDetail.title}</span>
               </nav>
               <div className="detail-toolbar">
+                {runnerMessage ? (
+                  <span className="detail-runner-chip" role="status" title={runnerMessage}>
+                    {runnerMessageSummary(runnerMessage)}
+                  </span>
+                ) : null}
+                <button type="button" className="theme-toggle" onClick={toggleUiTheme} aria-label={`Switch to ${uiTheme === "light" ? "night" : "day"} mode`}>
+                  <span aria-hidden="true">{uiTheme === "light" ? "☾" : "☼"}</span>
+                  {uiTheme === "light" ? "Night" : "Day"}
+                </button>
                 <button type="button" onClick={() => navigator.clipboard?.writeText(activeWorkItemDetail.target)}>
                   Copy target
                 </button>
@@ -1888,7 +2346,7 @@ function App() {
                   className="command-input"
                   value={searchQuery}
                   onChange={(event) => setSearchQuery(event.currentTarget.value)}
-                  placeholder={activeNav === "Issues" ? "Search work items..." : "Search..."}
+                  placeholder={topbarSearchPlaceholder(activeNav)}
                 />
                 <button type="button">Search</button>
               </div>
@@ -1896,16 +2354,20 @@ function App() {
                 {activeNav === "Issues" ? (
                   <button
                     type="button"
-                    className="primary-action topbar-create"
+                    className="topbar-create"
                     onClick={() => {
                       setShowInlineCreate((current) => !current);
                       setCreateComposerExpanded(true);
                       setCreateDescriptionMode("write");
                     }}
                   >
-                    New requirement
+                    <span className="topbar-create-label">New requirement</span>
                   </button>
                 ) : null}
+                <button type="button" className="theme-toggle" onClick={toggleUiTheme} aria-label={`Switch to ${uiTheme === "light" ? "night" : "day"} mode`}>
+                  <span aria-hidden="true">{uiTheme === "light" ? "☾" : "☼"}</span>
+                  {uiTheme === "light" ? "Night" : "Day"}
+                </button>
               </div>
             </>
           )}
@@ -1913,23 +2375,55 @@ function App() {
 
         {activeNav === "Projects" ? (
           <section className="project-surface">
-            <div className="overview-panel">
-              <h2>{primaryProject?.name ?? "Project"}</h2>
-              <p>{primaryProject?.description || "A product or engineering goal that can bind one or more repository targets."}</p>
-              <div className="overview-stats">
-                <span>{workItems.length} work items</span>
-                <span>{repositoryTargetCount} repository targets</span>
-                <span>Pipeline runs start from work items</span>
+            <div className="overview-panel project-hero-panel">
+              <div className="project-hero-copy">
+                <span className="section-label">Project</span>
+                <h2>{primaryProject?.name ?? "Omega Project"}</h2>
+                <p>
+                  {primaryProject?.description ||
+                    "A delivery space that groups requirements, repository workspaces, agent pipelines, human review, and delivery proof."}
+                </p>
+                {repositoryTargets.length > 0 ? (
+                  <div className="target-chip-list" aria-label="Project repository targets">
+                    {repositoryTargets.map((target) => (
+                      <span key={target.id}>
+                        {target.kind === "github" ? `${target.owner}/${target.repo}` : target.path}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+                <button
+                  type="button"
+                  className="project-config-link"
+                  onClick={() => {
+                    setActiveNav("Settings");
+                    setAgentConfigOpen(true);
+                  }}
+                >
+                  Project config
+                </button>
               </div>
-              {repositoryTargets.length > 0 ? (
-                <div className="target-chip-list" aria-label="Project repository targets">
-                  {repositoryTargets.map((target) => (
-                    <span key={target.id}>
-                      {target.kind === "github" ? `${target.owner}/${target.repo}` : target.path}
-                    </span>
-                  ))}
-                </div>
-              ) : null}
+              <div className="project-stat-grid" aria-label="Project delivery summary">
+                <span>
+                  <small>Work items</small>
+                  <strong>{workItems.length}</strong>
+                </span>
+                <span>
+                  <small>Repository workspaces</small>
+                  <strong>{repositoryTargetCount}</strong>
+                </span>
+                <span>
+                  <small>Pipeline runs</small>
+                  <strong>{pipelines.length}</strong>
+                </span>
+              </div>
+              <div className="project-flow-strip" aria-label="Project delivery flow">
+                <span>Requirements</span>
+                <span>Repository Workspace</span>
+                <span>Agent Pipeline</span>
+                <span>Human Review</span>
+                <span>Delivery</span>
+              </div>
             </div>
 
             {activeRepositoryWorkspace ? (
@@ -1993,8 +2487,9 @@ function App() {
             <div className="overview-panel repository-panel">
               <div className="control-card-header">
                 <div>
-                  <span className="section-label">Repository target</span>
-                  <h2>GitHub repositories</h2>
+                  <span className="section-label">Repository workspace</span>
+                  <h2>Attach GitHub repositories</h2>
+                  <p>Choose the repository targets this Project is allowed to run agents inside.</p>
                 </div>
                 <button onClick={loadGitHubRepositories} disabled={githubRepositoriesLoading}>
                   {githubRepositoriesLoading ? "Loading..." : "Refresh repositories"}
@@ -2133,20 +2628,6 @@ function App() {
                           codex
                         </option>
                       </select>
-                    </label>
-                    <label className="workspace-root-field">
-                      <span>Workspace location</span>
-                      <div>
-                        <input
-                          value={localWorkspaceRootDraft}
-                          onChange={(event) => setLocalWorkspaceRootDraft(event.currentTarget.value)}
-                          placeholder="~/Omega/workspaces"
-                        />
-                        <button type="button" onClick={saveLocalWorkspaceRoot}>
-                          Save
-                        </button>
-                      </div>
-                      {localWorkspaceRoot ? <small>Current: {localWorkspaceRoot}</small> : null}
                     </label>
                   </div>
                 </article>
@@ -2355,9 +2836,12 @@ function App() {
                             ) : null}
                           </p>
                           {operation.runnerProcess?.stderr || operation.runnerProcess?.stdout ? (
-                            <pre className="process-output">
-                              {(operation.runnerProcess.stderr || operation.runnerProcess.stdout || "").trim()}
-                            </pre>
+                            <details className="process-output-details">
+                              <summary>Runner output</summary>
+                              <pre className="process-output">
+                                {(operation.runnerProcess.stderr || operation.runnerProcess.stdout || "").trim()}
+                              </pre>
+                            </details>
                           ) : null}
                         </article>
                       ))
@@ -2415,15 +2899,439 @@ function App() {
           </section>
         ) : null}
 
+        {activeNav === "Settings" ? (
+          <section className="settings-surface">
+            <section className="operator-section">
+              <div className="operator-section-heading">
+                <div>
+                  <span className="section-label">Workspace config</span>
+                  <h2>{activeRepositoryWorkspaceLabel || primaryProject?.name || "Omega Project"}</h2>
+                </div>
+                {activeRepositoryWorkspace ? (
+                  <button type="button" onClick={() => setActiveNav("Issues")}>
+                    Open work items
+                  </button>
+                ) : null}
+              </div>
+              <div className="operator-grid settings-grid">
+                <article className="control-card workspace-location-card">
+                  <div className="control-card-header">
+                    <div>
+                      <span className="section-label">Local runtime</span>
+                      <h2>Workspace folder</h2>
+                    </div>
+                    <details className="info-popover">
+                      <summary aria-label="About workspace folder">
+                        <InfoIcon />
+                      </summary>
+                      <p>Omega creates isolated runner workspaces under this folder before dispatching Agent stages.</p>
+                    </details>
+                  </div>
+                  <div className="folder-picker">
+                    <label>
+                      <span>Folder path</span>
+                      <input
+                        value={localWorkspaceRootDraft}
+                        onChange={(event) => {
+                          setLocalWorkspaceRootDraft(event.currentTarget.value);
+                          setWorkspaceFolderPickerMessage("");
+                        }}
+                        placeholder="~/Omega/workspaces"
+                      />
+                    </label>
+                    <div className="folder-picker-actions">
+                      <button type="button" onClick={chooseLocalWorkspaceFolder}>
+                        Choose folder
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLocalWorkspaceRootDraft("~/Omega/workspaces");
+                          setWorkspaceFolderPickerMessage("Default Omega workspace folder selected.");
+                        }}
+                      >
+                        Use default
+                      </button>
+                      <button type="button" className="primary-action" onClick={saveLocalWorkspaceRoot}>
+                        Save
+                      </button>
+                    </div>
+                    {localWorkspaceRoot ? <small>Current: {localWorkspaceRoot}</small> : null}
+                    {workspaceFolderPickerMessage ? <p role="status">{workspaceFolderPickerMessage}</p> : null}
+                  </div>
+                </article>
+
+                <article className="control-card agent-config-map">
+                  <div className="control-card-header">
+                    <div>
+                      <span className="section-label">Scope</span>
+                      <h2>{activeRepositoryWorkspaceLabel ? "Repository" : "Project default"}</h2>
+                    </div>
+                    <details className="info-popover">
+                      <summary aria-label="About config scope">
+                        <InfoIcon />
+                      </summary>
+                      <p>These settings are resolved before a Pipeline starts and are written into each Agent runner's runtime spec.</p>
+                    </details>
+                  </div>
+                  <div className="agent-config-chip-row">
+                    <span>
+                      <small>Template</small>
+                      <strong>{agentConfigDraft.workflowTemplate}</strong>
+                    </span>
+                    <span>
+                      <small>Runner</small>
+                      <strong>{agentConfigDraft.runner}</strong>
+                    </span>
+                    <span>
+                      <small>Contracts</small>
+                      <strong>{agentDefinitions.length}</strong>
+                    </span>
+                  </div>
+                  <div className="agent-config-map-list">
+                    <button
+                      type="button"
+                      className="agent-config-map-entry"
+                      onClick={() => {
+                        setAgentConfigOpen(true);
+                        setAgentConfigTab("workflow");
+                      }}
+                    >
+                      <strong>Workflow</strong>
+                      <small>Stage markdown</small>
+                    </button>
+                    <button
+                      type="button"
+                      className="agent-config-map-entry"
+                      onClick={() => {
+                        setAgentConfigOpen(true);
+                        setAgentConfigTab("agents");
+                      }}
+                    >
+                      <strong>Tools</strong>
+                      <small>MCP / Skills</small>
+                    </button>
+                    <button
+                      type="button"
+                      className="agent-config-map-entry"
+                      onClick={() => {
+                        setAgentConfigOpen(true);
+                        setAgentConfigTab("runtime");
+                      }}
+                    >
+                      <strong>Runtime</strong>
+                      <small>Policy files</small>
+                    </button>
+                  </div>
+                </article>
+              </div>
+
+              {activeRepositoryWorkspace ? (
+                <article className="control-card workspace-management-card">
+                  <div className="control-card-header">
+                    <div>
+                      <span className="section-label">Operations</span>
+                      <h2>Workspace controls</h2>
+                    </div>
+                    <details className="info-popover align-right">
+                      <summary aria-label="About workspace controls">
+                        <InfoIcon />
+                      </summary>
+                      <p>These controls apply only to {activeRepositoryWorkspaceLabel}. Deleting removes Omega's workspace target, not the GitHub repository.</p>
+                    </details>
+                  </div>
+                  <div className="workspace-management-grid">
+                    <div className="workspace-management-row">
+                      <span>
+                        <strong>Auto scan</strong>
+                        <small>
+                          {activeRepositoryWorkspace.kind === "github"
+                            ? activeRepositoryWatcherActive
+                              ? "On · ready issues can start"
+                              : "Off · manual run only"
+                            : "GitHub workspace only"}
+                        </small>
+                      </span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={activeRepositoryWatcherActive}
+                        aria-label="Auto scan ready GitHub issues"
+                        className={activeRepositoryWatcherActive ? "workspace-switch active" : "workspace-switch"}
+                        disabled={activeRepositoryWorkspace.kind !== "github" || syncingRepositoryKey === activeRepositoryWorkspaceKey}
+                        onClick={() => {
+                          void toggleRepositoryAutoProcessing(activeRepositoryWorkspace.id);
+                        }}
+                      >
+                        <span />
+                      </button>
+                    </div>
+                    <div className="workspace-management-row danger-zone">
+                      <span>
+                        <strong>Delete workspace</strong>
+                        <small>Remove from Omega only</small>
+                      </span>
+                      <button
+                        type="button"
+                        className="danger-action workspace-delete-action"
+                        onClick={() => {
+                          void deleteRepositoryWorkspace(activeRepositoryWorkspace.id);
+                        }}
+                      >
+                        Delete workspace
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              ) : null}
+            </section>
+
+            <section className="operator-section agent-config-section">
+              <div className="operator-section-heading">
+                <div>
+                  <span className="section-label">Agent profile</span>
+                  <h2>Project Agent Profile</h2>
+                </div>
+                <button type="button" onClick={() => setAgentConfigOpen((current) => !current)}>
+                  {agentConfigOpen ? "Collapse editor" : "Edit profile"}
+                </button>
+              </div>
+
+              <article className="control-card agent-config-card">
+                <div className="control-card-header">
+                  <div>
+                    <span className="section-label">DevFlow defaults</span>
+                    <h2>{primaryProject?.name ?? "Omega"} Agent orchestration</h2>
+                    <p>Draft workflow, per-Agent tools, and local runtime policy for this project.</p>
+                  </div>
+                  <button type="button" className="primary-action" onClick={saveAgentConfigurationDraft}>
+                    Save draft
+                  </button>
+                </div>
+
+                {agentConfigOpen ? (
+                  <div className="agent-config-shell">
+                    <div className="agent-config-summary-grid" aria-label="Agent profile summary">
+                      <span>
+                        <strong>{agentConfigDraft.workflowTemplate}</strong>
+                        <small>workflow draft</small>
+                      </span>
+                      <span>
+                        <strong>{agentConfigDraft.agentProfiles.length}</strong>
+                        <small>agent profiles</small>
+                      </span>
+                      <span>
+                        <strong>{agentConfigDraft.agentProfiles.reduce((count, profile) => count + profile.skills.split("\n").filter(Boolean).length, 0)}</strong>
+                        <small>skill bindings</small>
+                      </span>
+                      <span>
+                        <strong>.omega + .codex + .claude</strong>
+                        <small>runtime files</small>
+                      </span>
+                    </div>
+
+                    <div className="agent-config-tabs" role="tablist" aria-label="Project Agent Profile sections">
+                      {(["workflow", "agents", "runtime"] as AgentConfigTab[]).map((tab) => (
+                        <button
+                          key={tab}
+                          type="button"
+                          className={agentConfigTab === tab ? "active" : ""}
+                          onClick={() => setAgentConfigTab(tab)}
+                        >
+                          {tab === "workflow" ? "Workflow" : tab === "agents" ? "Agents" : "Runtime files"}
+                        </button>
+                      ))}
+                    </div>
+
+                    {agentConfigTab === "workflow" ? (
+                      <div className="workflow-builder">
+                        <div className="workflow-stage-flow" aria-label="Workflow parser draft">
+                          {workflowStagePreview.map((stage, index) => (
+                            <article key={stage.id} className="workflow-stage-card">
+                              <span>{String(index + 1).padStart(2, "0")}</span>
+                              <strong>{stage.title}</strong>
+                              <small>{stage.agents}</small>
+                              <em>{stage.gate}</em>
+                            </article>
+                          ))}
+                        </div>
+                        <div className="control-form workflow-markdown-editor">
+                          <label>
+                            <span>Template</span>
+                            <select
+                              value={agentConfigDraft.workflowTemplate}
+                              onChange={(event) => updateAgentConfigDraft("workflowTemplate", event.currentTarget.value)}
+                            >
+                              <option value="devflow-pr">devflow-pr</option>
+                              {pipelineTemplates
+                                .filter((template) => template.id !== "devflow-pr")
+                                .map((template) => (
+                                  <option key={template.id} value={template.id}>
+                                    {template.name}
+                                  </option>
+                                ))}
+                            </select>
+                          </label>
+                          <label>
+                            <span>Markdown</span>
+                            <textarea
+                              value={agentConfigDraft.workflowMarkdown}
+                              onChange={(event) => updateAgentConfigDraft("workflowMarkdown", event.currentTarget.value)}
+                            />
+                          </label>
+                          <label>
+                            <span>Rules</span>
+                            <textarea
+                              value={agentConfigDraft.stagePolicy}
+                              onChange={(event) => updateAgentConfigDraft("stagePolicy", event.currentTarget.value)}
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {agentConfigTab === "agents" ? (
+                      <div className="agent-profile-layout">
+                        <div className="agent-roster" aria-label="Agent roster">
+                          {agentConfigDraft.agentProfiles.map((profile) => (
+                            <button
+                              key={profile.id}
+                              type="button"
+                              className={[
+                                profile.id === selectedAgentProfile.id ? "active" : "",
+                                unavailableAgentProfiles({ ...agentConfigDraft, agentProfiles: [profile] }, localCapabilities).length > 0
+                                  ? "runner-missing"
+                                  : ""
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
+                              onClick={() => setSelectedAgentProfileId(profile.id)}
+                            >
+                              <strong>{profile.label}</strong>
+                              <span>{profile.runner} · {profile.model}</span>
+                            </button>
+                          ))}
+                        </div>
+                        <div className="control-form agent-profile-editor">
+                          <div className="agent-profile-editor-header">
+                            <span className="section-label">Agent override</span>
+                            <strong>{selectedAgentProfile.label}</strong>
+                          </div>
+                          <label>
+                            <span>Runner</span>
+                            <select
+                              value={selectedAgentProfile.runner}
+                              onChange={(event) =>
+                                updateAgentProfileDraft(
+                                  selectedAgentProfile.id,
+                                  "runner",
+                                  event.currentTarget.value as AgentProfileDraft["runner"]
+                                )
+                              }
+                            >
+                              {agentRunnerOptions.map((option) => (
+                                <option
+                                  key={option.value}
+                                  value={option.value}
+                                  disabled={!capabilityAvailable(localCapabilities, option.capabilityId)}
+                                >
+                                  {option.label}
+                                  {!capabilityAvailable(localCapabilities, option.capabilityId) ? " (missing)" : ""}
+                                </option>
+                              ))}
+                            </select>
+                            <small className={selectedRunnerReady ? "runner-availability ready" : "runner-availability missing"}>
+                              {selectedRunnerAvailability}
+                            </small>
+                          </label>
+                          <label>
+                            <span>Model</span>
+                            <input
+                              value={selectedAgentProfile.model}
+                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "model", event.currentTarget.value)}
+                            />
+                          </label>
+                          <label>
+                            <span>Skills</span>
+                            <textarea
+                              value={selectedAgentProfile.skills}
+                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "skills", event.currentTarget.value)}
+                            />
+                          </label>
+                          <label>
+                            <span>MCP</span>
+                            <textarea
+                              value={selectedAgentProfile.mcp}
+                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "mcp", event.currentTarget.value)}
+                            />
+                          </label>
+                          <label>
+                            <span>Stage note</span>
+                            <textarea
+                              value={selectedAgentProfile.stageNotes}
+                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "stageNotes", event.currentTarget.value)}
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {agentConfigTab === "runtime" ? (
+                      <div className="runtime-config-layout">
+                        <div className="runtime-file-tabs" role="tablist" aria-label="Runtime file templates">
+                          {(["omega", "codex", "claude"] as RuntimeConfigTab[]).map((tab) => (
+                            <button
+                              key={tab}
+                              type="button"
+                              className={runtimeConfigTab === tab ? "active" : ""}
+                              onClick={() => setRuntimeConfigTab(tab)}
+                            >
+                              {tab === "omega" ? ".omega/agent-runtime.json" : tab === "codex" ? ".codex/OMEGA.md" : ".claude/CLAUDE.md"}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="control-form runtime-policy-editor">
+                          <label>
+                            <span>.codex</span>
+                            <textarea
+                              value={selectedAgentProfile.codexPolicy}
+                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "codexPolicy", event.currentTarget.value)}
+                            />
+                          </label>
+                          <label>
+                            <span>.claude</span>
+                            <textarea
+                              value={selectedAgentProfile.claudePolicy}
+                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "claudePolicy", event.currentTarget.value)}
+                            />
+                          </label>
+                        </div>
+                        <div className="agent-config-preview">
+                          <span className="section-label">Runtime file preview</span>
+                          <pre>{runtimeConfigPreview}</pre>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {agentConfigSavedMessage ? <p className="agent-config-save-status" role="status">{agentConfigSavedMessage}</p> : null}
+                  </div>
+                ) : (
+                  <div className="agent-profile-summary">
+                    <span>Workflow: {agentConfigDraft.workflowTemplate}</span>
+                    <span>Agents: {agentConfigDraft.agentProfiles.length}</span>
+                    <span>Runtime: .omega / .codex / .claude</span>
+                    <span>Draft: local only</span>
+                  </div>
+                )}
+              </article>
+            </section>
+          </section>
+        ) : null}
+
         {activeNav === "Issues" ? (
           <>
             {activeWorkItemDetail ? (
               <section className="issue-detail-view" aria-label="Work item detail">
-                {runnerMessage ? (
-                  <p className="runner-status detail-runner-status" role="status">
-                    {runnerMessage}
-                  </p>
-                ) : null}
                 <article className="issue-detail-document">
                   <nav className="detail-breadcrumb" aria-label="Requirement hierarchy">
                     <span>{activeDetailRepositoryLabel || "Workspace"}</span>
@@ -2478,165 +3386,24 @@ function App() {
 
                   <section className="issue-detail-section">
                     <h3>Current attempt</h3>
-                    {activeDetailAttempt ? (
-                      <article className="attempt-card">
-                        <header>
-                          <div>
-                            <strong>{attemptStatusLabel(activeDetailAttempt.status)}</strong>
-                            <span>
-                              {activeDetailAttempt.runner ?? "runner"}
-                              {typeof activeDetailAttempt.durationMs === "number" && activeDetailAttempt.durationMs > 0
-                                ? ` · ${activeDetailAttempt.durationMs}ms`
-                                : ""}
-                            </span>
-                          </div>
-                          {activeDetailAttempt.pullRequestUrl ? (
-                            <a href={activeDetailAttempt.pullRequestUrl} target="_blank" rel="noreferrer">PR</a>
-                          ) : activeDetailAttempt.branchName ? (
-                            <span>{activeDetailAttempt.branchName}</span>
-                          ) : null}
-                        </header>
-                        <div className="attempt-stage-flow" aria-label={`Attempt ${activeDetailAttempt.id} stages`}>
-                          {(activeDetailAttempt.stages?.length ? activeDetailAttempt.stages : activeDetailPipeline?.run?.stages ?? []).map((stage) => {
-                            const agentIds = stage.agentIds ?? [];
-                            const evidence = "evidence" in stage && Array.isArray(stage.evidence) ? stage.evidence : [];
-                            const artifactLabels = [
-                              ...(stage.outputArtifacts ?? []),
-                              ...evidence.map((item: string) => item.split("/").pop() ?? item)
-                            ];
-                            return (
-                              <article key={`${activeDetailAttempt.id}-${stage.id}`} className={pipelineStageClassName(stage.status)}>
-                                <span>{pipelineStageLabel(stage.status)}</span>
-                                <strong>{stage.title ?? stage.id}</strong>
-                                <small>
-                                  {agentIds.length ? agentIds.map(agentShortLabel).join(" + ") : "Agent pending"}
-                                </small>
-                                {artifactLabels.length ? (
-                                  <em>{artifactLabels.slice(0, 2).join(", ")}</em>
-                                ) : null}
-                              </article>
-                            );
-                          })}
-                        </div>
-                        {activeDetailCheckpoint ? (
-                          <section className="human-gate-card" aria-label="Human review checkpoint">
-                            <div className="human-gate-heading">
-                              <span>Human gate</span>
-                              <strong>{activeDetailCheckpoint.title}</strong>
-                              <p>{activeDetailCheckpoint.summary}</p>
-                            </div>
-                            <div className="human-review-context">
-                              <div className="human-review-links">
-                                {activeDetailAttempt.pullRequestUrl ? (
-                                  <a href={activeDetailAttempt.pullRequestUrl} target="_blank" rel="noreferrer">
-                                    Open PR
-                                  </a>
-                                ) : null}
-                                {activeDetailAttempt.branchName ? <span>Branch {activeDetailAttempt.branchName}</span> : null}
-                                {activeDetailAttempt.workspacePath ? <code>{activeDetailAttempt.workspacePath}</code> : null}
-                              </div>
-                              <div className="human-review-columns">
-                                <section>
-                                  <h4>Review materials</h4>
-                                  {activeHumanReviewArtifacts.length ? (
-                                    <div className="human-review-artifacts">
-                                      {activeHumanReviewArtifacts.map((proof) => (
-                                        <article key={proof.id}>
-                                          <span>{proof.kind}</span>
-                                          <strong>{proof.label}</strong>
-                                          {proof.stage ? <small>{proof.stage}</small> : null}
-                                          {proof.url ? (
-                                            <a href={proof.url} target="_blank" rel="noreferrer">Open</a>
-                                          ) : proof.path ? (
-                                            <code>{proof.path}</code>
-                                          ) : null}
-                                        </article>
-                                      ))}
-                                    </div>
-                                  ) : (
-                                    <p>Review artifacts will appear after the agent records diff, test, and review outputs.</p>
-                                  )}
-                                </section>
-                                <section>
-                                  <h4>Recent agent decisions</h4>
-                                  {activeHumanReviewEvents.length ? (
-                                    <div className="human-review-events">
-                                      {activeHumanReviewEvents.map((event) => (
-                                        <article key={event.id}>
-                                          <span>{event.stageId ?? event.type}</span>
-                                          <strong>{event.type}</strong>
-                                          <p>{displayText(event.message)}</p>
-                                        </article>
-                                      ))}
-                                    </div>
-                                  ) : (
-                                    <p>Agent decisions will appear once stages start reporting review events.</p>
-                                  )}
-                                </section>
-                              </div>
-                            </div>
-                            <div className="human-gate-actions">
-                              <button
-                                type="button"
-                                className="primary-action"
-                                onClick={() => void approvePendingCheckpoint(activeDetailCheckpoint.id)}
-                              >
-                                Approve delivery
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => void rejectPendingCheckpoint(activeDetailCheckpoint.id)}
-                              >
-                                Request changes
-                              </button>
-                            </div>
-                          </section>
-                        ) : null}
-                        {activeDetailAttempt.status === "failed" ? (
-                          <section className="attempt-failure-report" aria-label="Attempt failure report">
-                            <div>
-                              <span>Failure report</span>
-                              <strong>
-                                {activeFailedStages[0]?.title ?? activeDetailAttempt.currentStageId ?? "Pipeline"} blocked this attempt
-                              </strong>
-                              <p>{activeDetailAttempt.errorMessage ?? activeDetailAttempt.stderrSummary ?? "The run failed before a detailed reason was captured."}</p>
-                            </div>
-                            {activeFailureOperations.length ? (
-                              <div className="failure-agent-list">
-                                {activeFailureOperations.map((operation) => (
-                                  <article key={operation.id}>
-                                    <span>{operation.stageId ?? "stage"} · {agentShortLabel(operation.agentId ?? "agent")}</span>
-                                    <strong>{operationStatusLabel(operation.status)}</strong>
-                                    {operation.summary ? <p>{operation.summary}</p> : null}
-                                    {operation.runnerProcess?.stderr ? <code>{operation.runnerProcess.stderr.slice(0, 420)}</code> : null}
-                                  </article>
-                                ))}
-                              </div>
-                            ) : null}
-                            {activeFailureProofCards.length ? (
-                              <div className="failure-proof-list">
-                                {activeFailureProofCards.map((proof) => (
-                                  <article key={proof.id}>
-                                    <span>{proof.kind}</span>
-                                    <strong>{proof.label}</strong>
-                                    {proof.path ? <code>{proof.path}</code> : null}
-                                    {proof.url ? <a href={proof.url} target="_blank" rel="noreferrer">Open artifact</a> : null}
-                                  </article>
-                                ))}
-                              </div>
-                            ) : null}
-                          </section>
-                        ) : null}
-                        {activeDetailAttempt.status !== "failed" && activeDetailAttempt.errorMessage ? (
-                          <p className="attempt-error">{activeDetailAttempt.errorMessage}</p>
-                        ) : null}
-                        {activeDetailAttempt.workspacePath ? (
-                          <p className="attempt-path">Workspace: {activeDetailAttempt.workspacePath}</p>
-                        ) : null}
-                      </article>
-                    ) : (
-                      <p className="muted-copy">No execution attempt yet. Run this item to create a traceable attempt.</p>
-                    )}
+                    <WorkItemAttemptPanel
+                      agentShortLabel={agentShortLabel}
+                      attempt={activeDetailAttempt}
+                      attemptStatusLabel={attemptStatusLabel}
+                      checkpoint={activeDetailCheckpoint}
+                      displayText={displayText}
+                      failedStages={activeFailedStages}
+                      failureOperations={activeFailureOperations}
+                      failureProofCards={activeFailureProofCards}
+                      humanReviewArtifacts={activeHumanReviewArtifacts}
+                      humanReviewEvents={activeHumanReviewEvents}
+                      onApproveCheckpoint={(checkpointId) => void approvePendingCheckpoint(checkpointId)}
+                      onRequestCheckpointChanges={(checkpointId, note) => void rejectPendingCheckpoint(checkpointId, note)}
+                      operationStatusLabel={operationStatusLabel}
+                      pipeline={activeDetailPipeline}
+                      pipelineStageClassName={pipelineStageClassName}
+                      pipelineStageLabel={pipelineStageLabel}
+                    />
                   </section>
 
                   <section className="issue-detail-section">
@@ -2671,57 +3438,17 @@ function App() {
 
                   <section className="issue-detail-section">
                     <h3>Agent orchestration</h3>
-                    {activeDetailOperations.length ? (
-                      <div className="agent-trace-list">
-                        {activeDetailOperations.map((operation) => (
-                          <article key={operation.id} className={`agent-trace-row ${pipelineStageClassName(operation.status)}`}>
-                            <header>
-                              <div>
-                                <span>{operation.stageId ?? "stage"}</span>
-                                <strong>{agentShortLabel(operation.agentId ?? "agent")}</strong>
-                              </div>
-                              <small>{operationStatusLabel(operation.status)}</small>
-                            </header>
-                            {operation.summary ? <p>{operation.summary}</p> : null}
-                            {operation.prompt ? <code>{operation.prompt.slice(0, 260)}</code> : null}
-                            {operation.runnerProcess ? (
-                              <div className="agent-runner-meta">
-                                <span>{operation.runnerProcess.runner ?? "runner"}</span>
-                                {operation.runnerProcess.status ? <span>{operation.runnerProcess.status}</span> : null}
-                                {typeof operation.runnerProcess.exitCode === "number" ? <span>exit {operation.runnerProcess.exitCode}</span> : null}
-                                {typeof operation.runnerProcess.durationMs === "number" ? <span>{operation.runnerProcess.durationMs}ms</span> : null}
-                              </div>
-                            ) : null}
-                          </article>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="muted-copy">Agent trace will appear as soon as the local orchestrator starts assigning stage work.</p>
-                    )}
+                    <AgentTraceList
+                      agentShortLabel={agentShortLabel}
+                      operations={activeDetailOperations}
+                      operationStatusLabel={operationStatusLabel}
+                      pipelineStageClassName={pipelineStageClassName}
+                    />
                   </section>
 
                   <section className="issue-detail-section">
                     <h3>Artifacts</h3>
-                    {activeDetailProofCards.length ? (
-                      <div className="proof-grid">
-                        {activeDetailProofCards.map((proof) => (
-                          <article key={proof.id} className="proof-card">
-                            <span className="proof-kind">{proof.kind}</span>
-                            <strong>{proof.label}</strong>
-                            {proof.stage ? <small>{proof.stage}</small> : null}
-                            {proof.url ? (
-                              <a href={proof.url} target="_blank" rel="noreferrer">
-                                Open URL
-                              </a>
-                            ) : proof.path ? (
-                              <code>{proof.path}</code>
-                            ) : null}
-                          </article>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="muted-copy">No artifact has been collected yet.</p>
-                    )}
+                    <ArtifactGrid proofs={activeDetailProofCards} />
                   </section>
 
                   <section className="issue-detail-section">
@@ -2733,26 +3460,7 @@ function App() {
 
                   <section className="issue-detail-section">
                     <h3>Attempt history</h3>
-                    <div className="attempt-history">
-                      {activeDetailAttempts.length === 0 ? (
-                        <p className="muted-copy">No prior attempts.</p>
-                      ) : (
-                        activeDetailAttempts.map((attempt, index) => (
-                          <article key={attempt.id}>
-                            <span>#{activeDetailAttempts.length - index}</span>
-                            <div>
-                              <strong>{attemptStatusLabel(attempt.status)}</strong>
-                              <small>
-                                {attempt.runner ?? "runner"}
-                                {attempt.currentStageId ? ` · ${attempt.currentStageId}` : ""}
-                                {attempt.pullRequestUrl ? ` · ${attempt.pullRequestUrl}` : ""}
-                              </small>
-                            </div>
-                            <time>{attempt.finishedAt ?? attempt.startedAt ?? ""}</time>
-                          </article>
-                        ))
-                      )}
-                    </div>
+                    <AttemptHistory attempts={activeDetailAttempts} attemptStatusLabel={attemptStatusLabel} />
                   </section>
                 </article>
               </section>
@@ -2911,7 +3619,9 @@ function App() {
                           onClick={() => selectWorkItem(item)}
                         >
                           <div>
-                            <span className="issue-key">{item.key}</span>
+                            <span className="issue-key" title={`Internal key: ${item.key}`}>
+                              {workItemDisplayLabel(item)}
+                            </span>
                             <strong>{item.title}</strong>
                           </div>
                           <small>{item.sourceExternalRef ?? item.target}</small>
@@ -3002,6 +3712,7 @@ function App() {
                         const runDisabled = completed || runningWorkItemId === item.id || item.status === "Planning" || item.status === "In Review";
                         const artifactCount = proofCountForItem(item, itemPipeline);
                         const turnCount = agentTurnCountForItem(item, itemPipeline);
+                        const progress = summarizePipelineProgress(item, pipelineStages, runningWorkItemId === item.id);
                         return (
                           <article
                             key={item.id}
@@ -3014,7 +3725,9 @@ function App() {
                             </div>
                             <div className="issue-main">
                               <div className="issue-title-line">
-                                <span className="issue-key">{item.key}</span>
+                                <span className="issue-key" title={`Internal key: ${item.key}`}>
+                                  {workItemDisplayLabel(item)}
+                                </span>
                                 <strong>{item.title}</strong>
                               </div>
                               <div className="issue-meta-line">
@@ -3024,36 +3737,27 @@ function App() {
                                 {repositoryLabel ? <span>{repositoryLabel}</span> : null}
                                 <span>{agentShortLabel(item.assignee)}</span>
                               </div>
-                              {pipelineStages.length ? (
-                                <div className="issue-pipeline-strip" aria-label={`Pipeline for ${item.key}`}>
-                                  {pipelineStages.map((stage) => {
-                                    const agentIds = stage.agentIds ?? (stage.agentId ? [stage.agentId] : []);
-                                    return (
-                                      <span key={stage.id} className={`pipeline-step ${pipelineStageClassName(stage.status)}`}>
-                                        <strong>{stage.title ?? stage.id}</strong>
-                                        <small>
-                                          {pipelineStageLabel(stage.status)}
-                                          {agentIds.length ? ` · ${agentIds.map(agentShortLabel).join("+")}` : ""}
-                                        </small>
-                                      </span>
-                                    );
-                                  })}
-                                </div>
-                              ) : item.status === "Planning" || runningWorkItemId === item.id ? (
-                                <div className="issue-pipeline-strip" aria-label={`Pipeline planning for ${item.key}`}>
-                                  {["Master", "Req", "Arch", "Code", "Test", "Rev", "Ship"].map((label, index) => (
-                                    <span key={label} className={`pipeline-step ${index === 0 ? "stage-running" : "stage-waiting"}`}>
-                                      <strong>{label}</strong>
-                                      <small>{index === 0 ? "Planning" : "Queued"}</small>
-                                    </span>
-                                  ))}
+                              {pipelineStages.length || item.status === "Planning" || runningWorkItemId === item.id ? (
+                                <div
+                                  className={`issue-progress-track ${pipelineStageClassName(progress.status)}`}
+                                  aria-label={`${item.key} current progress ${progress.label}`}
+                                >
+                                  <div className="issue-progress-copy">
+                                    <span>{pipelineStageLabel(progress.status)}</span>
+                                    <strong>{progress.label}</strong>
+                                  </div>
+                                  <div className="issue-progress-rail" aria-hidden="true">
+                                    <span style={{ width: `${progress.percent}%` }} />
+                                  </div>
                                 </div>
                               ) : null}
                             </div>
                             <div className="issue-trailing">
-                              <span className="issue-chip">
-                                {turnCount > 0 ? `Turns ${turnCount}` : artifactCount > 0 ? `Artifacts ${artifactCount}` : "Trace"}
-                              </span>
+                              {!pipelineStages.length ? (
+                                <span className="issue-chip">
+                                  {turnCount > 0 ? `Turns ${turnCount}` : artifactCount > 0 ? `Artifacts ${artifactCount}` : "Trace"}
+                                </span>
+                              ) : null}
                               {itemPendingCheckpoint ? (
                                 <button
                                   type="button"
@@ -3068,8 +3772,12 @@ function App() {
                                   Human review
                                 </button>
                               ) : null}
-                              <span className={`status-pill ${statusClassName(item.status)}`}>{workItemStatusLabel(item.status)}</span>
-                              <div>
+                              {completed ? (
+                                <span className="status-pill status-done">Done</span>
+                              ) : !itemPendingCheckpoint && item.status !== "In Review" ? (
+                                <span className={`status-pill ${statusClassName(item.status)}`}>{workItemStatusLabel(item.status)}</span>
+                              ) : null}
+                              {!completed && item.status !== "In Review" && item.status !== "Planning" ? (
                                 <button
                                   className="run-inline"
                                   disabled={runDisabled}
@@ -3078,17 +3786,9 @@ function App() {
                                     void runItem(item);
                                   }}
                                 >
-                                  {completed
-                                    ? "Completed"
-                                    : runningWorkItemId === item.id
-                                      ? "Running..."
-                                      : item.status === "Planning"
-                                        ? "Planning..."
-                                        : failed
-                                          ? "Retry"
-                                          : "Run"}
+                                  {runningWorkItemId === item.id ? "Running..." : failed ? "Retry" : "Run"}
                                 </button>
-                              </div>
+                              ) : null}
                             </div>
                           </article>
                         );
@@ -3255,7 +3955,7 @@ function App() {
                       ) : null}
                       <details
                         className="provider-advanced"
-                        open={githubOAuthSetupOpen || !githubOAuthConfig.configured}
+                        open={githubOAuthSetupOpen}
                         onToggle={(event) => setGitHubOAuthSetupOpen(event.currentTarget.open)}
                       >
                         <summary>OAuth app setup</summary>

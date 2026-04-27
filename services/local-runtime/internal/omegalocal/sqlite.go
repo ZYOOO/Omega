@@ -23,6 +23,7 @@ var sqliteMigrations = []struct {
 	Name    string
 }{
 	{Version: "20260424_001", Name: "bootstrap_go_local_service_schema"},
+	{Version: "20260427_001", Name: "agent_profiles_first_class_table"},
 }
 
 func NewSQLiteRepository(path string) *SQLiteRepository {
@@ -64,6 +65,17 @@ CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, pipeline_id TEXT NO
 CREATE TABLE IF NOT EXISTS missions (id TEXT PRIMARY KEY, pipeline_id TEXT NOT NULL, work_item_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, mission_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, stage_id TEXT NOT NULL, agent_id TEXT NOT NULL, status TEXT NOT NULL, prompt TEXT NOT NULL, required_proof_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS proof_records (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, label TEXT NOT NULL, value TEXT NOT NULL, source_path TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_profiles (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  repository_target_id TEXT,
+  version INTEGER NOT NULL,
+  profile_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_project_scope ON agent_profiles(project_id, scope, COALESCE(repository_target_id, ''));
 `); err != nil {
 		return err
 	}
@@ -296,6 +308,81 @@ SELECT key, value_json AS valueJson, updated_at AS updatedAt FROM omega_settings
 		}
 	}
 	return settings, nil
+}
+
+func (repo *SQLiteRepository) GetAgentProfile(ctx context.Context, projectID string, repositoryTargetID string) (map[string]any, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	scope := "project"
+	targetSQL := "repository_target_id IS NULL"
+	if strings.TrimSpace(repositoryTargetID) != "" {
+		scope = "repository"
+		targetSQL = "repository_target_id = " + sqlQuote(repositoryTargetID)
+	}
+	output, err := repo.query(ctx, fmt.Sprintf(
+		"SELECT profile_json FROM agent_profiles WHERE project_id = %s AND scope = %s AND %s ORDER BY version DESC LIMIT 1;",
+		sqlQuote(stringOr(projectID, "project_omega")),
+		sqlQuote(scope),
+		targetSQL,
+	))
+	if err != nil {
+		return nil, err
+	}
+	raw := strings.TrimSpace(output)
+	if raw == "" {
+		return nil, sql.ErrNoRows
+	}
+	var value map[string]any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func (repo *SQLiteRepository) SetAgentProfile(ctx context.Context, profile ProjectAgentProfile) error {
+	if err := repo.Initialize(ctx); err != nil {
+		return err
+	}
+	profile = normalizeAgentProfile(profile)
+	if profile.UpdatedAt == "" {
+		profile.UpdatedAt = nowISO()
+	}
+	scope := "project"
+	if strings.TrimSpace(profile.RepositoryTargetID) != "" {
+		scope = "repository"
+	}
+	id := agentProfileRecordID(profile.ProjectID, profile.RepositoryTargetID)
+	raw, err := json.Marshal(profile)
+	if err != nil {
+		return err
+	}
+	target := "NULL"
+	if profile.RepositoryTargetID != "" {
+		target = sqlQuote(profile.RepositoryTargetID)
+	}
+	now := nowISO()
+	return repo.exec(ctx, fmt.Sprintf(`
+INSERT INTO agent_profiles (id, scope, project_id, repository_target_id, version, profile_json, created_at, updated_at)
+VALUES (%s, %s, %s, %s, COALESCE((SELECT version FROM agent_profiles WHERE id = %s), 0) + 1, %s, COALESCE((SELECT created_at FROM agent_profiles WHERE id = %s), %s), %s)
+ON CONFLICT(id) DO UPDATE SET
+  scope = excluded.scope,
+  project_id = excluded.project_id,
+  repository_target_id = excluded.repository_target_id,
+  version = excluded.version,
+  profile_json = excluded.profile_json,
+  updated_at = excluded.updated_at;
+`,
+		sqlQuote(id),
+		sqlQuote(scope),
+		sqlQuote(profile.ProjectID),
+		target,
+		sqlQuote(id),
+		sqlQuote(string(raw)),
+		sqlQuote(id),
+		sqlQuote(now),
+		sqlQuote(profile.UpdatedAt),
+	))
 }
 
 func (repo *SQLiteRepository) exec(ctx context.Context, input string) error {
