@@ -14,11 +14,18 @@ Target responsibilities:
 - open the React app in Electron Chromium
 - provide desktop-only affordances such as workspace folder selection, preview webviews, and deep-link callbacks
 
-Development remains:
+Development mode does not require packaging. Run the existing web and runtime services, then start Electron as a desktop shell:
 
 ```bash
 npm run local-runtime:dev
-npm run web:dev
+npm run web:dev -- --host 127.0.0.1 --port 5174
+npm run desktop:dev
 ```
 
-Packaging will later add Electron dependencies, platform-specific Go binary builds, and an app builder config.
+The development shell loads `OMEGA_WEB_URL` or `http://127.0.0.1:5174/` by default. It keeps the current architecture:
+
+- React SPA remains the Omega product UI.
+- Go local runtime remains the execution engine and API server.
+- Electron adds desktop-only browser capabilities for Page Pilot preview, selection injection, reload, and future process management.
+
+Packaging will later add platform-specific Go binary builds and an app builder config.

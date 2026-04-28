@@ -1,6 +1,8 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+const pagePilotTargetProxy = process.env.OMEGA_PAGE_PILOT_TARGET_URL ?? "http://127.0.0.1:5173";
+
 export default defineConfig({
   root: "apps/web",
   plugins: [react()],
@@ -14,6 +16,11 @@ export default defineConfig({
         target: "http://127.0.0.1:3888",
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, "")
+      },
+      "/page-pilot-target": {
+        target: pagePilotTargetProxy,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/page-pilot-target/, "") || "/"
       }
     }
   },

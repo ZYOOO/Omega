@@ -25,6 +25,10 @@ export function createSpawnRunner(env: Record<string, string | undefined> = proc
       const child = spawn(command, args, { shell: false, env });
       let stdout = "";
       let stderr = "";
+      if (!child.stdout || !child.stderr) {
+        resolve({ stdout, stderr: `${command} stdio streams are unavailable`, exitCode: null });
+        return;
+      }
       child.stdout.on("data", (chunk) => {
         stdout += chunk.toString();
       });

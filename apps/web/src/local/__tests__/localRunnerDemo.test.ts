@@ -17,6 +17,10 @@ function runDemo(workspaceRoot: string): Promise<{
 
     let stdout = "";
     let stderr = "";
+    if (!child.stdout || !child.stderr) {
+      resolve({ exitCode: null, stdout, stderr: "local runner demo stdio streams are unavailable" });
+      return;
+    }
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();

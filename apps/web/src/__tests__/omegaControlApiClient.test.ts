@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  applyPagePilotInstruction,
   approveCheckpoint,
   createPipelineFromTemplate,
   createGitHubPullRequest,
+  deliverPagePilotChange,
   decomposeRequirement,
+  discardPagePilotRun,
   fetchCheckpoints,
   fetchAgentDefinitions,
   fetchGitHubRepoInfo,
@@ -15,6 +18,7 @@ import {
   fetchLlmProviderSelection,
   fetchLlmProviders,
   fetchObservability,
+  fetchPagePilotRuns,
   fetchPipelines,
   fetchPipelineTemplates,
   requestCheckpointChanges,
@@ -96,6 +100,69 @@ describe("omegaControlApiClient", () => {
     await expect(
       sendFeishuNotification("http://omega.local", "oc_demo", "Pipeline waiting for review", fetchImpl)
     ).resolves.toMatchObject({ status: "sent", messageId: "om_123" });
+  });
+
+  it("sends Page Pilot apply and delivery requests to the local runtime", async () => {
+    const selection = {
+      elementKind: "title",
+      stableSelector: `[data-omega-source="apps/web/src/components/PortalHome.tsx:headline"]`,
+      textSnapshot: "Old headline",
+      styleSnapshot: { fontSize: "32px" },
+      domContext: { tagName: "h1" },
+      sourceMapping: {
+        source: "apps/web/src/components/PortalHome.tsx:headline",
+        file: "apps/web/src/components/PortalHome.tsx",
+        symbol: "headline"
+      }
+    };
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/page-pilot/apply")) {
+        expect(init?.method).toBe("POST");
+        const body = JSON.parse(String(init?.body));
+        expect(body.repositoryTargetId).toBe("repo_ZYOOO_Omega");
+        expect(body.selection.sourceMapping.symbol).toBe("headline");
+        return Promise.resolve(jsonResponse({ id: "page_pilot_1", status: "applied", changedFiles: ["apps/web/src/components/PortalHome.tsx"] }));
+      }
+      if (String(input).endsWith("/page-pilot/runs")) {
+        expect(init).toBeUndefined();
+        return Promise.resolve(jsonResponse([{ id: "page_pilot_1", status: "applied", changedFiles: ["apps/web/src/components/PortalHome.tsx"] }]));
+      }
+      if (String(input).endsWith("/page-pilot/runs/page_pilot_1/discard")) {
+        expect(init?.method).toBe("POST");
+        return Promise.resolve(jsonResponse({ id: "page_pilot_1", status: "discarded", changedFiles: ["apps/web/src/components/PortalHome.tsx"] }));
+      }
+      expect(init?.method).toBe("POST");
+      const body = JSON.parse(String(init?.body));
+      expect(body.repositoryTargetId).toBe("repo_ZYOOO_Omega");
+      expect(body.selection.sourceMapping.symbol).toBe("headline");
+      return Promise.resolve(jsonResponse({ status: "delivered", branchName: "omega/page-pilot-headline", changedFiles: ["apps/web/src/components/PortalHome.tsx"] }));
+    }) as unknown as typeof fetch;
+
+    await expect(
+      applyPagePilotInstruction("http://omega.local", {
+        projectId: "project_omega",
+        repositoryTargetId: "repo_ZYOOO_Omega",
+        instruction: "Make the headline shorter",
+        selection
+      }, fetchImpl)
+    ).resolves.toMatchObject({ id: "page_pilot_1", status: "applied" });
+
+    await expect(
+      deliverPagePilotChange("http://omega.local", {
+        runId: "page_pilot_1",
+        projectId: "project_omega",
+        repositoryTargetId: "repo_ZYOOO_Omega",
+        instruction: "Make the headline shorter",
+        selection
+      }, fetchImpl)
+    ).resolves.toMatchObject({ status: "delivered" });
+
+    await expect(fetchPagePilotRuns("http://omega.local", fetchImpl)).resolves.toMatchObject([
+      { id: "page_pilot_1", status: "applied" }
+    ]);
+    await expect(discardPagePilotRun("http://omega.local", "page_pilot_1", fetchImpl)).resolves.toMatchObject({
+      status: "discarded"
+    });
   });
 
   it("starts GitHub OAuth through the local control plane", async () => {

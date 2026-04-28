@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite --config apps/web/vite.config.ts",
     "web:dev": "vite --config apps/web/vite.config.ts",
+    "desktop:dev": "electron apps/desktop/src/main.cjs",
+    "desktop:pilot": "electron apps/desktop/src/pilot-main.cjs",
     "build": "tsc -b && vite build --config apps/web/vite.config.ts",
     "web:build": "vite build --config apps/web/vite.config.ts",
     "preview": "vite preview --config apps/web/vite.config.ts",
@@ -25,12 +27,13 @@
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^5.0.4",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.0",
     "@types/react": "^19.1.15",
     "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.4",
     "@vitest/coverage-v8": "^3.2.4",
+    "electron": "^41.3.0",
     "jsdom": "^27.0.0",
     "typescript": "^5.9.3",
     "vite": "^7.1.12",

@@ -19,6 +19,7 @@ import { runOperationViaMissionControlApi } from "./missionControlApiClient";
 import type { MissionControlRunnerPreset } from "./missionControlApiClient";
 import { navigateToExternalUrl } from "./browserNavigation";
 import { openExternalUrlInNewTab } from "./browserNavigation";
+import { PagePilotPreview } from "./components/PagePilotPreview";
 import { PortalHome } from "./components/PortalHome";
 import {
   AgentTraceList,
@@ -27,8 +28,11 @@ import {
   WorkItemAttemptPanel
 } from "./components/WorkItemDetailPanels";
 import {
+  applyPagePilotInstruction,
   approveCheckpoint,
   createPipelineFromTemplate,
+  deliverPagePilotChange,
+  discardPagePilotRun,
   fetchAttempts,
   fetchExecutionLocks,
   fetchCheckpoints,
@@ -45,6 +49,7 @@ import {
   fetchOrchestratorWatchers,
   fetchPipelines,
   fetchPipelineTemplates,
+  fetchPagePilotRuns,
   fetchProofRecords,
   fetchProjectAgentProfile,
   fetchRequirements,
@@ -73,6 +78,7 @@ import {
   type LlmProviderSelection,
   type ObservabilitySummary,
   type OperationRecordInfo,
+  type PagePilotSelectionContext,
   type OrchestratorWatcherInfo,
   type PipelineRecordInfo,
   type PipelineTemplateInfo,
@@ -94,7 +100,7 @@ import {
 import type { ConnectionProvider, ProjectRecord, ProviderId, WorkItem, WorkItemPriority, WorkItemStatus, WorkboardViewSort } from "./core";
 import "./styles.css";
 
-type PrimaryNav = "Projects" | "Views" | "Issues" | "Settings";
+type PrimaryNav = "Projects" | "Views" | "Issues" | "Page Pilot" | "Settings";
 type InspectorPanel = "properties" | "provider";
 type AppSurface = "home" | "workboard";
 type UiTheme = "light" | "dark";
@@ -154,6 +160,7 @@ function InfoIcon() {
 
 function topbarSearchPlaceholder(nav: PrimaryNav) {
   if (nav === "Issues") return "Search work items...";
+  if (nav === "Page Pilot") return "Search Page Pilot runs...";
   if (nav === "Settings") return "Search settings...";
   return "Search...";
 }
@@ -812,6 +819,14 @@ function App() {
     activeRepositoryWorkspace?.kind === "github"
       ? activeRepositoryWorkspace.url ?? `https://github.com/${activeRepositoryWorkspace.owner}/${activeRepositoryWorkspace.repo}`
       : activeRepositoryWorkspace?.path;
+  const pagePilotRepositoryTarget =
+    activeRepositoryWorkspace ??
+    repositoryTargets.find((target) => target.id === primaryProject?.defaultRepositoryTargetId) ??
+    (repositoryTargets.length === 1 ? repositoryTargets[0] : undefined);
+  const pagePilotRepositoryLabel =
+    pagePilotRepositoryTarget?.kind === "github"
+      ? `${pagePilotRepositoryTarget.owner}/${pagePilotRepositoryTarget.repo}`
+      : pagePilotRepositoryTarget?.path ?? "";
   const activeRepositoryWorkspaceKey =
     activeRepositoryWorkspace?.kind === "github"
       ? `${activeRepositoryWorkspace.owner}/${activeRepositoryWorkspace.repo}`
@@ -2005,6 +2020,7 @@ function App() {
   const shellClassName = [
     "product-shell",
     `theme-${uiTheme}`,
+    activeNav === "Page Pilot" ? "page-pilot-mode" : "",
     !inspectorAvailable ? "inspector-hidden" : "",
     inspectorAvailable && !inspectorOpen ? "inspector-collapsed" : ""
   ]
@@ -2081,6 +2097,48 @@ function App() {
       window.localStorage.setItem("omega-ui-theme", next);
       return next;
     });
+  }
+
+  async function applyPagePilotChange(instruction: string, selection: PagePilotSelectionContext) {
+    if (!missionControlApiUrl || !pagePilotRepositoryTarget?.id) {
+      throw new Error("Page Pilot needs the local runtime and a repository workspace.");
+    }
+    return applyPagePilotInstruction(missionControlApiUrl, {
+      projectId: primaryProject?.id ?? "project_omega",
+      repositoryTargetId: pagePilotRepositoryTarget.id,
+      instruction,
+      selection,
+      runner: "profile"
+    });
+  }
+
+  async function deliverPagePilotConfirmedChange(instruction: string, selection: PagePilotSelectionContext, runId?: string) {
+    if (!missionControlApiUrl || !pagePilotRepositoryTarget?.id) {
+      throw new Error("Page Pilot needs the local runtime and a repository workspace.");
+    }
+    return deliverPagePilotChange(missionControlApiUrl, {
+      runId,
+      projectId: primaryProject?.id ?? "project_omega",
+      repositoryTargetId: pagePilotRepositoryTarget.id,
+      instruction,
+      selection,
+      draft: true
+    });
+  }
+
+  async function discardPagePilotPendingChange(runId: string) {
+    if (!missionControlApiUrl) {
+      throw new Error("Page Pilot needs the local runtime.");
+    }
+    return discardPagePilotRun(missionControlApiUrl, runId);
+  }
+
+  async function loadPagePilotRuns() {
+    if (!missionControlApiUrl) return [];
+    const runs = await fetchPagePilotRuns(missionControlApiUrl);
+    return pagePilotRepositoryTarget?.id
+      ? runs.filter((run) => run.repositoryTargetId === pagePilotRepositoryTarget.id)
+      : runs;
   }
 
   function updateAgentConfigDraft<Key extends keyof AgentConfigurationDraft>(key: Key, value: AgentConfigurationDraft[Key]) {
@@ -2179,7 +2237,7 @@ function App() {
         </div>
 
         <nav className="nav-stack">
-          {(["Projects", "Views", "Issues"] as const).map((item) => (
+          {(["Projects", "Views", "Issues", "Page Pilot"] as const).map((item) => (
             <button
               key={item}
               className={item === activeNav ? "nav-item active" : "nav-item"}
@@ -2191,6 +2249,9 @@ function App() {
                   setActiveWorkItemDetailId("");
                 }
                 if (item === "Views") {
+                  setActiveWorkItemDetailId("");
+                }
+                if (item === "Page Pilot") {
                   setActiveWorkItemDetailId("");
                 }
               }}
@@ -3326,6 +3387,20 @@ function App() {
               </article>
             </section>
           </section>
+        ) : null}
+
+        {activeNav === "Page Pilot" ? (
+          <PagePilotPreview
+            projectId={primaryProject?.id ?? "project_omega"}
+            repositoryTargetId={pagePilotRepositoryTarget?.id}
+            repositoryLabel={pagePilotRepositoryLabel}
+            apiAvailable={Boolean(missionControlApiUrl)}
+            onApply={applyPagePilotChange}
+            onDeliver={deliverPagePilotConfirmedChange}
+            onDiscard={discardPagePilotPendingChange}
+            onFetchRuns={loadPagePilotRuns}
+            onExit={() => setActiveNav("Issues")}
+          />
         ) : null}
 
         {activeNav === "Issues" ? (

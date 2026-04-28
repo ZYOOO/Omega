@@ -234,6 +234,90 @@ paths:
           description: Local workspace root updated
         '400':
           description: Invalid workspace root
+  /page-pilot/apply:
+    post:
+      summary: Apply an in-page Page Pilot instruction to real source
+      description: Receives selection context from the Page Pilot overlay, resolves the locked repository target, runs the single Page Pilot Agent page-editing stage, writes a real source patch, and returns changed files plus diff summaries. On success the runtime also materializes a `source=page_pilot` Requirement, Work Item, and lightweight `page-pilot` pipeline run linked back to the Page Pilot run. The runtime rejects requests that cannot resolve a local worktree suitable for HMR or dev server reload.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - repositoryTargetId
+                - instruction
+                - selection
+              properties:
+                projectId:
+                  type: string
+                repositoryTargetId:
+                  type: string
+                instruction:
+                  type: string
+                runner:
+                  type: string
+                  example: profile
+                selection:
+                  type: object
+      responses:
+        '200':
+          description: Source patch applied; diff summary and feature-one linkage (`requirementId`, `workItemId`, `pipelineId`, `pipelineRunId`) returned
+        '400':
+          description: Missing repository target, invalid source mapping, unavailable runner, or no source diff
+  /page-pilot/deliver:
+    post:
+      summary: Deliver a confirmed Page Pilot change
+      description: Creates or switches to a Page Pilot branch, commits the current source diff, and creates a GitHub PR when the repository target is GitHub-backed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - repositoryTargetId
+                - selection
+              properties:
+                projectId:
+                  type: string
+                repositoryTargetId:
+                  type: string
+                instruction:
+                  type: string
+                branchName:
+                  type: string
+                draft:
+                  type: boolean
+                selection:
+                  type: object
+      responses:
+        '200':
+          description: Branch, commit, and optional PR information returned
+        '400':
+          description: No pending diff or repository delivery failed
+  /page-pilot/runs:
+    get:
+      summary: List Page Pilot run records
+      description: Returns persisted Page Pilot apply / discard / delivery records from the local runtime SQLite `page_pilot_runs` table.
+      responses:
+        '200':
+          description: Page Pilot runs returned
+  /page-pilot/runs/{id}/discard:
+    post:
+      summary: Discard an unapplied Page Pilot source patch
+      description: Reverts changed files for a Page Pilot run that is still in `applied` status, then updates the persisted run record to `discarded`.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Page Pilot changes discarded
+        '400':
+          description: Run is missing, already delivered, or cannot be reverted
   /observability:
     get:
       summary: Return pipeline, checkpoint, operation, proof, and attention summary

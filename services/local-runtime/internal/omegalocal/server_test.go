@@ -2354,6 +2354,151 @@ func TestWorkspaceChildPathCannotEscapeConfiguredRoot(t *testing.T) {
 	}
 }
 
+func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	targetRepo := createDemoGitRepo(t)
+	sourceFile := filepath.Join(targetRepo, "src", "Page.tsx")
+	if err := os.WriteFile(sourceFile, []byte("export function Page() {\n  return <h1>Old headline</h1>;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, targetRepo, "add", ".")
+	runGit(t, targetRepo, "commit", "-m", "add page")
+
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{
+		"id":            "repo_local_page",
+		"kind":          "local",
+		"path":          targetRepo,
+		"defaultBranch": "main",
+	}}
+	project["defaultRepositoryTargetId"] = "repo_local_page"
+	database.Tables.Projects[0] = project
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	profile := map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_page",
+		"workflowTemplate":   "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "local-proof",
+			"model":  "local",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+
+	selection := map[string]any{
+		"elementKind":    "title",
+		"stableSelector": `[data-omega-source="src/Page.tsx:headline"]`,
+		"textSnapshot":   "Old headline",
+		"styleSnapshot":  map[string]any{"fontSize": "32px"},
+		"domContext":     map[string]any{"tagName": "h1"},
+		"sourceMapping":  map[string]any{"source": "src/Page.tsx:headline", "file": "src/Page.tsx", "symbol": "headline"},
+	}
+	var applied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_page",
+		"instruction":        `replace text with "New headline"`,
+		"selection":          selection,
+		"runner":             "profile",
+	}), &applied)
+	if applied["status"] != "applied" || applied["repositoryPath"] != targetRepo {
+		t.Fatalf("applied = %+v", applied)
+	}
+	runID := text(applied, "id")
+	if runID == "" {
+		t.Fatalf("Page Pilot run id missing: %+v", applied)
+	}
+	raw, err := os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "New headline") {
+		t.Fatalf("source not patched: %s", raw)
+	}
+	if got := arrayValues(applied["changedFiles"]); len(got) != 1 || got[0] != "src/Page.tsx" {
+		t.Fatalf("changed files = %+v", applied["changedFiles"])
+	}
+	storedRun, err := repo.GetPagePilotRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedRun["status"] != "applied" || storedRun["repositoryTargetId"] != "repo_local_page" {
+		t.Fatalf("stored run = %+v", storedRun)
+	}
+	if text(storedRun, "requirementId") == "" || text(storedRun, "workItemId") == "" || text(storedRun, "pipelineId") == "" {
+		t.Fatalf("stored run should link Page Pilot back to feature-one records: %+v", storedRun)
+	}
+	linkedDatabase, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workItem := findWorkItem(*linkedDatabase, text(storedRun, "workItemId"))
+	if workItem == nil || workItem["source"] != "page_pilot" || workItem["repositoryTargetId"] != "repo_local_page" {
+		t.Fatalf("Page Pilot work item missing or unscoped: %+v", workItem)
+	}
+	requirementIndex := findByID(linkedDatabase.Tables.Requirements, text(storedRun, "requirementId"))
+	if requirementIndex < 0 || linkedDatabase.Tables.Requirements[requirementIndex]["source"] != "page_pilot" {
+		t.Fatalf("Page Pilot requirement missing: %+v", linkedDatabase.Tables.Requirements)
+	}
+	pipelineIndex := findByID(linkedDatabase.Tables.Pipelines, text(storedRun, "pipelineId"))
+	if pipelineIndex < 0 || linkedDatabase.Tables.Pipelines[pipelineIndex]["templateId"] != "page-pilot" {
+		t.Fatalf("Page Pilot pipeline missing: %+v", linkedDatabase.Tables.Pipelines)
+	}
+	var runs []map[string]any
+	decode(t, mustGet(t, api.URL+"/page-pilot/runs"), &runs)
+	if len(runs) != 1 || runs[0]["id"] != runID || runs[0]["status"] != "applied" {
+		t.Fatalf("runs = %+v", runs)
+	}
+	var discarded map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/runs/"+runID+"/discard", map[string]any{}), &discarded)
+	if discarded["status"] != "discarded" {
+		t.Fatalf("discarded = %+v", discarded)
+	}
+	raw, err = os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Old headline") {
+		t.Fatalf("source not discarded: %s", raw)
+	}
+
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_page",
+		"instruction":        `replace text with "New headline"`,
+		"selection":          selection,
+		"runner":             "profile",
+	}), &applied)
+	runID = text(applied, "id")
+
+	var delivered map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/deliver", map[string]any{
+		"runId":              runID,
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_page",
+		"instruction":        `replace text with "New headline"`,
+		"selection":          selection,
+		"branchName":         "omega/page-pilot-test",
+	}), &delivered)
+	if delivered["status"] != "delivered" || delivered["branchName"] != "omega/page-pilot-test" || delivered["commitSha"] == "" {
+		t.Fatalf("delivered = %+v", delivered)
+	}
+	if branch := strings.TrimSpace(runGit(t, targetRepo, "branch", "--show-current")); branch != "omega/page-pilot-test" {
+		t.Fatalf("branch = %s", branch)
+	}
+}
+
 func TestFeishuNotifyUsesLocalLarkCLI(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake shell script uses POSIX sh")

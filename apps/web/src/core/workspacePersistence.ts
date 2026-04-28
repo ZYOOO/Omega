@@ -9,7 +9,7 @@ import type { PipelineRun, PipelineStageId } from "./types";
 export const workspacePersistenceSchemaVersion = 1;
 
 export type InspectorPanelPersistence = "properties" | "provider";
-export type PrimaryNavPersistence = "Projects" | "Views" | "Issues";
+export type PrimaryNavPersistence = "Projects" | "Views" | "Issues" | "Page Pilot";
 export type RunnerPresetPersistence = "local-proof" | "demo-code" | "codex";
 
 export interface ProjectRecord extends WorkboardProject {

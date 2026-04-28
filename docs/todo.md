@@ -140,6 +140,25 @@ Item
 - [x] 建立功能实现记录文档：`docs/feature-implementation-log.md`，后续功能按同一格式记录目标、做法、验证和后续工作
 - [x] Operator Runner processes UI 收敛为摘要列表，stdout/stderr 默认折叠，避免执行记录页面被日志块淹没
 - [x] 使用正式 Omega logo 资产：`apps/web/public/omega-logo.png`
+- [x] 建立功能二 Page Pilot 架构文档：`docs/page-pilot-architecture.md`
+- [x] 在 React SPA 中注入 Page Pilot Overlay：悬浮对话框、元素圈选模式、selector / DOM / 文本 / 样式快照采集
+- [x] 增加 Page Pilot preview surface：在 Omega 内打开目标项目页面，并把 Overlay 绑定到目标 preview document，而不是 Omega 自身管理 UI
+- [x] 增加 Page Pilot dev proxy：`/page-pilot-target` 同源代理本地目标项目，方便浏览器模式验证圈选和真实 patch
+- [x] Page Pilot 进入 immersive preview mode：隐藏 Workboard chrome，让用户产品在 Omega 主工作区中直接打开
+- [x] 增加 Electron dev shell 基础版：开发模式加载 React SPA，并预留目标项目 BrowserView / preload selection bridge
+- [x] 增加 Electron direct pilot mode：直接打开目标产品 URL，并在页面内注入悬浮手指、hover 高亮和修改输入框
+- [x] Electron direct pilot 支持多元素批注队列：单元素 comment 只加 pin，底部悬浮输入框统一收集整体需求后再提交 Agent
+- [x] 为 Portal Home 关键可编辑元素加入最小 `data-omega-source` 源码映射
+- [x] 增加 Page Pilot Go runtime API：`/page-pilot/apply` 接收 selection context + 用户指令，在明确 repository target 中执行真实源码 patch
+- [x] Page Pilot apply 成功后物化为功能一记录：`source=page_pilot` Requirement / Work Item / Page Pilot pipeline run
+- [x] Electron direct pilot apply 成功后自动 reload 目标页面，并恢复 Page Pilot run 结果面板
+- [x] Electron direct pilot 结果面板基础版：展示 changed files、diff summary、Requirement/Work Item/Pipeline linkage
+- [x] Electron direct pilot Confirm / Discard 基础版：Confirm 调用 deliver，Discard 调用 runtime discard 并刷新预览
+- [x] Electron direct pilot 提交态基础版：提交后切换为 Agent 过程面板，展示批注历史、primary target、修改文件和 Work Item/Pipeline linkage
+- [x] Electron direct pilot 多批注主目标修正：默认使用最新一条带源码映射的批注作为 `/page-pilot/apply` selection
+- [x] 增加 Page Pilot 确认交付 API：`/page-pilot/deliver` 创建 branch / commit，并在 GitHub target 上继续创建 PR
+- [x] 增加 Page Pilot run 记录与撤销 API：`/page-pilot/runs`、`/page-pilot/runs/{id}/discard`
+- [x] 将 Page Pilot run 从 `omega_settings` 升级为 SQLite 一等表 `page_pilot_runs`
 
 ## 进行中
 
@@ -185,6 +204,27 @@ Item
 - [ ] 把 Checkpoint Reject 的“回退重做”做成更清晰的 stage timeline 可视化，突出 rejected -> rework -> review 回流
 - [x] Operator 视图增加基础 stage timeline，可看到当前 Pipeline 每个阶段的状态
 - [ ] 按赛题要求持续维护 Must-have / Good-to-have 对照与完成度
+- [ ] Page Pilot：将 proof 从 run JSON / proof 文件升级为 SQLite 一等表，并在 Operator / Proof UI 展示
+- [ ] Page Pilot：扩展 `data-omega-source` 到 Workboard 关键可编辑区域，不只覆盖 Portal Home
+- [ ] Page Pilot：增加 patch preview、selection history、discard/revert 的更完整 UI 状态（基础 selection history / process panel 已落地，仍缺完整 diff preview）
+- [ ] Page Pilot：把 Electron preview webview、repository target、local worktree 绑定成一等配置
+- [ ] Page Pilot：把 Electron direct pilot 的 target URL、projectId、repositoryTargetId 从 env/default 升级为用户可选配置
+- [ ] Page Pilot：定义单一 Page Pilot Agent 的 stage contracts：preview-runtime / page-editing / delivery
+- [ ] Page Pilot：增加 Preview Runtime stage，读取 repo 文件并生成 install/start/preview URL/health/reload 的可审计运行档案
+- [ ] Page Pilot：增加 Preview Runtime Profile API：resolve/start/restart，所有命令锁定到明确 repository workspace
+- [ ] Page Pilot：增加 preview process supervisor，记录目标项目 dev server 的 pid、stdout/stderr、端口、健康检查和失败诊断
+- [ ] Page Pilot：在 UI 中展示 session 对应的 Requirement / Work Item / Page Pilot pipeline run，并支持从 Work Item 回到 Page Pilot run
+- [ ] Page Pilot：增加 live-preview repository write lock，避免和 DevFlow/operation 同时写同一个 worktree
+- [ ] Page Pilot：设计 isolated-devflow mode，让预览可以指向隔离 operation workspace 或在确认后回写原 workspace
+- [ ] Page Pilot：Preview Runtime stage 落地后，apply 成功时按 profile 必要重启目标项目 dev server
+- [ ] Page Pilot：Electron direct pilot 结果面板升级为完整 diff preview / PR body preview / Work Item 回跳
+- [ ] Page Pilot：支持同一 Page Pilot run 的多轮追加批注 / 追加说明 / 重新 apply
+- [ ] Page Pilot：为 DOM-only 批注增加源码候选定位能力，缺少 `data-omega-source` 时也能给 Agent 更强定位线索
+- [ ] Page Pilot：把 `/page-pilot-target` 调试代理替换为 Electron bridge 或显式开发配置
+- [ ] Page Pilot：实现 Electron webview preload bridge，支持跨 origin 本地预览的真实元素圈选
+- [ ] Page Pilot：把 React Page Pilot 页面接入 Electron `omegaDesktop.openPreview` / `reloadPreview` / selection event
+- [ ] Page Pilot：增加 Go target dev server start/restart API，支持修改后重启用户项目 dev server
+- [ ] Page Pilot：PR body 增加 DOM context、样式快照和截图证据
 
 ## 已完成且不再作为独立任务
 

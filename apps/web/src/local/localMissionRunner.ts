@@ -81,6 +81,13 @@ function runCommand(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    if (!child.stdout || !child.stderr || !child.stdin) {
+      resolve({ exitCode: null, stdout, stderr: "runner stdio streams are unavailable" });
+      return;
+    }
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
+    const childStdin = child.stdin;
 
     const timer = setTimeout(() => {
       if (settled) {
@@ -89,26 +96,26 @@ function runCommand(
       child.kill("SIGTERM");
     }, timeoutMs);
 
-    child.stdout.on("data", (chunk: Buffer) => {
+    childStdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
 
-    child.stderr.on("data", (chunk: Buffer) => {
+    childStderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
     });
 
     if (command.stdinFile) {
       readFile(join(cwd, command.stdinFile), "utf8")
         .then((content) => {
-          child.stdin.write(content);
-          child.stdin.end();
+          childStdin.write(content);
+          childStdin.end();
         })
         .catch((error) => {
           stderr += error.message;
-          child.stdin.end();
+          childStdin.end();
         });
     } else {
-      child.stdin.end();
+      childStdin.end();
     }
 
     child.on("close", (exitCode) => {

@@ -124,6 +124,14 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.getLocalWorkspaceRoot(response, request)
 	case request.Method == http.MethodPut && path == "/local-workspace-root":
 		server.putLocalWorkspaceRoot(response, request)
+	case request.Method == http.MethodPost && path == "/page-pilot/apply":
+		server.pagePilotApply(response, request)
+	case request.Method == http.MethodPost && path == "/page-pilot/deliver":
+		server.pagePilotDeliver(response, request)
+	case request.Method == http.MethodGet && path == "/page-pilot/runs":
+		server.listPagePilotRuns(response, request)
+	case request.Method == http.MethodPost && strings.HasPrefix(path, "/page-pilot/runs/") && strings.HasSuffix(path, "/discard"):
+		server.discardPagePilotRun(response, request)
 	case request.Method == http.MethodGet && path == "/github/status":
 		server.githubStatus(response, request)
 	case request.Method == http.MethodGet && path == "/github/oauth/config":

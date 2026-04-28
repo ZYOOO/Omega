@@ -51,7 +51,7 @@ export function PortalHome({ onOpenWorkboard, onToggleTheme, uiTheme }: PortalHo
           <button type="button" className="portal-outline" onClick={onOpenWorkboard}>
             联系团队
           </button>
-          <button type="button" className="portal-primary" onClick={onOpenWorkboard}>
+          <button type="button" className="portal-primary" onClick={onOpenWorkboard} data-omega-source="apps/web/src/components/PortalHome.tsx:primary-workboard-button">
             进入 Workboard
           </button>
         </div>
@@ -77,10 +77,10 @@ export function PortalHome({ onOpenWorkboard, onToggleTheme, uiTheme }: PortalHo
             <article className="portal-card portal-welcome">
               <img className="portal-hero-logo" src="/omega-logo.png" alt="Omega AI DevFlow Engine" />
               <span className="portal-avatar">张涌</span>
-              <h1>张涌，欢迎回到 Omega</h1>
-              <p>把需求、Agent 编排、GitHub PR 和人工审核放进同一个可追踪工作台。</p>
+              <h1 data-omega-source="apps/web/src/components/PortalHome.tsx:headline">张涌，欢迎回到 Omega</h1>
+              <p data-omega-source="apps/web/src/components/PortalHome.tsx:welcome-copy">把需求、Agent 编排、GitHub PR 和人工审核放进同一个可追踪工作台。</p>
               <div className="portal-button-row">
-                <button type="button" className="portal-outline" onClick={onOpenWorkboard}>
+                <button type="button" className="portal-outline" onClick={onOpenWorkboard} data-omega-source="apps/web/src/components/PortalHome.tsx:open-workboard-button">
                   打开 Workboard
                 </button>
                 <button type="button" className="portal-outline" onClick={onOpenWorkboard}>
@@ -115,7 +115,7 @@ export function PortalHome({ onOpenWorkboard, onToggleTheme, uiTheme }: PortalHo
                     <i />
                     <b />
                   </span>
-                  <strong>{title}</strong>
+                  <strong data-omega-source={`apps/web/src/components/PortalHome.tsx:template-card-${index}`}>{title}</strong>
                   <small>{index % 2 === 0 ? "需求到 PR 的完整链路" : "评审、返工、人工确认可复用"}</small>
                 </button>
               ))}

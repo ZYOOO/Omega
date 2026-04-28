@@ -16,6 +16,10 @@ function startScript(workspaceRoot: string): Promise<{
     );
 
     let stderr = "";
+    if (!child.stderr || !child.stdout) {
+      reject(new Error("local runner API script stdio streams are unavailable"));
+      return;
+    }
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
     });

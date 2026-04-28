@@ -24,6 +24,7 @@ var sqliteMigrations = []struct {
 }{
 	{Version: "20260424_001", Name: "bootstrap_go_local_service_schema"},
 	{Version: "20260427_001", Name: "agent_profiles_first_class_table"},
+	{Version: "20260428_001", Name: "page_pilot_runs_first_class_table"},
 }
 
 func NewSQLiteRepository(path string) *SQLiteRepository {
@@ -76,6 +77,22 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
   updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_project_scope ON agent_profiles(project_id, scope, COALESCE(repository_target_id, ''));
+CREATE TABLE IF NOT EXISTS page_pilot_runs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  repository_target_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  runner TEXT,
+  repository_path TEXT,
+  branch_name TEXT,
+  commit_sha TEXT,
+  pull_request_url TEXT,
+  changed_files_json TEXT NOT NULL,
+  run_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_page_pilot_runs_scope ON page_pilot_runs(project_id, repository_target_id, updated_at);
 `); err != nil {
 		return err
 	}
@@ -383,6 +400,97 @@ ON CONFLICT(id) DO UPDATE SET
 		sqlQuote(now),
 		sqlQuote(profile.UpdatedAt),
 	))
+}
+
+func (repo *SQLiteRepository) SetPagePilotRun(ctx context.Context, run map[string]any) error {
+	if err := repo.Initialize(ctx); err != nil {
+		return err
+	}
+	if text(run, "id") == "" {
+		return errors.New("page pilot run id is required")
+	}
+	if text(run, "projectId") == "" {
+		run["projectId"] = "project_omega"
+	}
+	if text(run, "createdAt") == "" {
+		run["createdAt"] = nowISO()
+	}
+	if text(run, "updatedAt") == "" {
+		run["updatedAt"] = nowISO()
+	}
+	raw, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	return repo.exec(ctx, fmt.Sprintf(`
+INSERT OR REPLACE INTO page_pilot_runs (
+  id, project_id, repository_target_id, status, runner, repository_path, branch_name, commit_sha,
+  pull_request_url, changed_files_json, run_json, created_at, updated_at
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+`,
+		q(run, "id"),
+		q(run, "projectId"),
+		q(run, "repositoryTargetId"),
+		q(run, "status"),
+		nullableQ(run["runner"]),
+		nullableQ(run["repositoryPath"]),
+		nullableQ(run["branchName"]),
+		nullableQ(run["commitSha"]),
+		nullableQ(run["pullRequestUrl"]),
+		jsonQ(run["changedFiles"]),
+		sqlQuote(string(raw)),
+		q(run, "createdAt"),
+		q(run, "updatedAt"),
+	))
+}
+
+func (repo *SQLiteRepository) GetPagePilotRun(ctx context.Context, id string) (map[string]any, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	output, err := repo.query(ctx, fmt.Sprintf("SELECT run_json FROM page_pilot_runs WHERE id = %s;", sqlQuote(id)))
+	if err != nil {
+		return nil, err
+	}
+	raw := strings.TrimSpace(output)
+	if raw == "" {
+		return nil, sql.ErrNoRows
+	}
+	var run map[string]any
+	if err := json.Unmarshal([]byte(raw), &run); err != nil {
+		return nil, err
+	}
+	return run, nil
+}
+
+func (repo *SQLiteRepository) ListPagePilotRuns(ctx context.Context) ([]map[string]any, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	output, err := repo.query(ctx, `.mode json
+SELECT run_json AS runJson FROM page_pilot_runs ORDER BY updated_at DESC, created_at DESC;
+`)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(output) == "" {
+		return []map[string]any{}, nil
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(output), &rows); err != nil {
+		return nil, err
+	}
+	runs := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		var run map[string]any
+		if err := json.Unmarshal([]byte(text(row, "runJson")), &run); err != nil {
+			return nil, err
+		}
+		if run != nil {
+			runs = append(runs, run)
+		}
+	}
+	return runs, nil
 }
 
 func (repo *SQLiteRepository) exec(ctx context.Context, input string) error {

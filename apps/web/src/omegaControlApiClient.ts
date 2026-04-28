@@ -433,6 +433,87 @@ export interface RunDevFlowCycleResult {
   attempt?: AttemptRecordInfo;
 }
 
+export interface PagePilotSelectionContext {
+  elementKind: "button" | "title" | "card-copy" | "other" | string;
+  stableSelector: string;
+  textSnapshot: string;
+  styleSnapshot: Record<string, string>;
+  domContext: Record<string, unknown>;
+  sourceMapping: {
+    source: string;
+    file: string;
+    symbol: string;
+    line?: number;
+  };
+}
+
+export interface PagePilotApplyInput {
+  projectId?: string;
+  repositoryTargetId: string;
+  instruction: string;
+  selection: PagePilotSelectionContext;
+  runner?: string;
+}
+
+export interface PagePilotApplyResult {
+  id?: string;
+  status: string;
+  projectId?: string;
+  repositoryTargetId?: string;
+  requirementId?: string;
+  workItemId?: string;
+  pipelineId?: string;
+  pipelineRunId?: string;
+  agentMode?: string;
+  executionMode?: string;
+  repositoryPath?: string;
+  repositoryTarget?: string;
+  runner?: string;
+  instruction?: string;
+  selection?: PagePilotSelectionContext;
+  changedFiles: string[];
+  diffSummary?: string;
+  lineDiffSummary?: string;
+  proofFiles?: string[];
+  hmr?: {
+    mode: string;
+    touchedFiles: string[];
+  };
+  runnerProcess?: RunnerProcessInfo;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface PagePilotDeliverInput {
+  runId?: string;
+  projectId?: string;
+  repositoryTargetId: string;
+  instruction: string;
+  selection: PagePilotSelectionContext;
+  branchName?: string;
+  draft?: boolean;
+}
+
+export interface PagePilotDeliverResult {
+  id?: string;
+  status: string;
+  projectId?: string;
+  repositoryTargetId?: string;
+  repositoryPath?: string;
+  branchName?: string;
+  commitSha?: string;
+  pullRequestUrl?: string;
+  changedFiles: string[];
+  diffSummary?: string;
+  lineDiffSummary?: string;
+  updatedAt?: string;
+}
+
+export type PagePilotRunInfo = PagePilotApplyResult & Partial<PagePilotDeliverResult> & {
+  discardedAt?: string;
+  repositoryStatus?: string;
+};
+
 async function fetchJson<T>(apiUrl: string, path: string, fetchImpl: typeof fetch): Promise<T> {
   const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}${path}`);
   if (!response.ok) {
@@ -763,6 +844,37 @@ export async function runDevFlowCycle(
     { autoApproveHuman: false, autoMerge: false },
     fetchImpl
   );
+}
+
+export async function applyPagePilotInstruction(
+  apiUrl: string,
+  input: PagePilotApplyInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotApplyResult> {
+  return postJson<PagePilotApplyResult>(apiUrl, "/page-pilot/apply", input, fetchImpl);
+}
+
+export async function deliverPagePilotChange(
+  apiUrl: string,
+  input: PagePilotDeliverInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotDeliverResult> {
+  return postJson<PagePilotDeliverResult>(apiUrl, "/page-pilot/deliver", input, fetchImpl);
+}
+
+export async function fetchPagePilotRuns(
+  apiUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotRunInfo[]> {
+  return fetchJson<PagePilotRunInfo[]>(apiUrl, "/page-pilot/runs", fetchImpl);
+}
+
+export async function discardPagePilotRun(
+  apiUrl: string,
+  runId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotRunInfo> {
+  return postJson<PagePilotRunInfo>(apiUrl, `/page-pilot/runs/${encodeURIComponent(runId)}/discard`, {}, fetchImpl);
 }
 
 export interface OrchestratorTickInput {

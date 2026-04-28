@@ -22,6 +22,10 @@ function runSqlite(databasePath: string, input: string): Promise<SqliteResult> {
     const child = spawn("sqlite3", [databasePath], { shell: false });
     let stdout = "";
     let stderr = "";
+    if (!child.stdout || !child.stderr || !child.stdin) {
+      resolve({ stdout, stderr: "sqlite3 stdio streams are unavailable", exitCode: null });
+      return;
+    }
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
