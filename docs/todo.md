@@ -42,6 +42,37 @@ Item
 
 所以“GitHub issue 只是 Requirement 的 source”不等于 GitHub 不重要。Omega 不照搬 GitHub 的对象边界，但会把 GitHub repo / issue / PR / checks / review / merge 作为默认交付协议。
 
+## 功能一核心 Todo（下一阶段补强）
+
+这些是功能一从“可演示闭环”升级到“可托管运行”的核心缺口，优先级高于继续扩展功能二体验。
+
+- [ ] 建立正式 JobSupervisor：常驻扫描 ready work items、running attempts、failed attempts、waiting-human gates，并按 workflow contract 推进下一步。
+- [ ] JobSupervisor 增加 heartbeat：每个 Attempt / Agent turn / runner process 定期写入 lastSeen，前端和 API 可判断运行是否仍健康。
+- [ ] 增加 stalled detection：长时间无 heartbeat、无 stdout/stderr、无 stage event 的运行自动标记为 stalled，并进入可重试或人工处理状态。
+- [ ] 增加自动恢复策略：对 runner crash、临时网络失败、GitHub API 临时失败、CI flaky failure 支持有限次数 retry 和 backoff。
+- [ ] 增加 cancel / timeout 策略：Attempt、Stage、Agent turn、runner process 都有明确超时、取消入口和清理结果。
+- [ ] 建立统一 append-only runtime log：API request、stage transition、agent invocation、runner process、git operation、checkpoint decision、PR/checks 事件都写入一条可查询日志流。
+- [ ] 新增 runtime log API：按 project / repository target / requirement / work item / pipeline / attempt 查询日志，并支持按 level、event type、time range 过滤。
+- [ ] Operator UI 增加 Run Timeline：把 runtime log、attempt events、stage status、runner telemetry、checkpoint decision 统一展示，减少用户翻 proof 文件排障。
+- [ ] 增加数据分析指标：stage 平均耗时、attempt 成功率、失败原因分布、runner 使用次数、checkpoint 等待时长、PR 创建/合并数量。
+- [ ] 扩展 `/observability`：从 summary 升级为 dashboard data API，返回趋势、分组统计、最近失败、慢阶段和待人工处理队列。
+- [ ] 增加接口测试套件：按 OpenAPI 覆盖 requirement、pipeline、attempt、checkpoint、proof、GitHub delivery、Page Pilot linkage 的 smoke / e2e。
+- [ ] 生成统一测试报告：把 API 测试、Go 测试、前端测试、一次端到端演示结果汇总到 `docs/test-report.md`。
+- [ ] 强化 workspace lifecycle：workspace prepare / reuse / cleanup / lock / dirty-state check / artifact collection 形成明确 hook，而不是散在 runner 流程里。
+- [ ] 增加 workspace cleanup 策略：已完成、失败、取消、过期 Attempt 的 workspace 如何保留、归档或删除，需要和数据库状态联动。
+- [ ] 强化并发控制：repository target、work item、issue、branch、workspace 维度都要有明确 execution lock 和冲突提示。
+- [ ] 增加 CI 失败处理闭环：读取 checks 后能区分 flaky、测试失败、lint 失败、权限失败，并生成下一步动作建议。
+- [ ] 增加 rebase / branch sync 能力：PR 分支落后默认分支时可自动 fetch/rebase 或提示人工处理。
+- [ ] 增加 merge conflict 处理路径：检测冲突、记录冲突文件、生成 rework instruction，并把流程回到对应 stage。
+- [ ] 增加自动回归 / 自动修复重试：Review Agent 或 CI 发现问题时，在最大次数内自动进入 Rework，再回到测试与评审。
+- [ ] 把 workflow contract 升级为 repo-owned 运行协议：支持目标仓库内 `.omega/WORKFLOW.md` 或等价配置，并允许 Project / Repository override。
+- [ ] 让 runtime 行为完整消费 workflow contract：stage、agent、prompt section、artifact、gate、retry、timeout、required checks 都从契约读取。
+- [ ] 增加 workflow contract 校验：保存或加载时检查 stage DAG、artifact 引用、agent id、gate、runner policy 是否完整。
+- [ ] 增加 run report / review packet：每次 Attempt 结束后生成面向人类审核的一页报告，包含需求、方案、diff、测试、review、CI、风险和下一步。
+- [ ] 减少人工盯守成本：失败、等待、重试、PR/checks 状态都通过 Workboard/Operator 明确给出推荐操作，而不是只暴露原始日志。
+- [ ] 打通两个真实 runner/provider 的端到端执行映射：Project Agent Profile 中的 runner/model/policy 必须实际影响 Codex / opencode / Claude Code 执行。
+- [ ] 固定功能一标准演示脚本：从输入 Requirement 到 PR/checks/human gate/proof/report 的流程可重复跑，并纳入测试报告。
+
 ## 已完成
 
 - [x] 明确两层架构（Product Layer + Execution Layer）
