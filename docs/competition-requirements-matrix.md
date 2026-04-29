@@ -121,7 +121,7 @@ Omega 当前状态：
   - `run-current-stage` 与 `run-devflow-cycle` 两条执行入口
   - `run-devflow-cycle` 默认异步：先返回 `accepted` 和 Attempt，后台 job 继续执行，前端通过轮询观察进度
 - 未完成：
-  - 正式 JobSupervisor、heartbeat、stall retry、cancel、timeout、worker host 分配和多 turn continuation 仍需增强
+  - JobSupervisor v1 已覆盖 heartbeat、stall retry、cancel、timeout、workspace lock、workspace cleanup、worker host lease 和 continuation policy metadata 基础版；GitHub polling heartbeat、远端 worker 分配和远端崩溃恢复仍需增强
 
 结论：
 

@@ -46,29 +46,57 @@ Item
 
 这些是功能一从“可演示闭环”升级到“可托管运行”的核心缺口，优先级高于继续扩展功能二体验。
 
-- [ ] 建立正式 JobSupervisor：常驻扫描 ready work items、running attempts、failed attempts、waiting-human gates，并按 workflow contract 推进下一步。
-- [ ] JobSupervisor 增加 heartbeat：每个 Attempt / Agent turn / runner process 定期写入 lastSeen，前端和 API 可判断运行是否仍健康。
-- [ ] 增加 stalled detection：长时间无 heartbeat、无 stdout/stderr、无 stage event 的运行自动标记为 stalled，并进入可重试或人工处理状态。
-- [ ] 增加自动恢复策略：对 runner crash、临时网络失败、GitHub API 临时失败、CI flaky failure 支持有限次数 retry 和 backoff。
-- [ ] 增加 cancel / timeout 策略：Attempt、Stage、Agent turn、runner process 都有明确超时、取消入口和清理结果。
-- [ ] 建立统一 append-only runtime log：API request、stage transition、agent invocation、runner process、git operation、checkpoint decision、PR/checks 事件都写入一条可查询日志流。
-- [ ] 新增 runtime log API：按 project / repository target / requirement / work item / pipeline / attempt 查询日志，并支持按 level、event type、time range 过滤。
-- [ ] Operator UI 增加 Run Timeline：把 runtime log、attempt events、stage status、runner telemetry、checkpoint decision 统一展示，减少用户翻 proof 文件排障。
-- [ ] 增加数据分析指标：stage 平均耗时、attempt 成功率、失败原因分布、runner 使用次数、checkpoint 等待时长、PR 创建/合并数量。
-- [ ] 扩展 `/observability`：从 summary 升级为 dashboard data API，返回趋势、分组统计、最近失败、慢阶段和待人工处理队列。
-- [ ] 增加接口测试套件：按 OpenAPI 覆盖 requirement、pipeline、attempt、checkpoint、proof、GitHub delivery、Page Pilot linkage 的 smoke / e2e。
-- [ ] 生成统一测试报告：把 API 测试、Go 测试、前端测试、一次端到端演示结果汇总到 `docs/test-report.md`。
-- [ ] 强化 workspace lifecycle：workspace prepare / reuse / cleanup / lock / dirty-state check / artifact collection 形成明确 hook，而不是散在 runner 流程里。
-- [ ] 增加 workspace cleanup 策略：已完成、失败、取消、过期 Attempt 的 workspace 如何保留、归档或删除，需要和数据库状态联动。
-- [ ] 强化并发控制：repository target、work item、issue、branch、workspace 维度都要有明确 execution lock 和冲突提示。
-- [ ] 增加 CI 失败处理闭环：读取 checks 后能区分 flaky、测试失败、lint 失败、权限失败，并生成下一步动作建议。
-- [ ] 增加 rebase / branch sync 能力：PR 分支落后默认分支时可自动 fetch/rebase 或提示人工处理。
-- [ ] 增加 merge conflict 处理路径：检测冲突、记录冲突文件、生成 rework instruction，并把流程回到对应 stage。
-- [ ] 增加自动回归 / 自动修复重试：Review Agent 或 CI 发现问题时，在最大次数内自动进入 Rework，再回到测试与评审。
-- [ ] 把 workflow contract 升级为 repo-owned 运行协议：支持目标仓库内 `.omega/WORKFLOW.md` 或等价配置，并允许 Project / Repository override。
-- [ ] 让 runtime 行为完整消费 workflow contract：stage、agent、prompt section、artifact、gate、retry、timeout、required checks 都从契约读取。
-- [ ] 增加 workflow contract 校验：保存或加载时检查 stage DAG、artifact 引用、agent id、gate、runner policy 是否完整。
-- [ ] 增加 run report / review packet：每次 Attempt 结束后生成面向人类审核的一页报告，包含需求、方案、diff、测试、review、CI、风险和下一步。
+当前执行优先级：先完成 workspace cleanup / repo-owned workflow contract / prompt sections / JobSupervisor worker-host 与恢复基础版。CI 自动 rework、Run Timeline 深挖、统一 E2E 报告暂缓，不从清单删除。
+
+- [x] 建立正式 JobSupervisor v1：常驻扫描 Ready Work Item、running attempt、failed/stalled attempt、waiting-human gate 和 workflow contract；危险写仓库动作由显式策略开关控制。
+- [x] JobSupervisor daemon 基础版：Go Local Runtime 启动时默认开启后台维护 tick，周期性执行 checkpoint integrity、stalled detection 和 Ready item preflight scan；默认不自动启动 Ready item，必须显式开启 `job-supervisor-auto-run-ready`。
+- [x] JobSupervisor runnable scan 基础版：`POST /job-supervisor/tick` 会扫描 Ready + repository target 的 Work Item，执行 DevFlow preflight，并在 `autoRunReady=true` 时创建 Attempt 交给后台 job。
+- [x] JobSupervisor integrity tick 基础版：`POST /job-supervisor/tick` 扫描 pending human gates，修复 checkpoint -> attempt 断链，并在必要时 backfill 可审计 attempt。
+- [x] JobSupervisor heartbeat 基础版：Attempt 创建、Agent invocation、完成/失败会写入 `lastSeenAt`，作为运行健康判断的主字段。
+- [x] JobSupervisor stalled detection 基础版：`POST /job-supervisor/tick` 会扫描 running attempts，超过阈值未更新 heartbeat 时标记为 `stalled`，Pipeline 进入 `stalled`，Work Item 进入 `Blocked`，并写 runtime ERROR log。
+- [x] 扩展 heartbeat 基础版：runner process stdout/stderr 流和长时间 Codex/opencode/Claude Code 子进程会写入 attempt event、runtime DEBUG log，并周期性刷新 `lastSeenAt`；旧做法只在 Attempt 创建、Agent invocation 和完成/失败时刷新。
+- [ ] 扩展 heartbeat：GitHub API polling、CI watch 和远端 runner host 仍需周期性刷新 `lastSeenAt`。
+- [x] Attempt retry API 基础版：`POST /attempts/{id}/retry` 支持 failed / stalled / canceled attempt 创建新 Attempt，保留旧 Attempt，并写入 retry metadata。
+- [x] 扩展 stalled recovery 基础版：JobSupervisor 可扫描 stalled / failed Attempt，按 retry 上限和 backoff 生成 recoverable summary，并在 `autoRetryFailed=true` 时创建真实 retry Attempt。
+- [x] 增加自动恢复策略基础版：`autoRetryFailed` + `maxRetryAttempts` + `retryBackoffSeconds` 支持有限次数自动 retry 和 backoff；更细的失败分类仍保留为后续项。
+- [ ] 扩展自动恢复策略：继续区分 runner crash、临时网络失败、GitHub API 临时失败、CI flaky failure、权限失败，并给出不同动作。
+- [x] 增加 runner process context timeout/cancel 基础：Codex / opencode / Claude Code 子进程使用 context-aware supervisor，deadline/cancel 会真实终止子进程并返回 `timed-out` / `canceled` process status。
+- [x] 增加 Attempt cancel API 基础：`POST /attempts/{id}/cancel` 会向本机注册的 background job 发送 cancel signal，并把 Attempt / Pipeline / Work Item 状态落库。
+- [x] 扩展 timeout / retry policy 基础版：`devflow-pr` workflow runtime 开始驱动 runner heartbeat、Attempt timeout、retry 上限和 backoff；旧做法主要依赖 Go 常量和 API 参数。
+- [x] 扩展 cancel / timeout 策略基础版：workspace cleanup、worker host lease 和 workflow runtime timeout/retry 已纳入 JobSupervisor；GitHub/git operation timeout 继续保留为后续项。
+- [x] 建立 append-only runtime log 基础版：API request、DevFlow job、agent invocation、checkpoint decision、Page Pilot apply/deliver/discard、PR merge 等事件写入结构化日志。
+- [x] 新增 runtime log API 基础版：`GET /runtime-logs` 支持按 project / repository target / work item / pipeline / attempt、level、event type 等条件查询。
+- [ ] 扩展 runtime log 查询：补齐 Requirement 维度、cursor pagination、全文搜索和导出。
+- [x] Operator UI 增加 Run Timeline 基础版：`GET /attempts/{id}/timeline` 聚合 runtime log、attempt events、stage status、operation、proof、checkpoint decision，并在 Work Item 详情页展示。
+- [ ] 暂缓：扩展 Run Timeline：补齐 cursor pagination、runner stdout/stderr 摘要展开、GitHub checks/rebase/conflict 事件和按 stage/agent 过滤。
+- [x] 增加数据分析指标基础版：`/observability.dashboard` 返回 Attempt 成功率、失败原因分布、慢阶段、待人工队列、活跃运行和推荐动作。
+- [ ] 扩展数据分析指标：继续补 stage 平均耗时、runner 使用次数、checkpoint 等待时长、PR 创建/合并数量和趋势统计。
+- [x] 扩展 `/observability` dashboard 基础版：保留旧 summary 字段，并新增 dashboard data，供 UI/CLI 后续消费。
+- [ ] 扩展 `/observability` dashboard：补齐时间窗口、分组统计、趋势、最近失败详情和慢阶段 drilldown。
+- [ ] 暂缓：增加接口测试套件：按 OpenAPI 覆盖 requirement、pipeline、attempt、checkpoint、proof、GitHub delivery、Page Pilot linkage 的 smoke / e2e。
+- [ ] 暂缓：生成统一测试报告：把 API 测试、Go 测试、前端测试、一次端到端演示结果汇总到 `docs/test-report.md`。
+- [x] 强化 workspace lifecycle 基础版：DevFlow run 统一生成 workspace lifecycle spec，写入 `.omega/workspace-lifecycle.json`，并在 manual run / retry / JobSupervisor auto run 中声明 execution lock；旧做法主要依赖分散的 workspace path 计算和 active attempt 判断。
+- [x] 增加 workspace cleanup 策略：已完成 Attempt 可按 retention 清理 repo checkout 并保留 `.omega` proof/lifecycle，失败/取消/stalled 默认保留；`POST /workspaces/cleanup` 和 JobSupervisor 显式开关会写回 attempt cleanup metadata。
+- [x] 强化并发控制基础版：DevFlow manual run / retry / JobSupervisor auto run 对同一 repository workspace scope 使用 execution lock，并在 preflight 中提示冲突；旧做法只有部分 GitHub issue auto-run 有 lock。
+- [x] 增加 CI/checks 处理基础版：`/github/pr-status` 汇总 passed / pending / failed / missing required checks，并输出 delivery gate 和推荐动作；旧做法只透传 `gh pr checks` 原始列表。
+- [x] 增加 rebase / branch sync 检测基础版：`/github/pr-status` 在提供 repository/workspace path 时用真实 git fetch / merge-base / merge-tree 判断 current / behind / conflict；旧做法不判断 PR 分支是否落后。
+- [x] 增加 merge conflict 检测基础版：发现冲突时 delivery recommended action 输出 merge-conflict，供 Human Review / Rework 决策；自动生成 rework instruction 仍是后续项。
+- [ ] 暂缓：增加自动回归 / 自动修复重试：Review Agent 或 CI 发现问题时，在最大次数内自动进入 Rework，再回到测试与评审。
+- [x] 让 JobSupervisor 消费 workflow contract 基础版：tick 校验/回填 devflow pipeline 的 workflow source、runtime、review rounds、transitions，并在 summary/log 中暴露 contract 状态。
+- [x] 把 workflow contract 升级为 repo-owned 运行协议：目标仓库 `.omega/WORKFLOW.md` 优先于默认模板；Agent Profile 中的 front matter workflow markdown 可作为 Project / Repository override。
+- [x] 扩展 workflow contract 消费基础版：timeout、retry、required checks 和 runner heartbeat 已从 `devflow-pr` runtime 读取；旧做法保留在 Go 常量、CLI flag 或 API payload 中。
+- [x] 扩展 workflow contract 消费：requirement / architect / coding / testing / rework / review / delivery prompt sections、Project / Repository override、cleanup retention、continuation turns 已从契约读取；runner policy 和 stage-specific timeout 继续后续增强。旧做法只完整覆盖 coding / rework / review。
+- [x] 增强 Review / Rework 交接契约：Review Prompt 必须输出 Summary、Blocking findings、Validation gaps、Rework instructions、Residual risks；旧做法主要依赖 verdict line，容易让 retry/rework 缺少可执行原因。
+- [x] 补齐全 Agent 交接契约：Requirement、Architect、Testing、Delivery 的 prompt section 和 Agent output contract 已统一为结构化 handoff，避免只在 Review 阶段有明确原因和下一步。
+- [x] 增加 workflow contract 校验基础版：加载 repo/profile workflow 时检查 stage id、transition 引用、review round 引用、agent 和 runtime 非负值，失败时阻止运行。
+- [x] 增加 run report / review packet 基础版：DevFlow 进入 Human Review 前生成 `attempt-run-report.md`，聚合需求、PR、changed files、测试、checks、review 和 artifact。
+- [ ] 扩展 run report / review packet：补结构化 diff/test/check preview、风险分级、下一步推荐动作和前端一页预览。
+- [x] 增加 Run Workpad UI 基础版：旧做法把 Requirement、Attempt、Agent trace、Proof 分散展示；新做法先在 Work Item 详情页聚合 Plan、Acceptance Criteria、Validation、Notes、Blockers、PR、Review Feedback、Retry Reason，并全部来自真实 Requirement / Pipeline / Attempt / Operation / Proof / Checkpoint / PR status 记录。
+- [x] 扩展一等 Run Workpad record 基础版：runtime 新增 `runWorkpads` 记录和 `GET /run-workpads`，Attempt 创建、Agent invocation、完成/失败/取消、retry、Human Review approve 后进入 merging 时都会刷新 Plan、Acceptance Criteria、Validation、Notes、Blockers、PR、Review Feedback、Retry Reason。
+- [ ] 扩展一等 Run Workpad record：继续把 Agent / supervisor 的写入从当前 runtime 派生刷新升级为按字段 patch，并让 Rework Agent 直接消费 checklist。
+- [x] 拆分 Work Item 详情页：旧做法由 `App.tsx` 内嵌详情大面板；新做法使用独立 item 路由和独立详情组件，减少入口文件耦合。
+- [x] 增强 Review/Rework feedback sweep UI 基础版：旧做法失败原因、review 意见、PR/check 推荐动作分散；新做法在 Workpad 汇总 Review Feedback / Retry Reason，让用户先看到为什么要 rework / retry。
+- [ ] 扩展 Review/Rework feedback sweep 运行时：把 review agent 结果、PR comments、human request changes 和 checks/rebase/conflict 推荐动作持久化成 rework checklist，并让 Rework Agent 和 Retry API 直接消费。
 - [ ] 减少人工盯守成本：失败、等待、重试、PR/checks 状态都通过 Workboard/Operator 明确给出推荐操作，而不是只暴露原始日志。
 - [ ] 打通两个真实 runner/provider 的端到端执行映射：Project Agent Profile 中的 runner/model/policy 必须实际影响 Codex / opencode / Claude Code 执行。
 - [ ] 固定功能一标准演示脚本：从输入 Requirement 到 PR/checks/human gate/proof/report 的流程可重复跑，并纳入测试报告。
@@ -96,6 +124,8 @@ Item
 - [x] 增加 Agent definitions API，包含 System Prompt、输入契约、输出契约
 - [x] 增加可观测性 summary API（pipeline / checkpoint / operation / proof / attention）
 - [x] 把 observability summary 接到 Operator 面板
+- [x] Operator 面板展示最近 runtime logs 和最近失败，便于本地联调排障
+- [x] 增加 Omega operator CLI 基础版：`omega` 命令通过 Go Local Runtime API 查看 status/logs/work items/attempts/checkpoints，并显式触发 run/retry/cancel/approve/supervisor tick。
 - [x] 把 LLM Provider selection 接到前端运行时设置 UI
 - [x] 把 Pipeline / Checkpoint API 接到前端 Operator UI
 - [x] Operator 面板支持从模板创建并启动 Pipeline
@@ -160,6 +190,12 @@ Item
 - [x] 把默认 `devflow-pr` 从 Go hardcode 抽成 Markdown workflow：`services/local-runtime/workflows/devflow-pr.md`，并让 Go runtime 从模板读取 stages、agents、artifact、review rounds
 - [x] 按赛题功能二的第一项补齐 TS + React SPA 双页面结构：门户首页 + Workboard 功能页，默认首页，`#workboard` 进入真实功能区
 - [x] 把门户首页从 `App.tsx` 拆到 `apps/web/src/components/PortalHome.tsx`，降低单文件复杂度
+- [x] 拆出 Requirement 创建链路：`RequirementComposer`、`manualWorkItem`、Go `work_items.go`，避免创建 UI / Work Item lifecycle 继续堆在巨型入口文件里
+- [x] 拆出 Projects / Repository Workspace 总览：`ProjectSurface`，让 `App.tsx` 少承担一个完整页面
+- [x] 拆出 Workboard shell：`WorkspaceChrome` 承担左侧导航、workspace 切换、顶部搜索、详情工具栏，`App.tsx` 继续保留状态编排
+- [x] 拆出 DevFlow PR 长流程执行器：`devflow_cycle.go`，为后续 JobSupervisor / heartbeat / retry 留出清晰边界
+- [x] 拆出 Pipeline record / template materialization：`pipeline_records.go`，减少 `server.go` 的状态构造负担
+- [x] 增加未开始 Work Item 删除能力：只允许无执行历史的 not-started item，删除时同步清理未共享 Requirement 和 mission state 投影
 - [x] 将 Workboard 视觉更新为与门户一致的浅色工作台风格，同时保留原有本地执行、GitHub workspace、Agent trace、Human gate、Proof 功能
 - [x] 新增 Workspace Config 入口：Project 页面 `Project config`、Workspace 齿轮和 Workspace subnav 都可进入配置页
 - [x] Workspace Config 支持本地 workspace root 配置 UI：路径输入、默认路径、目录选择器兜底和保存入口
@@ -199,8 +235,11 @@ Item
 - [x] DevFlow 编排重构：一个 Item 的执行复用稳定 workspace、稳定 branch 和同一个 PR；Attempt 只记录一次执行轮次和事件
 - [x] DevFlow 编排重构：抽象 AgentRunner，当前默认 Codex，后续可切换 opencode / Claude Code / local runner
 - [x] DevFlow 编排重构：前端详情页展示真实 Agent turn、输入/输出 artifact、状态流转和 runner telemetry，弱化单纯 proof 数字
-- [ ] DevFlow 编排重构：继续把当前 background goroutine 升级为 JobSupervisor，补齐 heartbeat、stall retry、cancel、timeout、多 turn continuation、worker host 分配
+- [x] DevFlow 编排重构：JobSupervisor 已接入 heartbeat、stall retry、cancel、contract-driven timeout/retry 和 workspace lock 基础版
+- [x] DevFlow 编排重构：补 worker host 分配、本地 worker lease、continuation policy metadata 和 orphan running Attempt crash recovery 基础版
+- [ ] DevFlow 编排重构：继续补远端 runner 崩溃恢复和 GitHub polling supervisor
 - [ ] 前端模块化：继续拆分 `App.tsx`，优先拆 Workboard list/detail、Inspector、Operator 面板和 GitHub workspace 组件
+- [ ] Go runtime 模块化：继续拆 `server.go`，优先拆 HTTP handler 注册、delivery/PR API、workspace cleanup API 和 runtime settings API
 - [x] 把 Requirement Decomposition 建成一等服务端能力：raw requirement / GitHub issue -> structured requirement / acceptance criteria / risks / sub-items / target repo context
 - [x] 把 Agent handoff bundle 建成基础 artifact：每个 stage 有输入/输出 artifact contract，`devflow-pr` 生成 handoff bundle
 - [ ] 把 Agent handoff bundle 从文件 proof 继续升级为可查询的一等表记录
@@ -212,11 +251,14 @@ Item
 - [x] Human Review checkpoint 产品主路径真实化：默认不 auto approve / auto merge，Review Agent 通过后停在 `waiting-human`
 - [ ] 把 Workflow Template 从文件默认值继续升级为 SQLite 一等记录，并支持 Project / Repository Workspace 覆盖
 - [ ] 增加 Workflow Template 编辑 API：读取、保存、校验、恢复默认、导入/导出 Markdown
-- [ ] 把 coding / review / delivery prompt sections 从 Markdown body 渲染到每个 Agent，进一步减少 Go 里的 prompt hardcode
-- [ ] 增加正式 JobSupervisor：扫描 repository open issues / ready work items / runnable stages / failed attempts / human gates，并按模板调度下一步
-- [ ] JobSupervisor 增加 heartbeat、stall detection、retry、cancel、timeout、worker host 分配、多 turn continuation 和崩溃恢复
+- [x] 把 coding / rework / review prompt sections 从 Workflow Markdown body 渲染到 Agent prompt，进一步减少 Go 里的 prompt hardcode
+- [x] 增加正式 JobSupervisor v1：扫描 ready work items / failed attempts / stalled attempts / human gates / workflow contract，并按显式策略调度下一步
+- [x] JobSupervisor 增加 heartbeat、stall detection、retry、cancel、timeout 基础版
+- [x] JobSupervisor 增加 worker host 分配、多 turn continuation policy metadata 和本地 orphan crash recovery 基础版
+- [ ] JobSupervisor 增加远端崩溃恢复和 GitHub polling
 - [ ] 增加 issue/work item preflight checks：repo target、workspace root、branch 权限、dirty state、重复执行锁、必要 CLI 能力检查
 - [ ] 增加 GitHub delivery contract preflight：issue source 可选，但 repository target、branch 权限、PR 创建权限、checks 读取权限必须在运行前验证
+- [x] DevFlow preflight 基础版：运行前集中检查 repository target、workspace root、git/gh、runner availability、local dirty state，并被 manual run / retry / JobSupervisor scan 复用。
 - [x] 增加 orchestrator execution lock：同一个 GitHub issue / Work item / repository target 不能被多个本地 App 重复认领或重复执行
 - [x] 增加 Agent runner registry：按 stage/agent/runner 选择 Codex、opencode、Claude Code 或 local runner，并注入不同 issue、workspace、prompt、artifact 上下文
 - [x] 增加 Agent runner availability preflight：按 Agent Profile 配置检查 Codex / opencode / Claude Code / demo-code 所需 CLI，缺失时阻止启动而不是生成假失败流程
@@ -235,7 +277,7 @@ Item
 - [ ] 把 Checkpoint Reject 的“回退重做”做成更清晰的 stage timeline 可视化，突出 rejected -> rework -> review 回流
 - [x] Operator 视图增加基础 stage timeline，可看到当前 Pipeline 每个阶段的状态
 - [ ] 按赛题要求持续维护 Must-have / Good-to-have 对照与完成度
-- [ ] Page Pilot：将 proof 从 run JSON / proof 文件升级为 SQLite 一等表，并在 Operator / Proof UI 展示
+- [x] Page Pilot：将 proof 从 run JSON / proof 文件升级为通用 Mission / Operation / Proof records，并在 Work Item 详情的 Agent trace / Proof 面板展示
 - [ ] Page Pilot：扩展 `data-omega-source` 到 Workboard 关键可编辑区域，不只覆盖 Portal Home
 - [ ] Page Pilot：增加 patch preview、selection history、discard/revert 的更完整 UI 状态（基础 selection history / process panel 已落地，仍缺完整 diff preview）
 - [ ] Page Pilot：把 Electron preview webview、repository target、local worktree 绑定成一等配置
@@ -250,6 +292,9 @@ Item
 - [ ] Page Pilot：Preview Runtime stage 落地后，apply 成功时按 profile 必要重启目标项目 dev server
 - [ ] Page Pilot：Electron direct pilot 结果面板升级为完整 diff preview / PR body preview / Work Item 回跳
 - [ ] Page Pilot：支持同一 Page Pilot run 的多轮追加批注 / 追加说明 / 重新 apply
+- [ ] Page Pilot：把 Electron direct pilot 的批注历史、primary target、process events 从 localStorage 升级为服务端 run conversation 记录
+- [ ] Page Pilot：增加 source mapping 覆盖率报告，按页面/组件统计强源码映射、DOM-only 选区和定位失败原因
+- [ ] Page Pilot：增加修改前/修改后截图或 DOM snapshot 证据，并把视觉 proof 关联到 Work Item、PR body 和 run report
 - [ ] Page Pilot：为 DOM-only 批注增加源码候选定位能力，缺少 `data-omega-source` 时也能给 Agent 更强定位线索
 - [ ] Page Pilot：把 `/page-pilot-target` 调试代理替换为 Electron bridge 或显式开发配置
 - [ ] Page Pilot：实现 Electron webview preload bridge，支持跨 origin 本地预览的真实元素圈选
@@ -290,7 +335,7 @@ Item
 - [x] 完成 GitHub PR 创建：branch / commit / diff proof -> PR title/body
 - [x] 完成 Omega DevFlow PR 周期基础版：branch / commit / PR / Review Agent verdict / Human Review checkpoint / approve 后 merge proof
 - [ ] 完成 GitHub issue 状态回写：Pipeline 状态 -> issue comment / label / status
-- [ ] 完成 GitHub PR 生命周期 UI：展示 branch、PR、checks、review、merge gate，而不是只把 PR URL 放进 proof
+- [x] 完成 GitHub PR 生命周期 UI 基础版：Work Item detail 在真实 PR URL 存在时读取 `/github/pr-status`，展示 branch、checks、review、merge gate；旧做法只展示 PR URL / proof。
 - [x] 完成 GitHub checks/CI 读取：check run / workflow run -> proof record / delivery gate
 - [ ] 完成 GitHub / CI 的真实出站同步
 - [x] 增加真实 Feishu/lark-cli 文本通知发送
@@ -312,12 +357,18 @@ Item
 - [x] 增加显式的 run attempts 表
 - [x] AutoRun 会形成一条正式 Attempt，并把 workspace、branch、PR、proof、错误和耗时写入持久化记录
 - [x] Done Item 在列表禁用 Run；详情页提供显式 Rerun；失败状态显示 Retry 入口
-- [ ] 增加 attempts 的 retry / cancel / timeout 策略，并接入 JobSupervisor
+- [ ] 增加 attempts 的 retry / cancel / timeout 策略，并接入 JobSupervisor（旧做法：列表 Retry 重新触发 item；新做法：优先按 concrete Attempt 建立 retry 链路，后续继续补自动 retry policy）
 - [ ] 增加 timeout / retry policy 持久化
-- [ ] 增加与数据库状态联动的 workspace cleanup 策略
+- [x] 增加与数据库状态联动的 workspace cleanup 策略
 - [x] Work item 详情页增加 Proof 一等展示，按 Requirement / Solution / Diff / Test / Review / PR / Merge 等类型展示证据
 - [ ] 增加 proof 内容解析和预览，不只停留在文件路径层
 - [x] 增加本地 CLI capability detection：codex / opencode / git / gh / lark-cli
+- [x] Human Review Request changes 创建真实 rework Attempt，并把人工反馈写入 Workpad / retry reason / 下一轮 Agent prompt
+- [x] Human Review Request changes 复用同一 workspace、branch 和 PR，并在本地 workspace 丢失时优先恢复远端 delivery branch
+- [x] Human Review rework 后按需更新 PR description，并让二次 review 核对人工意见和本轮增量 diff
+- [x] Human Review Request changes 增加 Rework Assessment：局部修改走 fast rework，需求 / 架构 / 接口变化走 replan rework，信息不足时等待人工补充
+- [x] Human Review Request changes 对 fast rework 跳过无需重复的 requirement / architect 阶段，直接复用上一轮 branch / PR 从 Rework 阶段续跑
+- [ ] Human Review Rework Assessment 继续增强为可配置策略：按项目/仓库配置关键词、风险阈值和是否强制重新规划
 
 ## 产品 / 体验缺口
 

@@ -5,7 +5,7 @@ coverage
 *.local
 *.tsbuildinfo
 .omega
-.docs
+# 。/docs
 .env
 .history
 .migration-backups

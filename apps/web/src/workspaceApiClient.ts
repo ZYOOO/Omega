@@ -84,6 +84,23 @@ export async function patchWorkItemViaApi(
   return workspaceSessionFromDatabase(run, await response.json() as WorkspaceDatabase);
 }
 
+export async function deleteWorkItemViaApi(
+  apiUrl: string,
+  run: PipelineRun,
+  itemId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkspaceSession> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/work-items/${itemId}`, {
+    method: "DELETE"
+  });
+
+  if (!response.ok) {
+    throw new Error(`Delete work item API failed: ${response.status}`);
+  }
+
+  return workspaceSessionFromDatabase(run, await response.json() as WorkspaceDatabase);
+}
+
 export async function importGitHubIssuesViaApi(
   apiUrl: string,
   run: PipelineRun,

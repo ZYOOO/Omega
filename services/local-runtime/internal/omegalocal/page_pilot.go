@@ -104,14 +104,18 @@ func (server *Server) pagePilotDeliver(response http.ResponseWriter, request *ht
 }
 
 func (server *Server) executePagePilotApply(ctx context.Context, payload pagePilotApplyRequest) (map[string]any, error) {
+	server.logInfo(ctx, "page_pilot.apply.requested", "Page Pilot apply requested.", map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "stageId": "page_editing"})
 	if strings.TrimSpace(payload.RepositoryTargetID) == "" {
+		server.logError(ctx, "page_pilot.apply.invalid", "repositoryTargetId is required", map[string]any{"projectId": payload.ProjectID})
 		return nil, errors.New("repositoryTargetId is required")
 	}
 	if strings.TrimSpace(payload.Instruction) == "" {
+		server.logError(ctx, "page_pilot.apply.invalid", "instruction is required", map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID})
 		return nil, errors.New("instruction is required")
 	}
 	repoPath, target, profile, err := server.resolvePagePilotWorkspace(ctx, payload.ProjectID, payload.RepositoryTargetID, payload.Selection.SourceMapping.File)
 	if err != nil {
+		server.logError(ctx, "page_pilot.apply.resolve_failed", err.Error(), map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "sourceFile": payload.Selection.SourceMapping.File})
 		return nil, err
 	}
 	runnerID := strings.TrimSpace(payload.Runner)
@@ -120,8 +124,10 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 	}
 	effectiveRunner, err := preflightAgentRunner(runnerID, profile, "coding")
 	if err != nil {
+		server.logError(ctx, "page_pilot.apply.preflight_failed", err.Error(), map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "runner": runnerID})
 		return nil, err
 	}
+	server.logDebug(ctx, "page_pilot.apply.runner_selected", "Page Pilot runner selected.", map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "runner": effectiveRunner, "repositoryPath": repoPath})
 	proofDir := filepath.Join(repoPath, ".omega", "page-pilot")
 	if err := os.MkdirAll(proofDir, 0o755); err != nil {
 		return nil, err
@@ -150,6 +156,7 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 		})
 		process = turn.Process
 		if turn.Error != nil {
+			server.logError(ctx, "page_pilot.apply.runner_failed", turn.Error.Error(), map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "runner": effectiveRunner, "repositoryPath": repoPath})
 			return map[string]any{"status": "failed", "repositoryPath": repoPath, "runnerProcess": process}, fmt.Errorf("page pilot runner failed: %w", turn.Error)
 		}
 	}
@@ -159,6 +166,7 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 	}
 	sourceStatusFiles := pagePilotSourceStatusFiles(statusOutput)
 	if len(sourceStatusFiles) == 0 {
+		server.logError(ctx, "page_pilot.apply.no_changes", "Page Pilot runner produced no repository changes.", map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "runner": effectiveRunner, "repositoryPath": repoPath})
 		return nil, errors.New("page pilot runner produced no repository changes")
 	}
 	diffText, _ := runCommand(repoPath, "git", "diff", "--", sourceFileOrDot(payload.Selection.SourceMapping.File))
@@ -207,17 +215,25 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 		"updatedAt":     nowISO(),
 	}
 	if err := server.Repo.SetPagePilotRun(ctx, result); err != nil {
+		server.logError(ctx, "page_pilot.apply.persist_failed", err.Error(), map[string]any{"runId": runID, "projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID})
 		return nil, err
 	}
+	if err := server.syncPagePilotRunRecords(ctx, result, "page_editing"); err != nil {
+		server.logError(ctx, "page_pilot.apply.sync_failed", err.Error(), map[string]any{"runId": runID, "projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID})
+		return nil, err
+	}
+	server.logInfo(ctx, "page_pilot.apply.applied", "Page Pilot source patch applied.", map[string]any{"entityType": "page-pilot-run", "entityId": runID, "projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "workItemId": text(result, "workItemId"), "pipelineId": text(result, "pipelineId"), "runner": effectiveRunner, "changedFiles": changedFiles})
 	return result, nil
 }
 
 func (server *Server) executePagePilotDeliver(ctx context.Context, payload pagePilotDeliverRequest) (map[string]any, error) {
+	server.logInfo(ctx, "page_pilot.deliver.requested", "Page Pilot delivery requested.", map[string]any{"entityType": "page-pilot-run", "entityId": payload.RunID, "projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID})
 	if strings.TrimSpace(payload.RepositoryTargetID) == "" {
 		return nil, errors.New("repositoryTargetId is required")
 	}
 	repoPath, target, _, err := server.resolvePagePilotWorkspace(ctx, payload.ProjectID, payload.RepositoryTargetID, payload.Selection.SourceMapping.File)
 	if err != nil {
+		server.logError(ctx, "page_pilot.deliver.resolve_failed", err.Error(), map[string]any{"entityType": "page-pilot-run", "entityId": payload.RunID, "projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID})
 		return nil, err
 	}
 	statusOutput, err := runCommand(repoPath, "git", "status", "--short")
@@ -225,6 +241,7 @@ func (server *Server) executePagePilotDeliver(ctx context.Context, payload pageP
 		return nil, fmt.Errorf("read repository diff: %w", err)
 	}
 	if strings.TrimSpace(statusOutput) == "" {
+		server.logError(ctx, "page_pilot.deliver.no_changes", "No Page Pilot changes are waiting for delivery.", map[string]any{"entityType": "page-pilot-run", "entityId": payload.RunID, "repositoryPath": repoPath})
 		return nil, errors.New("no Page Pilot changes are waiting for delivery")
 	}
 	branchName := strings.TrimSpace(payload.BranchName)
@@ -255,6 +272,7 @@ func (server *Server) executePagePilotDeliver(ctx context.Context, payload pageP
 	if text(target, "kind") == "github" {
 		_, _ = runCommand(repoPath, "gh", "auth", "setup-git")
 		if err := pushDevFlowBranch(repoPath, branchName); err != nil {
+			server.logError(ctx, "page_pilot.deliver.push_failed", err.Error(), map[string]any{"entityType": "page-pilot-run", "entityId": payload.RunID, "repositoryPath": repoPath, "branchName": branchName})
 			return nil, fmt.Errorf("push page pilot branch: %w", err)
 		}
 		prBody := fmt.Sprintf("## Omega Page Pilot\n\n### Instruction\n%s\n\n### Source\n- `%s`\n- Selector: `%s`\n\n### Changed files\n%s\n\n### Line-level summary\n%s\n",
@@ -266,6 +284,7 @@ func (server *Server) executePagePilotDeliver(ctx context.Context, payload pageP
 		)
 		prURL, err = ensureDevFlowPullRequest(repoPath, repositoryTargetLabel(target), branchName, stringOr(text(target, "defaultBranch"), "main"), commitMessage, prBody)
 		if err != nil {
+			server.logError(ctx, "page_pilot.deliver.pr_failed", err.Error(), map[string]any{"entityType": "page-pilot-run", "entityId": payload.RunID, "repositoryPath": repoPath, "branchName": branchName})
 			return nil, fmt.Errorf("create page pilot pull request: %w", err)
 		}
 	}
@@ -303,12 +322,16 @@ func (server *Server) executePagePilotDeliver(ctx context.Context, payload pageP
 		return nil, err
 	}
 	_ = server.updatePagePilotWorkItemStatus(ctx, text(result, "workItemId"), "Done", text(result, "pipelineId"), "delivered")
+	_ = server.syncPagePilotRunRecords(ctx, result, "delivery")
+	server.logInfo(ctx, "page_pilot.deliver.delivered", "Page Pilot change delivered.", map[string]any{"entityType": "page-pilot-run", "entityId": text(result, "id"), "projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "workItemId": text(result, "workItemId"), "pipelineId": text(result, "pipelineId"), "branchName": branchName, "pullRequestUrl": prURL})
 	return result, nil
 }
 
 func (server *Server) executePagePilotDiscard(ctx context.Context, runID string) (map[string]any, error) {
+	server.logInfo(ctx, "page_pilot.discard.requested", "Page Pilot discard requested.", map[string]any{"entityType": "page-pilot-run", "entityId": runID})
 	record, err := server.getPagePilotRun(ctx, runID)
 	if err != nil {
+		server.logError(ctx, "page_pilot.discard.not_found", err.Error(), map[string]any{"entityType": "page-pilot-run", "entityId": runID})
 		return nil, fmt.Errorf("Page Pilot run %s not found", runID)
 	}
 	if text(record, "status") != "applied" {
@@ -341,6 +364,8 @@ func (server *Server) executePagePilotDiscard(ctx context.Context, runID string)
 		return nil, err
 	}
 	_ = server.updatePagePilotWorkItemStatus(ctx, text(record, "workItemId"), "Blocked", text(record, "pipelineId"), "discarded")
+	_ = server.syncPagePilotRunRecords(ctx, record, "delivery")
+	server.logInfo(ctx, "page_pilot.discard.discarded", "Page Pilot local source changes discarded.", map[string]any{"entityType": "page-pilot-run", "entityId": runID, "projectId": text(record, "projectId"), "repositoryTargetId": text(record, "repositoryTargetId"), "workItemId": text(record, "workItemId"), "pipelineId": text(record, "pipelineId")})
 	return record, nil
 }
 
@@ -559,6 +584,170 @@ func (server *Server) updatePagePilotWorkItemStatus(ctx context.Context, workIte
 		}
 	}
 	return server.Repo.Save(ctx, database)
+}
+
+func (server *Server) syncPagePilotRunRecords(ctx context.Context, run map[string]any, activeStageID string) error {
+	pipelineID := text(run, "pipelineId")
+	workItemID := text(run, "workItemId")
+	if pipelineID == "" || workItemID == "" {
+		return nil
+	}
+	database, err := mustLoad(server, ctx)
+	if err != nil {
+		return err
+	}
+	timestamp := nowISO()
+	runID := text(run, "id")
+	missionID := fmt.Sprintf("mission_%s_page_pilot", pipelineID)
+	operationID := fmt.Sprintf("%s:page-pilot:%s", pipelineID, activeStageID)
+	status := text(run, "status")
+	operationStatus := "done"
+	if status == "discarded" || status == "failed" {
+		operationStatus = "failed"
+	}
+	database.Tables.Missions = appendOrReplace(database.Tables.Missions, map[string]any{
+		"id":         missionID,
+		"pipelineId": pipelineID,
+		"workItemId": workItemID,
+		"title":      "Page Pilot Agent",
+		"status":     status,
+		"mission": map[string]any{
+			"id":                 missionID,
+			"sourceWorkItemId":   workItemID,
+			"title":              "Page Pilot live-preview flow",
+			"pagePilotRunId":     runID,
+			"repositoryPath":     run["repositoryPath"],
+			"repositoryTargetId": run["repositoryTargetId"],
+			"changedFiles":       run["changedFiles"],
+		},
+		"createdAt": stringOr(text(run, "createdAt"), timestamp),
+		"updatedAt": timestamp,
+	})
+	database.Tables.Operations = appendOrReplace(database.Tables.Operations, map[string]any{
+		"id":            operationID,
+		"missionId":     missionID,
+		"stageId":       activeStageID,
+		"agentId":       "page-pilot",
+		"status":        operationStatus,
+		"prompt":        stringOr(text(run, "instruction"), "Page Pilot live-preview edit."),
+		"requiredProof": []any{"selection-context", "source-patch", "diff-summary", "delivery-proof"},
+		"runnerProcess": run["runnerProcess"],
+		"summary":       pagePilotOperationSummary(run),
+		"createdAt":     stringOr(text(run, "createdAt"), timestamp),
+		"updatedAt":     timestamp,
+	})
+	for proofIndex, proof := range stringSlice(run["proofFiles"]) {
+		database.Tables.ProofRecords = appendOrReplace(database.Tables.ProofRecords, map[string]any{
+			"id":          fmt.Sprintf("%s:proof:%d", operationID, proofIndex+1),
+			"operationId": operationID,
+			"label":       "page-pilot-proof",
+			"value":       filepath.Base(proof),
+			"sourcePath":  proof,
+			"createdAt":   timestamp,
+		})
+	}
+	if prURL := text(run, "pullRequestUrl"); prURL != "" {
+		database.Tables.ProofRecords = appendOrReplace(database.Tables.ProofRecords, map[string]any{
+			"id":          fmt.Sprintf("%s:pull-request", operationID),
+			"operationId": operationID,
+			"label":       "page-pilot-pr",
+			"value":       prURL,
+			"sourceUrl":   prURL,
+			"createdAt":   timestamp,
+		})
+	}
+	for index, pipeline := range database.Tables.Pipelines {
+		if text(pipeline, "id") != pipelineID {
+			continue
+		}
+		next := cloneMap(pipeline)
+		next["updatedAt"] = timestamp
+		if status != "" {
+			next["status"] = pagePilotPipelineStatus(status)
+		}
+		runRecord := mapValue(next["run"])
+		runRecord["updatedAt"] = timestamp
+		runRecord["status"] = next["status"]
+		runRecord["events"] = appendPagePilotRunEvent(arrayMaps(runRecord["events"]), run, activeStageID, timestamp)
+		stages := arrayMaps(runRecord["stages"])
+		for stageIndex, stage := range stages {
+			if text(stage, "id") != activeStageID {
+				continue
+			}
+			stage["status"] = pagePilotStageStatus(status)
+			stage["completedAt"] = timestamp
+			stage["notes"] = pagePilotOperationSummary(run)
+			stage["evidence"] = pagePilotEvidence(run)
+			stages[stageIndex] = stage
+		}
+		runRecord["stages"] = stages
+		next["run"] = runRecord
+		database.Tables.Pipelines[index] = next
+		break
+	}
+	touch(&database)
+	return server.Repo.Save(ctx, database)
+}
+
+func pagePilotPipelineStatus(status string) string {
+	switch status {
+	case "applied":
+		return "waiting-human"
+	case "delivered":
+		return "delivered"
+	case "discarded":
+		return "discarded"
+	default:
+		return status
+	}
+}
+
+func pagePilotStageStatus(status string) string {
+	switch status {
+	case "applied", "delivered":
+		return "passed"
+	case "discarded":
+		return "failed"
+	default:
+		return status
+	}
+}
+
+func pagePilotEvidence(run map[string]any) []any {
+	evidence := []any{}
+	for _, proof := range stringSlice(run["proofFiles"]) {
+		evidence = append(evidence, proof)
+	}
+	if prURL := text(run, "pullRequestUrl"); prURL != "" {
+		evidence = append(evidence, prURL)
+	}
+	return evidence
+}
+
+func pagePilotOperationSummary(run map[string]any) string {
+	status := stringOr(text(run, "status"), "updated")
+	files := stringSlice(run["changedFiles"])
+	if len(files) == 0 {
+		return fmt.Sprintf("Page Pilot run %s.", status)
+	}
+	return fmt.Sprintf("Page Pilot run %s with %d changed file(s): %s.", status, len(files), strings.Join(files, ", "))
+}
+
+func appendPagePilotRunEvent(events []map[string]any, run map[string]any, stageID string, timestamp string) []map[string]any {
+	eventID := fmt.Sprintf("event_%s_%s_%s", text(run, "id"), stageID, text(run, "status"))
+	for _, event := range events {
+		if text(event, "id") == eventID {
+			return events
+		}
+	}
+	return append(events, map[string]any{
+		"id":        eventID,
+		"type":      "page_pilot." + stringOr(text(run, "status"), "updated"),
+		"message":   pagePilotOperationSummary(run),
+		"timestamp": timestamp,
+		"stageId":   stageID,
+		"agentId":   "page-pilot",
+	})
 }
 
 func buildPagePilotRequirementText(payload pagePilotApplyRequest) string {

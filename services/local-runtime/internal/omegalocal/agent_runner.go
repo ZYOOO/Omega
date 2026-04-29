@@ -6,18 +6,21 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 type AgentTurnRequest struct {
-	Role       string
-	StageID    string
-	Runner     string
-	Workspace  string
-	Prompt     string
-	OutputPath string
-	Sandbox    string
-	Model      string
-	Effort     string
+	Role              string
+	StageID           string
+	Runner            string
+	Workspace         string
+	Prompt            string
+	OutputPath        string
+	Sandbox           string
+	Model             string
+	Effort            string
+	HeartbeatInterval time.Duration
+	OnProcessEvent    func(SupervisedCommandEvent)
 }
 
 type AgentTurnResult struct {
@@ -138,7 +141,9 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 		process := runnerProcessNotAvailable("codex", "codex", request.Workspace, err)
 		return AgentTurnResult{Status: "failed", Process: process, Error: err}
 	}
-	process, err := runSupervisedCommand(
+	process, err := runSupervisedCommandContextWithOptions(
+		ctx,
+		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent},
 		request.Workspace,
 		request.Prompt,
 		"codex",
@@ -164,14 +169,14 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 
 type OpenCodeAgentRunner struct{}
 
-func (runner OpenCodeAgentRunner) RunTurn(_ context.Context, request AgentTurnRequest) AgentTurnResult {
+func (runner OpenCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequest) AgentTurnResult {
 	model := stringOr(request.Model, "gpt-5.4-mini")
 	if err := executableAvailable("opencode"); err != nil {
 		process := runnerProcessNotAvailable("opencode", "opencode", request.Workspace, err)
 		return AgentTurnResult{Status: "failed", Process: process, Error: err}
 	}
 	args := []string{"run", "--model", model, "-"}
-	process, err := runSupervisedCommand(request.Workspace, request.Prompt, "opencode", args...)
+	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent}, request.Workspace, request.Prompt, "opencode", args...)
 	if request.OutputPath != "" {
 		ensureAgentOutputFile(request.OutputPath, process)
 	}
@@ -185,7 +190,7 @@ func (runner OpenCodeAgentRunner) RunTurn(_ context.Context, request AgentTurnRe
 
 type ClaudeCodeAgentRunner struct{}
 
-func (runner ClaudeCodeAgentRunner) RunTurn(_ context.Context, request AgentTurnRequest) AgentTurnResult {
+func (runner ClaudeCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequest) AgentTurnResult {
 	model := stringOr(request.Model, "claude-sonnet-4-5")
 	executable := "claude"
 	if err := executableAvailable(executable); err != nil {
@@ -196,7 +201,7 @@ func (runner ClaudeCodeAgentRunner) RunTurn(_ context.Context, request AgentTurn
 		executable = "claude-code"
 	}
 	args := []string{"-p", "-", "--model", model}
-	process, err := runSupervisedCommand(request.Workspace, request.Prompt, executable, args...)
+	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent}, request.Workspace, request.Prompt, executable, args...)
 	if request.OutputPath != "" {
 		ensureAgentOutputFile(request.OutputPath, process)
 	}

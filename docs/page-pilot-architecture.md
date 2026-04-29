@@ -244,6 +244,7 @@ MVP 优先走 `live-preview` mode，并同时创建 Requirement/Work Item 记录
 - Work Item 绑定当前 `repositoryTargetId`，并记录 selection context、用户 instruction、`agentMode = single-page-pilot-agent` 和 `executionMode = live-preview`。
 - runtime 创建 `templateId = page-pilot` 的轻量 pipeline run，包含 `preview_runtime`、`page_editing`、`delivery` 三个 stage。
 - Page Pilot run 返回并持久化 `requirementId`、`workItemId`、`pipelineId` 和 `pipelineRunId`。
+- apply / deliver / discard 会同步写入通用 Mission / Operation / Proof records，Work Item 详情页可以直接展示 Page Pilot Agent trace 和 proof。
 - `/page-pilot/deliver` 会把关联 Work Item/Pipeline 推进到 delivered；discard 会标记为 blocked/discarded。
 - Electron direct pilot 会在 apply 成功后自动 reload 目标页面，并从 localStorage 恢复结果面板。
 - 结果面板展示 changed files、diff summary、Requirement / Work Item / Pipeline linkage，并提供 Confirm / Discard。
@@ -262,16 +263,13 @@ data-omega-source="apps/web/src/components/PortalHome.tsx:headline"
 新增 API：
 
 ```text
-POST /page-pilot/preview-runtime/resolve
-POST /page-pilot/preview-runtime/start
-POST /page-pilot/preview-runtime/restart
 POST /page-pilot/apply
 POST /page-pilot/deliver
 GET  /page-pilot/runs
 POST /page-pilot/runs/{id}/discard
 ```
 
-Preview runtime API 计划：
+计划中的 Preview runtime API：
 
 - `/page-pilot/preview-runtime/resolve`：调用或读取 Preview Runtime Agent/Profile，返回启动命令、preview URL、健康检查和风险说明。
 - `/page-pilot/preview-runtime/start`：由 Go process supervisor 在明确 repository workspace 内启动目标项目 dev server。

@@ -1,6 +1,7 @@
 package omegalocal
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -88,10 +89,13 @@ func (server *Server) githubCreatePR(response http.ResponseWriter, request *http
 
 func (server *Server) githubPRStatus(response http.ResponseWriter, request *http.Request) {
 	var payload struct {
-		RepositoryOwner string `json:"repositoryOwner"`
-		RepositoryName  string `json:"repositoryName"`
-		Number          int    `json:"number"`
-		URL             string `json:"url"`
+		RepositoryOwner string   `json:"repositoryOwner"`
+		RepositoryName  string   `json:"repositoryName"`
+		RepositoryPath  string   `json:"repositoryPath"`
+		WorkspacePath   string   `json:"workspacePath"`
+		RequiredChecks  []string `json:"requiredChecks"`
+		Number          int      `json:"number"`
+		URL             string   `json:"url"`
 	}
 	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 		writeError(response, http.StatusBadRequest, err)
@@ -140,18 +144,35 @@ func (server *Server) githubPRStatus(response http.ResponseWriter, request *http
 		return
 	}
 
-	deliveryGate := githubDeliveryGate(pr, checks)
+	checkSummary := githubCheckSummaryWithRequired(checks, payload.RequiredChecks)
+	deliveryGate := githubDeliveryGateForSummary(pr, checks, checkSummary)
 	proofs := githubPRProofRecords(pr, checks)
+	repositoryPath := strings.TrimSpace(payload.RepositoryPath)
+	if repositoryPath == "" && strings.TrimSpace(payload.WorkspacePath) != "" {
+		repositoryPath = filepath.Join(strings.TrimSpace(payload.WorkspacePath), "repo")
+	}
+	branchSync := githubBranchSyncStatus(request.Context(), repositoryPath, text(pr, "baseRefName"), text(pr, "headRefName"))
+	actions := githubDeliveryRecommendedActions(pr, checkSummary, branchSync)
 	result := cloneMap(pr)
 	result["checks"] = checks
+	result["checkSummary"] = checkSummary
 	result["deliveryGate"] = deliveryGate
 	result["proofRecords"] = proofs
+	result["branchSync"] = branchSync
+	result["recommendedActions"] = actions
 	writeJSON(response, http.StatusOK, result)
 }
 
 func githubDeliveryGate(pr map[string]any, checks []map[string]any) string {
+	return githubDeliveryGateForSummary(pr, checks, githubCheckSummary(checks))
+}
+
+func githubDeliveryGateForSummary(pr map[string]any, checks []map[string]any, summary map[string]any) string {
 	if text(pr, "state") == "MERGED" || text(pr, "state") == "CLOSED" {
 		return "closed"
+	}
+	if intValue(summary["failed"]) > 0 || intValue(summary["missingRequired"]) > 0 {
+		return "blocked"
 	}
 	for _, check := range checks {
 		state := strings.ToUpper(text(check, "state"))
@@ -166,6 +187,114 @@ func githubDeliveryGate(pr map[string]any, checks []map[string]any) string {
 		return "ready"
 	}
 	return "pending"
+}
+
+func githubCheckSummary(checks []map[string]any) map[string]any {
+	return githubCheckSummaryWithRequired(checks, nil)
+}
+
+func githubCheckSummaryWithRequired(checks []map[string]any, requiredChecks []string) map[string]any {
+	summary := map[string]any{
+		"total":                 len(checks),
+		"passed":                0,
+		"pending":               0,
+		"failed":                0,
+		"neutral":               0,
+		"failedChecks":          []map[string]any{},
+		"pendingChecks":         []map[string]any{},
+		"requiredChecks":        requiredChecks,
+		"missingRequired":       0,
+		"missingRequiredChecks": []map[string]any{},
+	}
+	seen := map[string]bool{}
+	for _, check := range checks {
+		seen[strings.ToLower(strings.TrimSpace(text(check, "name")))] = true
+		state := strings.ToUpper(strings.TrimSpace(text(check, "state")))
+		switch state {
+		case "SUCCESS", "COMPLETED", "PASSED":
+			summary["passed"] = intValue(summary["passed"]) + 1
+		case "FAILURE", "FAILED", "ERROR", "CANCELLED", "CANCELED", "TIMED_OUT", "ACTION_REQUIRED":
+			summary["failed"] = intValue(summary["failed"]) + 1
+			summary["failedChecks"] = append(arrayMaps(summary["failedChecks"]), check)
+		case "SKIPPED", "NEUTRAL":
+			summary["neutral"] = intValue(summary["neutral"]) + 1
+		default:
+			summary["pending"] = intValue(summary["pending"]) + 1
+			summary["pendingChecks"] = append(arrayMaps(summary["pendingChecks"]), check)
+		}
+	}
+	for _, name := range requiredChecks {
+		normalized := strings.ToLower(strings.TrimSpace(name))
+		if normalized == "" || seen[normalized] {
+			continue
+		}
+		missing := map[string]any{"name": strings.TrimSpace(name), "state": "MISSING"}
+		summary["missingRequired"] = intValue(summary["missingRequired"]) + 1
+		summary["missingRequiredChecks"] = append(arrayMaps(summary["missingRequiredChecks"]), missing)
+	}
+	return summary
+}
+
+func githubDeliveryRecommendedActions(pr map[string]any, checkSummary map[string]any, branchSync map[string]any) []map[string]any {
+	actions := []map[string]any{}
+	if intValue(checkSummary["failed"]) > 0 {
+		actions = append(actions, map[string]any{"type": "checks-failed", "label": "Inspect failed CI checks and route back to rework", "count": intValue(checkSummary["failed"])})
+	}
+	if intValue(checkSummary["missingRequired"]) > 0 {
+		actions = append(actions, map[string]any{"type": "required-checks-missing", "label": "Configure or wait for required checks", "count": intValue(checkSummary["missingRequired"])})
+	}
+	if intValue(checkSummary["pending"]) > 0 {
+		actions = append(actions, map[string]any{"type": "checks-pending", "label": "Wait for pending CI checks", "count": intValue(checkSummary["pending"])})
+	}
+	switch text(branchSync, "status") {
+	case "behind":
+		actions = append(actions, map[string]any{"type": "branch-sync", "label": "Rebase or sync PR branch with base branch", "count": 1})
+	case "conflict":
+		actions = append(actions, map[string]any{"type": "merge-conflict", "label": "Resolve merge conflicts before delivery", "count": 1})
+	}
+	if text(pr, "reviewDecision") != "" && text(pr, "reviewDecision") != "APPROVED" {
+		actions = append(actions, map[string]any{"type": "review", "label": "Address PR review decision before delivery", "count": 1})
+	}
+	return actions
+}
+
+func githubBranchSyncStatus(ctx context.Context, repositoryPath string, baseRef string, headRef string) map[string]any {
+	status := map[string]any{"status": "unknown"}
+	if strings.TrimSpace(repositoryPath) == "" {
+		status["reason"] = "repositoryPath not provided"
+		return status
+	}
+	if strings.TrimSpace(baseRef) == "" || strings.TrimSpace(headRef) == "" {
+		status["reason"] = "baseRefName or headRefName missing"
+		return status
+	}
+	_, _ = exec.CommandContext(ctx, "git", "-C", repositoryPath, "fetch", "--quiet", "origin", baseRef, headRef).CombinedOutput()
+	baseRemote := "origin/" + baseRef
+	headRemote := "origin/" + headRef
+	ancestor := exec.CommandContext(ctx, "git", "-C", repositoryPath, "merge-base", "--is-ancestor", baseRemote, headRemote)
+	if err := ancestor.Run(); err == nil {
+		status["status"] = "current"
+		status["baseRefName"] = baseRef
+		status["headRefName"] = headRef
+		return status
+	}
+	mergeBaseOutput, err := exec.CommandContext(ctx, "git", "-C", repositoryPath, "merge-base", baseRemote, headRemote).CombinedOutput()
+	if err != nil {
+		status["status"] = "unknown"
+		status["reason"] = "merge-base failed: " + strings.TrimSpace(string(mergeBaseOutput))
+		return status
+	}
+	mergeBase := strings.TrimSpace(string(mergeBaseOutput))
+	treeOutput, _ := exec.CommandContext(ctx, "git", "-C", repositoryPath, "merge-tree", mergeBase, baseRemote, headRemote).CombinedOutput()
+	status["status"] = "behind"
+	status["baseRefName"] = baseRef
+	status["headRefName"] = headRef
+	status["mergeBase"] = mergeBase
+	if strings.Contains(string(treeOutput), "<<<<<<<") || strings.Contains(strings.ToLower(string(treeOutput)), "changed in both") {
+		status["status"] = "conflict"
+		status["conflictSummary"] = truncateForProof(string(treeOutput), 4000)
+	}
+	return status
 }
 
 func githubPRProofRecords(pr map[string]any, checks []map[string]any) []map[string]any {

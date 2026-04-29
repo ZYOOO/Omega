@@ -517,6 +517,33 @@ export function updateWorkItemInDatabase(
   };
 }
 
+export function deleteWorkItemFromDatabase(database: WorkspaceDatabase, itemId: string): WorkspaceDatabase {
+  const timestamp = nowIso();
+  const item = database.tables.workItems.find((candidate) => candidate.id === itemId);
+  const workItems = database.tables.workItems.filter((candidate) => candidate.id !== itemId);
+  const requirementId = item?.requirementId;
+  const requirements =
+    requirementId && !workItems.some((candidate) => candidate.requirementId === requirementId)
+      ? database.tables.requirements.filter((requirement) => requirement.id !== requirementId)
+      : database.tables.requirements;
+  const missionControlStates = database.tables.missionControlStates.map((state) => ({
+    ...state,
+    workItems: state.workItems.filter((candidate) => candidate.id !== itemId),
+    updatedAt: timestamp
+  }));
+
+  return {
+    ...database,
+    savedAt: timestamp,
+    tables: {
+      ...database.tables,
+      requirements,
+      workItems,
+      missionControlStates
+    }
+  };
+}
+
 export function applyMissionEventsToDatabase(
   database: WorkspaceDatabase,
   events: MissionEvent[]

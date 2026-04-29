@@ -1,7 +1,9 @@
 import { useState } from "react";
 import type {
   AttemptRecordInfo,
+  AttemptTimelineItemInfo,
   CheckpointRecordInfo,
+  GitHubPullRequestStatusResult,
   OperationRecordInfo,
   PipelineRecordInfo
 } from "../omegaControlApiClient";
@@ -52,6 +54,9 @@ interface WorkItemAttemptPanelProps extends LabelHelpers {
   humanReviewEvents: DetailReviewEventCard[];
   onApproveCheckpoint: (checkpointId: string) => void;
   onRequestCheckpointChanges: (checkpointId: string, note?: string) => void;
+  onRetryAttempt?: (attemptId: string) => void;
+  pullRequestStatus?: GitHubPullRequestStatusResult | null;
+  timelineItems?: AttemptTimelineItemInfo[];
 }
 
 export function WorkItemAttemptPanel({
@@ -67,16 +72,40 @@ export function WorkItemAttemptPanel({
   humanReviewEvents,
   onApproveCheckpoint,
   onRequestCheckpointChanges,
+  onRetryAttempt,
   operationStatusLabel,
   pipeline,
   pipelineStageClassName,
-  pipelineStageLabel
+  pipelineStageLabel,
+  pullRequestStatus,
+  timelineItems = []
 }: WorkItemAttemptPanelProps) {
   if (!attempt) {
+    if (checkpoint) {
+      return (
+        <article className="attempt-card review-ready-card">
+          <header>
+            <div>
+              <strong>Waiting for human review</strong>
+              <span>Review the delivery packet, then approve or request changes.</span>
+            </div>
+          </header>
+          <HumanGateCard
+            checkpoint={checkpoint}
+            displayText={displayText}
+            humanReviewArtifacts={humanReviewArtifacts}
+            humanReviewEvents={humanReviewEvents}
+            onApproveCheckpoint={onApproveCheckpoint}
+            onRequestCheckpointChanges={onRequestCheckpointChanges}
+          />
+        </article>
+      );
+    }
     return <p className="muted-copy">No execution attempt yet. Run this item to create a traceable attempt.</p>;
   }
 
   const stages = attempt.stages?.length ? attempt.stages : pipeline?.run?.stages ?? [];
+  const retryable = ["failed", "stalled", "canceled"].includes(attempt.status);
 
   return (
     <article className="attempt-card">
@@ -92,6 +121,11 @@ export function WorkItemAttemptPanel({
           <a href={attempt.pullRequestUrl} target="_blank" rel="noreferrer">PR</a>
         ) : attempt.branchName ? (
           <span>{attempt.branchName}</span>
+        ) : null}
+        {retryable && onRetryAttempt ? (
+          <button type="button" className="attempt-retry-action" onClick={() => onRetryAttempt(attempt.id)}>
+            Retry attempt
+          </button>
         ) : null}
       </header>
 
@@ -119,6 +153,10 @@ export function WorkItemAttemptPanel({
         />
       ) : null}
 
+      {pullRequestStatus ? <PullRequestLifecycleCard status={pullRequestStatus} /> : null}
+
+      <RunTimeline items={timelineItems} />
+
       {attempt.status === "failed" ? (
         <AttemptFailureReport
           agentShortLabel={agentShortLabel}
@@ -133,6 +171,83 @@ export function WorkItemAttemptPanel({
       {attempt.status !== "failed" && attempt.errorMessage ? <p className="attempt-error">{attempt.errorMessage}</p> : null}
       {attempt.workspacePath ? <p className="attempt-path">Workspace: {attempt.workspacePath}</p> : null}
     </article>
+  );
+}
+
+function RunTimeline({ items }: { items: AttemptTimelineItemInfo[] }) {
+  if (!items.length) {
+    return null;
+  }
+  const visibleItems = [...items].reverse();
+  const latestItem = visibleItems[0];
+  return (
+    <details className="run-timeline" aria-label="Run timeline">
+      <summary>
+        <div>
+          <span>Run timeline</span>
+          <strong>{items.length} recent event{items.length === 1 ? "" : "s"}</strong>
+          {latestItem ? <small>{latestItem.eventType}: {latestItem.message}</small> : null}
+        </div>
+      </summary>
+      <div className="run-timeline-list">
+        {visibleItems.map((item) => (
+          <article key={item.id} className={`run-timeline-row ${item.level.toLowerCase() === "error" ? "is-error" : ""}`}>
+            <span className="run-timeline-dot" />
+            <div>
+              <p>
+                <strong>{item.eventType}</strong>
+                {item.stageId ? <small>{item.stageId}</small> : null}
+              </p>
+              <span>{item.message}</span>
+              <footer>
+                <time>{formatBeijingTimestamp(item.time)}</time>
+                <em>{item.source}</em>
+                {item.agentId ? <em>{item.agentId}</em> : null}
+              </footer>
+            </div>
+          </article>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function PullRequestLifecycleCard({ status }: { status: GitHubPullRequestStatusResult }) {
+  return (
+    <section className="pr-lifecycle-card" aria-label="Pull request lifecycle">
+      <header>
+        <div>
+          <span>PR lifecycle</span>
+          <strong>{status.title ?? `Pull request #${status.number ?? ""}`}</strong>
+        </div>
+        <small>{status.deliveryGate}</small>
+      </header>
+      <div className="pr-lifecycle-grid">
+        <article>
+          <span>Review</span>
+          <strong>{status.reviewDecision || "No decision"}</strong>
+        </article>
+        <article>
+          <span>Mergeable</span>
+          <strong>{status.mergeable || "Unknown"}</strong>
+        </article>
+        <article>
+          <span>Branch</span>
+          <strong>{status.headRefName || "Unknown"}</strong>
+          {status.baseRefName ? <small>into {status.baseRefName}</small> : null}
+        </article>
+      </div>
+      {status.checks.length ? (
+        <div className="pr-check-list">
+          {status.checks.map((check) => (
+            <a key={`${check.name}:${check.link ?? check.state}`} href={check.link} target="_blank" rel="noreferrer">
+              <span>{check.name}</span>
+              <strong>{check.state}</strong>
+            </a>
+          ))}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -162,7 +277,7 @@ function AttemptStageCard({
 }
 
 interface HumanGateCardProps {
-  attempt: AttemptRecordInfo;
+  attempt?: AttemptRecordInfo;
   checkpoint: CheckpointRecordInfo;
   displayText: (value: string) => string;
   humanReviewArtifacts: DetailProofCard[];
@@ -193,19 +308,17 @@ function HumanGateCard({
   return (
     <section className="human-gate-card human-review-thread" aria-label="Human review checkpoint">
       <header className="human-review-thread-header">
-        <span className="human-review-avatar">Ω</span>
         <div>
-          <span>Omega review</span>
           <strong>{checkpoint.title}</strong>
           <p>{checkpoint.summary}</p>
         </div>
-        <small>{attempt.status}</small>
+        <small>{attempt?.status ?? checkpoint.status}</small>
       </header>
 
       <article className="human-review-pr-card">
         <section>
           <h4>PR</h4>
-          {attempt.pullRequestUrl ? (
+          {attempt?.pullRequestUrl ? (
             <a href={attempt.pullRequestUrl} target="_blank" rel="noreferrer">
               {attempt.pullRequestUrl}
             </a>
@@ -213,8 +326,8 @@ function HumanGateCard({
             <p>PR link will appear after delivery creates the pull request.</p>
           )}
           <div className="human-review-links">
-            {attempt.branchName ? <span>Branch {attempt.branchName}</span> : null}
-            {attempt.workspacePath ? <code>{attempt.workspacePath}</code> : null}
+            {attempt?.branchName ? <span>Branch {attempt.branchName}</span> : null}
+            {attempt?.workspacePath ? <code>{attempt.workspacePath}</code> : null}
           </div>
         </section>
 
@@ -282,7 +395,6 @@ function HumanGateCard({
       </div>
 
       <div className="human-review-composer">
-        <span className="human-review-avatar small">H</span>
         <div>
           <textarea
             aria-label="Human review comment"
@@ -319,9 +431,16 @@ function ArtifactInline({ proof }: { proof: DetailProofCard }) {
   return (
     <>
       <span>{proof.label}</span>
-      {proof.path ? <code>{proof.path}</code> : null}
+      {proof.path ? <code title={proof.path}>{compactArtifactPath(proof.path)}</code> : null}
     </>
   );
+}
+
+function compactArtifactPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length <= 3) return path;
+  return `.../${parts.slice(-3).join("/")}`;
 }
 
 interface AttemptFailureReportProps {
@@ -341,21 +460,29 @@ function AttemptFailureReport({
   failureProofCards,
   operationStatusLabel
 }: AttemptFailureReportProps) {
+  const reason = attempt.failureReason ?? attempt.errorMessage ?? attempt.statusReason ?? "The run failed before a detailed reason was captured.";
+  const detail = attempt.failureReviewFeedback ?? attempt.failureDetail;
+  const operationDetails = failureOperations
+    .map((operation) => ({
+      operation,
+      stderr: (operation.runnerProcess?.stderr ?? "").trim()
+    }));
   return (
     <section className="attempt-failure-report" aria-label="Attempt failure report">
       <div>
-        <span>Failure report</span>
+        <span>Why retry is needed</span>
         <strong>{failedStages[0]?.title ?? attempt.currentStageId ?? "Pipeline"} blocked this attempt</strong>
-        <p>{attempt.errorMessage ?? attempt.stderrSummary ?? "The run failed before a detailed reason was captured."}</p>
+        <p>{reason}</p>
+        {detail ? <code>{detail.slice(0, 700)}</code> : null}
       </div>
       {failureOperations.length ? (
         <div className="failure-agent-list">
-          {failureOperations.map((operation) => (
+          {operationDetails.map(({ operation, stderr }) => (
             <article key={operation.id}>
               <span>{operation.stageId ?? "stage"} · {agentShortLabel(operation.agentId ?? "agent")}</span>
               <strong>{operationStatusLabel(operation.status)}</strong>
               {operation.summary ? <p>{operation.summary}</p> : null}
-              {operation.runnerProcess?.stderr ? <code>{operation.runnerProcess.stderr.slice(0, 420)}</code> : null}
+              {stderr && !detail ? <code>{stderr.slice(0, 420)}</code> : null}
             </article>
           ))}
         </div>
@@ -386,16 +513,16 @@ export function AgentTraceList({
   return (
     <div className="agent-trace-list">
       {operations.map((operation) => (
-        <article key={operation.id} className={`agent-trace-row ${pipelineStageClassName(operation.status)}`}>
-          <header>
-            <div>
+        <details key={operation.id} className={`agent-trace-row ${pipelineStageClassName(operation.status)}`}>
+          <summary>
+            <div className="agent-trace-summary-copy">
               <span>{operation.stageId ?? "stage"}</span>
               <strong>{agentShortLabel(operation.agentId ?? "agent")}</strong>
+              <em>{agentOperationPreview(operation)}</em>
             </div>
-            <small>{operationStatusLabel(operation.status)}</small>
-          </header>
+            <small className="agent-trace-status">{operationStatusLabel(operation.status)}</small>
+          </summary>
           {operation.summary ? <p>{operation.summary}</p> : null}
-          {operation.prompt ? <code>{operation.prompt.slice(0, 260)}</code> : null}
           {operation.runnerProcess ? (
             <div className="agent-runner-meta">
               <span>{operation.runnerProcess.runner ?? "runner"}</span>
@@ -404,7 +531,25 @@ export function AgentTraceList({
               {typeof operation.runnerProcess.durationMs === "number" ? <span>{operation.runnerProcess.durationMs}ms</span> : null}
             </div>
           ) : null}
-        </article>
+          {operation.prompt ? (
+            <section className="agent-detail-block">
+              <strong>Prompt</strong>
+              <code>{operation.prompt}</code>
+            </section>
+          ) : null}
+          {operation.runnerProcess?.stdout ? (
+            <section className="agent-detail-block">
+              <strong>Stdout</strong>
+              <code>{operation.runnerProcess.stdout}</code>
+            </section>
+          ) : null}
+          {operation.runnerProcess?.stderr ? (
+            <section className="agent-detail-block">
+              <strong>Stderr</strong>
+              <code>{operation.runnerProcess.stderr}</code>
+            </section>
+          ) : null}
+        </details>
       ))}
     </div>
   );
@@ -418,10 +563,14 @@ export function ArtifactGrid({ proofs }: { proofs: DetailProofCard[] }) {
   return (
     <div className="proof-grid">
       {proofs.map((proof) => (
-        <article key={proof.id} className="proof-card">
-          <span className="proof-kind">{proof.kind}</span>
-          <strong>{proof.label}</strong>
-          {proof.stage ? <small>{proof.stage}</small> : null}
+        <details key={proof.id} className="proof-card">
+          <summary>
+            <span className="proof-kind">{proof.kind}</span>
+            <div className="proof-card-copy">
+              <strong>{proof.label}</strong>
+              {proof.stage ? <small>{proof.stage}</small> : null}
+            </div>
+          </summary>
           {proof.url ? (
             <a href={proof.url} target="_blank" rel="noreferrer">
               Open URL
@@ -429,10 +578,26 @@ export function ArtifactGrid({ proofs }: { proofs: DetailProofCard[] }) {
           ) : proof.path ? (
             <code>{proof.path}</code>
           ) : null}
-        </article>
+        </details>
       ))}
     </div>
   );
+}
+
+function agentOperationPreview(operation: OperationRecordInfo): string {
+  const value =
+    operation.summary ||
+    operation.runnerProcess?.stderr ||
+    operation.runnerProcess?.stdout ||
+    operation.prompt ||
+    "";
+  return shortInline(value, 110) || "Trace details captured for this stage.";
+}
+
+function shortInline(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1)}…`;
 }
 
 export function AttemptHistory({
@@ -458,12 +623,27 @@ export function AttemptHistory({
                 {attempt.pullRequestUrl ? ` · ${attempt.pullRequestUrl}` : ""}
               </small>
             </div>
-            <time>{attempt.finishedAt ?? attempt.startedAt ?? ""}</time>
+            <time>{formatBeijingTimestamp(attempt.finishedAt ?? attempt.startedAt)}</time>
           </article>
         ))
       )}
     </div>
   );
+}
+
+function formatBeijingTimestamp(value?: string): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(date);
 }
 
 function ArtifactSummary({

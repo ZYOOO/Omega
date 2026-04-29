@@ -124,6 +124,6 @@ Active Repository workspace
 - 把 `devflow-pr` 从默认 Markdown 模板继续升级成 App 内可编辑模板，并支持 repository workspace 覆盖。
 - 把上述 artifact 从 proof file 继续升级成数据库一等 artifact 表。
 - `AgentRunner` 已抽出第一版，当前默认 Codex CLI；下一步继续接入 opencode / Claude Code / 长期 session runner。
-- 抽出正式 `JobSupervisor`，补齐 heartbeat、stall retry、cancel、timeout、多 turn continuation 和 worker host 分配。
+- 继续增强 `JobSupervisor`：补 GitHub polling、Git/GitHub command timeout、远端 worker 分配和远端崩溃恢复。
 - 把 GitHub issue comment / label / PR status 回写补齐。
 - 把 Feishu checkpoint card 接入人工确认，而不是只做文本通知。

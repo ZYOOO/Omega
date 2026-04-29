@@ -14,6 +14,7 @@ import {
   createPipelineRun,
   createMissionFromRun,
   createSampleRun,
+  deleteWorkItemFromDatabase,
   nowIso,
   type Mission,
   type MissionOperation,
@@ -650,6 +651,41 @@ export function startLocalRunnerApi(options: LocalRunnerApiOptions): Promise<Loc
           const rawBody = await readRequestBody(request);
           const patch = JSON.parse(rawBody) as Partial<Pick<WorkItem, "status" | "priority">>;
           const next = updateWorkItemInDatabase(database, itemId, patch);
+          await workspaceRepository.saveDatabase(next);
+          sendJson(response, 200, next);
+        } catch (error) {
+          sendJson(response, 500, { error: error instanceof Error ? error.message : "unknown error" });
+        }
+        return;
+      }
+
+      if (request.method === "DELETE" && request.url?.startsWith("/work-items/")) {
+        if (!workspaceRepository) {
+          sendJson(response, 404, { error: "workspace persistence is not configured" });
+          return;
+        }
+
+        try {
+          const itemId = request.url.split("/")[2];
+          const database = await workspaceRepository.getDatabase();
+          if (!database) {
+            sendJson(response, 404, { error: "workspace not found" });
+            return;
+          }
+          const item = database.tables.workItems.find((candidate) => candidate.id === itemId);
+          if (!item) {
+            sendJson(response, 404, { error: "work item not found" });
+            return;
+          }
+          if (item.status !== "Ready" && item.status !== "Backlog") {
+            sendJson(response, 409, { error: "only not-started work items can be deleted" });
+            return;
+          }
+          if (database.tables.pipelines.some((candidate) => candidate.workItemId === itemId)) {
+            sendJson(response, 409, { error: "work item has pipeline history" });
+            return;
+          }
+          const next = deleteWorkItemFromDatabase(database, itemId);
           await workspaceRepository.saveDatabase(next);
           sendJson(response, 200, next);
         } catch (error) {

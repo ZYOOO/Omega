@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -85,6 +86,36 @@ func TestCreateWorkItemInitializesEmptyWorkspace(t *testing.T) {
 	}
 	if len(database.Tables.Requirements) != 1 || database.Tables.WorkItems[0]["requirementId"] != database.Tables.Requirements[0]["id"] {
 		t.Fatalf("requirement link missing: items=%+v requirements=%+v", database.Tables.WorkItems, database.Tables.Requirements)
+	}
+}
+
+func TestDeleteNotStartedWorkItemRemovesUnsharedRequirement(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	item := map[string]any{
+		"id": "item_manual_delete", "key": "OMG-18", "title": "Delete stale item", "description": "Created by mistake.",
+		"status": "Ready", "priority": "Medium", "assignee": "requirement", "labels": []any{"manual"}, "team": "Omega", "stageId": "intake", "target": "No target",
+	}
+	create := postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create item status = %d", create.StatusCode)
+	}
+	remove := requestJSON(t, http.MethodDelete, api.URL+"/work-items/item_manual_delete", nil)
+	if remove.StatusCode != http.StatusOK {
+		t.Fatalf("delete item status = %d", remove.StatusCode)
+	}
+	var database WorkspaceDatabase
+	decode(t, remove, &database)
+	if len(database.Tables.WorkItems) != 0 {
+		t.Fatalf("work item was not deleted: %+v", database.Tables.WorkItems)
+	}
+	if len(database.Tables.Requirements) != 0 {
+		t.Fatalf("unshared requirement was not deleted: %+v", database.Tables.Requirements)
+	}
+	stateItems := arrayMaps(database.Tables.MissionControlStates[0]["workItems"])
+	if len(stateItems) != 0 {
+		t.Fatalf("mission state work item projection was not deleted: %+v", stateItems)
 	}
 }
 
@@ -168,8 +199,16 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	if len(template.ReviewRounds) != 2 || template.ReviewRounds[0].Focus != "correctness, regressions, and acceptance criteria" || template.ReviewRounds[1].DiffSource != "pr_diff" {
 		t.Fatalf("review rounds should come from workflow markdown: %+v", template.ReviewRounds)
 	}
-	if template.Runtime.MaxReviewCycles != 3 || len(template.Transitions) == 0 {
+	if template.Runtime.MaxReviewCycles != 3 || template.Runtime.RunnerHeartbeatSeconds != 10 || template.Runtime.AttemptTimeoutMinutes != 30 || template.Runtime.MaxRetryAttempts != 2 || template.Runtime.RetryBackoffSeconds != 300 || template.Runtime.CleanupRetentionSeconds != 86400 || template.Runtime.MaxContinuationTurns != 2 || len(template.Transitions) == 0 {
 		t.Fatalf("workflow runtime/transitions should come from markdown: runtime=%+v transitions=%+v", template.Runtime, template.Transitions)
+	}
+	for _, section := range []string{"requirement", "architect", "coding", "testing", "rework", "review", "delivery"} {
+		if !strings.Contains(template.PromptSections[section], "{{") {
+			t.Fatalf("workflow prompt section %s missing variables: prompts=%+v", section, template.PromptSections)
+		}
+	}
+	if !validateWorkflowTemplate(*template).ok() || !strings.Contains(template.PromptSections["coding"], "{{repositoryPath}}") || !strings.Contains(template.PromptSections["review"], "Blocking findings") {
+		t.Fatalf("workflow validation/prompt sections missing: validation=%+v prompts=%+v", validateWorkflowTemplate(*template), template.PromptSections)
 	}
 	pipeline := makePipelineWithTemplate(map[string]any{
 		"id": "item_manual_89", "key": "OMG-89", "title": "Ship feature", "description": "Build it", "assignee": "requirement", "requirementId": "req_item_manual_89",
@@ -185,6 +224,86 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	}
 	if got := anySlice(stages[1]["outputArtifacts"]); len(got) == 0 || got[len(got)-1] != "test-report" {
 		t.Fatalf("pipeline stages did not preserve workflow artifacts: %+v", stages[1])
+	}
+}
+
+func TestRepositoryWorkflowTemplateOverrideValidatesAndParsesPrompts(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, ".omega"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workflow := `---
+id: devflow-pr
+name: Repo workflow
+stages:
+  - id: todo
+    title: Todo
+    agentId: requirement
+  - id: done
+    title: Done
+    agentId: delivery
+runtime:
+  maxReviewCycles: 1
+  maxContinuationTurns: 3
+transitions:
+  - from: todo
+    on: passed
+    to: done
+---
+
+# Repo Workflow
+
+## Prompt: coding
+
+Repo-owned coding prompt for {{repositoryPath}}.
+`
+	if err := os.WriteFile(filepath.Join(repo, ".omega", "WORKFLOW.md"), []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	template, validation, exists := loadRepositoryWorkflowTemplate(repo, "devflow-pr")
+	if !exists || !validation.ok() {
+		t.Fatalf("repo workflow should be valid: exists=%v validation=%+v", exists, validation)
+	}
+	if template.Source != filepath.Join(repo, ".omega", "WORKFLOW.md") || template.Runtime.MaxContinuationTurns != 3 {
+		t.Fatalf("repo workflow not parsed: %+v", template)
+	}
+	rendered := renderWorkflowPromptSection(&template, "coding", map[string]string{"repositoryPath": "/tmp/repo"}, "fallback")
+	if rendered != "Repo-owned coding prompt for /tmp/repo." {
+		t.Fatalf("rendered prompt = %q", rendered)
+	}
+}
+
+func TestAgentDefinitionsExposeStructuredHandoffContracts(t *testing.T) {
+	definitions := agentDefinitions(defaultProviderSelection())
+	byID := map[string]AgentDefinition{}
+	for _, definition := range definitions {
+		byID[definition.ID] = definition
+	}
+	expectOutput := func(agentID string, expected string) {
+		for _, value := range byID[agentID].OutputContract {
+			if value == expected {
+				return
+			}
+		}
+		t.Fatalf("agent %s output contract missing %q: %+v", agentID, expected, byID[agentID].OutputContract)
+	}
+	expectOutput("requirement", "Repository boundary")
+	expectOutput("architect", "Agent handoff")
+	expectOutput("coding", "Known follow-up or risk")
+	expectOutput("testing", "Residual risk")
+	expectOutput("review", "Rework instructions")
+	expectOutput("delivery", "Operator notes")
+}
+
+func TestRepositoryWorkflowTemplateValidationRejectsBrokenContract(t *testing.T) {
+	template := PipelineTemplate{
+		ID:            "devflow-pr",
+		StageProfiles: []StageProfile{{ID: "todo", Title: "Todo", Agent: "requirement"}},
+		Transitions:   []WorkflowTransitionProfile{{From: "todo", On: "passed", To: "missing"}},
+	}
+	validation := validateWorkflowTemplate(template)
+	if validation.ok() || !strings.Contains(strings.Join(validation.Errors, "; "), "unknown stage") {
+		t.Fatalf("expected validation failure, got %+v", validation)
 	}
 }
 
@@ -211,12 +330,15 @@ func TestDevFlowRunNamesAreStablePerItem(t *testing.T) {
 func TestDevFlowReviewOutcomeRoutesChangesRequestedToRework(t *testing.T) {
 	dir := t.TempDir()
 	review := filepath.Join(dir, "review.md")
-	if err := os.WriteFile(review, []byte("# Review\n\nVerdict: CHANGES_REQUESTED\n\nPlease fix the missing behavior."), 0o644); err != nil {
+	if err := os.WriteFile(review, []byte("# Review\n\nVerdict: CHANGES_REQUESTED\n\nSummary:\n- The diff does not satisfy the registration requirement.\n\nBlocking findings:\n- [high] src/register.tsx - submit does not persist the user - wire it to the save API.\n\nRework instructions:\n- Add the save call and cover it with a focused test."), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	outcome := devFlowReviewOutcome(review)
 	if outcome.Verdict != "changes_requested" {
 		t.Fatalf("outcome = %+v", outcome)
+	}
+	if !strings.Contains(outcome.Summary, "submit does not persist the user") || strings.Contains(outcome.Summary, "Verdict:") {
+		t.Fatalf("review summary should preserve agent feedback: %+v", outcome)
 	}
 	template := findPipelineTemplate("devflow-pr")
 	if got := devFlowTransitionTo(template, "code_review_round_1", "changes_requested", ""); got != "rework" {
@@ -379,6 +501,9 @@ func TestCreateWorkItemAllocatesUniqueIDForDuplicateClientID(t *testing.T) {
 	if database.Tables.WorkItems[1]["id"] != "item_manual_1_2" {
 		t.Fatalf("second work item id = %v", database.Tables.WorkItems[1]["id"])
 	}
+	if database.Tables.WorkItems[1]["key"] == "OMG-1" {
+		t.Fatalf("second work item key should be unique: %+v", database.Tables.WorkItems)
+	}
 }
 
 func TestGitHubRepositorySlugFromTarget(t *testing.T) {
@@ -511,6 +636,1121 @@ func TestPipelineCheckpointAndOperationAPI(t *testing.T) {
 	decode(t, operationsResponse, &operations)
 	if len(operations) == 0 || operations[0]["status"] != "done" {
 		t.Fatalf("operations = %+v", operations)
+	}
+}
+
+func TestDevFlowCheckpointApprovalToleratesMissingAttempt(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	timestamp := nowISO()
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id":        "item_manual_legacy",
+		"projectId": "project_omega", "key": "OMG-legacy", "title": "Legacy human gate", "description": "Checkpoint predates attempts.",
+		"status": "In Review", "priority": "High", "assignee": "delivery", "labels": []any{"manual"}, "team": "Omega", "stageId": "human_review", "target": "ZYOOO/TestRepo", "createdAt": timestamp, "updatedAt": timestamp,
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
+			{ID: "merging", Title: "Merging", Agent: "delivery"},
+			{ID: "done", Title: "Done", Agent: "delivery"},
+		},
+	})
+	run := mapValue(pipeline["run"])
+	stages := arrayMaps(run["stages"])
+	stages[0]["status"] = "needs-human"
+	run["stages"] = stages
+	pipeline["run"] = run
+	pipeline["status"] = "waiting-human"
+	checkpoint := map[string]any{
+		"id": "pipeline_item_manual_legacy:human_review", "pipelineId": pipeline["id"], "stageId": "human_review",
+		"status": "pending", "title": "Human Review", "summary": "Waiting for approval.", "createdAt": timestamp, "updatedAt": timestamp,
+	}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var approved map[string]any
+	decode(t, postJSON(t, api.URL+"/checkpoints/"+text(checkpoint, "id")+"/approve", map[string]any{"reviewer": "alice"}), &approved)
+	if approved["status"] != "approved" {
+		t.Fatalf("checkpoint status = %v", approved["status"])
+	}
+	updated, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := findByID(updated.Tables.Pipelines, text(pipeline, "id"))
+	if index < 0 {
+		t.Fatalf("pipeline not found")
+	}
+	events := arrayMaps(mapValue(updated.Tables.Pipelines[index]["run"])["events"])
+	if !containsEventType(events, "gate.approved.incomplete") {
+		t.Fatalf("incomplete approval event missing: %+v", events)
+	}
+	if len(updated.Tables.Attempts) != 1 || text(updated.Tables.Checkpoints[0], "attemptId") == "" {
+		t.Fatalf("legacy approval should recover attempt link: attempts=%+v checkpoints=%+v", updated.Tables.Attempts, updated.Tables.Checkpoints)
+	}
+}
+
+func TestJobSupervisorTickBackfillsPendingCheckpointAttemptLink(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	timestamp := nowISO()
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id":        "item_manual_supervisor",
+		"projectId": "project_omega", "key": "OMG-supervisor", "title": "Repair checkpoint link", "description": "Pending gate lost attempt.",
+		"status": "In Review", "priority": "High", "assignee": "delivery", "labels": []any{"manual"}, "team": "Omega", "stageId": "human_review", "target": "ZYOOO/TestRepo", "createdAt": timestamp, "updatedAt": timestamp,
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
+			{ID: "merging", Title: "Merging", Agent: "delivery"},
+			{ID: "done", Title: "Done", Agent: "delivery"},
+		},
+	})
+	run := mapValue(pipeline["run"])
+	stages := arrayMaps(run["stages"])
+	stages[0]["status"] = "needs-human"
+	run["stages"] = stages
+	pipeline["run"] = run
+	pipeline["status"] = "waiting-human"
+	checkpoint := map[string]any{
+		"id": "pipeline_item_manual_supervisor:human_review", "pipelineId": pipeline["id"], "stageId": "human_review",
+		"status": "pending", "title": "Human Review", "summary": "Waiting for approval.", "createdAt": timestamp, "updatedAt": timestamp,
+	}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var summary map[string]any
+	decode(t, postJSON(t, api.URL+"/job-supervisor/tick", map[string]any{}), &summary)
+	if summary["backfilledAttempts"].(float64) != 1 || summary["linkedCheckpoints"].(float64) != 1 {
+		t.Fatalf("supervisor summary = %+v", summary)
+	}
+	updated, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Tables.Attempts) != 1 || text(updated.Tables.Checkpoints[0], "attemptId") != text(updated.Tables.Attempts[0], "id") {
+		t.Fatalf("repaired state attempts=%+v checkpoints=%+v", updated.Tables.Attempts, updated.Tables.Checkpoints)
+	}
+}
+
+func TestJobSupervisorTickMarksStalledRunningAttempt(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	timestamp := nowISO()
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id":        "item_manual_stalled",
+		"projectId": "project_omega", "key": "OMG-stalled", "title": "Detect stalled run", "description": "Runner stopped heartbeating.",
+		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "ZYOOO/TestRepo", "createdAt": timestamp, "updatedAt": timestamp,
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Requirement", Agent: "requirement"},
+			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
+			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
+		},
+	})
+	run := mapValue(pipeline["run"])
+	stages := arrayMaps(run["stages"])
+	stages[0]["status"] = "passed"
+	stages[1]["status"] = "running"
+	stages[1]["startedAt"] = timestamp
+	run["stages"] = stages
+	pipeline["run"] = run
+	pipeline["status"] = "running"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_stalled"
+	attempt["lastSeenAt"] = time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	attempt["updatedAt"] = attempt["lastSeenAt"]
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var summary map[string]any
+	decode(t, postJSON(t, api.URL+"/job-supervisor/tick", map[string]any{"staleAfterSeconds": 60}), &summary)
+	if summary["stalledAttempts"].(float64) != 1 {
+		t.Fatalf("supervisor summary = %+v", summary)
+	}
+	updated, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Tables.Attempts[0]["status"] != "stalled" || updated.Tables.Pipelines[0]["status"] != "stalled" || updated.Tables.WorkItems[0]["status"] != "Blocked" {
+		t.Fatalf("stalled state attempt=%+v pipeline=%+v item=%+v", updated.Tables.Attempts[0], updated.Tables.Pipelines[0], updated.Tables.WorkItems[0])
+	}
+	if text(updated.Tables.Attempts[0], "stalledAt") == "" || text(updated.Tables.Attempts[0], "statusReason") == "" {
+		t.Fatalf("stalled metadata missing: %+v", updated.Tables.Attempts[0])
+	}
+}
+
+func TestJobSupervisorLoopRunsMaintenanceTicks(t *testing.T) {
+	root := t.TempDir()
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	seedWorkspace(t, server.Repo)
+	timestamp := nowISO()
+	database, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id":        "item_manual_supervisor_loop",
+		"projectId": "project_omega", "key": "OMG-loop", "title": "Detect stalled run in loop", "description": "Runner stopped heartbeating.",
+		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "ZYOOO/TestRepo", "createdAt": timestamp, "updatedAt": timestamp,
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Requirement", Agent: "requirement"},
+			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
+		},
+	})
+	pipeline["status"] = "running"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_supervisor_loop"
+	attempt["lastSeenAt"] = time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	attempt["updatedAt"] = attempt["lastSeenAt"]
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	if err := server.Repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := server.StartJobSupervisor(context.Background(), JobSupervisorConfig{
+		Enabled:            true,
+		Interval:           10 * time.Millisecond,
+		StaleAfter:         time.Second,
+		ReadyScanItemLimit: 1,
+	})
+	defer stop()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		updated, err := server.Repo.Load(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(updated.Tables.Attempts) == 1 && updated.Tables.Attempts[0]["status"] == "stalled" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	updated, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("supervisor loop did not mark attempt stalled: %+v", updated.Tables.Attempts)
+}
+
+func TestCancelAttemptAPIUpdatesStateAndSignalsRunningJob(t *testing.T) {
+	root := t.TempDir()
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	api := httptest.NewServer(server.Handler())
+	t.Cleanup(api.Close)
+	seedWorkspace(t, server.Repo)
+	database, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id": "item_manual_cancel", "projectId": "project_omega", "key": "OMG-cancel", "title": "Cancel run", "description": "Cancel a running attempt.",
+		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "ZYOOO/TestRepo", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Requirement", Agent: "requirement"},
+			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
+		},
+	})
+	pipeline["status"] = "running"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_cancel"
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	if err := server.Repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	jobContext, cancel := context.WithCancel(context.Background())
+	server.registerAttemptJob("attempt_cancel", cancel)
+	defer server.unregisterAttemptJob("attempt_cancel")
+
+	var result map[string]any
+	decode(t, postJSON(t, api.URL+"/attempts/attempt_cancel/cancel", map[string]any{"reason": "Operator stopped the run."}), &result)
+	if result["cancelSignalSent"] != true {
+		t.Fatalf("cancel result = %+v", result)
+	}
+	select {
+	case <-jobContext.Done():
+	case <-time.After(time.Second):
+		t.Fatalf("registered job was not canceled")
+	}
+	updated, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Tables.Attempts[0]["status"] != "canceled" || updated.Tables.Pipelines[0]["status"] != "canceled" || updated.Tables.WorkItems[0]["status"] != "Blocked" {
+		t.Fatalf("canceled state attempt=%+v pipeline=%+v item=%+v", updated.Tables.Attempts[0], updated.Tables.Pipelines[0], updated.Tables.WorkItems[0])
+	}
+	if updated.Tables.Attempts[0]["statusReason"] != "Operator stopped the run." {
+		t.Fatalf("status reason = %+v", updated.Tables.Attempts[0])
+	}
+}
+
+func TestPrepareDevFlowAttemptRetryLinksAttempts(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	seedWorkspace(t, server.Repo)
+	repoPath := createDemoGitRepo(t)
+	ctx := context.Background()
+	profile := defaultAgentProfile("project_omega", "repo_retry")
+	for index := range profile.AgentProfiles {
+		profile.AgentProfiles[index].Runner = "demo-code"
+	}
+	if err := server.Repo.SetAgentProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	database, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{"id": "repo_retry", "kind": "local", "path": repoPath, "createdAt": nowISO(), "updatedAt": nowISO()}}
+	project["defaultRepositoryTargetId"] = "repo_retry"
+	database.Tables.Projects[0] = project
+	item := map[string]any{
+		"id": "item_retry", "projectId": "project_omega", "key": "OMG-retry", "title": "Retry failed attempt", "description": "Retry this failed work.",
+		"status": "Blocked", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": repoPath, "repositoryTargetId": "repo_retry", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Requirement", Agent: "requirement"},
+			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
+			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
+		},
+	})
+	pipeline["id"] = "pipeline_retry"
+	pipeline["status"] = "failed"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_retry_old"
+	attempt["status"] = "failed"
+	attempt["errorMessage"] = "Coding agent produced no repository changes."
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+
+	updated, retryPipeline, retryAttempt, err := server.prepareDevFlowAttemptRetry(ctx, *database, "attempt_retry_old", "Operator retry after failed diff.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(retryAttempt, "retryOfAttemptId") != "attempt_retry_old" || text(retryAttempt, "retryRootAttemptId") != "attempt_retry_old" || intValue(retryAttempt["retryIndex"]) != 1 {
+		t.Fatalf("retry attempt metadata = %+v", retryAttempt)
+	}
+	if text(retryPipeline, "status") != "running" {
+		t.Fatalf("retry pipeline = %+v", retryPipeline)
+	}
+	oldAttempt := updated.Tables.Attempts[findByID(updated.Tables.Attempts, "attempt_retry_old")]
+	if text(oldAttempt, "retryAttemptId") != text(retryAttempt, "id") {
+		t.Fatalf("old attempt retry link = %+v", oldAttempt)
+	}
+	itemAfter := findWorkItem(updated, "item_retry")
+	if text(itemAfter, "status") != "In Review" {
+		t.Fatalf("work item status = %+v", itemAfter)
+	}
+}
+
+func TestPrepareDevFlowHumanRequestedReworkStartsAttemptWithFeedback(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	seedWorkspace(t, server.Repo)
+	repoPath := createDemoGitRepo(t)
+	ctx := context.Background()
+	profile := defaultAgentProfile("project_omega", "repo_human_rework")
+	for index := range profile.AgentProfiles {
+		profile.AgentProfiles[index].Runner = "demo-code"
+	}
+	if err := server.Repo.SetAgentProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	database, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{"id": "repo_human_rework", "kind": "local", "path": repoPath, "createdAt": nowISO(), "updatedAt": nowISO()}}
+	project["defaultRepositoryTargetId"] = "repo_human_rework"
+	database.Tables.Projects[0] = project
+	item := map[string]any{
+		"id": "item_human_rework", "projectId": "project_omega", "key": "OMG-rework", "title": "Rename default user", "description": "Rename the default user.",
+		"status": "In Review", "priority": "High", "assignee": "delivery", "labels": []any{"manual"}, "team": "Omega", "stageId": "human_review", "target": repoPath, "repositoryTargetId": "repo_human_rework", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Requirement", Agent: "requirement"},
+			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
+			{ID: "code_review_round_1", Title: "Code Review Round 1", Agent: "review"},
+			{ID: "rework", Title: "Rework", Agent: "coding"},
+			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
+			{ID: "merging", Title: "Merging", Agent: "delivery"},
+			{ID: "done", Title: "Done", Agent: "delivery"},
+		},
+	})
+	pipeline["id"] = "pipeline_human_rework"
+	pipeline["status"] = "waiting-human"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_human_review"
+	attempt["status"] = "waiting-human"
+	attempt["branchName"] = "omega/OMG-rework-devflow"
+	attempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/44"
+	attempt["workspacePath"] = filepath.Join(root, "workspace", "OMG-rework")
+	checkpoint := map[string]any{"id": "checkpoint_human_rework", "pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Approve delivery."}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
+
+	reason := "改成章四"
+	rejectPipelineStage(database, checkpoint, reason)
+	updated, reworkPipeline, reworkAttempt, err := server.prepareDevFlowHumanRequestedRework(ctx, *database, checkpoint, reason)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(reworkAttempt, "trigger") != "human-request-changes" || text(reworkAttempt, "humanChangeRequest") != reason {
+		t.Fatalf("rework attempt metadata = %+v", reworkAttempt)
+	}
+	if text(reworkAttempt, "retryOfAttemptId") != "attempt_human_review" {
+		t.Fatalf("rework link = %+v", reworkAttempt)
+	}
+	if text(reworkAttempt, "currentStageId") != "rework" {
+		t.Fatalf("fast rework should enter rework stage, got %+v", reworkAttempt)
+	}
+	assessment := mapValue(reworkAttempt["reworkAssessment"])
+	if text(assessment, "strategy") != reworkStrategyFastRework || text(assessment, "entryStageId") != "rework" {
+		t.Fatalf("rework assessment = %+v", assessment)
+	}
+	if text(reworkAttempt, "branchName") != "omega/OMG-rework-devflow" || text(reworkAttempt, "pullRequestUrl") != "https://github.com/acme/demo/pull/44" {
+		t.Fatalf("rework attempt did not inherit delivery branch/PR = %+v", reworkAttempt)
+	}
+	reworkStages := arrayMaps(mapValue(reworkPipeline["run"])["stages"])
+	reworkStage := map[string]any{}
+	for _, stage := range reworkStages {
+		if text(stage, "id") == "rework" {
+			reworkStage = stage
+		}
+	}
+	if text(reworkStages[0], "status") != "passed" || text(reworkStage, "status") != "running" {
+		t.Fatalf("fast rework pipeline stages = %+v", reworkStages)
+	}
+	if got := latestHumanChangeRequestFromPipeline(reworkPipeline); got != reason {
+		t.Fatalf("human change request = %q", got)
+	}
+	oldAttempt := updated.Tables.Attempts[findByID(updated.Tables.Attempts, "attempt_human_review")]
+	if text(oldAttempt, "status") != "changes-requested" || text(oldAttempt, "failureReviewFeedback") != reason {
+		t.Fatalf("old attempt = %+v", oldAttempt)
+	}
+	workpadIndex := findByID(updated.Tables.RunWorkpads, text(reworkAttempt, "id")+":workpad")
+	if workpadIndex < 0 {
+		t.Fatalf("rework workpad missing: %+v", updated.Tables.RunWorkpads)
+	}
+	workpad := mapValue(updated.Tables.RunWorkpads[workpadIndex]["workpad"])
+	if !strings.Contains(strings.Join(stringSlice(workpad["reviewFeedback"]), "\n"), reason) || !strings.Contains(text(workpad, "retryReason"), reason) {
+		t.Fatalf("workpad feedback = %+v", workpad)
+	}
+	workpadAssessment := mapValue(workpad["reworkAssessment"])
+	if text(workpadAssessment, "strategy") != reworkStrategyFastRework {
+		t.Fatalf("workpad rework assessment = %+v", workpadAssessment)
+	}
+}
+
+func TestAssessHumanRequestedReworkRoutesByScope(t *testing.T) {
+	item := map[string]any{"id": "item_scope", "key": "OMG-scope", "title": "Scope"}
+	previousAttempt := map[string]any{"id": "attempt_previous", "branchName": "omega/OMG-scope-devflow", "pullRequestUrl": "https://github.com/acme/demo/pull/9"}
+	pipeline := map[string]any{"id": "pipeline_scope"}
+
+	fast := assessHumanRequestedRework("把默认用户名改成章四", item, previousAttempt, pipeline)
+	if text(fast, "strategy") != reworkStrategyFastRework || text(fast, "entryStageId") != "rework" {
+		t.Fatalf("fast assessment = %+v", fast)
+	}
+
+	replan := assessHumanRequestedRework("需要重做接口和权限流程", item, previousAttempt, pipeline)
+	if text(replan, "strategy") != reworkStrategyReplanRework || text(replan, "entryStageId") != "todo" {
+		t.Fatalf("replan assessment = %+v", replan)
+	}
+
+	needsInfo := assessHumanRequestedRework("你看着办？", item, previousAttempt, pipeline)
+	if text(needsInfo, "strategy") != reworkStrategyNeedsHumanInfo || text(needsInfo, "entryStageId") != "human_review" {
+		t.Fatalf("needs-human assessment = %+v", needsInfo)
+	}
+}
+
+func TestPrepareDevFlowHumanRequestedReworkWaitsWhenFeedbackNeedsInfo(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	seedWorkspace(t, server.Repo)
+	repoPath := createDemoGitRepo(t)
+	ctx := context.Background()
+	profile := defaultAgentProfile("project_omega", "repo_human_rework_info")
+	for index := range profile.AgentProfiles {
+		profile.AgentProfiles[index].Runner = "demo-code"
+	}
+	if err := server.Repo.SetAgentProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	database, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{"id": "repo_human_rework_info", "kind": "local", "path": repoPath, "createdAt": nowISO(), "updatedAt": nowISO()}}
+	project["defaultRepositoryTargetId"] = "repo_human_rework_info"
+	database.Tables.Projects[0] = project
+	item := map[string]any{
+		"id": "item_human_rework_info", "projectId": "project_omega", "key": "OMG-rework-info", "title": "Clarify user", "description": "Clarify user change.",
+		"status": "In Review", "priority": "High", "assignee": "delivery", "labels": []any{"manual"}, "team": "Omega", "stageId": "human_review", "target": repoPath, "repositoryTargetId": "repo_human_rework_info", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_human_rework_info"
+	pipeline["status"] = "waiting-human"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_human_review_info"
+	attempt["status"] = "waiting-human"
+	attempt["branchName"] = "omega/OMG-rework-info-devflow"
+	attempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/45"
+	checkpoint := map[string]any{"id": "checkpoint_human_rework_info", "pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Approve delivery."}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
+
+	reason := "你看着办？"
+	rejectPipelineStage(database, checkpoint, reason)
+	_, reworkPipeline, reworkAttempt, err := server.prepareDevFlowHumanRequestedRework(ctx, *database, checkpoint, reason)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(reworkAttempt, "status") != "waiting-human" || text(reworkAttempt, "currentStageId") != "human_review" {
+		t.Fatalf("needs-info attempt should wait for human, got %+v", reworkAttempt)
+	}
+	assessment := mapValue(reworkAttempt["reworkAssessment"])
+	if text(assessment, "strategy") != reworkStrategyNeedsHumanInfo {
+		t.Fatalf("needs-info assessment = %+v", assessment)
+	}
+	stages := arrayMaps(mapValue(reworkPipeline["run"])["stages"])
+	humanStage := map[string]any{}
+	for _, stage := range stages {
+		if text(stage, "id") == "human_review" {
+			humanStage = stage
+			break
+		}
+	}
+	if text(humanStage, "status") != "needs-human" {
+		t.Fatalf("human stage should need info: %+v", stages)
+	}
+}
+
+func TestResetDevFlowPipelineForAttemptFromStageFallsBackWhenStageMissing(t *testing.T) {
+	item := map[string]any{"id": "item_reset", "projectId": "project_omega", "key": "OMG-reset", "title": "Reset", "repositoryTargetId": "repo_reset"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID: "devflow-pr",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Todo", Agent: "requirement"},
+			{ID: "rework", Title: "Rework", Agent: "coding"},
+		},
+	})
+	reset := resetDevFlowPipelineForAttemptFromStage(pipeline, "missing-stage")
+	stages := arrayMaps(mapValue(reset["run"])["stages"])
+	if text(stages[0], "status") != "running" || text(stages[1], "status") != "waiting" {
+		t.Fatalf("missing stage should fall back to todo: %+v", stages)
+	}
+}
+
+func TestEnsureDevFlowRepositoryWorkspaceRestoresRemoteDeliveryBranch(t *testing.T) {
+	repoPath := createDemoGitRepo(t)
+	branchName := "omega/OMG-restore-devflow"
+	runGit(t, repoPath, "checkout", "-b", branchName)
+	if err := os.WriteFile(filepath.Join(repoPath, "reviewed-version.txt"), []byte("first reviewed version\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoPath, "add", ".")
+	runGit(t, repoPath, "commit", "-m", "first reviewed version")
+	runGit(t, repoPath, "checkout", "main")
+
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	repoWorkspace := filepath.Join(workspace, "repo")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureDevFlowRepositoryWorkspace(workspace, repoWorkspace, repoPath, branchName, "main"); err != nil {
+		t.Fatal(err)
+	}
+	currentBranch := strings.TrimSpace(runGit(t, repoWorkspace, "branch", "--show-current"))
+	if currentBranch != branchName {
+		t.Fatalf("current branch = %s", currentBranch)
+	}
+	if _, err := os.Stat(filepath.Join(repoWorkspace, "reviewed-version.txt")); err != nil {
+		t.Fatalf("remote delivery branch content was not restored: %v", err)
+	}
+}
+
+func TestFailAttemptRecordPersistsFailureReasonContract(t *testing.T) {
+	item := map[string]any{
+		"id": "item_failure_reason", "projectId": "project_omega", "key": "OMG-failure", "title": "Failure reason", "description": "Capture retry reason.",
+		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "repo", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Requirement", Agent: "requirement"},
+			{ID: "in_progress", Title: "Implementation and PR", Agent: "coding"},
+			{ID: "code_review_round_1", Title: "Code Review Round 1", Agent: "review"},
+		},
+	})
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_failure_reason"
+	database := WorkspaceDatabase{Tables: WorkspaceTables{WorkItems: []map[string]any{item}, Pipelines: []map[string]any{pipeline}, Attempts: []map[string]any{attempt}}}
+	result := map[string]any{
+		"failureStageId":        "rework",
+		"failureAgentId":        "coding",
+		"failureReason":         "Rework agent failed while applying review feedback.",
+		"failureDetail":         "rework agent produced no repository changes",
+		"failureReviewFeedback": "Review requested a clearer validation state.",
+	}
+	updated, failedAttempt := failAttemptRecord(database, "attempt_failure_reason", pipeline, "rework agent produced no repository changes", result)
+	if text(failedAttempt, "failureReason") != "Rework agent failed while applying review feedback." || text(failedAttempt, "failureStageId") != "rework" || text(failedAttempt, "failureAgentId") != "coding" {
+		t.Fatalf("failure contract = %+v", failedAttempt)
+	}
+	if text(failedAttempt, "failureReviewFeedback") == "" || text(failedAttempt, "failureDetail") == "" {
+		t.Fatalf("failure detail missing = %+v", failedAttempt)
+	}
+	persisted := updated.Tables.Attempts[findByID(updated.Tables.Attempts, "attempt_failure_reason")]
+	if text(persisted, "currentStageId") != "rework" {
+		t.Fatalf("current stage = %+v", persisted)
+	}
+}
+
+func TestJobSupervisorTickReportsRunnableReadyWork(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	api := httptest.NewServer(server.Handler())
+	t.Cleanup(api.Close)
+	seedWorkspace(t, server.Repo)
+	repoPath := createDemoGitRepo(t)
+	ctx := context.Background()
+	profile := defaultAgentProfile("project_omega", "repo_supervisor_ready")
+	for index := range profile.AgentProfiles {
+		profile.AgentProfiles[index].Runner = "demo-code"
+	}
+	if err := server.Repo.SetAgentProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	database, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{"id": "repo_supervisor_ready", "kind": "local", "path": repoPath, "createdAt": nowISO(), "updatedAt": nowISO()}}
+	project["defaultRepositoryTargetId"] = "repo_supervisor_ready"
+	database.Tables.Projects[0] = project
+	item := map[string]any{
+		"id": "item_supervisor_ready", "projectId": "project_omega", "key": "OMG-ready", "title": "Ready supervisor run", "description": "Runnable work.",
+		"status": "Ready", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "todo", "target": repoPath, "repositoryTargetId": "repo_supervisor_ready", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	if err := server.Repo.Save(ctx, *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var summary map[string]any
+	decode(t, postJSON(t, api.URL+"/job-supervisor/tick", map[string]any{"limit": 5}), &summary)
+	if summary["runnableItems"].(float64) != 1 || len(arrayMaps(summary["runnableWorkItems"])) != 1 {
+		t.Fatalf("supervisor summary = %+v", summary)
+	}
+	loaded, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Tables.Attempts) != 0 {
+		t.Fatalf("scan without autoRunReady should not create attempts: %+v", loaded.Tables.Attempts)
+	}
+}
+
+func TestJobSupervisorTickBackfillsWorkflowContractMetadata(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{"id": "item_workflow_contract", "projectId": "project_omega", "key": "OMG-contract", "title": "Contract", "status": "Ready", "repositoryTargetId": "repo_contract", "createdAt": nowISO(), "updatedAt": nowISO()}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	run := mapValue(pipeline["run"])
+	delete(run, "workflow")
+	pipeline["run"] = run
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var summary map[string]any
+	decode(t, postJSON(t, api.URL+"/job-supervisor/tick", map[string]any{"limit": 1}), &summary)
+	if summary["workflowContractPipelines"].(float64) != 1 || summary["workflowContractMissing"].(float64) != 0 {
+		t.Fatalf("workflow summary = %+v", summary)
+	}
+	contracts := arrayMaps(summary["workflowContracts"])
+	if len(contracts) != 1 || intValue(contracts[0]["transitionCount"]) == 0 || intValue(contracts[0]["maxReviewCycles"]) == 0 {
+		t.Fatalf("workflow contracts = %+v", contracts)
+	}
+	updated, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := mapValue(mapValue(updated.Tables.Pipelines[0]["run"])["workflow"])
+	if len(arrayMaps(workflow["transitions"])) == 0 || len(mapValue(workflow["runtime"])) == 0 {
+		t.Fatalf("workflow was not backfilled: %+v", workflow)
+	}
+}
+
+func TestJobSupervisorScanRecoverableAttemptsRetriesWithPolicy(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	seedWorkspace(t, server.Repo)
+	repoPath := createDemoGitRepo(t)
+	ctx := context.Background()
+	profile := defaultAgentProfile("project_omega", "repo_supervisor_retry")
+	for index := range profile.AgentProfiles {
+		profile.AgentProfiles[index].Runner = "demo-code"
+	}
+	if err := server.Repo.SetAgentProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	database, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{"id": "repo_supervisor_retry", "kind": "local", "path": repoPath, "createdAt": nowISO(), "updatedAt": nowISO()}}
+	project["defaultRepositoryTargetId"] = "repo_supervisor_retry"
+	database.Tables.Projects[0] = project
+	item := map[string]any{
+		"id": "item_supervisor_retry", "projectId": "project_omega", "key": "OMG-retry-supervisor", "title": "Supervisor retry", "description": "Retry this failed work.",
+		"status": "Blocked", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": repoPath, "repositoryTargetId": "repo_supervisor_retry", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Requirement", Agent: "requirement"},
+			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
+			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
+		},
+	})
+	pipeline["id"] = "pipeline_supervisor_retry"
+	pipeline["status"] = "failed"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_supervisor_failed"
+	attempt["status"] = "failed"
+	attempt["errorMessage"] = "temporary network failure"
+	attempt["updatedAt"] = time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+
+	jobs := []map[string]any{}
+	summary := server.scanRecoverableAttempts(ctx, database, jobSupervisorTickOptions{AutoRetryFailed: true, MaxRetryAttempts: 2, RetryBackoffSeconds: 60, Limit: 5}, &jobs)
+	if summary["acceptedRetryAttempts"] != 1 || len(jobs) != 1 {
+		t.Fatalf("recovery summary=%+v jobs=%+v", summary, jobs)
+	}
+	if len(database.Tables.Attempts) != 2 {
+		t.Fatalf("retry attempt not appended: %+v", database.Tables.Attempts)
+	}
+	retryAttempt := database.Tables.Attempts[1]
+	if text(retryAttempt, "retryOfAttemptId") != "attempt_supervisor_failed" || intValue(retryAttempt["retryIndex"]) != 1 {
+		t.Fatalf("retry attempt = %+v", retryAttempt)
+	}
+	previous := database.Tables.Attempts[findByID(database.Tables.Attempts, "attempt_supervisor_failed")]
+	if text(previous, "retryAttemptId") != text(retryAttempt, "id") {
+		t.Fatalf("previous attempt link = %+v", previous)
+	}
+	if text(mapValue(jobs[0]["lock"]), "attemptId") != text(retryAttempt, "id") {
+		t.Fatalf("retry job should carry workspace lock: %+v", jobs[0])
+	}
+}
+
+func TestJobSupervisorScanRecoverableAttemptsUsesWorkflowRetryPolicy(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{}}
+	item := map[string]any{"id": "item_contract_retry", "key": "OMG-contract-retry", "status": "Blocked", "repositoryTargetId": "repo_contract_retry", "createdAt": nowISO(), "updatedAt": nowISO()}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:            "devflow-pr",
+		Name:          "DevFlow PR cycle",
+		StageProfiles: []StageProfile{{ID: "todo", Title: "Todo", Agent: "requirement"}, {ID: "in_progress", Title: "Implementation", Agent: "coding"}},
+		Runtime:       WorkflowRuntimeProfile{MaxRetryAttempts: 1, RetryBackoffSeconds: 7200},
+	})
+	pipeline["id"] = "pipeline_contract_retry"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_contract_retry"
+	attempt["status"] = "failed"
+	attempt["updatedAt"] = time.Now().UTC().Add(-30 * time.Minute).Format(time.RFC3339Nano)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+
+	jobs := []map[string]any{}
+	summary := server.scanRecoverableAttempts(context.Background(), database, jobSupervisorTickOptions{AutoRetryFailed: true, Limit: 5}, &jobs)
+	if summary["retryBackoff"] != 1 || summary["acceptedRetryAttempts"] != 0 {
+		t.Fatalf("workflow retry policy was not applied: %+v", summary)
+	}
+	record := arrayMaps(summary["recoverableAttempts"])[0]
+	if intValue(record["retryBackoffSeconds"]) != 7200 || intValue(record["maxRetryAttempts"]) != 1 {
+		t.Fatalf("recoverable record missing contract policy: %+v", record)
+	}
+}
+
+func TestDevFlowWorkspaceLifecycleSpecLocksRepositoryWorkspace(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	ctx := context.Background()
+	item := map[string]any{"id": "item_lifecycle", "key": "OMG-lifecycle", "repositoryTargetId": "repo_lifecycle"}
+	target := map[string]any{"id": "repo_lifecycle", "kind": "local", "path": filepath.Join(root, "target")}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow PR cycle", StageProfiles: []StageProfile{{ID: "todo", Title: "Todo", Agent: "requirement"}}, Runtime: WorkflowRuntimeProfile{AttemptTimeoutMinutes: 7}})
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "todo")
+
+	lock, err := claimDevFlowWorkspaceLock(ctx, server, item, target, pipeline, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(lock, "status") != "claimed" || text(lock, "repositoryPath") == "" || !pathInsideRoot(text(lock, "workspaceRoot"), text(lock, "repositoryPath")) {
+		t.Fatalf("lock should describe bounded workspace: %+v", lock)
+	}
+	if _, err := claimDevFlowWorkspaceLock(ctx, server, item, target, pipeline, attempt); err == nil {
+		t.Fatalf("expected second lock claim to fail")
+	}
+}
+
+func TestWorkspaceCleanupRemovesRepoAndRetainsProof(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	workspace, err := workspaceChildPath(server.WorkspaceRoot, "OMG-cleanup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoPath := filepath.Join(workspace, "repo")
+	proofPath := filepath.Join(workspace, ".omega", "proof")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(proofPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "file.txt"), []byte("repo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proofPath, "proof.md"), []byte("proof"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{"id": "item_cleanup", "key": "OMG-cleanup", "repositoryTargetId": "repo_cleanup"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow", StageProfiles: []StageProfile{{ID: "todo", Title: "Todo", Agent: "requirement"}}, Runtime: WorkflowRuntimeProfile{CleanupRetentionSeconds: 1}})
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "done")
+	attempt["id"] = "attempt_cleanup"
+	attempt["status"] = "done"
+	attempt["workspacePath"] = workspace
+	attempt["finishedAt"] = time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{Pipelines: []map[string]any{pipeline}, Attempts: []map[string]any{attempt}}}
+
+	summary := server.scanWorkspaceCleanup(context.Background(), database, workspaceCleanupOptions{AutoCleanupWorkspaces: true, WorkspaceRetentionSeconds: 1, Limit: 5})
+	if summary["cleanedWorkspaces"] != 1 {
+		t.Fatalf("cleanup summary = %+v", summary)
+	}
+	if pathExists(repoPath) {
+		t.Fatalf("repo path should be removed: %s", repoPath)
+	}
+	if !pathExists(filepath.Join(proofPath, "proof.md")) {
+		t.Fatalf("proof should be retained")
+	}
+	if text(mapValue(database.Tables.Attempts[0]["workspaceCleanup"]), "status") != "cleaned" {
+		t.Fatalf("attempt cleanup metadata = %+v", database.Tables.Attempts[0])
+	}
+}
+
+func TestJobSupervisorMarksOrphanedWorkerAttemptStalled(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	item := map[string]any{"id": "item_orphan", "key": "OMG-orphan", "repositoryTargetId": "repo_orphan"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow", StageProfiles: []StageProfile{{ID: "todo", Title: "Todo", Agent: "requirement"}}})
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "todo")
+	attempt["id"] = "attempt_orphan"
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{WorkItems: []map[string]any{item}, Pipelines: []map[string]any{pipeline}, Attempts: []map[string]any{attempt}}}
+
+	summary := server.scanWorkerHostLeases(context.Background(), database)
+	if summary["orphanedWorkerAttempts"] != 1 || database.Tables.Attempts[0]["status"] != "stalled" {
+		t.Fatalf("orphan summary=%+v attempt=%+v", summary, database.Tables.Attempts[0])
+	}
+}
+
+func TestJobSupervisorScanRecoverableAttemptsRespectsBackoffAndLimit(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{Attempts: []map[string]any{
+		{"id": "attempt_recent_failed", "pipelineId": "pipeline_recent", "itemId": "item_recent", "status": "failed", "updatedAt": now, "errorMessage": "recent failure"},
+		{"id": "attempt_limit_failed", "pipelineId": "pipeline_limit", "itemId": "item_limit", "status": "failed", "updatedAt": "2026-04-29T00:00:00Z", "retryRootAttemptId": "attempt_limit_root", "errorMessage": "limit failure"},
+		{"id": "attempt_limit_retry_1", "pipelineId": "pipeline_limit", "itemId": "item_limit", "status": "done", "retryRootAttemptId": "attempt_limit_root"},
+	}}}
+	jobs := []map[string]any{}
+	summary := server.scanRecoverableAttempts(context.Background(), database, jobSupervisorTickOptions{AutoRetryFailed: true, MaxRetryAttempts: 1, RetryBackoffSeconds: 3600, Limit: 5}, &jobs)
+	if summary["retryBackoff"] != 1 || summary["retryLimitReached"] != 1 || summary["acceptedRetryAttempts"] != 0 || len(jobs) != 0 {
+		t.Fatalf("policy summary=%+v jobs=%+v", summary, jobs)
+	}
+}
+
+func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
+	api, repo := newTestAPI(t)
+	if err := repo.AppendRuntimeLog(context.Background(), RuntimeLogRecord{
+		ID:         "log_error_1",
+		Level:      "ERROR",
+		EventType:  "checkpoint.approve.missing_attempt",
+		Message:    "Missing attempt was detected.",
+		PipelineID: "pipeline_item_manual_1",
+		AttemptID:  "attempt_missing",
+		Details:    map[string]any{"pipelineId": "pipeline_item_manual_1"},
+		CreatedAt:  "2026-04-29T10:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AppendRuntimeLog(context.Background(), RuntimeLogRecord{
+		ID:        "log_debug_1",
+		Level:     "DEBUG",
+		EventType: "api.request",
+		Message:   "GET /health -> 200",
+		Details:   map[string]any{"path": "/health"},
+		CreatedAt: "2026-04-28T10:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs []RuntimeLogRecord
+	decode(t, mustGet(t, api.URL+"/runtime-logs?level=ERROR"), &logs)
+	if len(logs) != 1 {
+		t.Fatalf("filtered logs = %+v", logs)
+	}
+	if logs[0].Level != "ERROR" || logs[0].EventType != "checkpoint.approve.missing_attempt" || logs[0].PipelineID != "pipeline_item_manual_1" {
+		t.Fatalf("error log = %+v", logs[0])
+	}
+	decode(t, mustGet(t, api.URL+"/runtime-logs?eventType=checkpoint.approve.missing_attempt&createdAfter=2026-04-29T00%3A00%3A00Z"), &logs)
+	if len(logs) != 1 || logs[0].ID != "log_error_1" {
+		t.Fatalf("time filtered logs = %+v", logs)
+	}
+
+	var summary map[string]any
+	decode(t, mustGet(t, api.URL+"/observability"), &summary)
+	recentErrors := arrayMaps(summary["recentErrors"])
+	if len(recentErrors) == 0 || recentErrors[0]["eventType"] != "checkpoint.approve.missing_attempt" {
+		t.Fatalf("observability recent errors = %+v", recentErrors)
+	}
+}
+
+func TestAttemptTimelineAggregatesRunRecords(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	timestamp := "2026-04-29T10:00:00Z"
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id": "item_timeline", "projectId": "project_omega", "key": "OMG-timeline", "title": "Timeline", "description": "Show run trace.",
+		"status": "In Review", "priority": "High", "assignee": "delivery", "labels": []any{"manual"}, "team": "Omega", "stageId": "human_review", "target": "ZYOOO/TestRepo", "createdAt": timestamp, "updatedAt": timestamp,
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
+			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
+		},
+	})
+	pipeline["id"] = "pipeline_timeline"
+	run := mapValue(pipeline["run"])
+	run["events"] = []map[string]any{{"type": "gate.created", "message": "Human review checkpoint opened.", "stageId": "human_review", "agentId": "delivery", "timestamp": "2026-04-29T10:03:00Z"}}
+	stages := arrayMaps(run["stages"])
+	stages[0]["status"] = "passed"
+	stages[0]["completedAt"] = "2026-04-29T10:02:00Z"
+	stages[1]["status"] = "needs-human"
+	stages[1]["startedAt"] = "2026-04-29T10:03:00Z"
+	run["stages"] = stages
+	pipeline["run"] = run
+	pipeline["status"] = "waiting-human"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_timeline"
+	attempt["events"] = []map[string]any{{"type": "attempt.started", "message": "Attempt started.", "stageId": "in_progress", "createdAt": "2026-04-29T10:01:00Z"}}
+	checkpoint := map[string]any{
+		"id": "checkpoint_timeline", "pipelineId": pipeline["id"], "attemptId": attempt["id"], "stageId": "human_review",
+		"status": "pending", "title": "Human Review", "summary": "Waiting for approval.", "createdAt": "2026-04-29T10:03:00Z", "updatedAt": "2026-04-29T10:03:00Z",
+	}
+	operation := map[string]any{
+		"id": "pipeline_timeline:agent:in_progress:coding", "missionId": "mission_pipeline_timeline_agent_workflow",
+		"stageId": "in_progress", "agentId": "coding", "status": "passed", "summary": "Implementation completed.", "createdAt": "2026-04-29T10:01:00Z", "updatedAt": "2026-04-29T10:02:00Z",
+	}
+	proof := map[string]any{
+		"id": "proof_timeline", "operationId": operation["id"], "label": "git-diff", "sourcePath": "/tmp/proof/git-diff.patch", "createdAt": "2026-04-29T10:02:30Z",
+	}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
+	database.Tables.Operations = append(database.Tables.Operations, operation)
+	database.Tables.ProofRecords = append(database.Tables.ProofRecords, proof)
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AppendRuntimeLog(context.Background(), RuntimeLogRecord{
+		ID:         "log_timeline",
+		Level:      "INFO",
+		EventType:  "checkpoint.pending",
+		Message:    "Checkpoint pending.",
+		PipelineID: "pipeline_timeline",
+		AttemptID:  "attempt_timeline",
+		StageID:    "human_review",
+		CreatedAt:  "2026-04-29T10:03:10Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var timeline AttemptTimelineResponse
+	decode(t, mustGet(t, api.URL+"/attempts/attempt_timeline/timeline"), &timeline)
+	if text(timeline.Attempt, "id") != "attempt_timeline" || text(timeline.Pipeline, "id") != "pipeline_timeline" {
+		t.Fatalf("timeline identity = %+v", timeline)
+	}
+	found := map[string]bool{}
+	previous := ""
+	for _, item := range timeline.Items {
+		found[item.Source] = true
+		if previous != "" && item.Time < previous {
+			t.Fatalf("timeline not sorted: %+v", timeline.Items)
+		}
+		previous = item.Time
+	}
+	for _, source := range []string{"attempt", "pipeline", "stage", "operation", "proof", "checkpoint", "runtime-log"} {
+		if !found[source] {
+			t.Fatalf("timeline missing source %s: %+v", source, timeline.Items)
+		}
+	}
+}
+
+func TestRunSupervisedCommandContextTimesOutProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell timeout test uses POSIX sh")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	process, err := runSupervisedCommandContext(ctx, t.TempDir(), "", "sh", "-c", "sleep 5")
+	if err == nil {
+		t.Fatalf("expected timeout error")
+	}
+	if process["status"] != "timed-out" || process["exitCode"] != -1 {
+		t.Fatalf("process = %+v", process)
+	}
+	if process["cancellationReason"] != context.DeadlineExceeded.Error() {
+		t.Fatalf("cancellation reason = %+v", process)
+	}
+}
+
+func TestCompleteDevFlowCycleBackfillsMissingAttempt(t *testing.T) {
+	root := t.TempDir()
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	api := httptest.NewServer(server.Handler())
+	t.Cleanup(api.Close)
+	repo := server.Repo
+	seedWorkspace(t, repo)
+	item := map[string]any{
+		"id": "item_manual_backfill", "key": "OMG-backfill", "title": "Backfill attempt", "description": "Recover missing attempt.",
+		"status": "Ready", "priority": "High", "assignee": "requirement", "labels": []any{"manual"}, "team": "Omega", "stageId": "intake", "target": "No target",
+	}
+	_ = postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+
+	var pipeline map[string]any
+	decode(t, postJSON(t, api.URL+"/pipelines/from-template", map[string]any{"templateId": "devflow-pr", "item": item}), &pipeline)
+	result := map[string]any{
+		"status":         "waiting-human",
+		"workspacePath":  "/tmp/omega-backfill",
+		"branchName":     "omega/backfill",
+		"pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/999",
+		"proofFiles":     []string{},
+	}
+	_, _, err := server.completeDevFlowCycleJob(context.Background(), text(pipeline, "id"), "missing-attempt-id", result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := findByID(updated.Tables.Attempts, "missing-attempt-id")
+	if index < 0 {
+		t.Fatalf("attempt was not backfilled: %+v", updated.Tables.Attempts)
+	}
+	if updated.Tables.Attempts[index]["status"] != "waiting-human" || updated.Tables.Attempts[index]["pullRequestUrl"] != result["pullRequestUrl"] {
+		t.Fatalf("backfilled attempt = %+v", updated.Tables.Attempts[index])
+	}
+	var checkpoints []map[string]any
+	decode(t, mustGet(t, api.URL+"/checkpoints"), &checkpoints)
+	if len(checkpoints) != 1 || text(checkpoints[0], "attemptId") != "missing-attempt-id" {
+		t.Fatalf("checkpoint attempt link = %+v", checkpoints)
 	}
 }
 
@@ -691,6 +1931,7 @@ echo "fake coding agent completed"
 		"code-review-round-1.md",
 		"code-review-round-2.md",
 		"human-review-request.md",
+		"attempt-run-report.md",
 		"handoff-bundle.json",
 	} {
 		if !containsSuffix(proofFiles, want) {
@@ -711,6 +1952,13 @@ echo "fake coding agent completed"
 	}
 	if artifacts := arrayMaps(handoff["artifacts"]); len(artifacts) < 7 {
 		t.Fatalf("handoff artifacts = %+v", artifacts)
+	}
+	reportRaw, err := os.ReadFile(filepath.Join(proofDir, "attempt-run-report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(reportRaw), "Attempt Run Report") || !strings.Contains(string(reportRaw), "https://github.com/acme/demo/pull/123") {
+		t.Fatalf("attempt report = %s", string(reportRaw))
 	}
 	planRaw, err := os.ReadFile(filepath.Join(proofDir, "solution-plan.md"))
 	if err != nil {
@@ -784,6 +2032,134 @@ echo "fake coding agent completed"
 	if len(arrayMaps(attempt["stages"])) < 7 || text(attempt, "branchName") == "" {
 		t.Fatalf("attempt stage/branch evidence missing: %+v", attempt)
 	}
+}
+
+func TestApproveDevFlowCheckpointIgnoresBranchCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	repoWorkspace := filepath.Join(root, "workspace", "OMG-cleanup", "repo")
+	proofDir := filepath.Join(root, "workspace", "OMG-cleanup", ".omega", "proof")
+	if err := os.MkdirAll(repoWorkspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoWorkspace, "init")
+	runGit(t, repoWorkspace, "checkout", "-b", "main")
+	runGit(t, repoWorkspace, "config", "user.email", "omega-test@example.local")
+	runGit(t, repoWorkspace, "config", "user.name", "Omega Test")
+	if err := os.WriteFile(filepath.Join(repoWorkspace, "README.md"), []byte("demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoWorkspace, "add", ".")
+	runGit(t, repoWorkspace, "commit", "-m", "initial")
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{"merged": false}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	gh := filepath.Join(bin, "gh")
+	script := "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  printf 'merged\\n'\n  exit 0\nfi\nprintf 'MERGED\\n'\n"
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	item := map[string]any{"id": "item_cleanup_approve", "key": "OMG-cleanup", "repositoryTargetId": "repo_cleanup"}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_cleanup_approve"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_cleanup_approve"
+	attempt["status"] = "waiting-human"
+	attempt["workspacePath"] = filepath.Join(root, "workspace", "OMG-cleanup")
+	attempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/1"
+	attempt["branchName"] = "omega/missing-branch"
+	checkpoint := map[string]any{"id": "checkpoint_cleanup_approve", "pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "stageId": "human_review", "status": "pending"}
+	database := WorkspaceDatabase{Tables: WorkspaceTables{WorkItems: []map[string]any{item}, Pipelines: []map[string]any{pipeline}, Attempts: []map[string]any{attempt}, Checkpoints: []map[string]any{checkpoint}}}
+
+	if err := server.completeApprovedDevFlowCheckpoint(&database, checkpoint, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if database.Tables.Pipelines[0]["status"] != "done" || database.Tables.Attempts[0]["status"] != "done" {
+		t.Fatalf("approval should complete despite branch cleanup failure: pipeline=%+v attempt=%+v", database.Tables.Pipelines[0], database.Tables.Attempts[0])
+	}
+}
+
+func TestApproveDevFlowCheckpointCanContinueDeliveryAsync(t *testing.T) {
+	api, repo := newTestAPI(t)
+	root := t.TempDir()
+	repoWorkspace := filepath.Join(root, "workspace", "OMG-async", "repo")
+	proofDir := filepath.Join(root, "workspace", "OMG-async", ".omega", "proof")
+	if err := os.MkdirAll(repoWorkspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoWorkspace, "init")
+	runGit(t, repoWorkspace, "checkout", "-b", "main")
+	runGit(t, repoWorkspace, "config", "user.email", "omega-test@example.local")
+	runGit(t, repoWorkspace, "config", "user.name", "Omega Test")
+	if err := os.WriteFile(filepath.Join(repoWorkspace, "README.md"), []byte("demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoWorkspace, "add", ".")
+	runGit(t, repoWorkspace, "commit", "-m", "initial")
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{"merged": false}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	gh := filepath.Join(bin, "gh")
+	script := "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  sleep 1\n  printf 'merged\\n'\n  exit 0\nfi\nprintf 'MERGED\\n'\n"
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	item := map[string]any{"id": "item_async_approve", "projectId": "project_omega", "key": "OMG-async", "title": "Async approve", "status": "In Review", "priority": "High", "assignee": "delivery", "labels": []any{"manual"}, "team": "Omega", "stageId": "human_review", "target": "repo", "repositoryTargetId": "repo_async"}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_async_approve"
+	pipeline["status"] = "waiting-human"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_async_approve"
+	attempt["status"] = "waiting-human"
+	attempt["workspacePath"] = filepath.Join(root, "workspace", "OMG-async")
+	attempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/2"
+	attempt["branchName"] = "omega/missing-async-branch"
+	checkpoint := map[string]any{"id": "checkpoint_async_approve", "pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Approve delivery."}
+	database := defaultWorkspaceDatabase()
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	var approved map[string]any
+	decode(t, postJSON(t, api.URL+"/checkpoints/checkpoint_async_approve/approve", map[string]any{"reviewer": "alice", "asyncDelivery": true}), &approved)
+	if elapsed := time.Since(start); elapsed > 900*time.Millisecond {
+		t.Fatalf("async approval waited for merge: %s", elapsed)
+	}
+	if approved["status"] != "approved" {
+		t.Fatalf("approved response = %+v", approved)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		updated, err := repo.Load(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		pipelineIndex := findByID(updated.Tables.Pipelines, "pipeline_async_approve")
+		attemptIndex := findByID(updated.Tables.Attempts, "attempt_async_approve")
+		if pipelineIndex >= 0 && attemptIndex >= 0 && updated.Tables.Pipelines[pipelineIndex]["status"] == "done" && updated.Tables.Attempts[attemptIndex]["status"] == "done" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	updated, _ := repo.Load(context.Background())
+	t.Fatalf("async delivery did not complete: pipelines=%+v attempts=%+v", updated.Tables.Pipelines, updated.Tables.Attempts)
 }
 
 func TestRequirementDecomposeProducesStructuredArtifacts(t *testing.T) {
@@ -953,6 +2329,82 @@ func TestCodexRunnerFailureCapturesSupervisedProcessResult(t *testing.T) {
 	}
 	if result.RunnerProcess["exitCode"] != float64(7) || result.RunnerProcess["status"] != "failed" {
 		t.Fatalf("runner process = %+v", result.RunnerProcess)
+	}
+}
+
+func TestSupervisedCommandStreamsOutputAndHeartbeatEvents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script uses POSIX sh")
+	}
+	var mu sync.Mutex
+	seen := []SupervisedCommandEvent{}
+	process, err := runSupervisedCommandContextWithOptions(context.Background(), SupervisedCommandOptions{
+		HeartbeatInterval: 20 * time.Millisecond,
+		OnEvent: func(event SupervisedCommandEvent) {
+			mu.Lock()
+			defer mu.Unlock()
+			seen = append(seen, event)
+		},
+	}, t.TempDir(), "", "sh", "-c", "printf 'stream stdout'; sleep 0.08; printf 'stream stderr' >&2; sleep 0.08")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text(process, "stdout"), "stream stdout") || !strings.Contains(text(process, "stderr"), "stream stderr") {
+		t.Fatalf("process output = %+v", process)
+	}
+	events := arrayMaps(process["events"])
+	if !hasProcessStream(events, "stdout") || !hasProcessStream(events, "stderr") || !hasProcessStream(events, "heartbeat") {
+		t.Fatalf("process events = %+v", events)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) < 3 {
+		t.Fatalf("callback events = %+v", seen)
+	}
+}
+
+func TestRunnerHeartbeatRefreshesAttemptAndLogsTrace(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	seedWorkspace(t, server.Repo)
+	database, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{"id": "item_runner_heartbeat", "projectId": "project_omega", "key": "OMG-heartbeat", "title": "Heartbeat", "status": "In Review", "repositoryTargetId": "repo_heartbeat", "createdAt": nowISO(), "updatedAt": nowISO()}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_runner_heartbeat"
+	attempt["lastSeenAt"] = "2026-04-29T00:00:00Z"
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	if err := server.Repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	server.recordAttemptRunnerHeartbeat(context.Background(), text(pipeline, "id"), text(item, "id"), "attempt_runner_heartbeat", "in_progress", "coding", "codex", SupervisedCommandEvent{
+		Stream:    "stdout",
+		Chunk:     "still working",
+		CreatedAt: "2026-04-29T00:01:00Z",
+	})
+	updated, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAttempt := updated.Tables.Attempts[findByID(updated.Tables.Attempts, "attempt_runner_heartbeat")]
+	if text(updatedAttempt, "lastSeenAt") != "2026-04-29T00:01:00Z" {
+		t.Fatalf("attempt heartbeat = %+v", updatedAttempt)
+	}
+	if !containsEventType(arrayMaps(updatedAttempt["events"]), "runner.stdout") {
+		t.Fatalf("attempt events = %+v", updatedAttempt["events"])
+	}
+	logs, err := server.Repo.ListRuntimeLogs(context.Background(), map[string]string{"eventType": "runner.stdout"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].AttemptID != "attempt_runner_heartbeat" {
+		t.Fatalf("runtime logs = %+v", logs)
 	}
 }
 
@@ -1188,6 +2640,80 @@ func TestObservabilitySummary(t *testing.T) {
 	}
 }
 
+func TestObservabilityDashboardMetrics(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	startedAt := "2026-04-29T09:00:00Z"
+	completedAt := "2026-04-29T09:03:00Z"
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id": "item_dashboard", "projectId": "project_omega", "key": "OMG-dashboard", "title": "Dashboard", "description": "Observe run health.",
+		"status": "In Review", "priority": "High", "assignee": "delivery", "labels": []any{"manual"}, "team": "Omega", "stageId": "human_review", "target": "ZYOOO/TestRepo", "createdAt": startedAt, "updatedAt": completedAt,
+	}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
+		ID:          "devflow-pr",
+		Name:        "DevFlow PR cycle",
+		Description: "DevFlow",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Requirement", Agent: "requirement"},
+			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
+			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
+		},
+	})
+	pipeline["status"] = "waiting-human"
+	checkpoint := map[string]any{"id": "checkpoint_dashboard", "pipelineId": text(pipeline, "id"), "attemptId": "attempt_waiting", "stageId": "human_review", "status": "pending", "title": "Human Review", "createdAt": startedAt, "updatedAt": completedAt}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
+	database.Tables.Attempts = append(database.Tables.Attempts,
+		map[string]any{"id": "attempt_done", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "done", "currentStageId": "done", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "in_progress", "title": "Implementation", "status": "passed", "startedAt": startedAt, "completedAt": completedAt}}},
+		map[string]any{"id": "attempt_failed", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "failed", "currentStageId": "in_progress", "errorMessage": "tests failed", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "code_review", "title": "Review", "status": "failed", "durationMs": 240000}}},
+		map[string]any{"id": "attempt_running", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "running", "currentStageId": "in_progress", "lastSeenAt": startedAt, "startedAt": startedAt, "updatedAt": startedAt, "stages": []map[string]any{}},
+		map[string]any{"id": "attempt_waiting", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "waiting-human", "currentStageId": "human_review", "lastSeenAt": completedAt, "startedAt": startedAt, "updatedAt": completedAt, "stages": []map[string]any{}},
+	)
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var summary map[string]any
+	decode(t, mustGet(t, api.URL+"/observability"), &summary)
+	counts := mapValue(summary["counts"])
+	if counts["attempts"].(float64) != 4 {
+		t.Fatalf("attempt count = %+v", counts)
+	}
+	dashboard := mapValue(summary["dashboard"])
+	attempts := mapValue(dashboard["attempts"])
+	if attempts["total"].(float64) != 4 || attempts["terminal"].(float64) != 2 || attempts["active"].(float64) != 1 {
+		t.Fatalf("attempt dashboard = %+v", attempts)
+	}
+	if attempts["successRate"].(float64) != 0.5 {
+		t.Fatalf("success rate = %+v", attempts["successRate"])
+	}
+	failures := arrayMaps(dashboard["failureReasons"])
+	if len(failures) == 0 || failures[0]["reason"] != "tests failed" {
+		t.Fatalf("failure reasons = %+v", failures)
+	}
+	slowStages := arrayMaps(dashboard["slowStages"])
+	if len(slowStages) == 0 || slowStages[0]["stageId"] != "code_review" {
+		t.Fatalf("slow stages = %+v", slowStages)
+	}
+	waiting := arrayMaps(dashboard["waitingHumanQueue"])
+	if len(waiting) != 1 || waiting[0]["checkpointId"] != "checkpoint_dashboard" {
+		t.Fatalf("waiting queue = %+v", waiting)
+	}
+	activeRuns := arrayMaps(dashboard["activeRuns"])
+	if len(activeRuns) != 2 {
+		t.Fatalf("active runs = %+v", activeRuns)
+	}
+	actions := arrayMaps(dashboard["recommendedActions"])
+	if len(actions) == 0 {
+		t.Fatalf("recommended actions missing: %+v", dashboard)
+	}
+}
+
 func TestGitHubIssueImportUsesGhAndPersistsWorkItems(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake shell gh script uses POSIX sh")
@@ -1280,6 +2806,33 @@ func TestOrchestratorTickClaimsNextGitHubIssueAndCreatesDevFlowPipeline(t *testi
 	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	codex := filepath.Join(bin, "codex")
+	codexScript := `#!/bin/sh
+prompt="$(cat)"
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    output="$1"
+  fi
+  shift
+done
+if printf '%s' "$prompt" | grep -q "You are the review agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Review' '' 'Verdict: APPROVED' '' 'The change satisfies the requirement.' > "$output"
+  fi
+  echo "fake review agent approved"
+  exit 0
+fi
+printf '%s\n' '# Claimed issue proof' '' 'Implemented by fake codex for auto-run.' > omega-claimed-proof.md
+if [ -n "$output" ]; then
+  echo "fake coding agent completed" > "$output"
+fi
+echo "fake coding agent completed"
+`
+	if err := os.WriteFile(codex, []byte(codexScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	decode(t, postJSON(t, api.URL+"/github/bind-repository-target", map[string]any{
@@ -1336,6 +2889,33 @@ func TestOrchestratorTickSkipsIssuesWithoutReadyLabel(t *testing.T) {
 	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	codex := filepath.Join(bin, "codex")
+	codexScript := `#!/bin/sh
+prompt="$(cat)"
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    output="$1"
+  fi
+  shift
+done
+if printf '%s' "$prompt" | grep -q "You are the review agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Review' '' 'Verdict: APPROVED' '' 'The change satisfies the requirement.' > "$output"
+  fi
+  echo "fake review agent approved"
+  exit 0
+fi
+printf '%s\n' '# Claimed issue proof' '' 'Implemented by fake codex for auto-run.' > omega-claimed-proof.md
+if [ -n "$output" ]; then
+  echo "fake coding agent completed" > "$output"
+fi
+echo "fake coding agent completed"
+`
+	if err := os.WriteFile(codex, []byte(codexScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	decode(t, postJSON(t, api.URL+"/github/bind-repository-target", map[string]any{
@@ -1386,6 +2966,33 @@ else
 fi
 `, ghLog)
 	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	codex := filepath.Join(bin, "codex")
+	codexScript := `#!/bin/sh
+prompt="$(cat)"
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    output="$1"
+  fi
+  shift
+done
+if printf '%s' "$prompt" | grep -q "You are the review agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Review' '' 'Verdict: APPROVED' '' 'The change satisfies the requirement.' > "$output"
+  fi
+  echo "fake review agent approved"
+  exit 0
+fi
+printf '%s\n' '# Claimed issue proof' '' 'Implemented by fake codex for auto-run.' > omega-claimed-proof.md
+if [ -n "$output" ]; then
+  echo "fake coding agent completed" > "$output"
+fi
+echo "fake coding agent completed"
+`
+	if err := os.WriteFile(codex, []byte(codexScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1444,14 +3051,37 @@ fi
 	if raw, err := os.ReadFile(ghLog); err != nil || !strings.Contains(string(raw), "issue list") {
 		t.Fatalf("gh log = %s err=%v", string(raw), err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
+	completed := false
 	for time.Now().Before(deadline) {
 		var refreshed WorkspaceDatabase
 		decode(t, mustGet(t, api.URL+"/workspace"), &refreshed)
 		if len(refreshed.Tables.Attempts) == 1 && refreshed.Tables.Attempts[0]["status"] != "running" {
+			completed = true
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
+	}
+	if !completed {
+		var refreshed WorkspaceDatabase
+		decode(t, mustGet(t, api.URL+"/workspace"), &refreshed)
+		t.Fatalf("auto-run attempt did not settle before cleanup: %+v", refreshed.Tables.Attempts)
+	}
+	lockReleased := false
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var refreshedLocks []map[string]any
+		decode(t, mustGet(t, api.URL+"/execution-locks"), &refreshedLocks)
+		if len(refreshedLocks) == 1 && refreshedLocks[0]["status"] == "released" {
+			lockReleased = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !lockReleased {
+		var refreshedLocks []map[string]any
+		decode(t, mustGet(t, api.URL+"/execution-locks"), &refreshedLocks)
+		t.Fatalf("auto-run lock did not release before cleanup: %+v", refreshedLocks)
 	}
 }
 
@@ -1710,9 +3340,59 @@ exit 1
 	if len(checks) != 2 || checks[0]["name"] != "lint" || checks[1]["state"] != "PENDING" {
 		t.Fatalf("checks = %+v", checks)
 	}
+	checkSummary := mapValue(result["checkSummary"])
+	if checkSummary["passed"].(float64) != 1 || checkSummary["pending"].(float64) != 1 || checkSummary["failed"].(float64) != 0 {
+		t.Fatalf("check summary = %+v", checkSummary)
+	}
 	proofs := arrayMaps(result["proofRecords"])
 	if len(proofs) != 3 || proofs[0]["label"] != "pull-request" || proofs[1]["label"] != "check" {
 		t.Fatalf("proof records = %+v", proofs)
+	}
+	actions := arrayMaps(result["recommendedActions"])
+	if len(actions) != 1 || actions[0]["type"] != "checks-pending" {
+		t.Fatalf("recommended actions = %+v", actions)
+	}
+	branchSync := mapValue(result["branchSync"])
+	if branchSync["status"] != "unknown" {
+		t.Fatalf("branch sync = %+v", branchSync)
+	}
+}
+
+func TestGitHubPRStatusClassifiesFailedChecks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell gh script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	gh := filepath.Join(bin, "gh")
+	script := `#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s' '{"number":13,"title":"Omega delivery","state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","headRefName":"omega/OMG-2-coding","baseRefName":"main","url":"https://github.com/acme/demo/pull/13"}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
+  printf '%s' '[{"name":"lint","state":"FAILURE","link":"https://github.com/acme/demo/actions/runs/3"},{"name":"test","state":"SUCCESS","link":"https://github.com/acme/demo/actions/runs/4"}]'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var result map[string]any
+	decode(t, postJSON(t, api.URL+"/github/pr-status", map[string]any{"repositoryOwner": "acme", "repositoryName": "demo", "number": 13}), &result)
+	if result["deliveryGate"] != "blocked" {
+		t.Fatalf("delivery gate = %+v", result)
+	}
+	checkSummary := mapValue(result["checkSummary"])
+	if checkSummary["failed"].(float64) != 1 || len(arrayMaps(checkSummary["failedChecks"])) != 1 {
+		t.Fatalf("check summary = %+v", checkSummary)
+	}
+	actions := arrayMaps(result["recommendedActions"])
+	if len(actions) == 0 || actions[0]["type"] != "checks-failed" {
+		t.Fatalf("recommended actions = %+v", actions)
 	}
 }
 
@@ -2455,6 +4135,24 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if pipelineIndex < 0 || linkedDatabase.Tables.Pipelines[pipelineIndex]["templateId"] != "page-pilot" {
 		t.Fatalf("Page Pilot pipeline missing: %+v", linkedDatabase.Tables.Pipelines)
 	}
+	pagePilotProofs := 0
+	for _, proof := range linkedDatabase.Tables.ProofRecords {
+		if strings.Contains(text(proof, "operationId"), text(storedRun, "pipelineId")) {
+			pagePilotProofs++
+		}
+	}
+	if pagePilotProofs == 0 {
+		t.Fatalf("Page Pilot proof records missing: %+v", linkedDatabase.Tables.ProofRecords)
+	}
+	pagePilotOperations := 0
+	for _, operation := range linkedDatabase.Tables.Operations {
+		if strings.Contains(text(operation, "missionId"), text(storedRun, "pipelineId")) && text(operation, "agentId") == "page-pilot" {
+			pagePilotOperations++
+		}
+	}
+	if pagePilotOperations == 0 {
+		t.Fatalf("Page Pilot operation record missing: %+v", linkedDatabase.Tables.Operations)
+	}
 	var runs []map[string]any
 	decode(t, mustGet(t, api.URL+"/page-pilot/runs"), &runs)
 	if len(runs) != 1 || runs[0]["id"] != runID || runs[0]["status"] != "applied" {
@@ -2471,6 +4169,18 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "Old headline") {
 		t.Fatalf("source not discarded: %s", raw)
+	}
+	discardedDatabase, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	discardedItemIndex := findByID(discardedDatabase.Tables.WorkItems, text(discarded, "workItemId"))
+	if discardedItemIndex < 0 || discardedDatabase.Tables.WorkItems[discardedItemIndex]["status"] != "Blocked" {
+		t.Fatalf("discarded Page Pilot work item status = %+v", discardedDatabase.Tables.WorkItems)
+	}
+	discardedPipelineIndex := findByID(discardedDatabase.Tables.Pipelines, text(discarded, "pipelineId"))
+	if discardedPipelineIndex < 0 || discardedDatabase.Tables.Pipelines[discardedPipelineIndex]["status"] != "discarded" {
+		t.Fatalf("discarded Page Pilot pipeline status = %+v", discardedDatabase.Tables.Pipelines)
 	}
 
 	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
@@ -2493,6 +4203,14 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	}), &delivered)
 	if delivered["status"] != "delivered" || delivered["branchName"] != "omega/page-pilot-test" || delivered["commitSha"] == "" {
 		t.Fatalf("delivered = %+v", delivered)
+	}
+	deliveredRun, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipelineIndex = findByID(deliveredRun.Tables.Pipelines, text(delivered, "pipelineId"))
+	if pipelineIndex < 0 || deliveredRun.Tables.Pipelines[pipelineIndex]["status"] != "delivered" {
+		t.Fatalf("Page Pilot delivered pipeline not updated: %+v", deliveredRun.Tables.Pipelines)
 	}
 	if branch := strings.TrimSpace(runGit(t, targetRepo, "branch", "--show-current")); branch != "omega/page-pilot-test" {
 		t.Fatalf("branch = %s", branch)
@@ -2684,6 +4402,24 @@ func decode(t *testing.T, response *http.Response, target any) {
 func containsSuffix(values []string, suffix string) bool {
 	for _, value := range values {
 		if strings.HasSuffix(value, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEventType(events []map[string]any, eventType string) bool {
+	for _, event := range events {
+		if text(event, "type") == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func hasProcessStream(events []map[string]any, stream string) bool {
+	for _, event := range events {
+		if text(event, "stream") == stream {
 			return true
 		}
 	}

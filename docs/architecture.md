@@ -191,7 +191,7 @@ Pipeline stage 支持一个或多个 `agentIds`，implementation 阶段已能同
 /Users/zyong/Projects/Omega/services/local-runtime/workflows/devflow-pr.md
 ```
 
-Go local runtime 会读取该 Markdown 的 front matter，编译出 Pipeline stages、Agent 分配、artifact 输入输出和 review rounds。代码仍保留运行时安全边界、workspace、Attempt、runner、checkpoint、proof 和 GitHub 操作；流程策略本身则逐步迁移到可替换的 Workflow Template。
+Go local runtime 会读取该 Markdown 的 front matter，编译出 Pipeline stages、Agent 分配、artifact 输入输出和 review rounds。Markdown body 的 `Prompt: requirement / architect / coding / testing / rework / review / delivery` 会作为全 Agent 交接契约，要求每个阶段输出可被下一阶段、Human Review 和 Retry 消费的结构化内容。代码仍保留运行时安全边界、workspace、Attempt、runner、checkpoint、proof 和 GitHub 操作；流程策略本身则逐步迁移到可替换的 Workflow Template。
 
 ```text
 Requirement intake
@@ -230,11 +230,19 @@ Requirement intake
 - `POST /orchestrator/tick` + `autoRun`：认领可执行任务后同样创建 Attempt，并交给后台 job 跑完整 PR cycle。
 - `GET /workflow-templates`：返回当前可用 Workflow Template，包括 source、markdown、stages、review rounds。
 
-Human Review 是真实阻塞点，不再由服务端默认自动通过。`run-devflow-cycle` 最多推进到 `waiting-human`：此时 PR 已创建，Review Agent 的 verdict 已记录，Pipeline 停在 `human_review` stage。只有调用 `POST /checkpoints/:id/approve` 后，后端才继续执行 merge / delivery；`request-changes` 会携带拒绝原因回退流程。
+Human Review 是真实阻塞点，不再由服务端默认自动通过。`run-devflow-cycle` 最多推进到 `waiting-human`：此时 PR 已创建，Review Agent 的 verdict 已记录，Pipeline 停在 `human_review` stage。Pending checkpoint 会绑定具体 `attemptId`，确保人工审核继续的是同一次真实执行的 workspace / branch / PR / proof。只有调用 `POST /checkpoints/:id/approve` 后，后端才继续执行 merge / delivery；`request-changes` 会携带拒绝原因回退流程。
 
-这已经解决“HTTP 请求等待整条流程完成”的问题，并完成第一版 `AgentRunner` 抽象。下一步不是继续把执行逻辑塞进 request handler，而是抽出正式 `JobSupervisor`，补齐 heartbeat、stall retry、cancel、timeout、多 turn continuation、worker host 分配和进程崩溃恢复。
+这已经解决“HTTP 请求等待整条流程完成”的问题，并完成第一版 `AgentRunner` 抽象。`JobSupervisor` 已进入 v1：integrity tick、Attempt heartbeat、runner stdout/stderr heartbeat、stalled detection、retry、Attempt cancel、contract-driven timeout/retry、workspace execution lock、workspace cleanup、worker host lease 和 continuation policy metadata 基础版已接入；Codex / opencode / Claude Code runner 已接入 context-aware supervisor，可在 deadline/cancel 时终止子进程。`GET /attempts/:id/timeline` 会按一次 Attempt 聚合 attempt events、pipeline events、stage snapshots、operations、proof records、checkpoints 和 runtime logs，作为排障和人工审核的真实运行时间线。下一步继续补 GitHub polling heartbeat、Git/GitHub command timeout、远端 worker 分配和远端崩溃恢复。功能一生产化内核的当前口径见 `docs/devflow-production-core.md`。
 
 ## 6. 执行安全边界
+
+Omega 同时处理三类“workspace”，必须明确区分：
+
+1. **真实项目目录 / 远端仓库**：用户已有项目或 GitHub remote，是代码来源、权限和默认分支的事实来源。Omega 可以读取 clone URL、default branch、repo-owned `.omega/WORKFLOW.md`，但默认不让 Agent 直接在用户原目录里写代码。
+2. **Omega 隔离执行 workspace**：由 `local_workspace_root` 派生，例如 `~/Omega/workspaces/<item>/repo`。Agent、git commit、push、PR 创建、PR merge、proof 和 lifecycle 都在这里执行。这个目录是写入边界，也是 Human Review approve 后继续 delivery 的工作目录。
+3. **产品里的 Repository Workspace**：Workboard 中的项目上下文，用来绑定 repository target、展示 issues / work items / attempts / proof，不等同于本机真实项目目录。
+
+因此，DevFlow 的原则是：真实项目目录或 remote 负责提供来源，Omega 隔离 workspace 负责执行和写入，Repository Workspace 负责产品语义。即使 repository target 是一个本地路径，运行时也会 clone / checkout 到 Omega workspace 中执行，避免 Agent 直接修改用户正在开发的原目录。`gh pr merge`、branch sync、proof collection 也应基于 Attempt 记录的隔离 `repositoryPath` 执行，而不是基于 Omega 自身仓库或任意全局 cwd。
 
 当前安全原则：
 
@@ -261,6 +269,7 @@ GET  /requirements
 POST /requirements/decompose
 GET  /pipelines
 GET  /attempts
+POST /attempts/:id/cancel
 POST /pipelines/from-work-item
 POST /pipelines/from-template
 POST /pipelines/:id/start
@@ -278,6 +287,8 @@ GET  /operations
 GET  /proof-records
 GET  /execution-locks
 POST /execution-locks/:id/release
+GET  /attempts/:id/timeline
+POST /job-supervisor/tick
 POST /missions/from-work-item
 POST /operations/run
 POST /orchestrator/tick
@@ -339,7 +350,7 @@ OpenAPI 文档位于：
 - 继续拆分 `App.tsx`，把 Workboard 列表、详情、inspector、operator 面板拆成更小组件。
 - Pipeline Template 可编辑化。
 - Agent runner registry 已接入 Codex / opencode / Claude Code 的统一分发骨架；仍需补 runner-specific 模板、timeout/cancel/retry 和 provider 映射。
-- JobSupervisor：heartbeat、stall detection、retry、cancel、timeout、多 turn continuation、worker host 分配和崩溃恢复。
+- JobSupervisor：继续补 GitHub polling、Git/GitHub command timeout、远端 worker 分配和远端崩溃恢复。
 - 更完整的 checkpoint timeline。
 - GitHub issue comment / label 回写。
 - Feishu 审核卡片与回调。

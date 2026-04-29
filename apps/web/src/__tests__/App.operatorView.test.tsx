@@ -39,6 +39,58 @@ describe("App operator view", () => {
     await waitFor(() => expect(screen.getByDisplayValue("/Users/demo/Omega")).toBeInTheDocument());
   });
 
+  it("deletes not-started work items from the workboard", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const workspaceDatabase = (workItems: unknown[]) => ({
+      schemaVersion: 1,
+      savedAt: new Date().toISOString(),
+      tables: {
+        projects: [{ id: "project_omega", name: "Omega", description: "", team: "Omega", status: "Active", labels: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }],
+        requirements: workItems.length ? [{ id: "req_item_manual_1", projectId: "project_omega", title: "Remove stale requirement", rawText: "Remove stale requirement", status: "converted" }] : [],
+        workItems,
+        missionControlStates: [{ runId: "run_req_omega_001", projectId: "project_omega", workItems, events: [], syncIntents: [], updatedAt: new Date().toISOString() }],
+        missionEvents: [],
+        syncIntents: [],
+        connections: [],
+        uiPreferences: [],
+        pipelines: [],
+        attempts: [],
+        checkpoints: [],
+        missions: [],
+        operations: [],
+        proofRecords: []
+      }
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/workspace") && !init) {
+        return Promise.resolve(jsonResponse({ error: "workspace not found" }, 404));
+      }
+      if (url.endsWith("/workspace") && init?.method === "PUT") {
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      if (url.endsWith("/work-items") && init?.method === "POST") {
+        const item = (JSON.parse(String(init.body)) as { item: unknown }).item;
+        return Promise.resolve(jsonResponse(workspaceDatabase([{ ...(item as object), requirementId: "req_item_manual_1" }])));
+      }
+      if (url.endsWith("/work-items/item_manual_1") && init?.method === "DELETE") {
+        return Promise.resolve(jsonResponse(workspaceDatabase([])));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", fetchMock);
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    fireEvent.change(await screen.findByPlaceholderText("Work item title"), { target: { value: "Remove stale requirement" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create item" }));
+    expect(await screen.findByRole("button", { name: "Delete Remove stale requirement" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Remove stale requirement" }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Delete Remove stale requirement" })).not.toBeInTheDocument());
+  });
+
   it("renders Go control-plane observability, provider, templates, and agent contracts", async () => {
     vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
 
@@ -177,12 +229,13 @@ describe("App operator view", () => {
       }
       if (url.endsWith("/observability")) {
         return Promise.resolve(jsonResponse({
-          counts: { workItems: 1, pipelines: 1, checkpoints: 0, missions: 1, operations: 1, proofRecords: 2, events: 3 },
+          counts: { workItems: 1, pipelines: 1, checkpoints: 0, missions: 1, operations: 1, proofRecords: 2, events: 3, runtimeLogs: 2 },
           pipelineStatus: { running: 1 },
           checkpointStatus: {},
           operationStatus: { failed: 1 },
           workItemStatus: {},
-          attention: { waitingHuman: 0, failed: 1, blocked: 0 }
+          attention: { waitingHuman: 0, failed: 1, blocked: 0 },
+          recentErrors: []
         }));
       }
       if (url.endsWith("/pipelines")) {
@@ -237,6 +290,28 @@ describe("App operator view", () => {
           updatedAt: new Date().toISOString()
         }]));
       }
+      if (url.includes("/runtime-logs")) {
+        return Promise.resolve(jsonResponse([
+          {
+            id: "log_error_1",
+            level: "ERROR",
+            eventType: "checkpoint.approve.missing_attempt",
+            message: "Missing attempt was detected.",
+            pipelineId: "pipeline_gh_42",
+            attemptId: "attempt_missing",
+            requestId: "req_42",
+            createdAt: new Date().toISOString()
+          },
+          {
+            id: "log_info_1",
+            level: "INFO",
+            eventType: "devflow.job.started",
+            message: "DevFlow background job started.",
+            pipelineId: "pipeline_gh_42",
+            createdAt: new Date().toISOString()
+          }
+        ]));
+      }
       if (url.endsWith("/llm-provider-selection")) {
         return Promise.resolve(jsonResponse({ providerId: "openai", model: "gpt-5.4-mini", reasoningEffort: "medium" }));
       }
@@ -274,6 +349,9 @@ describe("App operator view", () => {
     expect(screen.getByText("Runner processes")).toBeInTheDocument();
     expect(screen.getByText("operation_coding")).toBeInTheDocument();
     expect(screen.getByText("exit 7")).toBeInTheDocument();
+    expect(screen.getByText("Runtime logs")).toBeInTheDocument();
+    expect(screen.getByText("checkpoint.approve.missing_attempt")).toBeInTheDocument();
+    expect(screen.getByText("Missing attempt was detected.")).toBeInTheDocument();
     expect(screen.getByText("Requirement")).toBeInTheDocument();
     expect(screen.getByText("Coding")).toBeInTheDocument();
   });
@@ -925,6 +1003,7 @@ describe("App operator view", () => {
       }
     };
     let workspaceSnapshot: any = baseWorkspace;
+    let workItemPostCount = 0;
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -935,6 +1014,7 @@ describe("App operator view", () => {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
       if (url.endsWith("/work-items")) {
+        workItemPostCount += 1;
         expect(init).toMatchObject({ method: "POST" });
         const { item } = JSON.parse(String(init?.body));
         expect(item).toMatchObject({
@@ -1042,21 +1122,23 @@ describe("App operator view", () => {
     expect(screen.queryByRole("button", { name: "New item in Ready" })).not.toBeInTheDocument();
     fireEvent.click(await screen.findByRole("button", { name: "New requirement" }));
     fireEvent.focus(await screen.findByPlaceholderText("Title"));
-    fireEvent.change(screen.getByPlaceholderText("Title"), { target: { value: "Create an empty docs file" } });
     fireEvent.change(screen.getByPlaceholderText("Type your description here..."), {
-      target: { value: "## Demo requirement\n\n- Use this app-created requirement as the pipeline entry.\n- Touch `omega-empty.md`." }
+      target: { value: "## Create an empty docs file\n\n- Use this app-created requirement as the pipeline entry.\n- Touch `omega-empty.md`." }
     });
     fireEvent.click(screen.getByRole("button", { name: "Preview" }));
-    expect(screen.getByRole("heading", { name: "Demo requirement" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Create an empty docs file" })).toBeInTheDocument();
     expect(screen.getByText("Use this app-created requirement as the pipeline entry.")).toBeInTheDocument();
     expect(screen.getByText("omega-empty.md")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    const createButton = screen.getByRole("button", { name: "Create" });
+    fireEvent.click(createButton);
+    fireEvent.click(createButton);
 
-    await waitFor(() => expect(screen.getAllByText("Create an empty docs file").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Creating..." })).not.toBeInTheDocument());
+    expect(workItemPostCount).toBe(1);
     const shell = document.querySelector("main.product-shell");
     expect(shell?.className).toContain("inspector-collapsed");
 
-    fireEvent.click(screen.getAllByText("Create an empty docs file")[0]);
+    fireEvent.click(within(screen.getByRole("region", { name: "Work items" })).getByText("Create an empty docs file"));
     expect(screen.getByRole("region", { name: "Work item detail" })).toBeInTheDocument();
     expect(screen.getByText("Acceptance criteria")).toBeInTheDocument();
     expect(shell?.className).toContain("inspector-collapsed");
@@ -1569,6 +1651,27 @@ describe("App operator view", () => {
             blockedByItemIds: [],
             createdAt: now,
             updatedAt: now
+          },
+          {
+            id: "item_page_pilot_waiting",
+            key: "PP-3",
+            projectId: "project_req_omega_001",
+            title: "Page Pilot: kept for review",
+            description: "Page Pilot edit awaiting delivery confirmation",
+            status: "Done",
+            priority: "High",
+            assignee: "page-pilot",
+            labels: ["page-pilot", "live-preview"],
+            team: "Omega",
+            stageId: "page_pilot",
+            target: "https://github.com/ZYOOO/TestRepo",
+            source: "manual",
+            sourceExternalRef: "page-pilot:item_page_pilot_waiting",
+            repositoryTargetId: "repo_ZYOOO_TestRepo",
+            acceptanceCriteria: [],
+            blockedByItemIds: [],
+            createdAt: now,
+            updatedAt: now
           }
         ],
         missionControlStates: [],
@@ -1590,20 +1693,36 @@ describe("App operator view", () => {
       if (url.endsWith("/workspace") && init?.method === "PUT") return Promise.resolve(jsonResponse({ ok: true }));
       if (url.endsWith("/requirements")) return Promise.resolve(jsonResponse([]));
       if (url.endsWith("/pipelines")) {
-        return Promise.resolve(jsonResponse([{
-          id: "pipeline_item_done",
-          workItemId: "item_done",
-          runId: "run_item_done",
-          status: "done",
-          templateId: "devflow-pr",
-          run: {
-            stages: [
-              { id: "requirement", title: "Requirement intake", status: "passed", agentIds: ["master", "requirement"] },
-              { id: "implementation", title: "Implementation and PR", status: "passed", agentIds: ["coding", "testing"] },
-              { id: "review", title: "Review gate", status: "passed", agentIds: ["review", "delivery"] }
-            ]
+        return Promise.resolve(jsonResponse([
+          {
+            id: "pipeline_item_done",
+            workItemId: "item_done",
+            runId: "run_item_done",
+            status: "done",
+            templateId: "devflow-pr",
+            run: {
+              stages: [
+                { id: "requirement", title: "Requirement intake", status: "passed", agentIds: ["master", "requirement"] },
+                { id: "implementation", title: "Implementation and PR", status: "passed", agentIds: ["coding", "testing"] },
+                { id: "review", title: "Review gate", status: "passed", agentIds: ["review", "delivery"] }
+              ]
+            }
+          },
+          {
+            id: "pipeline_item_page_pilot_waiting",
+            workItemId: "item_page_pilot_waiting",
+            runId: "run_item_page_pilot_waiting",
+            status: "waiting-human",
+            templateId: "page-pilot",
+            run: {
+              stages: [
+                { id: "preview_runtime", title: "Preview runtime", status: "passed", agentIds: ["page-pilot"] },
+                { id: "page_editing", title: "Page editing", status: "passed", agentIds: ["page-pilot"] },
+                { id: "delivery", title: "Delivery", status: "waiting-human", agentIds: ["page-pilot"] }
+              ]
+            }
           }
-        }]));
+        ]));
       }
       if (url.endsWith("/attempts")) {
         return Promise.resolve(jsonResponse([{
@@ -1662,8 +1781,8 @@ describe("App operator view", () => {
       }
       if (url.endsWith("/observability")) {
         return Promise.resolve(jsonResponse({
-          counts: { workItems: 2, pipelines: 1, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
-          pipelineStatus: { done: 1 },
+          counts: { workItems: 3, pipelines: 2, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
+          pipelineStatus: { done: 1, "waiting-human": 1 },
           checkpointStatus: {},
           operationStatus: {},
           workItemStatus: {},
@@ -1688,6 +1807,8 @@ describe("App operator view", () => {
     expect(screen.getAllByText("Not started").length).toBeGreaterThan(1);
     expect(screen.getByLabelText(/current progress Rev \+ Ship/)).toBeInTheDocument();
     expect(screen.getAllByText("Rev + Ship")).toHaveLength(1);
+    expect(screen.getByText("Page Pilot: kept for review")).toBeInTheDocument();
+    expect(screen.getByLabelText(/PP-3 current progress Delivery/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Completed" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Delivered requirement"));
@@ -1696,7 +1817,7 @@ describe("App operator view", () => {
     expect(screen.getByText("implementation-summary.md")).toBeInTheDocument();
     expect(screen.getByText("Attempt history")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /ZYOOO\/TestRepo 2/ }));
+    fireEvent.click(screen.getByRole("button", { name: /ZYOOO\/TestRepo 3/ }));
     expect(screen.queryByRole("button", { name: "Run ready issue now" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Configure ZYOOO/TestRepo" }));
@@ -1812,6 +1933,37 @@ describe("App operator view", () => {
           ]
         }]));
       }
+      if (url.endsWith("/attempts/pipeline_item_review%3Aattempt%3A1/timeline")) {
+        return Promise.resolve(jsonResponse({
+          attempt: { id: "pipeline_item_review:attempt:1", itemId: "item_review", pipelineId: "pipeline_item_review", status: "waiting-human" },
+          pipeline: { id: "pipeline_item_review", workItemId: "item_review", status: "waiting-human" },
+          items: [
+            { id: "attempt-event:1", time: now, source: "attempt", level: "INFO", eventType: "attempt.started", message: "Attempt started.", stageId: "implementation" },
+            { id: "runtime-log:1", time: now, source: "runtime-log", level: "INFO", eventType: "checkpoint.pending", message: "Checkpoint pending.", stageId: "human_review" }
+          ],
+          generatedAt: now
+        }));
+      }
+      if (url.endsWith("/github/pr-status") && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          url: "https://github.com/ZYOOO/TestRepo/pull/18",
+          repositoryOwner: "ZYOOO",
+          repositoryName: "TestRepo"
+        });
+        return Promise.resolve(jsonResponse({
+          number: 18,
+          title: "Add registration page",
+          state: "OPEN",
+          mergeable: "MERGEABLE",
+          reviewDecision: "APPROVED",
+          headRefName: "omega/OMG-8-devflow",
+          baseRefName: "main",
+          url: "https://github.com/ZYOOO/TestRepo/pull/18",
+          deliveryGate: "ready",
+          checks: [{ name: "lint", state: "SUCCESS", link: "https://github.com/ZYOOO/TestRepo/actions/runs/1" }],
+          proofRecords: []
+        }));
+      }
       if (url.endsWith("/checkpoints")) {
         return Promise.resolve(jsonResponse([{
           id: "pipeline_item_review:human_review",
@@ -1848,12 +2000,17 @@ describe("App operator view", () => {
 
     fireEvent.click((await screen.findAllByText("Add registration page"))[0]);
 
-    expect(await screen.findByText("Omega review")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Approve delivery" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "https://github.com/ZYOOO/TestRepo/pull/18" })).toHaveAttribute("href", "https://github.com/ZYOOO/TestRepo/pull/18");
     expect(screen.getByText("Changed")).toBeInTheDocument();
     expect(screen.getAllByText("code-review-round-2-cycle-3.md").length).toBeGreaterThan(0);
     expect(screen.getByText("Validation")).toBeInTheDocument();
     expect(screen.getByText("Review approved the current diff.")).toBeInTheDocument();
+    expect(await screen.findByText("Run timeline")).toBeInTheDocument();
+    expect(screen.getByText("checkpoint.pending")).toBeInTheDocument();
+    expect(await screen.findByText("PR lifecycle")).toBeInTheDocument();
+    expect(screen.getByText("APPROVED")).toBeInTheDocument();
+    expect(screen.getByText("SUCCESS")).toBeInTheDocument();
     expect(screen.getByLabelText("Human review comment")).toBeInTheDocument();
   });
 

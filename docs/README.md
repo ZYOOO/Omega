@@ -13,6 +13,8 @@
 - `persistence-schema.md`：当前 SQLite / Product Layer 持久化模型。
 - `manual-testing-guide.md`：本地手动验证流程。
 - `omega-devflow-workflow.md`：当前 repository-backed delivery workflow。
+- `devflow-production-core.md`：功能一生产化内核，记录 workflow runtime、runner telemetry、PR checks、workspace lifecycle 和 execution lock 的当前做法。
+- `omega-cli.md`：本地 operator CLI 的命令、架构约束和使用说明。
 - `openapi.yaml`：本地 REST API 文档。
 - `todo.md`：开发任务清单。
 

@@ -1,10 +1,11 @@
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   buildAuthorizeUrl,
   connectionProviders,
   createActivityFeed,
   createMissionFromRun,
   createSampleRun,
+  createManualWorkItem,
   createWorkboardView,
   applyMissionControlEvents,
   groupWorkItemsByStatus,
@@ -12,6 +13,7 @@ import {
   loadWorkspaceSession,
   revokeProviderConnection,
   saveWorkspaceSession,
+  titleFromMarkdownDescription,
   updateWorkItemPriority,
   updateWorkItemStatus
 } from "./core";
@@ -19,14 +21,14 @@ import { runOperationViaMissionControlApi } from "./missionControlApiClient";
 import type { MissionControlRunnerPreset } from "./missionControlApiClient";
 import { navigateToExternalUrl } from "./browserNavigation";
 import { openExternalUrlInNewTab } from "./browserNavigation";
+import { retryReasonForAttempt } from "./attemptRetryReason";
 import { PagePilotPreview } from "./components/PagePilotPreview";
 import { PortalHome } from "./components/PortalHome";
-import {
-  AgentTraceList,
-  ArtifactGrid,
-  AttemptHistory,
-  WorkItemAttemptPanel
-} from "./components/WorkItemDetailPanels";
+import { ProjectSurface } from "./components/ProjectSurface";
+import { RequirementComposer } from "./components/RequirementComposer";
+import { WorkspaceChrome, type PrimaryNav, type UiTheme } from "./components/WorkspaceChrome";
+import { WorkItemDetailPage } from "./components/WorkItemDetailPage";
+import { isWorkItemDetailHash, parseWorkItemDetailHash, workItemDetailHash } from "./workItemRoutes";
 import {
   applyPagePilotInstruction,
   approveCheckpoint,
@@ -34,10 +36,12 @@ import {
   deliverPagePilotChange,
   discardPagePilotRun,
   fetchAttempts,
+  fetchAttemptTimeline,
   fetchExecutionLocks,
   fetchCheckpoints,
   fetchAgentDefinitions,
   fetchGitHubOAuthConfig,
+  fetchGitHubPullRequestStatus,
   fetchGitHubRepositories,
   fetchLocalCapabilities,
   fetchLocalWorkspaceRoot,
@@ -53,8 +57,11 @@ import {
   fetchProofRecords,
   fetchProjectAgentProfile,
   fetchRequirements,
+  fetchRunWorkpads,
+  fetchRuntimeLogs,
   releaseExecutionLock,
   requestCheckpointChanges,
+  retryAttempt,
   runCurrentPipelineStage,
   runDevFlowCycle,
   sendFeishuNotification,
@@ -68,9 +75,11 @@ import {
   updateProjectAgentProfile,
   type AgentDefinitionInfo,
   type AttemptRecordInfo,
+  type AttemptTimelineInfo,
   type CheckpointRecordInfo,
   type ExecutionLockInfo,
   type GitHubOAuthConfigInfo,
+  type GitHubPullRequestStatusResult,
   type GitHubStatusInfo,
   type GitHubRepositoryInfo,
   type LocalCapabilityInfo,
@@ -84,11 +93,14 @@ import {
   type PipelineTemplateInfo,
   type ProjectAgentProfileInfo,
   type ProofRecordInfo,
-  type RequirementRecordInfo
+  type RequirementRecordInfo,
+  type RunWorkpadRecordInfo,
+  type RuntimeLogRecordInfo
 } from "./omegaControlApiClient";
 import {
   bindGitHubRepositoryTargetViaApi,
   createWorkItemViaApi,
+  deleteWorkItemViaApi,
   deleteRepositoryTargetViaApi,
   fetchMissionFromWorkItem,
   fetchWorkspaceSession,
@@ -100,10 +112,8 @@ import {
 import type { ConnectionProvider, ProjectRecord, ProviderId, WorkItem, WorkItemPriority, WorkItemStatus, WorkboardViewSort } from "./core";
 import "./styles.css";
 
-type PrimaryNav = "Projects" | "Views" | "Issues" | "Page Pilot" | "Settings";
 type InspectorPanel = "properties" | "provider";
 type AppSurface = "home" | "workboard";
-type UiTheme = "light" | "dark";
 type AgentConfigTab = "workflow" | "agents" | "runtime";
 type RuntimeConfigTab = "omega" | "codex" | "claude";
 type AgentProfileDraft = {
@@ -144,10 +154,6 @@ const agentRunnerOptions: Array<{
   { value: "local-proof", label: "local-proof" }
 ];
 
-function primaryNavLabel(nav: PrimaryNav) {
-  return nav === "Issues" ? "Work items" : nav;
-}
-
 function InfoIcon() {
   return (
     <svg className="info-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -158,18 +164,22 @@ function InfoIcon() {
   );
 }
 
-function topbarSearchPlaceholder(nav: PrimaryNav) {
-  if (nav === "Issues") return "Search work items...";
-  if (nav === "Page Pilot") return "Search Page Pilot runs...";
-  if (nav === "Settings") return "Search settings...";
-  return "Search...";
-}
-
 function initialAppSurface(): AppSurface {
   if (typeof window === "undefined") return "home";
   if (window.location.hash === "#home") return "home";
   if (window.location.hash === "#workboard") return "workboard";
+  if (isWorkItemDetailHash(window.location.hash)) return "workboard";
   return import.meta.env.MODE === "test" ? "workboard" : "home";
+}
+
+function initialActiveNav(savedNav: PrimaryNav): PrimaryNav {
+  if (typeof window !== "undefined" && isWorkItemDetailHash(window.location.hash)) return "Issues";
+  return savedNav;
+}
+
+function initialWorkItemDetailId(): string {
+  if (typeof window === "undefined") return "";
+  return parseWorkItemDetailHash(window.location.hash);
 }
 
 function initialUiTheme(): UiTheme {
@@ -351,33 +361,6 @@ const visibleConnectionProviders = connectionProviders.filter((provider) =>
   ["github", "feishu", "google", "ci"].includes(provider.id)
 );
 
-function createManualWorkItem(
-  index: number,
-  title: string,
-  description: string,
-  assignee: string,
-  target: string,
-  repositoryTargetId?: string
-): WorkItem {
-  return {
-    id: `item_manual_${index}`,
-    key: `OMG-${index}`,
-    title,
-    description,
-    status: "Ready",
-    priority: "High",
-    assignee,
-    labels: ["manual", "ai-delivery"],
-    team: "Omega",
-    stageId: "intake",
-    target,
-    source: "manual",
-    repositoryTargetId,
-    acceptanceCriteria: ["The requested change can be verified by a human reviewer."],
-    blockedByItemIds: []
-  };
-}
-
 function agentShortLabel(agentId: string): string {
   const labels: Record<string, string> = {
     master: "Master",
@@ -423,6 +406,7 @@ function attemptStatusLabel(status: string): string {
   const labels: Record<string, string> = {
     running: "Running",
     "waiting-human": "Waiting for review",
+    "changes-requested": "Changes requested",
     failed: "Failed",
     done: "Done",
     completed: "Done",
@@ -452,42 +436,33 @@ function workItemDisplayLabel(item: WorkItem): string {
   return number ? `Work item ${number}` : "Work item";
 }
 
-function runnerMessageSummary(message: string): string {
-  const lower = message.toLowerCase();
-  if (lower.includes("failed")) return "Run needs attention";
-  if (lower.includes("completed") || lower.includes("passed")) return "Run updated";
-  if (lower.includes("pipeline started") || lower.includes("running")) return "Pipeline running";
-  if (lower.includes("sync")) return "Sync updated";
-  return "Status updated";
-}
-
 function displayText(value: string): string {
   return value.replace(/\\n/g, "\n");
 }
 
 function isCompletedWork(item: WorkItem, pipeline?: PipelineRecordInfo): boolean {
-  return item.status === "Done" || pipeline?.status === "done";
+  return runtimeStatusForWorkItem(item, pipeline) === "Done" || pipeline?.status === "done" || pipeline?.status === "delivered";
 }
 
 function isFailedWork(item: WorkItem, pipeline?: PipelineRecordInfo): boolean {
-  return item.status === "Blocked" || pipeline?.status === "failed";
+  return runtimeStatusForWorkItem(item, pipeline) === "Blocked" || pipeline?.status === "failed" || pipeline?.status === "discarded";
 }
 
-function fileNameFromPath(value: string): string {
-  return value.split(/[\\/]/).pop() ?? value;
+function isPagePilotWorkItem(item: WorkItem): boolean {
+  return item.labels.includes("page-pilot") || item.sourceExternalRef?.startsWith("page-pilot:") === true;
 }
 
-function proofKindLabel(value: string): string {
-  const lower = value.toLowerCase();
-  if (lower.includes("requirement")) return "Requirement";
-  if (lower.includes("solution") || lower.includes("plan")) return "Solution";
-  if (lower.includes("diff") || lower.includes("implementation") || lower.includes("change")) return "Diff";
-  if (lower.includes("test") || lower.includes("check")) return "Test";
-  if (lower.includes("review")) return "Review";
-  if (lower.includes("pr") || lower.includes("pull")) return "PR";
-  if (lower.includes("merge") || lower.includes("delivery")) return "Merge";
-  if (lower.includes("handoff")) return "Handoff";
-  return "Artifact";
+function runtimeStatusForWorkItem(item: WorkItem, pipeline?: PipelineRecordInfo): WorkItemStatus {
+  if (!isPagePilotWorkItem(item)) return item.status;
+  if (pipeline?.status === "waiting-human") return "In Review";
+  if (pipeline?.status === "discarded" || pipeline?.status === "failed") return "Blocked";
+  if (pipeline?.status === "delivered" || pipeline?.status === "done") return "Done";
+  return item.status;
+}
+
+function applyRuntimeWorkItemStatus(item: WorkItem, pipeline?: PipelineRecordInfo): WorkItem {
+  const status = runtimeStatusForWorkItem(item, pipeline);
+  return status === item.status ? item : { ...item, status };
 }
 
 function operationStatusLabel(status: string): string {
@@ -539,23 +514,6 @@ function summarizePipelineProgress(
     percent,
     status: currentStage.status
   };
-}
-
-interface ProofCard {
-  id: string;
-  kind: string;
-  label: string;
-  stage?: string;
-  path?: string;
-  url?: string;
-}
-
-interface ReviewEventCard {
-  id: string;
-  type: string;
-  message: string;
-  stageId?: string;
-  createdAt?: string;
 }
 
 function safeMarkdownHref(href: string): string | undefined {
@@ -710,14 +668,29 @@ function emptyObservability(): ObservabilitySummary {
       missions: 0,
       operations: 0,
       proofRecords: 0,
-      events: 0
+      events: 0,
+      runtimeLogs: 0
     },
     pipelineStatus: {},
     checkpointStatus: {},
     operationStatus: {},
     workItemStatus: {},
-    attention: { waitingHuman: 0, failed: 0, blocked: 0 }
+    attention: { waitingHuman: 0, failed: 0, blocked: 0 },
+    recentErrors: []
   };
+}
+
+function formatShortTimestamp(value?: string): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(date);
 }
 
 function App() {
@@ -725,7 +698,7 @@ function App() {
   const persistedSession = useMemo(() => loadWorkspaceSession(run), [run.id]);
   const [appSurface, setAppSurface] = useState<AppSurface>(() => initialAppSurface());
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => initialUiTheme());
-  const [activeNav, setActiveNav] = useState<PrimaryNav>(persistedSession.activeNav);
+  const [activeNav, setActiveNav] = useState<PrimaryNav>(() => initialActiveNav(persistedSession.activeNav));
   const [connections, setConnections] = useState(persistedSession.connections);
   const [selectedProviderId, setSelectedProviderId] = useState<ProviderId>(persistedSession.selectedProviderId);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -734,7 +707,7 @@ function App() {
   const [requirements, setRequirements] = useState<RequirementRecordInfo[]>(persistedSession.requirements);
   const [workItems, setWorkItems] = useState<WorkItem[]>(persistedSession.workItems);
   const [selectedWorkItemId, setSelectedWorkItemId] = useState(persistedSession.selectedWorkItemId);
-  const [activeWorkItemDetailId, setActiveWorkItemDetailId] = useState("");
+  const [activeWorkItemDetailId, setActiveWorkItemDetailId] = useState(() => initialWorkItemDetailId());
   const [newItemTitle, setNewItemTitle] = useState("");
   const [newItemDescription, setNewItemDescription] = useState("");
   const [newItemAssignee, setNewItemAssignee] = useState("requirement");
@@ -742,6 +715,8 @@ function App() {
   const [showInlineCreate, setShowInlineCreate] = useState(false);
   const [createComposerExpanded, setCreateComposerExpanded] = useState(false);
   const [createDescriptionMode, setCreateDescriptionMode] = useState<"write" | "preview">("write");
+  const [isCreatingItem, setIsCreatingItem] = useState(false);
+  const creatingItemRef = useRef(false);
   const [runnerMessage, setRunnerMessage] = useState("");
   const [runnerPreset, setRunnerPreset] = useState<MissionControlRunnerPreset>(persistedSession.runnerPreset);
   const [searchQuery, setSearchQuery] = useState("");
@@ -761,9 +736,13 @@ function App() {
   });
   const [pipelines, setPipelines] = useState<PipelineRecordInfo[]>([]);
   const [attempts, setAttempts] = useState<AttemptRecordInfo[]>([]);
+  const [activeAttemptTimeline, setActiveAttemptTimeline] = useState<AttemptTimelineInfo | null>(null);
+  const [activePullRequestStatus, setActivePullRequestStatus] = useState<GitHubPullRequestStatusResult | null>(null);
   const [proofRecords, setProofRecords] = useState<ProofRecordInfo[]>([]);
+  const [runWorkpads, setRunWorkpads] = useState<RunWorkpadRecordInfo[]>([]);
   const [checkpoints, setCheckpoints] = useState<CheckpointRecordInfo[]>([]);
   const [operations, setOperations] = useState<OperationRecordInfo[]>([]);
+  const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogRecordInfo[]>([]);
   const [executionLocks, setExecutionLocks] = useState<ExecutionLockInfo[]>([]);
   const [orchestratorWatchers, setOrchestratorWatchers] = useState<OrchestratorWatcherInfo[]>([]);
   const [localCapabilities, setLocalCapabilities] = useState<LocalCapabilityInfo[]>([]);
@@ -803,6 +782,24 @@ function App() {
   const [workspaceSectionOpen, setWorkspaceSectionOpen] = useState(true);
   const [connectionsSectionOpen, setConnectionsSectionOpen] = useState(true);
 
+  useEffect(() => {
+    function syncDetailRoute() {
+      const itemId = parseWorkItemDetailHash(window.location.hash);
+      if (itemId) {
+        setAppSurface("workboard");
+        setActiveNav("Issues");
+        setActiveWorkItemDetailId(itemId);
+        setInspectorOpen(false);
+        return;
+      }
+      if (window.location.hash === "#workboard" || window.location.hash === "#home") {
+        setActiveWorkItemDetailId("");
+      }
+    }
+    window.addEventListener("hashchange", syncDetailRoute);
+    return () => window.removeEventListener("hashchange", syncDetailRoute);
+  }, []);
+
   const primaryProject = projects[0];
   const repositoryTargets = primaryProject?.repositoryTargets ?? [];
   const repositoryTargetCount = repositoryTargets.length;
@@ -827,12 +824,23 @@ function App() {
     pagePilotRepositoryTarget?.kind === "github"
       ? `${pagePilotRepositoryTarget.owner}/${pagePilotRepositoryTarget.repo}`
       : pagePilotRepositoryTarget?.path ?? "";
+  const pipelinesByWorkItemId = useMemo(() => {
+    const byWorkItem = new Map<string, PipelineRecordInfo>();
+    for (const pipeline of pipelines) {
+      byWorkItem.set(pipeline.workItemId, pipeline);
+    }
+    return byWorkItem;
+  }, [pipelines]);
+  const displayWorkItems = useMemo(
+    () => workItems.map((item) => applyRuntimeWorkItemStatus(item, pipelinesByWorkItemId.get(item.id))),
+    [pipelinesByWorkItemId, workItems]
+  );
   const activeRepositoryWorkspaceKey =
     activeRepositoryWorkspace?.kind === "github"
       ? `${activeRepositoryWorkspace.owner}/${activeRepositoryWorkspace.repo}`
       : activeRepositoryWorkspace?.id ?? "";
   const activeRepositoryWorkspaceItems = activeRepositoryWorkspace
-    ? workItems.filter((item) => item.repositoryTargetId === activeRepositoryWorkspace.id)
+    ? displayWorkItems.filter((item) => item.repositoryTargetId === activeRepositoryWorkspace.id)
     : [];
   const activeRepositoryGitHubItems = activeRepositoryWorkspaceItems.filter((item) => item.source === "github_issue");
   const watcherByRepositoryTargetId = useMemo(
@@ -842,7 +850,7 @@ function App() {
   const activeRepositoryWatcher = activeRepositoryWorkspace ? watcherByRepositoryTargetId.get(activeRepositoryWorkspace.id) : undefined;
   const activeRepositoryWatcherActive = activeRepositoryWatcher?.status === "active";
   const scopedWorkItems =
-    activeNav === "Issues" && activeRepositoryWorkspace ? activeRepositoryWorkspaceItems : workItems;
+    activeNav === "Issues" && activeRepositoryWorkspace ? activeRepositoryWorkspaceItems : displayWorkItems;
 
   const workboardView = useMemo(
     () =>
@@ -868,19 +876,13 @@ function App() {
   }, [searchQuery, workboardView.items]);
 
   const groupedItems = useMemo(() => groupWorkItemsByStatus(filteredItems), [filteredItems]);
-  const selectedWorkItem = scopedWorkItems.find((item) => item.id === selectedWorkItemId) ?? scopedWorkItems[0] ?? workItems[0];
+  const selectedWorkItem = scopedWorkItems.find((item) => item.id === selectedWorkItemId) ?? scopedWorkItems[0] ?? displayWorkItems[0];
   const activeWorkItemDetail = activeNav === "Issues"
-    ? workItems.find((item) => item.id === activeWorkItemDetailId)
+    ? displayWorkItems.find((item) => item.id === activeWorkItemDetailId)
     : undefined;
   const selectedRequirement = selectedWorkItem?.requirementId
     ? requirements.find((requirement) => requirement.id === selectedWorkItem.requirementId)
     : undefined;
-  const activeDetailRequirement = activeWorkItemDetail?.requirementId
-    ? requirements.find((requirement) => requirement.id === activeWorkItemDetail.requirementId)
-    : undefined;
-  const activeDetailSiblingItems = activeDetailRequirement
-    ? workItems.filter((item) => item.requirementId === activeDetailRequirement.id)
-    : [];
   function repositoryLabelForItem(item: WorkItem | undefined): string {
     if (!item) return "";
     const repositoryTarget = item.repositoryTargetId
@@ -890,6 +892,11 @@ function App() {
     if (repositoryTarget?.kind === "local") return repositoryTarget.path;
     return activeRepositoryWorkspaceLabel;
   }
+  const activeDetailRepositoryTarget = activeWorkItemDetail?.repositoryTargetId
+    ? repositoryTargets.find((target) => target.id === activeWorkItemDetail.repositoryTargetId)
+    : undefined;
+  const activeDetailGitHubRepositoryTarget =
+    activeDetailRepositoryTarget?.kind === "github" ? activeDetailRepositoryTarget : undefined;
   const activeDetailRepositoryLabel = repositoryLabelForItem(activeWorkItemDetail);
   const activityFeed = useMemo(
     () => createActivityFeed({ events: missionState.events, syncIntents: missionState.syncIntents }),
@@ -918,28 +925,12 @@ function App() {
   const selectedRepositoryBound = Boolean(selectedRepositoryTarget);
   const activeRepositoryWorkspacePipelines = activeRepositoryWorkspace
     ? pipelines.filter((pipeline) =>
-        workItems.some((item) => item.id === pipeline.workItemId && item.repositoryTargetId === activeRepositoryWorkspace.id)
+        displayWorkItems.some((item) => item.id === pipeline.workItemId && item.repositoryTargetId === activeRepositoryWorkspace.id)
       )
     : [];
-  const pipelinesByWorkItemId = useMemo(() => {
-    const byWorkItem = new Map<string, PipelineRecordInfo>();
-    for (const pipeline of pipelines) {
-      byWorkItem.set(pipeline.workItemId, pipeline);
-    }
-    return byWorkItem;
-  }, [pipelines]);
   const activeDetailPipeline = activeWorkItemDetail
     ? pipelinesByWorkItemId.get(activeWorkItemDetail.id)
     : undefined;
-  const activeDetailCheckpoint = useMemo(
-    () =>
-      activeDetailPipeline
-        ? checkpoints.find((checkpoint) =>
-            checkpoint.pipelineId === activeDetailPipeline.id && checkpoint.status === "pending"
-          )
-        : undefined,
-    [activeDetailPipeline, checkpoints]
-  );
   const attemptsByWorkItemId = useMemo(() => {
     const byWorkItem = new Map<string, AttemptRecordInfo[]>();
     for (const attempt of attempts) {
@@ -959,141 +950,61 @@ function App() {
   const activeDetailCompleted = activeWorkItemDetail
     ? isCompletedWork(activeWorkItemDetail, activeDetailPipeline)
     : false;
-  const activeDetailProofCards = useMemo<ProofCard[]>(() => {
-    if (!activeWorkItemDetail) return [];
-    const cards: ProofCard[] = [];
-    const seen = new Set<string>();
-    const addCard = (input: Omit<ProofCard, "id" | "kind"> & { id?: string; kind?: string }) => {
-      const label = input.label || (input.path ? fileNameFromPath(input.path) : input.url ?? "proof");
-      const key = input.path || input.url || `${input.stage ?? ""}:${label}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      cards.push({
-        id: input.id ?? key,
-        kind: input.kind ?? proofKindLabel(`${label} ${input.path ?? ""} ${input.url ?? ""}`),
-        label,
-        stage: input.stage,
-        path: input.path,
-        url: input.url
+  useEffect(() => {
+    if (!missionControlApiUrl || !activeDetailAttempt?.id) {
+      setActiveAttemptTimeline(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchAttemptTimeline(missionControlApiUrl, activeDetailAttempt.id)
+      .then((timeline) => {
+        if (!cancelled) {
+          setActiveAttemptTimeline(timeline);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setActiveAttemptTimeline(null);
+        }
       });
+    return () => {
+      cancelled = true;
     };
-
-    const activeOperationIds = new Set(
-      operations
-        .filter((operation) => {
-          const pipelineId = activeDetailPipeline?.id ?? activeDetailAttempt?.pipelineId ?? "";
-          const itemId = activeWorkItemDetail.id;
-          const itemKey = activeWorkItemDetail.key;
-          return (
-            Boolean(pipelineId && (operation.id.includes(pipelineId) || operation.missionId?.includes(pipelineId))) ||
-            Boolean(operation.missionId?.includes(itemId)) ||
-            Boolean(operation.missionId?.includes(itemKey)) ||
-            Boolean(operation.prompt?.includes(itemKey))
-          );
-        })
-        .map((operation) => operation.id)
-    );
-    const stageSnapshots = activeDetailAttempt?.stages?.length
-      ? activeDetailAttempt.stages
-      : activeDetailPipeline?.run?.stages ?? [];
-    for (const stage of stageSnapshots) {
-      const evidence = "evidence" in stage && Array.isArray(stage.evidence) ? stage.evidence : [];
-      for (const proof of evidence) {
-        addCard({ label: fileNameFromPath(proof), path: proof, stage: stage.title ?? stage.id });
-      }
+  }, [activeDetailAttempt?.id, missionControlApiUrl]);
+  useEffect(() => {
+    if (!missionControlApiUrl || !activeDetailAttempt?.pullRequestUrl) {
+      setActivePullRequestStatus(null);
+      return;
     }
-
-    const pipelineId = activeDetailPipeline?.id ?? activeDetailAttempt?.pipelineId ?? "";
-    for (const record of proofRecords) {
-      const belongsToPipeline = pipelineId && record.operationId?.includes(pipelineId);
-      const belongsToAttempt = activeDetailAttempt?.id && record.operationId?.includes(activeDetailAttempt.id);
-      const belongsToOperation = record.operationId ? activeOperationIds.has(record.operationId) : false;
-      if (!belongsToPipeline && !belongsToAttempt && !belongsToOperation) continue;
-      if (!record.sourcePath && !record.sourceUrl) continue;
-      addCard({
-        id: record.id,
-        label: record.value || record.label,
-        path: record.sourcePath,
-        url: record.sourceUrl,
-        stage: record.label
-      });
-    }
-    return cards;
-  }, [activeDetailAttempt, activeDetailPipeline, activeWorkItemDetail, operations, proofRecords]);
-  const activeDetailOperations = useMemo(() => {
-    if (!activeWorkItemDetail) return [];
-    const pipelineId = activeDetailPipeline?.id ?? activeDetailAttempt?.pipelineId ?? "";
-    const itemId = activeWorkItemDetail.id;
-    const itemKey = activeWorkItemDetail.key;
-    return [...operations]
-      .filter((operation) => {
-        return (
-          Boolean(pipelineId && (operation.id.includes(pipelineId) || operation.missionId?.includes(pipelineId))) ||
-          Boolean(operation.missionId?.includes(itemId)) ||
-          Boolean(operation.missionId?.includes(itemKey)) ||
-          Boolean(operation.prompt?.includes(itemKey))
-        );
+    let cancelled = false;
+    void fetchGitHubPullRequestStatus(missionControlApiUrl, {
+      url: activeDetailAttempt.pullRequestUrl,
+      repositoryOwner: activeDetailGitHubRepositoryTarget?.owner,
+      repositoryName: activeDetailGitHubRepositoryTarget?.repo,
+      workspacePath: activeDetailAttempt.workspacePath,
+      requiredChecks: activeDetailPipeline?.run?.workflow?.runtime?.requiredChecks
+    })
+      .then((status) => {
+        if (!cancelled) {
+          setActivePullRequestStatus(status);
+        }
       })
-      .sort((left, right) => (left.createdAt ?? left.updatedAt ?? "").localeCompare(right.createdAt ?? right.updatedAt ?? ""));
-  }, [activeDetailAttempt, activeDetailPipeline, activeWorkItemDetail, operations]);
-  const activeFailureOperations = useMemo(
-    () => activeDetailOperations.filter((operation) => operation.status === "failed" || operation.runnerProcess?.status === "failed"),
-    [activeDetailOperations]
-  );
-  const activeFailedStages = useMemo(() => {
-    const stages = activeDetailAttempt?.stages?.length
-      ? activeDetailAttempt.stages
-      : activeDetailPipeline?.run?.stages ?? [];
-    return stages.filter((stage) => stage.status === "failed" || stage.status === "blocked");
-  }, [activeDetailAttempt, activeDetailPipeline]);
-  const activeFailureProofCards = useMemo(() => {
-    if (!activeFailedStages.length) return activeDetailProofCards.filter((proof) => proof.kind === "REVIEW").slice(0, 3);
-    const failedStageNames = new Set(activeFailedStages.flatMap((stage) => [stage.id, stage.title].filter(Boolean) as string[]));
-    return activeDetailProofCards
-      .filter((proof) => proof.kind === "REVIEW" || (proof.stage ? failedStageNames.has(proof.stage) : false))
-      .slice(0, 4);
-  }, [activeDetailProofCards, activeFailedStages]);
-  const activeHumanReviewArtifacts = useMemo(() => {
-    const preferred = /human-review|code-review|review|git-diff|diff|test-report|implementation-summary|rework-summary|solution-plan|changed-files/i;
-    const ranked = activeDetailProofCards
-      .filter((proof) => preferred.test(`${proof.label} ${proof.path ?? ""} ${proof.stage ?? ""} ${proof.kind}`))
-      .sort((left, right) => {
-        const leftReview = /review|human/i.test(`${left.label} ${left.kind} ${left.stage ?? ""}`) ? 0 : 1;
-        const rightReview = /review|human/i.test(`${right.label} ${right.kind} ${right.stage ?? ""}`) ? 0 : 1;
-        return leftReview - rightReview;
+      .catch(() => {
+        if (!cancelled) {
+          setActivePullRequestStatus(null);
+        }
       });
-    return ranked.slice(0, 8);
-  }, [activeDetailProofCards]);
-  const activeHumanReviewEvents = useMemo<ReviewEventCard[]>(() => {
-    const attemptEvents =
-      activeDetailAttempt?.events?.map((event, index) => ({
-        id: `attempt:${activeDetailAttempt.id}:${index}`,
-        type: event.type ?? "event",
-        message: event.message ?? "",
-        stageId: event.stageId,
-        createdAt: event.createdAt
-      })) ?? [];
-    const runEvents =
-      activeDetailPipeline?.run?.events?.map((event, index) => ({
-        id: `run:${activeDetailPipeline.id}:${index}`,
-        type: event.type,
-        message: event.message,
-        stageId: event.stageId,
-        createdAt: event.timestamp
-      })) ?? [];
-    const seen = new Set<string>();
-    return [...attemptEvents, ...runEvents]
-      .filter((event) => {
-        const text = `${event.type} ${event.stageId ?? ""} ${event.message}`.toLowerCase();
-        if (!/(review|rework|coding|test|delivery|human|changes|approve|blocked|passed)/.test(text)) return false;
-        const key = `${event.type}:${event.stageId ?? ""}:${event.message}:${event.createdAt ?? ""}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(-8)
-      .reverse();
-  }, [activeDetailAttempt, activeDetailPipeline]);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeDetailAttempt?.pullRequestUrl,
+    activeDetailAttempt?.workspacePath,
+    activeDetailGitHubRepositoryTarget?.owner,
+    activeDetailGitHubRepositoryTarget?.repo,
+    activeDetailPipeline?.run?.workflow?.runtime?.requiredChecks,
+    missionControlApiUrl
+  ]);
   const proofCountForItem = (item: WorkItem, pipeline?: PipelineRecordInfo): number => {
     const keys = new Set<string>();
     const pipelineId = pipeline?.id ?? "";
@@ -1146,6 +1057,13 @@ function App() {
         .slice(0, 6),
     [operations]
   );
+  const recentRuntimeLogs = useMemo(
+    () =>
+      [...runtimeLogs]
+        .sort((left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? ""))
+        .slice(0, 10),
+    [runtimeLogs]
+  );
 
   async function refreshControlPlane() {
     if (!missionControlApiUrl) return;
@@ -1159,8 +1077,10 @@ function App() {
       nextPipelines,
       nextAttempts,
       nextProofRecords,
+      nextRunWorkpads,
       nextCheckpoints,
       nextOperations,
+      nextRuntimeLogs,
       nextExecutionLocks,
       nextOrchestratorWatchers,
       nextCapabilities,
@@ -1177,8 +1097,10 @@ function App() {
       fetchPipelines(missionControlApiUrl),
       fetchAttempts(missionControlApiUrl).catch(() => []),
       fetchProofRecords(missionControlApiUrl).catch(() => []),
+      fetchRunWorkpads(missionControlApiUrl).catch(() => []),
       fetchCheckpoints(missionControlApiUrl),
       fetchOperations(missionControlApiUrl).catch(() => []),
+      fetchRuntimeLogs(missionControlApiUrl, { limit: 80 }).catch(() => []),
       fetchExecutionLocks(missionControlApiUrl).catch(() => []),
       fetchOrchestratorWatchers(missionControlApiUrl).catch(() => []),
       fetchLocalCapabilities(missionControlApiUrl),
@@ -1195,8 +1117,10 @@ function App() {
     setPipelines(nextPipelines);
     setAttempts(nextAttempts);
     setProofRecords(nextProofRecords);
+    setRunWorkpads(nextRunWorkpads);
     setCheckpoints(nextCheckpoints);
     setOperations(nextOperations);
+    setRuntimeLogs(nextRuntimeLogs);
     setExecutionLocks(nextExecutionLocks);
     setOrchestratorWatchers(nextOrchestratorWatchers);
     setLocalCapabilities(nextCapabilities);
@@ -1230,6 +1154,42 @@ function App() {
     setConnections(session.connections);
   }
 
+  async function refreshExecutionState(options: { includeArtifacts?: boolean } = {}) {
+    if (!missionControlApiUrl) return;
+    const [
+      session,
+      nextPipelines,
+      nextAttempts,
+      nextRunWorkpads,
+      nextCheckpoints
+    ] = await Promise.all([
+      fetchWorkspaceSession(missionControlApiUrl, run).catch(() => null),
+      fetchPipelines(missionControlApiUrl),
+      fetchAttempts(missionControlApiUrl).catch(() => []),
+      fetchRunWorkpads(missionControlApiUrl).catch(() => []),
+      fetchCheckpoints(missionControlApiUrl)
+    ]);
+    if (session) {
+      setProjects(session.projects);
+      setRequirements(session.requirements);
+      setWorkItems(session.workItems);
+      setMissionState(session.missionState);
+      setConnections(session.connections);
+    }
+    setPipelines(nextPipelines);
+    setAttempts(nextAttempts);
+    setRunWorkpads(nextRunWorkpads);
+    setCheckpoints(nextCheckpoints);
+    if (options.includeArtifacts) {
+      const [nextOperations, nextProofRecords] = await Promise.all([
+        fetchOperations(missionControlApiUrl).catch(() => []),
+        fetchProofRecords(missionControlApiUrl).catch(() => [])
+      ]);
+      setOperations(nextOperations);
+      setProofRecords(nextProofRecords);
+    }
+  }
+
   const hasLiveExecution =
     Boolean(runningWorkItemId) ||
     workItems.some((item) => item.status === "Planning" || item.status === "In Review") ||
@@ -1241,9 +1201,8 @@ function App() {
     let cancelled = false;
     const pollExecutionState = async () => {
       try {
-        await refreshControlPlane();
+        await refreshExecutionState();
         if (cancelled) return;
-        await refreshWorkspaceState();
       } catch (error) {
         console.warn("Live execution refresh failed", error);
       }
@@ -1392,8 +1351,14 @@ function App() {
   }, [activeNav, githubRepositories.length, githubRepositoriesLoading]);
 
   async function createItem() {
-    const title = newItemTitle.trim();
-    if (!title) return;
+    if (creatingItemRef.current) return;
+    const description = newItemDescription.trim();
+    const title = newItemTitle.trim() || titleFromMarkdownDescription(description);
+    if (!title) {
+      setRunnerMessage("Add a title or description before creating a requirement.");
+      setCreateComposerExpanded(true);
+      return;
+    }
 
     const target = activeRepositoryWorkspace
       ? activeRepositoryWorkspaceTarget ?? "No target"
@@ -1401,12 +1366,15 @@ function App() {
     const item = createManualWorkItem(
       workItems.length + 1,
       title,
-      newItemDescription.trim() || "No description provided.",
+      description || "No description provided.",
       newItemAssignee,
       target,
       activeRepositoryWorkspace?.id
     );
     try {
+      creatingItemRef.current = true;
+      setIsCreatingItem(true);
+      setRunnerMessage("Creating requirement...");
       if (missionControlApiUrl) {
         const session = await createWorkItemViaApi(missionControlApiUrl, run, item);
         setProjects(session.projects);
@@ -1427,20 +1395,79 @@ function App() {
       setNewItemTarget("");
       setCreateComposerExpanded(false);
       setCreateDescriptionMode("write");
+      setRunnerMessage(`Created requirement ${title}.`);
       setActiveNav("Issues");
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "Create work item failed.");
+    } finally {
+      creatingItemRef.current = false;
+      setIsCreatingItem(false);
     }
   }
 
   function selectWorkItem(item: WorkItem) {
     setSelectedWorkItemId(item.id);
-    setActiveWorkItemDetailId(item.id);
+    openWorkItemDetail(item.id);
     setActiveInspectorPanel("properties");
     setInspectorOpen(false);
     setShowInlineCreate(false);
     setCreateComposerExpanded(false);
     setCreateDescriptionMode("write");
+  }
+
+  function canDeleteWorkItem(item: WorkItem): boolean {
+    return (item.status === "Ready" || item.status === "Backlog") && !pipelinesByWorkItemId.has(item.id) && runningWorkItemId !== item.id;
+  }
+
+  function applyDeletedWorkItemState(nextWorkItems: WorkItem[], deletedItem: WorkItem) {
+    const nextSelectedId = selectedWorkItemId === deletedItem.id ? nextWorkItems[0]?.id ?? "" : selectedWorkItemId;
+    const nextRequirementIds = new Set(nextWorkItems.map((item) => item.requirementId).filter(Boolean));
+    setWorkItems(nextWorkItems);
+    setRequirements((current) =>
+      deletedItem.requirementId && !nextRequirementIds.has(deletedItem.requirementId)
+        ? current.filter((requirement) => requirement.id !== deletedItem.requirementId)
+        : current
+    );
+    setMissionState((current) => ({
+      ...current,
+      workItems: current.workItems.filter((candidate) => candidate.id !== deletedItem.id)
+    }));
+    setSelectedWorkItemId(nextSelectedId);
+    if (activeWorkItemDetailId === deletedItem.id) {
+      setActiveWorkItemDetailId("");
+      window.history.replaceState(null, "", "#workboard");
+    }
+  }
+
+  async function deleteWorkItem(item: WorkItem) {
+    if (!canDeleteWorkItem(item)) {
+      setRunnerMessage("Only not-started items without execution history can be deleted.");
+      return;
+    }
+    const confirmed = window.confirm(`Delete "${item.title}" from Omega?\n\nThis removes the not-started item and its unshared Requirement record.`);
+    if (!confirmed) return;
+    try {
+      setRunnerMessage(`Deleting ${item.key}...`);
+      if (missionControlApiUrl) {
+        const session = await deleteWorkItemViaApi(missionControlApiUrl, run, item.id);
+        setProjects(session.projects);
+        setRequirements(session.requirements);
+        setWorkItems(session.workItems);
+        setMissionState(session.missionState);
+        setConnections(session.connections);
+        setSelectedWorkItemId((current) => (current === item.id ? session.workItems[0]?.id ?? "" : current));
+        if (activeWorkItemDetailId === item.id) {
+          setActiveWorkItemDetailId("");
+          window.history.replaceState(null, "", "#workboard");
+        }
+        setRunnerMessage(`Deleted ${item.key}.`);
+        return;
+      }
+      applyDeletedWorkItemState(workItems.filter((candidate) => candidate.id !== item.id), item);
+      setRunnerMessage(`Deleted ${item.key}.`);
+    } catch (error) {
+      setRunnerMessage(error instanceof Error ? error.message : "Delete work item failed.");
+    }
   }
 
   function clearWorkspaceMessages() {
@@ -1778,6 +1805,25 @@ function App() {
     }
   }
 
+  async function retryWorkItemAttempt(attemptId: string) {
+    if (!missionControlApiUrl || !activeWorkItemDetail) return;
+    const previousAttempt = attempts.find((attempt) => attempt.id === attemptId);
+    setRunningWorkItemId(activeWorkItemDetail.id);
+    setRunnerMessage(`Retrying ${activeWorkItemDetail.key} from attempt ${attemptId}...`);
+    try {
+      const result = await retryAttempt(missionControlApiUrl, attemptId, retryReasonForAttempt(previousAttempt));
+      setRunnerMessage(`Retry attempt started for ${activeWorkItemDetail.key}: ${result.attempt.id}.`);
+      await refreshControlPlane();
+      await refreshWorkspaceState().catch((error) => {
+        console.warn("Workspace refresh after attempt retry failed", error);
+      });
+    } catch (error) {
+      setRunnerMessage(error instanceof Error ? error.message : "Attempt retry failed.");
+    } finally {
+      setRunningWorkItemId("");
+    }
+  }
+
   async function saveLocalWorkspaceRoot() {
     const nextRoot = localWorkspaceRootDraft.trim();
     if (!missionControlApiUrl || !nextRoot) return;
@@ -1877,6 +1923,7 @@ function App() {
       if (activeRepositoryWorkspaceTargetId === targetId) {
         setActiveRepositoryWorkspaceTargetId("");
         setActiveWorkItemDetailId("");
+        window.history.replaceState(null, "", "#workboard");
         setSelectedWorkItemId(session.workItems[0]?.id ?? "");
         setActiveNav("Projects");
         setRunnerMessage(`${label} was removed from Omega.`);
@@ -1989,9 +2036,9 @@ function App() {
     if (!missionControlApiUrl) return;
     try {
       setRunnerMessage(`Approving checkpoint ${checkpointId}...`);
-      await approveCheckpoint(missionControlApiUrl, checkpointId, "human");
-      setRunnerMessage(`Checkpoint ${checkpointId} approved.`);
-      await refreshControlPlane();
+      await approveCheckpoint(missionControlApiUrl, checkpointId, "human", true);
+      setRunnerMessage(`Checkpoint ${checkpointId} approved. Delivery is continuing in the background.`);
+      await refreshExecutionState();
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "Checkpoint approval failed.");
     }
@@ -2009,8 +2056,11 @@ function App() {
     try {
       setRunnerMessage(`Sending checkpoint ${checkpointId} back for changes...`);
       await requestCheckpointChanges(missionControlApiUrl, checkpointId, reason.trim() || "Human requested changes.");
-      setRunnerMessage(`Checkpoint ${checkpointId} sent back for changes.`);
-      await refreshControlPlane();
+      setRunnerMessage(`Checkpoint ${checkpointId} sent back for changes. Rework is queued when the repository target is ready.`);
+      await refreshExecutionState({ includeArtifacts: true });
+      window.setTimeout(() => {
+        void refreshExecutionState({ includeArtifacts: true });
+      }, 1200);
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "Checkpoint rejection failed.");
     }
@@ -2086,6 +2136,13 @@ function App() {
     window.history.replaceState(null, "", "#workboard");
   }
 
+  function openWorkItemDetail(itemId: string) {
+    setAppSurface("workboard");
+    setActiveNav("Issues");
+    setActiveWorkItemDetailId(itemId);
+    window.history.pushState(null, "", workItemDetailHash(itemId));
+  }
+
   function openHome() {
     setAppSurface("home");
     window.history.replaceState(null, "", "#home");
@@ -2130,7 +2187,11 @@ function App() {
     if (!missionControlApiUrl) {
       throw new Error("Page Pilot needs the local runtime.");
     }
-    return discardPagePilotRun(missionControlApiUrl, runId);
+    const result = await discardPagePilotRun(missionControlApiUrl, runId);
+    await refreshControlPlane().catch(() => {
+      setRunnerMessage("Page Pilot discarded, but the workboard refresh failed.");
+    });
+    return result;
   }
 
   async function loadPagePilotRuns() {
@@ -2228,383 +2289,130 @@ function App() {
 
   return (
     <main className={shellClassName}>
-      <aside className="sidebar" aria-label="Workspace navigation">
-        <div className="brand-lockup">
-          <img className="brand-logo" src="/omega-logo.png" alt="Omega AI DevFlow Engine" />
-          <button type="button" className="sidebar-home-button" onClick={openHome}>
-            Home
-          </button>
-        </div>
-
-        <nav className="nav-stack">
-          {(["Projects", "Views", "Issues", "Page Pilot"] as const).map((item) => (
-            <button
-              key={item}
-              className={item === activeNav ? "nav-item active" : "nav-item"}
-              onClick={() => {
-                setActiveNav(item);
-                clearWorkspaceMessages();
-                if (item === "Projects") {
-                  setActiveRepositoryWorkspaceTargetId("");
-                  setActiveWorkItemDetailId("");
-                }
-                if (item === "Views") {
-                  setActiveWorkItemDetailId("");
-                }
-                if (item === "Page Pilot") {
-                  setActiveWorkItemDetailId("");
-                }
-              }}
-            >
-              <span>{primaryNavLabel(item)}</span>
-            </button>
-          ))}
-        </nav>
-
-        {repositoryTargets.length > 0 ? (
-          <details
-            className="sidebar-section workspace-section"
-            open={workspaceSectionOpen}
-            onToggle={(event) => setWorkspaceSectionOpen(event.currentTarget.open)}
-          >
-            <summary>
-              <span className="section-label">Workspaces</span>
-            </summary>
-            <nav className="workspace-stack" aria-label="Project workspaces">
-              {repositoryTargets.map((target) => {
-                const label = target.kind === "github" ? `${target.owner}/${target.repo}` : target.path;
-                const targetItems = workItems.filter((item) => item.repositoryTargetId === target.id);
-                const count = targetItems.length;
-                const selected = target.id === activeRepositoryWorkspaceTargetId;
-                return (
-                  <div key={target.id} className={selected ? "workspace-entry selected" : "workspace-entry"}>
-                    <button
-                      className="workspace-row"
-                      aria-label={`${label} ${count}`}
-                      onClick={() => {
-                        setActiveRepositoryWorkspaceTargetId(target.id);
-                        setSelectedWorkItemId(targetItems[0]?.id ?? "");
-                        setActiveWorkItemDetailId("");
-                        setActiveNav("Issues");
-                        clearWorkspaceMessages();
-                      }}
-                    >
-                      <span className="dot online" aria-hidden="true" />
-                      <span>
-                        <strong>{label}</strong>
-                        <small>{count} items</small>
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      className="workspace-config-button"
-                      aria-label={`Configure ${label}`}
-                      title="Workspace config"
-                      onClick={() => {
-                        setActiveRepositoryWorkspaceTargetId(target.id);
-                        setActiveWorkItemDetailId("");
-                        setActiveNav("Settings");
-                        setAgentConfigOpen(true);
-                        clearWorkspaceMessages();
-                      }}
-                    >
-                      <span aria-hidden="true">⚙</span>
-                    </button>
-                  </div>
-                );
-              })}
-            </nav>
-          </details>
-        ) : null}
-
-        <details
-          className="sidebar-section"
-          open={connectionsSectionOpen}
-          onToggle={(event) => setConnectionsSectionOpen(event.currentTarget.open)}
-        >
-          <summary>
-            <span className="section-label">Connections</span>
-          </summary>
-          <div className="connection-stack">
-            {visibleConnectionProviders.map((provider) => (
-              <button
-                key={provider.id}
-                className={`connection-row ${selectedProviderId === provider.id ? "selected" : ""}`}
-                onClick={() => handleProviderRowClick(provider)}
-              >
-                <span className={connections[provider.id].status === "connected" ? "dot online" : "dot"} />
-                <span>{provider.name}</span>
-                <small>{connections[provider.id].status === "connected" ? "on" : "off"}</small>
-              </button>
-            ))}
-          </div>
-        </details>
-      </aside>
-
-      <section className="workbench">
-        <header className={activeWorkItemDetail ? "topbar detail-mode" : "topbar"}>
-          {activeWorkItemDetail ? (
-            <>
-              <nav className="detail-breadcrumb" aria-label="Issue detail breadcrumb">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveWorkItemDetailId("");
-                    setInspectorOpen(false);
-                  }}
-                >
-                  Work items
-                </button>
-                <span>›</span>
-                {activeDetailRepositoryLabel ? <span>{activeDetailRepositoryLabel}</span> : null}
-                {activeDetailRepositoryLabel ? <span>›</span> : null}
-                <strong>{activeWorkItemDetail.key}</strong>
-                <span>{activeWorkItemDetail.title}</span>
-              </nav>
-              <div className="detail-toolbar">
-                {runnerMessage ? (
-                  <span className="detail-runner-chip" role="status" title={runnerMessage}>
-                    {runnerMessageSummary(runnerMessage)}
-                  </span>
-                ) : null}
-                <button type="button" className="theme-toggle" onClick={toggleUiTheme} aria-label={`Switch to ${uiTheme === "light" ? "night" : "day"} mode`}>
-                  <span aria-hidden="true">{uiTheme === "light" ? "☾" : "☼"}</span>
-                  {uiTheme === "light" ? "Night" : "Day"}
-                </button>
-                <button type="button" onClick={() => navigator.clipboard?.writeText(activeWorkItemDetail.target)}>
-                  Copy target
-                </button>
-                <button
-                  type="button"
-                  className="primary-action"
-                  disabled={
-                    runningWorkItemId === activeWorkItemDetail.id ||
-                    activeWorkItemDetail.status === "Planning" ||
-                    activeWorkItemDetail.status === "In Review"
-                  }
-                  onClick={() => void runItem(activeWorkItemDetail, { force: activeDetailCompleted })}
-                >
-                  {activeDetailCompleted
-                    ? "Rerun"
-                    : runningWorkItemId === activeWorkItemDetail.id
-                      ? "Running..."
-                      : activeWorkItemDetail.status === "Planning"
-                        ? "Planning..."
-                        : isFailedWork(activeWorkItemDetail, activeDetailPipeline)
-                          ? "Retry"
-                        : "Run"}
-                </button>
-              </div>
-            </>
-          ) : (
-            <>
-              <div>
-                <p className="section-label">Omega</p>
-                <h1>{primaryNavLabel(activeNav)}</h1>
-              </div>
-              <div className="search-control">
-                <input
-                  className="command-input"
-                  value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.currentTarget.value)}
-                  placeholder={topbarSearchPlaceholder(activeNav)}
-                />
-                <button type="button">Search</button>
-              </div>
-              <div className="topbar-actions">
-                {activeNav === "Issues" ? (
-                  <button
-                    type="button"
-                    className="topbar-create"
-                    onClick={() => {
-                      setShowInlineCreate((current) => !current);
-                      setCreateComposerExpanded(true);
-                      setCreateDescriptionMode("write");
-                    }}
-                  >
-                    <span className="topbar-create-label">New requirement</span>
-                  </button>
-                ) : null}
-                <button type="button" className="theme-toggle" onClick={toggleUiTheme} aria-label={`Switch to ${uiTheme === "light" ? "night" : "day"} mode`}>
-                  <span aria-hidden="true">{uiTheme === "light" ? "☾" : "☼"}</span>
-                  {uiTheme === "light" ? "Night" : "Day"}
-                </button>
-              </div>
-            </>
-          )}
-        </header>
+      <WorkspaceChrome
+        activeNav={activeNav}
+        activeWorkItemDetail={activeWorkItemDetail}
+        activeDetailRepositoryLabel={activeDetailRepositoryLabel}
+        activeDetailCompleted={activeDetailCompleted}
+        detailRunDisabled={
+          activeWorkItemDetail
+            ? runningWorkItemId === activeWorkItemDetail.id ||
+              activeWorkItemDetail.status === "Planning" ||
+              activeWorkItemDetail.status === "In Review"
+            : false
+        }
+        detailRunLabel={
+          !activeWorkItemDetail
+            ? "Run"
+            : activeDetailCompleted
+              ? "Rerun"
+              : runningWorkItemId === activeWorkItemDetail.id
+                ? "Running..."
+                : activeWorkItemDetail.status === "Planning"
+                  ? "Planning..."
+                  : isFailedWork(activeWorkItemDetail, activeDetailPipeline)
+                    ? "Retry"
+                    : "Run"
+        }
+        runnerMessage={runnerMessage}
+        searchQuery={searchQuery}
+        uiTheme={uiTheme}
+        repositoryTargets={repositoryTargets}
+        workItems={workItems}
+        activeRepositoryWorkspaceTargetId={activeRepositoryWorkspaceTargetId}
+        workspaceSectionOpen={workspaceSectionOpen}
+        connectionsSectionOpen={connectionsSectionOpen}
+        visibleConnectionProviders={visibleConnectionProviders}
+        selectedProviderId={selectedProviderId}
+        connections={connections}
+        onBackToWorkItems={() => {
+          setActiveWorkItemDetailId("");
+          setInspectorOpen(false);
+          window.history.pushState(null, "", "#workboard");
+        }}
+        onHome={openHome}
+        onNavigate={(item) => {
+          setActiveNav(item);
+          clearWorkspaceMessages();
+          if (item === "Projects") {
+            setActiveRepositoryWorkspaceTargetId("");
+            setActiveWorkItemDetailId("");
+            window.history.replaceState(null, "", "#workboard");
+          }
+          if (item === "Views" || item === "Page Pilot") {
+            setActiveWorkItemDetailId("");
+            window.history.replaceState(null, "", "#workboard");
+          }
+        }}
+        onRunDetail={() => {
+          if (activeWorkItemDetail) {
+            void runItem(activeWorkItemDetail, { force: activeDetailCompleted });
+          }
+        }}
+        onSearchChange={setSearchQuery}
+        onToggleTheme={toggleUiTheme}
+        onToggleWorkspaceSection={setWorkspaceSectionOpen}
+        onToggleConnectionsSection={setConnectionsSectionOpen}
+        onSelectWorkspace={(target, targetItems) => {
+          setActiveRepositoryWorkspaceTargetId(target.id);
+          setSelectedWorkItemId(targetItems[0]?.id ?? "");
+          setActiveWorkItemDetailId("");
+          setActiveNav("Issues");
+          window.history.replaceState(null, "", "#workboard");
+          clearWorkspaceMessages();
+        }}
+        onConfigureWorkspace={(target) => {
+          setActiveRepositoryWorkspaceTargetId(target.id);
+          setActiveWorkItemDetailId("");
+          setActiveNav("Settings");
+          setAgentConfigOpen(true);
+          window.history.replaceState(null, "", "#workboard");
+          clearWorkspaceMessages();
+        }}
+        onProviderClick={handleProviderRowClick}
+        onNewRequirement={() => {
+          setShowInlineCreate((current) => !current);
+          setCreateComposerExpanded(true);
+          setCreateDescriptionMode("write");
+        }}
+      >
 
         {activeNav === "Projects" ? (
-          <section className="project-surface">
-            <div className="overview-panel project-hero-panel">
-              <div className="project-hero-copy">
-                <span className="section-label">Project</span>
-                <h2>{primaryProject?.name ?? "Omega Project"}</h2>
-                <p>
-                  {primaryProject?.description ||
-                    "A delivery space that groups requirements, repository workspaces, agent pipelines, human review, and delivery proof."}
-                </p>
-                {repositoryTargets.length > 0 ? (
-                  <div className="target-chip-list" aria-label="Project repository targets">
-                    {repositoryTargets.map((target) => (
-                      <span key={target.id}>
-                        {target.kind === "github" ? `${target.owner}/${target.repo}` : target.path}
-                      </span>
-                    ))}
-                  </div>
-                ) : null}
-                <button
-                  type="button"
-                  className="project-config-link"
-                  onClick={() => {
-                    setActiveNav("Settings");
-                    setAgentConfigOpen(true);
-                  }}
-                >
-                  Project config
-                </button>
-              </div>
-              <div className="project-stat-grid" aria-label="Project delivery summary">
-                <span>
-                  <small>Work items</small>
-                  <strong>{workItems.length}</strong>
-                </span>
-                <span>
-                  <small>Repository workspaces</small>
-                  <strong>{repositoryTargetCount}</strong>
-                </span>
-                <span>
-                  <small>Pipeline runs</small>
-                  <strong>{pipelines.length}</strong>
-                </span>
-              </div>
-              <div className="project-flow-strip" aria-label="Project delivery flow">
-                <span>Requirements</span>
-                <span>Repository Workspace</span>
-                <span>Agent Pipeline</span>
-                <span>Human Review</span>
-                <span>Delivery</span>
-              </div>
-            </div>
-
-            {activeRepositoryWorkspace ? (
-              <div className="overview-panel repository-workspace-panel repository-detail-panel">
-                <div className="control-card-header">
-                  <div>
-                    <span className="section-label">Repository workspace</span>
-                    <h2>{activeRepositoryWorkspaceLabel}</h2>
-                  </div>
-                  <div className="repository-actions">
-                    <button
-                      className="primary-action"
-                      disabled={syncingRepositoryKey === activeRepositoryWorkspaceKey}
-                      onClick={() => {
-                        if (activeRepositoryWorkspace.kind === "github") {
-                          void importGitHubIssues(activeRepositoryWorkspace.owner, activeRepositoryWorkspace.repo);
-                        }
-                      }}
-                    >
-                      {syncingRepositoryKey === activeRepositoryWorkspaceKey ? "Syncing..." : "Sync GitHub issues"}
-                    </button>
-                    <button onClick={() => setActiveNav("Issues")} disabled={activeRepositoryWorkspaceItems.length === 0}>
-                      View work items
-                    </button>
-                  </div>
-                </div>
-                {repositorySyncMessage ? (
-                  <p className="sync-feedback" role="status">
-                    {repositorySyncMessage}
-                  </p>
-                ) : null}
-                <div className="workspace-metrics">
-                  <span>{activeRepositoryWorkspaceItems.length} work items</span>
-                  <span>{activeRepositoryWorkspacePipelines.length} pipelines</span>
-                  <span>0 pull requests</span>
-                </div>
-                <div className="repository-workspace-grid">
-                  <section>
-                    <span className="section-label">Work items</span>
-                    {activeRepositoryWorkspaceItems.length > 0 ? (
-                      <div className="imported-issue-list">
-                        {activeRepositoryWorkspaceItems.slice(0, 8).map((item) => (
-                          <div key={item.id}>
-                            <span>{item.title}</span>
-                            <small>{item.sourceExternalRef ?? item.key}</small>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <p>No work items synced yet.</p>
-                    )}
-                  </section>
-                  <section>
-                    <span className="section-label">Pull requests</span>
-                    <p>No pull requests linked yet.</p>
-                  </section>
-                </div>
-              </div>
-            ) : null}
-
-            <div className="overview-panel repository-panel">
-              <div className="control-card-header">
-                <div>
-                  <span className="section-label">Repository workspace</span>
-                  <h2>Attach GitHub repositories</h2>
-                  <p>Choose the repository targets this Project is allowed to run agents inside.</p>
-                </div>
-                <button onClick={loadGitHubRepositories} disabled={githubRepositoriesLoading}>
-                  {githubRepositoriesLoading ? "Loading..." : "Refresh repositories"}
-                </button>
-              </div>
-              <div className="repository-picker">
-                <label>
-                  <span>Search repositories</span>
-                  <input
-                    value={githubRepositoryQuery}
-                    onChange={(event) => setGitHubRepositoryQuery(event.currentTarget.value)}
-                    placeholder="Search by repo name or description"
-                  />
-                </label>
-                <div className="repository-actions">
-                  <button disabled={!githubRepoOwner || !githubRepoName} className="primary-action" onClick={openSelectedRepositoryWorkspace}>
-                    {selectedRepositoryBound ? "Open workspace" : "Create workspace"}
-                  </button>
-                </div>
-              </div>
-              <div className="repository-list" aria-label="GitHub repositories">
-                {filteredGitHubRepositories.length === 0 ? (
-                  <p>{githubRepositoriesLoading ? "Loading repositories..." : "No repositories loaded. Refresh repositories after connecting GitHub."}</p>
-                ) : (
-                  filteredGitHubRepositories.slice(0, 20).map((repository) => {
-                    const nameWithOwner = repository.nameWithOwner ?? `${repository.owner?.login ?? ""}/${repository.name}`;
-                    const selected = nameWithOwner === `${githubRepoOwner}/${githubRepoName}`;
-                    return (
-                      <button
-                        key={nameWithOwner}
-                        className={selected ? "repository-option selected" : "repository-option"}
-                        onClick={() => selectGitHubRepository(repository)}
-                      >
-                        <span>
-                          <strong>{nameWithOwner}</strong>
-                          <small>{repository.description || "No description"}</small>
-                        </span>
-                        <small>{repository.isPrivate ? "private" : "public"} · {repository.defaultBranchRef?.name || "branch unknown"}</small>
-                      </button>
-                    );
-                  })
-                )}
-              </div>
-              {githubRepoInfo ? (
-                <div className="repository-summary">
-                  <strong>{githubRepoInfo.nameWithOwner ?? `${githubRepoInfo.owner?.login ?? githubRepoOwner}/${githubRepoInfo.name}`}</strong>
-                  <span>{githubRepoInfo.description || "No repository description"}</span>
-                  <small>
-                    {selectedRepositoryBound ? "Attached to project" : "Not attached yet"} · {githubRepoInfo.defaultBranchRef?.name ?? "default branch unknown"}
-                  </small>
-                </div>
-              ) : null}
-            </div>
-          </section>
+          <ProjectSurface
+            primaryProject={primaryProject}
+            repositoryTargets={repositoryTargets}
+            repositoryTargetCount={repositoryTargetCount}
+            workItems={workItems}
+            pipelines={pipelines}
+            activeRepositoryWorkspace={activeRepositoryWorkspace}
+            activeRepositoryWorkspaceLabel={activeRepositoryWorkspaceLabel}
+            activeRepositoryWorkspaceKey={activeRepositoryWorkspaceKey}
+            activeRepositoryWorkspaceItems={activeRepositoryWorkspaceItems}
+            activeRepositoryWorkspacePipelines={activeRepositoryWorkspacePipelines}
+            repositorySyncMessage={repositorySyncMessage}
+            syncingRepositoryKey={syncingRepositoryKey}
+            githubRepositoriesLoading={githubRepositoriesLoading}
+            githubRepositoryQuery={githubRepositoryQuery}
+            githubRepoOwner={githubRepoOwner}
+            githubRepoName={githubRepoName}
+            selectedRepositoryBound={selectedRepositoryBound}
+            filteredGitHubRepositories={filteredGitHubRepositories}
+            githubRepoInfo={githubRepoInfo}
+            onOpenProjectConfig={() => {
+              setActiveNav("Settings");
+              setAgentConfigOpen(true);
+            }}
+            onSyncActiveRepository={() => {
+              if (activeRepositoryWorkspace?.kind === "github") {
+                void importGitHubIssues(activeRepositoryWorkspace.owner, activeRepositoryWorkspace.repo);
+              }
+            }}
+            onOpenWorkItems={() => setActiveNav("Issues")}
+            onRefreshRepositories={loadGitHubRepositories}
+            onRepositoryQueryChange={setGitHubRepositoryQuery}
+            onCreateOrOpenWorkspace={openSelectedRepositoryWorkspace}
+            onSelectGitHubRepository={selectGitHubRepository}
+          />
         ) : null}
 
         {activeNav === "Views" ? (
@@ -2904,6 +2712,37 @@ function App() {
                               </pre>
                             </details>
                           ) : null}
+                        </article>
+                      ))
+                    )}
+                  </div>
+                </article>
+
+                <article className="control-card runtime-log-card">
+                  <div className="control-card-header">
+                    <div>
+                      <span className="section-label">Runtime logs</span>
+                      <h2>{observability.counts.runtimeLogs ?? runtimeLogs.length} entries</h2>
+                    </div>
+                  </div>
+                  <div className="runtime-log-list">
+                    {recentRuntimeLogs.length === 0 ? (
+                      <p className="muted-copy">No runtime logs have been recorded yet.</p>
+                    ) : (
+                      recentRuntimeLogs.map((record) => (
+                        <article key={record.id} className={`runtime-log-row ${record.level.toLowerCase()}`}>
+                          <header>
+                            <span className={`runtime-log-level ${record.level.toLowerCase()}`}>{record.level}</span>
+                            <strong>{record.eventType}</strong>
+                            <time>{formatShortTimestamp(record.createdAt)}</time>
+                          </header>
+                          <p>{record.message}</p>
+                          <div className="runtime-log-meta">
+                            {record.workItemId ? <span>{record.workItemId}</span> : null}
+                            {record.pipelineId ? <span>{record.pipelineId}</span> : null}
+                            {record.attemptId ? <span>{record.attemptId}</span> : null}
+                            {record.requestId ? <span>{record.requestId}</span> : null}
+                          </div>
                         </article>
                       ))
                     )}
@@ -3406,205 +3245,61 @@ function App() {
         {activeNav === "Issues" ? (
           <>
             {activeWorkItemDetail ? (
-              <section className="issue-detail-view" aria-label="Work item detail">
-                <article className="issue-detail-document">
-                  <nav className="detail-breadcrumb" aria-label="Requirement hierarchy">
-                    <span>{activeDetailRepositoryLabel || "Workspace"}</span>
-                    <span>Requirement</span>
-                    <strong>{activeWorkItemDetail.key}</strong>
-                  </nav>
-                  <header className="issue-detail-title">
-                    <div className="issue-detail-state">
-                      <span className={`issue-state ${statusClassName(activeWorkItemDetail.status)}`} aria-hidden="true" />
-                      <span>{workItemStatusLabel(activeWorkItemDetail.status)}</span>
-                    </div>
-                    <h2>{activeWorkItemDetail.title}</h2>
-                    <div className="issue-detail-meta">
-                      <span>{activeWorkItemDetail.key}</span>
-                      <span>{sourceLabel(activeWorkItemDetail)}</span>
-                      {activeWorkItemDetail.sourceExternalRef ? <span>{activeWorkItemDetail.sourceExternalRef}</span> : null}
-                      {activeDetailRepositoryLabel ? <span>{activeDetailRepositoryLabel}</span> : null}
-                      <span>{agentShortLabel(activeWorkItemDetail.assignee)}</span>
-                    </div>
-                  </header>
-
-                  <section className="issue-detail-section">
-                    <h3>Requirement source</h3>
-                    <div className="requirement-source-card">
-                      <div>
-                        <span>{activeDetailRequirement?.source === "github_issue" ? "GitHub issue" : "Manual requirement"}</span>
-                        <strong>{activeDetailRequirement?.title ?? activeWorkItemDetail.title}</strong>
-                      </div>
-                      <div className="requirement-source-meta">
-                        {activeDetailRequirement?.sourceExternalRef ? <span>{activeDetailRequirement.sourceExternalRef}</span> : null}
-                        {activeDetailRequirement?.status ? <span>{activeDetailRequirement.status}</span> : null}
-                        <span>{activeDetailSiblingItems.length || 1} item{(activeDetailSiblingItems.length || 1) === 1 ? "" : "s"}</span>
-                      </div>
-                    </div>
-                    {(activeDetailRequirement?.rawText || activeWorkItemDetail.description) && activeWorkItemDetail.description !== "No description provided." ? (
-                      <div className="issue-detail-copy markdown-content">
-                        {renderMarkdown(activeDetailRequirement?.rawText ?? activeWorkItemDetail.description)}
-                      </div>
-                    ) : (
-                      <p className="muted-copy">No description provided yet.</p>
-                    )}
-                  </section>
-
-                  <section className="issue-detail-section">
-                    <h3>Acceptance criteria</h3>
-                    <ul className="criteria-list">
-                      {activeWorkItemDetail.acceptanceCriteria.map((criterion) => (
-                        <li key={criterion}>{criterion}</li>
-                      ))}
-                    </ul>
-                  </section>
-
-                  <section className="issue-detail-section">
-                    <h3>Current attempt</h3>
-                    <WorkItemAttemptPanel
-                      agentShortLabel={agentShortLabel}
-                      attempt={activeDetailAttempt}
-                      attemptStatusLabel={attemptStatusLabel}
-                      checkpoint={activeDetailCheckpoint}
-                      displayText={displayText}
-                      failedStages={activeFailedStages}
-                      failureOperations={activeFailureOperations}
-                      failureProofCards={activeFailureProofCards}
-                      humanReviewArtifacts={activeHumanReviewArtifacts}
-                      humanReviewEvents={activeHumanReviewEvents}
-                      onApproveCheckpoint={(checkpointId) => void approvePendingCheckpoint(checkpointId)}
-                      onRequestCheckpointChanges={(checkpointId, note) => void rejectPendingCheckpoint(checkpointId, note)}
-                      operationStatusLabel={operationStatusLabel}
-                      pipeline={activeDetailPipeline}
-                      pipelineStageClassName={pipelineStageClassName}
-                      pipelineStageLabel={pipelineStageLabel}
-                    />
-                  </section>
-
-                  <section className="issue-detail-section">
-                    <h3>Delivery flow</h3>
-                    <div className="detail-stage-list">
-                      {activeDetailPipeline?.run?.stages?.length
-                        ? activeDetailPipeline.run.stages.map((stage, index) => {
-                            const agentIds = stage.agentIds ?? (stage.agentId ? [stage.agentId] : []);
-                            return (
-                              <article key={stage.id}>
-                                <span>{index + 1}</span>
-                                <div>
-                                  <strong>{stage.title ?? stage.id}</strong>
-                                  <p>{agentIds.length ? `Agents: ${agentIds.map(agentShortLabel).join(", ")}` : "Agents are assigned by the pipeline template."}</p>
-                                </div>
-                                <small>{pipelineStageLabel(stage.status)}</small>
-                              </article>
-                            );
-                          })
-                        : createMissionFromRun(run, activeWorkItemDetail).operations.map((operation, index) => (
-                            <article key={operation.id}>
-                              <span>{index + 1}</span>
-                              <div>
-                                <strong>{operation.stageId}</strong>
-                                <p>{operation.prompt}</p>
-                              </div>
-                              <small>{operation.status}</small>
-                            </article>
-                          ))}
-                    </div>
-                  </section>
-
-                  <section className="issue-detail-section">
-                    <h3>Agent orchestration</h3>
-                    <AgentTraceList
-                      agentShortLabel={agentShortLabel}
-                      operations={activeDetailOperations}
-                      operationStatusLabel={operationStatusLabel}
-                      pipelineStageClassName={pipelineStageClassName}
-                    />
-                  </section>
-
-                  <section className="issue-detail-section">
-                    <h3>Artifacts</h3>
-                    <ArtifactGrid proofs={activeDetailProofCards} />
-                  </section>
-
-                  <section className="issue-detail-section">
-                    <h3>Target</h3>
-                    <div className="detail-target-box">
-                      <span>{activeWorkItemDetail.target}</span>
-                    </div>
-                  </section>
-
-                  <section className="issue-detail-section">
-                    <h3>Attempt history</h3>
-                    <AttemptHistory attempts={activeDetailAttempts} attemptStatusLabel={attemptStatusLabel} />
-                  </section>
-                </article>
-              </section>
+              <WorkItemDetailPage
+                agentShortLabel={agentShortLabel}
+                attemptStatusLabel={attemptStatusLabel}
+                attemptTimeline={activeAttemptTimeline}
+                attempts={activeDetailAttempts}
+                checkpoints={checkpoints}
+                operations={operations}
+                operationStatusLabel={operationStatusLabel}
+                pipeline={activeDetailPipeline}
+                pipelineStageClassName={pipelineStageClassName}
+                pipelineStageLabel={pipelineStageLabel}
+                proofRecords={proofRecords}
+                pullRequestStatus={activePullRequestStatus}
+                repositoryLabel={activeDetailRepositoryLabel}
+                repositoryTargets={repositoryTargets}
+                requirements={requirements}
+                runWorkpads={runWorkpads}
+                sourceLabel={sourceLabel}
+                statusClassName={statusClassName}
+                workItem={activeWorkItemDetail}
+                workItems={displayWorkItems}
+                workItemStatusLabel={workItemStatusLabel}
+                onApproveCheckpoint={(checkpointId) => void approvePendingCheckpoint(checkpointId)}
+                onRequestCheckpointChanges={(checkpointId, note) => void rejectPendingCheckpoint(checkpointId, note)}
+                onRetryAttempt={(attemptId) => void retryWorkItemAttempt(attemptId)}
+              />
             ) : (
             <>
             {showInlineCreate ? (
-              <section className="inline-create">
-                <div className="inline-create-form">
-                  <label className="inline-title-field">
-                    <span>Add a title *</span>
-                    <input
-                      value={newItemTitle}
-                      onFocus={() => setCreateComposerExpanded(true)}
-                      onChange={(event) => setNewItemTitle(event.currentTarget.value)}
-                      placeholder="Title"
-                    />
-                  </label>
-                  <select value={newItemAssignee} onChange={(event) => setNewItemAssignee(event.currentTarget.value)}>
-                    {["requirement", "architect", "coding", "testing", "review", "delivery"].map((agent) => (
-                      <option key={agent}>{agent}</option>
-                    ))}
-                  </select>
-                  <button className="primary-action" onClick={createItem}>Create</button>
-                  {createComposerExpanded ? (
-                    <div className="description-composer">
-                      <span>Add a description</span>
-                      <div className="composer-tabs">
-                        <button
-                          type="button"
-                          className={createDescriptionMode === "write" ? "active" : ""}
-                          onClick={() => setCreateDescriptionMode("write")}
-                        >
-                          Write
-                        </button>
-                        <button
-                          type="button"
-                          className={createDescriptionMode === "preview" ? "active" : ""}
-                          onClick={() => setCreateDescriptionMode("preview")}
-                        >
-                          Preview
-                        </button>
-                      </div>
-                      {createDescriptionMode === "write" ? (
-                        <textarea
-                          value={newItemDescription}
-                          onChange={(event) => setNewItemDescription(event.currentTarget.value)}
-                          placeholder="Type your description here..."
-                        />
-                      ) : (
-                        <div className="description-preview" aria-label="Description preview">
-                          {newItemDescription.trim() ? (
-                            <div className="markdown-content">{renderMarkdown(newItemDescription)}</div>
-                          ) : (
-                            <p className="muted-copy">Nothing to preview yet.</p>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  ) : null}
-                </div>
-                <aside className="inline-create-note">
-                  <span>Requirement to item</span>
-                  <p>
-                    {activeRepositoryWorkspace
-                      ? `A requirement will be stored under ${activeRepositoryWorkspaceLabel}, then converted into its first executable item.`
-                      : "No repository workspace selected."}
-                  </p>
-                </aside>
-              </section>
+              <RequirementComposer
+                variant="inline"
+                title={newItemTitle}
+                description={newItemDescription}
+                assignee={newItemAssignee}
+                target={newItemTarget}
+                hasRepositoryWorkspace={Boolean(activeRepositoryWorkspace)}
+                repositoryWorkspaceLabel={activeRepositoryWorkspaceLabel}
+                isExpanded={createComposerExpanded}
+                descriptionMode={createDescriptionMode}
+                isCreating={isCreatingItem}
+                descriptionPreview={
+                  newItemDescription.trim() ? (
+                    <div className="markdown-content">{renderMarkdown(newItemDescription)}</div>
+                  ) : (
+                    <p className="muted-copy">Nothing to preview yet.</p>
+                  )
+                }
+                onTitleChange={setNewItemTitle}
+                onDescriptionChange={setNewItemDescription}
+                onAssigneeChange={setNewItemAssignee}
+                onTargetChange={setNewItemTarget}
+                onTitleFocus={() => setCreateComposerExpanded(true)}
+                onDescriptionModeChange={setCreateDescriptionMode}
+                onCreate={createItem}
+              />
             ) : null}
 
             {activeRepositoryWorkspace ? (
@@ -3720,37 +3415,26 @@ function App() {
                   <span />
                   <span />
                 </div>
-                <div className="empty-create">
-                  <div className="empty-copy">
-                    <h2>Create your first work item</h2>
-                    <p>Start the Workboard with a concrete requirement Mission Control can turn into an operation.</p>
-                  </div>
-                  <input
-                    value={newItemTitle}
-                    onChange={(event) => setNewItemTitle(event.currentTarget.value)}
-                    placeholder="Work item title"
-                  />
-                  <textarea
-                    value={newItemDescription}
-                    onChange={(event) => setNewItemDescription(event.currentTarget.value)}
-                    placeholder="Optional description"
-                  />
-                  {activeRepositoryWorkspace ? null : (
-                    <input
-                      value={newItemTarget}
-                      onChange={(event) => setNewItemTarget(event.currentTarget.value)}
-                      placeholder="Local repository path or GitHub repo URL"
-                    />
-                  )}
-                  <div className="empty-create-footer">
-                    <select value={newItemAssignee} onChange={(event) => setNewItemAssignee(event.currentTarget.value)}>
-                      {["requirement", "architect", "coding", "testing", "review", "delivery"].map((agent) => (
-                        <option key={agent}>{agent}</option>
-                      ))}
-                    </select>
-                    <button className="primary-action" onClick={createItem}>Create item</button>
-                  </div>
-                </div>
+                <RequirementComposer
+                  variant="empty"
+                  title={newItemTitle}
+                  description={newItemDescription}
+                  assignee={newItemAssignee}
+                  target={newItemTarget}
+                  hasRepositoryWorkspace={Boolean(activeRepositoryWorkspace)}
+                  repositoryWorkspaceLabel={activeRepositoryWorkspaceLabel}
+                  isExpanded={createComposerExpanded}
+                  descriptionMode={createDescriptionMode}
+                  isCreating={isCreatingItem}
+                  descriptionPreview={null}
+                  onTitleChange={setNewItemTitle}
+                  onDescriptionChange={setNewItemDescription}
+                  onAssigneeChange={setNewItemAssignee}
+                  onTargetChange={setNewItemTarget}
+                  onTitleFocus={() => setCreateComposerExpanded(true)}
+                  onDescriptionModeChange={setCreateDescriptionMode}
+                  onCreate={createItem}
+                />
               </section>
             ) : (
             <>
@@ -3785,17 +3469,35 @@ function App() {
                         const completed = isCompletedWork(item, itemPipeline);
                         const failed = isFailedWork(item, itemPipeline);
                         const runDisabled = completed || runningWorkItemId === item.id || item.status === "Planning" || item.status === "In Review";
-                        const artifactCount = proofCountForItem(item, itemPipeline);
-                        const turnCount = agentTurnCountForItem(item, itemPipeline);
                         const progress = summarizePipelineProgress(item, pipelineStages, runningWorkItemId === item.id);
+                        const hasProgress = pipelineStages.length > 0 || item.status === "Planning" || runningWorkItemId === item.id;
+                        const deleteAllowed = canDeleteWorkItem(item);
                         return (
                           <article
                             key={item.id}
                             className={`issue-row ${selectedWorkItem?.id === item.id ? "selected" : ""} ${pipelineStages.length ? "has-pipeline" : ""}`}
                             onClick={() => selectWorkItem(item)}
                           >
-                            <div className="issue-leading" aria-hidden="true">
-                              <span className="issue-drag">---</span>
+                            <div className="issue-leading">
+                              {deleteAllowed ? (
+                                <button
+                                  type="button"
+                                  className="issue-delete-button"
+                                  aria-label={`Delete ${item.title}`}
+                                  title="Delete not-started item"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void deleteWorkItem(item);
+                                  }}
+                                >
+                                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                                    <path d="M9 3h6l1 2h4v2H4V5h4l1-2Z" />
+                                    <path d="M6 9h12l-1 11H7L6 9Zm4 2v7h2v-7h-2Zm4 0v7h2v-7h-2Z" />
+                                  </svg>
+                                </button>
+                              ) : (
+                                <span className="issue-drag" aria-hidden="true">---</span>
+                              )}
                               <span className={`issue-state ${statusClassName(item.status)}`} />
                             </div>
                             <div className="issue-main">
@@ -3806,19 +3508,19 @@ function App() {
                                 <strong>{item.title}</strong>
                               </div>
                               <div className="issue-meta-line">
-                                <span>{sourceLabel(item)}</span>
                                 {item.sourceExternalRef ? <span>{item.sourceExternalRef}</span> : null}
                                 {item.requirementId ? <span>Req {item.requirementId.replace(/^req_/, "")}</span> : null}
                                 {repositoryLabel ? <span>{repositoryLabel}</span> : null}
                                 <span>{agentShortLabel(item.assignee)}</span>
                               </div>
-                              {pipelineStages.length || item.status === "Planning" || runningWorkItemId === item.id ? (
+                            </div>
+                            <div className="issue-progress-slot">
+                              {hasProgress ? (
                                 <div
                                   className={`issue-progress-track ${pipelineStageClassName(progress.status)}`}
                                   aria-label={`${item.key} current progress ${progress.label}`}
                                 >
                                   <div className="issue-progress-copy">
-                                    <span>{pipelineStageLabel(progress.status)}</span>
                                     <strong>{progress.label}</strong>
                                   </div>
                                   <div className="issue-progress-rail" aria-hidden="true">
@@ -3828,11 +3530,6 @@ function App() {
                               ) : null}
                             </div>
                             <div className="issue-trailing">
-                              {!pipelineStages.length ? (
-                                <span className="issue-chip">
-                                  {turnCount > 0 ? `Turns ${turnCount}` : artifactCount > 0 ? `Artifacts ${artifactCount}` : "Trace"}
-                                </span>
-                              ) : null}
                               {itemPendingCheckpoint ? (
                                 <button
                                   type="button"
@@ -3840,19 +3537,23 @@ function App() {
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     setSelectedWorkItemId(item.id);
-                                    setActiveWorkItemDetailId(item.id);
+                                    openWorkItemDetail(item.id);
                                     setInspectorOpen(false);
                                   }}
                                 >
                                   Human review
                                 </button>
-                              ) : null}
-                              {completed ? (
-                                <span className="status-pill status-done">Done</span>
-                              ) : !itemPendingCheckpoint && item.status !== "In Review" ? (
-                                <span className={`status-pill ${statusClassName(item.status)}`}>{workItemStatusLabel(item.status)}</span>
-                              ) : null}
-                              {!completed && item.status !== "In Review" && item.status !== "Planning" ? (
+                              ) : !completed && failed ? (
+                                <button
+                                  className="run-inline"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void runItem(item);
+                                  }}
+                                >
+                                  Retry
+                                </button>
+                              ) : !completed && !hasProgress && item.status !== "Planning" && item.status !== "In Review" ? (
                                 <button
                                   className="run-inline"
                                   disabled={runDisabled}
@@ -3861,9 +3562,13 @@ function App() {
                                     void runItem(item);
                                   }}
                                 >
-                                  {runningWorkItemId === item.id ? "Running..." : failed ? "Retry" : "Run"}
+                                  {runningWorkItemId === item.id ? "Running..." : "Run"}
                                 </button>
-                              ) : null}
+                              ) : completed ? (
+                                <span className="status-pill status-done">Done</span>
+                              ) : (
+                                <span className={`status-pill ${statusClassName(item.status)}`}>{workItemStatusLabel(item.status)}</span>
+                              )}
                             </div>
                           </article>
                         );
@@ -3877,7 +3582,7 @@ function App() {
             )}
           </>
         ) : null}
-      </section>
+      </WorkspaceChrome>
 
       {inspectorAvailable ? (
         <>

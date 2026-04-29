@@ -1,6 +1,7 @@
 package omegalocal
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,7 +24,14 @@ type WorkflowTransitionProfile struct {
 }
 
 type WorkflowRuntimeProfile struct {
-	MaxReviewCycles int `json:"maxReviewCycles,omitempty"`
+	MaxReviewCycles         int      `json:"maxReviewCycles,omitempty"`
+	RunnerHeartbeatSeconds  int      `json:"runnerHeartbeatSeconds,omitempty"`
+	AttemptTimeoutMinutes   int      `json:"attemptTimeoutMinutes,omitempty"`
+	MaxRetryAttempts        int      `json:"maxRetryAttempts,omitempty"`
+	RetryBackoffSeconds     int      `json:"retryBackoffSeconds,omitempty"`
+	CleanupRetentionSeconds int      `json:"cleanupRetentionSeconds,omitempty"`
+	MaxContinuationTurns    int      `json:"maxContinuationTurns,omitempty"`
+	RequiredChecks          []string `json:"requiredChecks,omitempty"`
 }
 
 func workflowPipelineTemplates() []PipelineTemplate {
@@ -83,7 +91,8 @@ func upwardWorkflowCandidates(start string, relative string) []string {
 
 func parseWorkflowTemplateMarkdown(markdown string, sourcePath string) (PipelineTemplate, error) {
 	frontMatter, prompt := splitWorkflowFrontMatter(markdown)
-	template := PipelineTemplate{Source: sourcePath, PromptTemplate: strings.TrimSpace(prompt), WorkflowMarkdown: markdown}
+	promptTemplate, promptSections := parseWorkflowPromptSections(prompt)
+	template := PipelineTemplate{Source: sourcePath, PromptTemplate: strings.TrimSpace(promptTemplate), WorkflowMarkdown: markdown, PromptSections: promptSections}
 	currentSection := ""
 	var currentStage *StageProfile
 	var currentReview *ReviewRoundProfile
@@ -180,6 +189,130 @@ func parseWorkflowTemplateMarkdown(markdown string, sourcePath string) (Pipeline
 	return template, nil
 }
 
+type WorkflowValidationResult struct {
+	Status   string   `json:"status"`
+	Errors   []string `json:"errors"`
+	Warnings []string `json:"warnings"`
+}
+
+func (result WorkflowValidationResult) ok() bool {
+	return len(result.Errors) == 0
+}
+
+func validateWorkflowTemplate(template PipelineTemplate) WorkflowValidationResult {
+	result := WorkflowValidationResult{Status: "passed", Errors: []string{}, Warnings: []string{}}
+	if strings.TrimSpace(template.ID) == "" {
+		result.Errors = append(result.Errors, "workflow id is required")
+	}
+	stageIDs := map[string]bool{}
+	for _, stage := range template.StageProfiles {
+		if strings.TrimSpace(stage.ID) == "" {
+			result.Errors = append(result.Errors, "stage id is required")
+			continue
+		}
+		if stageIDs[stage.ID] {
+			result.Errors = append(result.Errors, "duplicate stage id: "+stage.ID)
+		}
+		stageIDs[stage.ID] = true
+		if strings.TrimSpace(stage.Agent) == "" && len(stage.AgentIDs) == 0 {
+			result.Errors = append(result.Errors, "stage "+stage.ID+" has no agent")
+		}
+	}
+	if len(stageIDs) == 0 {
+		result.Errors = append(result.Errors, "at least one stage is required")
+	}
+	for _, transition := range template.Transitions {
+		if !stageIDs[transition.From] {
+			result.Errors = append(result.Errors, "transition from unknown stage: "+transition.From)
+		}
+		if !stageIDs[transition.To] {
+			result.Errors = append(result.Errors, "transition to unknown stage: "+transition.To)
+		}
+		if strings.TrimSpace(transition.On) == "" {
+			result.Errors = append(result.Errors, fmt.Sprintf("transition %s -> %s has no event", transition.From, transition.To))
+		}
+	}
+	for _, review := range template.ReviewRounds {
+		if !stageIDs[review.StageID] {
+			result.Errors = append(result.Errors, "review round references unknown stage: "+review.StageID)
+		}
+		if strings.TrimSpace(review.Artifact) == "" {
+			result.Errors = append(result.Errors, "review round "+review.StageID+" has no artifact")
+		}
+	}
+	if template.Runtime.MaxReviewCycles < 0 || template.Runtime.AttemptTimeoutMinutes < 0 || template.Runtime.MaxRetryAttempts < 0 || template.Runtime.RetryBackoffSeconds < 0 {
+		result.Errors = append(result.Errors, "runtime values must not be negative")
+	}
+	if len(result.Errors) > 0 {
+		result.Status = "failed"
+	}
+	return result
+}
+
+func loadRepositoryWorkflowTemplate(repositoryPath string, fallbackTemplateID string) (PipelineTemplate, WorkflowValidationResult, bool) {
+	path := filepath.Join(repositoryPath, ".omega", "WORKFLOW.md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return PipelineTemplate{}, WorkflowValidationResult{Status: "missing"}, false
+	}
+	template, parseErr := parseWorkflowTemplateMarkdown(string(raw), path)
+	if parseErr != nil {
+		return PipelineTemplate{}, WorkflowValidationResult{Status: "failed", Errors: []string{parseErr.Error()}}, true
+	}
+	if template.ID == "" {
+		template.ID = fallbackTemplateID
+	}
+	validation := validateWorkflowTemplate(template)
+	return template, validation, true
+}
+
+func loadProfileWorkflowTemplate(profile ProjectAgentProfile, fallbackTemplateID string) (PipelineTemplate, WorkflowValidationResult, bool) {
+	if !strings.HasPrefix(strings.TrimSpace(profile.WorkflowMarkdown), "---") {
+		return PipelineTemplate{}, WorkflowValidationResult{Status: "missing"}, false
+	}
+	template, err := parseWorkflowTemplateMarkdown(profile.WorkflowMarkdown, "agent-profile:"+profile.ProjectID+":"+profile.RepositoryTargetID)
+	if err != nil {
+		return PipelineTemplate{}, WorkflowValidationResult{Status: "failed", Errors: []string{err.Error()}}, true
+	}
+	if template.ID == "" {
+		template.ID = fallbackTemplateID
+	}
+	validation := validateWorkflowTemplate(template)
+	return template, validation, true
+}
+
+func parseWorkflowPromptSections(markdown string) (string, map[string]string) {
+	lines := strings.Split(strings.ReplaceAll(markdown, "\r\n", "\n"), "\n")
+	clean := []string{}
+	sections := map[string][]string{}
+	current := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## Prompt:") {
+			current = strings.TrimSpace(strings.TrimPrefix(trimmed, "## Prompt:"))
+			if current != "" {
+				sections[current] = []string{}
+			}
+			continue
+		}
+		if current != "" {
+			sections[current] = append(sections[current], line)
+			continue
+		}
+		clean = append(clean, line)
+	}
+	output := map[string]string{}
+	for key, values := range sections {
+		if text := strings.TrimSpace(strings.Join(values, "\n")); text != "" {
+			output[key] = text
+		}
+	}
+	if len(output) == 0 {
+		return markdown, nil
+	}
+	return strings.TrimSpace(strings.Join(clean, "\n")), output
+}
+
 func splitWorkflowFrontMatter(markdown string) (string, string) {
 	normalized := strings.ReplaceAll(markdown, "\r\n", "\n")
 	lines := strings.Split(normalized, "\n")
@@ -263,6 +396,32 @@ func applyWorkflowRuntimeField(runtime *WorkflowRuntimeProfile, line string) {
 		if parsed, err := strconv.Atoi(value); err == nil {
 			runtime.MaxReviewCycles = parsed
 		}
+	case "runnerHeartbeatSeconds":
+		if parsed, err := strconv.Atoi(value); err == nil {
+			runtime.RunnerHeartbeatSeconds = parsed
+		}
+	case "attemptTimeoutMinutes":
+		if parsed, err := strconv.Atoi(value); err == nil {
+			runtime.AttemptTimeoutMinutes = parsed
+		}
+	case "maxRetryAttempts":
+		if parsed, err := strconv.Atoi(value); err == nil {
+			runtime.MaxRetryAttempts = parsed
+		}
+	case "retryBackoffSeconds":
+		if parsed, err := strconv.Atoi(value); err == nil {
+			runtime.RetryBackoffSeconds = parsed
+		}
+	case "cleanupRetentionSeconds":
+		if parsed, err := strconv.Atoi(value); err == nil {
+			runtime.CleanupRetentionSeconds = parsed
+		}
+	case "maxContinuationTurns":
+		if parsed, err := strconv.Atoi(value); err == nil {
+			runtime.MaxContinuationTurns = parsed
+		}
+	case "requiredChecks":
+		runtime.RequiredChecks = parseWorkflowStringList(value)
 	}
 }
 

@@ -165,6 +165,9 @@ PATCH /work-items/:id
 GET  /pipelines
 GET  /workflow-templates
 GET  /attempts
+GET  /attempts/:id/timeline
+POST /attempts/:id/retry
+POST /attempts/:id/cancel
 POST /pipelines/from-template
 POST /pipelines/:id/run-devflow-cycle
 GET  /checkpoints
@@ -174,6 +177,8 @@ GET  /missions
 GET  /operations
 GET  /proof-records
 GET  /execution-locks
+GET  /runtime-logs
+POST /job-supervisor/tick
 POST /orchestrator/tick
 GET  /agent-definitions
 GET  /llm-providers
@@ -251,10 +256,10 @@ ZYOOO/TestRepo
 ## 当前重点缺口
 
 - Pipeline Template 仍需 App 内可编辑。
-- Agent runner registry 仍需统一 Codex / opencode / Claude Code / demo runner。
-- `run-devflow-cycle` 已改为默认异步后台 job：Run 立刻返回 `attempt`，前端靠轮询更新状态；`wait: true` 只作为测试和兼容路径。
+- Agent runner registry 已统一 Codex / opencode / Claude Code / demo runner 的基础能力，仍需增强 runner-specific prompt/runtime 模板。
+- `run-devflow-cycle` 已改为默认异步后台 job：Run 立刻返回 `attempt`，前端靠轮询更新状态；`wait: true` 只作为测试和兼容路径。Run Timeline 基础版已按 Attempt 聚合真实运行事件，便于 Human Review 和排障。
 - Human Review 已改为真实阻塞点：Review Agent 通过后停在 checkpoint，必须由用户 Approve 后才继续 merge / delivery。
-- 仍需把当前 goroutine job 继续升级为正式 `AgentRunner + JobSupervisor`：heartbeat、stall detection、retry、cancel、timeout、多 turn continuation、worker host 分配和崩溃恢复。
+- `AgentRunner + JobSupervisor` 已有正式 v1：heartbeat、stalled detection、retry、cancel、contract-driven timeout、workspace lock、workspace cleanup、worker host lease 和 continuation policy metadata 基础版已接入；远端崩溃恢复和 GitHub polling 仍需增强。
 - GitHub issue comment / label 回写仍需完成。
 - PR lifecycle UI 仍需加强。
 - Feishu 审核卡片和回调仍需完成。

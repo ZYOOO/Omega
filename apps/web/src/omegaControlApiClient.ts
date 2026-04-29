@@ -7,6 +7,7 @@ export interface ObservabilitySummary {
     operations: number;
     proofRecords: number;
     events: number;
+    runtimeLogs?: number;
   };
   pipelineStatus: Record<string, number>;
   checkpointStatus: Record<string, number>;
@@ -17,6 +18,26 @@ export interface ObservabilitySummary {
     failed: number;
     blocked: number;
   };
+  recentErrors?: RuntimeLogRecordInfo[];
+}
+
+export interface RuntimeLogRecordInfo {
+  id: string;
+  level: "INFO" | "DEBUG" | "ERROR" | string;
+  eventType: string;
+  message: string;
+  entityType?: string;
+  entityId?: string;
+  projectId?: string;
+  repositoryTargetId?: string;
+  workItemId?: string;
+  pipelineId?: string;
+  attemptId?: string;
+  stageId?: string;
+  agentId?: string;
+  requestId?: string;
+  details?: Record<string, unknown>;
+  createdAt: string;
 }
 
 export interface LlmProviderInfo {
@@ -192,6 +213,9 @@ export interface GitHubPullRequestResult {
 export interface GitHubPullRequestStatusInput {
   repositoryOwner?: string;
   repositoryName?: string;
+  repositoryPath?: string;
+  workspacePath?: string;
+  requiredChecks?: string[];
   number?: number;
   url?: string;
 }
@@ -260,6 +284,11 @@ export interface PipelineRecordInfo {
   status: string;
   templateId?: string;
   run?: {
+    workflow?: {
+      runtime?: {
+        requiredChecks?: string[];
+      };
+    };
     stages?: Array<{
       id: string;
       title: string;
@@ -297,9 +326,19 @@ export interface AttemptRecordInfo {
   branchName?: string;
   pullRequestUrl?: string;
   startedAt?: string;
+  lastSeenAt?: string;
+  stalledAt?: string;
   finishedAt?: string;
   durationMs?: number;
   errorMessage?: string;
+  statusReason?: string;
+  failureReason?: string;
+  failureStageId?: string;
+  failureAgentId?: string;
+  failureDetail?: string;
+  failureReviewFeedback?: string;
+  humanChangeRequest?: string;
+  reworkAssessment?: Record<string, unknown>;
   stdoutSummary?: string;
   stderrSummary?: string;
   stages?: Array<{
@@ -319,6 +358,29 @@ export interface AttemptRecordInfo {
     stageId?: string;
     createdAt?: string;
   }>;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface RunWorkpadRecordInfo {
+  id: string;
+  attemptId: string;
+  pipelineId: string;
+  workItemId: string;
+  repositoryTargetId?: string;
+  status: string;
+  workpad: {
+    plan?: Record<string, unknown>;
+    acceptanceCriteria?: string[];
+    validation?: Record<string, unknown>;
+    notes?: string[];
+    blockers?: string[];
+    pr?: Record<string, unknown>;
+    reviewFeedback?: string[];
+    retryReason?: string;
+    reworkAssessment?: Record<string, unknown>;
+    updatedBy?: string;
+  };
   createdAt?: string;
   updatedAt?: string;
 }
@@ -397,6 +459,7 @@ export interface ExecutionLockInfo {
 export interface CheckpointRecordInfo {
   id: string;
   pipelineId: string;
+  attemptId?: string;
   stageId: string;
   status: "pending" | "approved" | "rejected" | string;
   title: string;
@@ -431,6 +494,41 @@ export interface RunDevFlowCycleResult {
   proofFiles?: string[];
   pipeline?: PipelineRecordInfo;
   attempt?: AttemptRecordInfo;
+}
+
+export interface CancelAttemptResult {
+  attempt: AttemptRecordInfo;
+  cancelSignalSent: boolean;
+}
+
+export interface RetryAttemptResult {
+  status: string;
+  pipeline?: PipelineRecordInfo;
+  attempt: AttemptRecordInfo;
+  retryOfAttemptId: string;
+}
+
+export interface AttemptTimelineItemInfo {
+  id: string;
+  time: string;
+  source: string;
+  level: string;
+  eventType: string;
+  message: string;
+  stageId?: string;
+  agentId?: string;
+  operationId?: string;
+  proofId?: string;
+  checkpointId?: string;
+  runtimeLogId?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface AttemptTimelineInfo {
+  attempt: AttemptRecordInfo;
+  pipeline?: PipelineRecordInfo;
+  items: AttemptTimelineItemInfo[];
+  generatedAt: string;
 }
 
 export interface PagePilotSelectionContext {
@@ -517,7 +615,7 @@ export type PagePilotRunInfo = PagePilotApplyResult & Partial<PagePilotDeliverRe
 async function fetchJson<T>(apiUrl: string, path: string, fetchImpl: typeof fetch): Promise<T> {
   const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}${path}`);
   if (!response.ok) {
-    throw new Error(`Omega control API failed: ${path} ${response.status}`);
+    throw new Error(await apiErrorMessage(response, `Omega control API failed: ${path}`));
   }
   return response.json() as Promise<T>;
 }
@@ -534,7 +632,7 @@ async function postJson<T>(
     body: JSON.stringify(body ?? {})
   });
   if (!response.ok) {
-    throw new Error(`Omega control API failed: ${path} ${response.status}`);
+    throw new Error(await apiErrorMessage(response, `Omega control API failed: ${path}`));
   }
   return response.json() as Promise<T>;
 }
@@ -551,9 +649,26 @@ async function putJson<T>(
     body: JSON.stringify(body ?? {})
   });
   if (!response.ok) {
-    throw new Error(`Omega control API failed: ${path} ${response.status}`);
+    throw new Error(await apiErrorMessage(response, `Omega control API failed: ${path}`));
   }
   return response.json() as Promise<T>;
+}
+
+async function apiErrorMessage(response: Response, prefix: string): Promise<string> {
+  const fallback = `${prefix} ${response.status}`;
+  try {
+    const raw = await response.text();
+    if (!raw.trim()) return fallback;
+    try {
+      const parsed = JSON.parse(raw) as { error?: unknown; message?: unknown };
+      const detail = typeof parsed.error === "string" ? parsed.error : typeof parsed.message === "string" ? parsed.message : "";
+      return detail ? `${fallback}: ${detail}` : `${fallback}: ${raw.slice(0, 240)}`;
+    } catch {
+      return `${fallback}: ${raw.slice(0, 240)}`;
+    }
+  } catch {
+    return fallback;
+  }
 }
 
 export async function fetchObservability(
@@ -561,6 +676,20 @@ export async function fetchObservability(
   fetchImpl: typeof fetch = fetch
 ): Promise<ObservabilitySummary> {
   return fetchJson<ObservabilitySummary>(apiUrl, "/observability", fetchImpl);
+}
+
+export async function fetchRuntimeLogs(
+  apiUrl: string,
+  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; createdAfter?: string; createdBefore?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<RuntimeLogRecordInfo[]> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<RuntimeLogRecordInfo[]>(apiUrl, `/runtime-logs${suffix}`, fetchImpl);
 }
 
 export async function fetchLlmProviders(
@@ -764,6 +893,46 @@ export async function fetchAttempts(
   return fetchJson<AttemptRecordInfo[]>(apiUrl, "/attempts", fetchImpl);
 }
 
+export async function fetchAttemptTimeline(
+  apiUrl: string,
+  attemptId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<AttemptTimelineInfo> {
+  return fetchJson<AttemptTimelineInfo>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/timeline`, fetchImpl);
+}
+
+export async function fetchRunWorkpads(
+  apiUrl: string,
+  filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string; status?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<RunWorkpadRecordInfo[]> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (!value) continue;
+    params.set(key, value);
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<RunWorkpadRecordInfo[]>(apiUrl, `/run-workpads${suffix}`, fetchImpl);
+}
+
+export async function cancelAttempt(
+  apiUrl: string,
+  attemptId: string,
+  reason = "Canceled by operator.",
+  fetchImpl: typeof fetch = fetch
+): Promise<CancelAttemptResult> {
+  return postJson<CancelAttemptResult>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/cancel`, { reason }, fetchImpl);
+}
+
+export async function retryAttempt(
+  apiUrl: string,
+  attemptId: string,
+  reason = "Retry requested by operator.",
+  fetchImpl: typeof fetch = fetch
+): Promise<RetryAttemptResult> {
+  return postJson<RetryAttemptResult>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/retry`, { reason }, fetchImpl);
+}
+
 export async function fetchProofRecords(
   apiUrl: string,
   fetchImpl: typeof fetch = fetch
@@ -954,9 +1123,12 @@ export async function approveCheckpoint(
   apiUrl: string,
   checkpointId: string,
   reviewer = "human",
+  asyncDeliveryOrFetch: boolean | typeof fetch = false,
   fetchImpl: typeof fetch = fetch
 ): Promise<CheckpointRecordInfo> {
-  return postJson<CheckpointRecordInfo>(apiUrl, `/checkpoints/${checkpointId}/approve`, { reviewer }, fetchImpl);
+  const asyncDelivery = typeof asyncDeliveryOrFetch === "boolean" ? asyncDeliveryOrFetch : false;
+  const effectiveFetch = typeof asyncDeliveryOrFetch === "function" ? asyncDeliveryOrFetch : fetchImpl;
+  return postJson<CheckpointRecordInfo>(apiUrl, `/checkpoints/${checkpointId}/approve`, { reviewer, asyncDelivery }, effectiveFetch);
 }
 
 export async function requestCheckpointChanges(

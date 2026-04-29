@@ -148,7 +148,8 @@ Item
 - Prompt sections / stage instructions 从 Markdown body 渲染到每个 Agent。
 - Agent runner registry。
 - Codex / opencode / Claude Code prompt 文件模板。
-- JobSupervisor：heartbeat、timeout、cancel、retry、stall detection、worker host 分配和多 turn continuation。
+- JobSupervisor：integrity tick、Attempt heartbeat、runner process stream heartbeat、stalled detection、Attempt cancel、retry、contract-driven timeout、workspace lock、workspace cleanup、worker host lease 和 continuation policy metadata 基础版已接入，继续补 Git/GitHub command timeout、远端 worker 分配、远端崩溃恢复和 GitHub polling。
+- Run Timeline 基础版已接入：按 Attempt 聚合 attempt events、pipeline run events、stage snapshots、operations、proof records、checkpoints 和 runtime logs；继续补 GitHub polling event、runner stdout/stderr 摘要展开和筛选。
 - stage artifact 一等查询。
 
 ### 阶段 E：演示体验

@@ -205,6 +205,8 @@ The older Node local server remains only as a compatibility fallback while the G
 - Local orchestrator tick: reads eligible GitHub issues from a bound repository target, skips already claimed issues, creates repository-scoped Work items and `devflow-pr` Pipelines, and can explicitly `autoRun` the cycle when the operator enables it.
 - DevFlow Run semantics: `run-devflow-cycle` now creates an Attempt first, returns `accepted` immediately, and continues the cycle as a backend background job. The Workboard observes progress through polling rather than waiting for the HTTP request to finish.
 - Codex runner process supervision: Codex runs as an isolated child process and Omega records pid, exit code, duration, stdout, stderr, and status on the operation for debugging and audit.
+- Page Pilot Electron direct pilot MVP: opens a target project page, injects selection controls, collects DOM / selector / style / source context, applies a real patch through the Go runtime, refreshes preview, and supports confirm / discard.
+- Page Pilot apply / deliver / discard materializes `source=page_pilot` Requirement / Work Item / Pipeline records and now also writes common Mission / Operation / Proof records for Work Item detail, Agent trace, and Proof UI.
 
 ### DevFlow Template Adaptation
 
@@ -245,13 +247,20 @@ The orchestrator only treats a GitHub issue as executable when it carries an exp
 - `PUT /workspace`
 - `GET /events`
 - `GET /pipelines`
+- `GET /attempts`
+- `GET /attempts/:id/timeline`
+- `POST /attempts/:id/cancel`
 - `GET /checkpoints`
 - `GET /missions`
 - `GET /operations`
 - `GET /proof-records`
+- `GET /runtime-logs`
+- `GET /observability`
+- `POST /job-supervisor/tick`
 - `POST /orchestrator/tick`
 - `POST /work-items`
 - `PATCH /work-items/:id`
+- `DELETE /work-items/:id`
 - `POST /pipelines/from-work-item`
 - `POST /pipelines/:id/run-devflow-cycle`
 - `POST /missions/from-work-item`
@@ -261,6 +270,10 @@ The orchestrator only treats a GitHub issue as executable when it carries an exp
 - `POST /github/import-issues`
 - `POST /github/create-pr`
 - `POST /github/pr-status`
+- `POST /page-pilot/apply`
+- `POST /page-pilot/deliver`
+- `GET /page-pilot/runs`
+- `POST /page-pilot/runs/{id}/discard`
 - `GET /github/oauth/config`
 - `PUT /github/oauth/config`
 - `POST /github/oauth/start`
@@ -279,15 +292,16 @@ These are the main gaps after the v0Beta audit:
 
 1. 复杂任意代码生成还不稳：当前 `devflow-pr` 可以真实完成 repo clone、branch、commit、PR、Review Agent verdict、Human Review checkpoint、approve 后 merge proof；但复杂需求仍需要更完整的 Codex / opencode / Claude Code runner registry、prompt template 和执行策略。
 2. LLM Provider 已有 registry 和运行时选择，但 provider selection 尚未完整映射到每一种 runner 的真实模型调用；这是赛题 Must-have 的验收风险。
-3. Agent 协作已有基础：`master` dispatch、stage contracts、`agentIds`、artifact handoff、handoff bundle 已落地；但并行协商、自动修复重试、attempt/retry policy 仍未完成。
-4. Pipeline 编排已有生命周期、dataFlow、execution lock、异步 Attempt job 和 `orchestrator/tick` 基础；但正式 JobSupervisor、heartbeat、retry、cancel、stuck run 检测、worker host 分配和多 turn continuation 仍需增强。
-5. GitHub 工程闭环已有 OAuth、repo info、issue import、branch/commit/PR/checks/merge proof；但 issue 状态回写、CI proof 深度解析和 PR lifecycle UI 仍不完整。
+3. Agent 协作已有基础：`master` dispatch、stage contracts、`agentIds`、artifact handoff、handoff bundle 已落地；但并行协商、自动修复重试的完整 rework policy 仍未完成。
+4. Pipeline 编排已有生命周期、dataFlow、execution lock、异步 Attempt job、Run Timeline、JobSupervisor v1、runner heartbeat stream、retry、contract-driven timeout、workspace cleanup、worker host lease 和 continuation policy metadata 基础版；远端 worker 分配、远端崩溃恢复和 GitHub polling 仍需增强。
+5. GitHub 工程闭环已有 OAuth、repo info、issue import、branch/commit/PR/checks/branch sync/conflict/merge proof；但 issue 状态回写、CI proof 深度解析和 PR lifecycle UI 仍不完整。
 6. Workboard 数据已持久化，但 projects/missions/operations/checkpoints/proof 还没有全部从 snapshot-first 演进到 repository-first relational model。
 7. Product Layer 仍让前端承担部分业务 reducer 逻辑，服务端还没有成为 Mission Control 的唯一写入者。
 8. 当前 Workboard 仍是轻量 issue list，还不是完整的项目、视图、队列、operator workflow 系统。
 9. Feishu 目前有 lark-cli 文本通知基础，但还没有真实 approval card callback 和工具调用链。
 10. Proof 虽然有文件和记录，但缺少 artifact 类型、diff/test/check/review 等结构化 proof 解析。
-11. Shared sync 未实现，本地与远端/GitHub/Feishu 状态还不能双向 reconciled。
+11. Page Pilot 已有 direct pilot MVP，但 Preview Runtime Profile、source mapping 覆盖率、服务端多轮对话记录、视觉 proof 和目标 repo/worktree 配置仍需产品化。
+12. Shared sync 未实现，本地与远端/GitHub/Feishu 状态还不能双向 reconciled。
 
 ## 7. Near-Term Product Goal
 

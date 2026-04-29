@@ -2,6 +2,292 @@
 
 这个文档用于记录每个功能的落地方式。后续每完成一个功能，都按相同结构补一节：目标、入口、数据/API、运行时行为、验证、后续工作。
 
+## 2026-04-29: Work Item 详情页 / Run Workpad Record 基础版
+
+### 目标
+
+降低 Work Item 详情页和 `App.tsx` 的耦合，同时把用户真正需要排障和评审的信息前置。旧做法把 Requirement、Delivery flow、Agent orchestration、Artifacts、Retry reason 分散在多个大区块里，很多卡片只能看不能点；新做法以 Run Workpad record 汇总当前 Attempt 的计划、验收、验证、阻塞、PR、Review feedback 和 Retry reason。
+
+### 产品入口
+
+新增独立详情路由：
+
+```text
+#/work-items/{itemId}
+```
+
+新增前端模块：
+
+```text
+apps/web/src/workItemRoutes.ts
+apps/web/src/components/WorkItemDetailPage.tsx
+apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx
+services/local-runtime/internal/omegalocal/run_workpads.go
+services/local-runtime/internal/omegalocal/run_workpads_test.go
+```
+
+增强既有详情面板：
+
+```text
+apps/web/src/components/WorkItemDetailPanels.tsx
+```
+
+### 数据/API
+
+新增服务端记录：
+
+```text
+runWorkpads
+```
+
+新增 API：
+
+```text
+GET /run-workpads
+```
+
+支持按 `attemptId`、`pipelineId`、`workItemId`、`repositoryTargetId`、`status` 过滤。
+
+Workpad 的每个字段都从现有真实记录生成：
+
+- Plan：Pipeline stage 和当前 Attempt。
+- Acceptance criteria：Requirement / Work Item 验收条件。
+- Validation status：测试 proof、checks summary 和 Attempt 状态。
+- Notes：Attempt events、timeline 和 proof 摘要。
+- Blockers：pipeline failure、attempt failure、checkpoint、PR checks / conflict / branch sync。
+- PR：proof PR URL 和 `/github/pr-status` 返回的检查结果。
+- Review Feedback：review agent 结果、checkpoint decision、human request changes 相关记录。
+- Retry Reason：runtime 归并出的失败和重试依据；前端缺失 record 时才使用本地兜底。
+
+### 运行时行为
+
+- Runtime 在 Attempt 创建、Agent invocation 持久化、Attempt complete / fail / cancel、retry 创建、Human Review approve 后进入 merging 时刷新 `runWorkpads`。
+- `App.tsx` 继续负责读取 Requirement / Pipeline / Attempt / Operation / Proof / Checkpoint / PR status，并额外读取 `runWorkpads`，把当前 Work Item 的上下文传给独立详情组件。
+- `WorkItemDetailPage` 负责 Workpad-first 布局、Requirement 内部滚动、紧凑 Delivery flow、可展开 Agent operations 和可展开 Artifacts；Workpad 内容优先使用 `runWorkpads`，缺失时用真实执行记录兜底。
+- 点击 Work Item 或 Human Review 入口会进入独立 hash 路由，刷新页面后仍可恢复到同一个 item 详情。
+- Agent operation 现在可以展开查看 prompt / stdout / stderr / runner metadata，便于判断失败是 agent 输出、runner 环境、验证命令还是 delivery 步骤导致。
+- Artifact 卡片可以展开查看 URL / path，避免 proof 只作为不可操作的展示块。
+
+### 验证
+
+```bash
+npm run lint
+npm run test -- apps/web/src/core/__tests__/manualWorkItem.test.ts apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx apps/web/src/__tests__/attemptRetryReason.test.ts --testTimeout=15000
+npm run build
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunWorkpadRecordTracksAttemptRetryContext|TestApproveDevFlowCheckpointCanContinueDeliveryAsync|TestRunCurrentPipelineStagePersistsOperationProofAndCheckpoint'
+```
+
+浏览器验证：
+
+- `http://127.0.0.1:5173/#/work-items/item_manual_21` 可直接打开。
+- 浅色模式下 Requirement markdown 内容可读，长内容会在卡片内部滚动。
+- Delivery flow 为多列紧凑布局，active stage 有明显运行态反馈。
+- Agent operation 可展开查看 Prompt 和执行输出。
+
+### 后续工作
+
+- 把当前 runtime 刷新的 Run Workpad 升级为按字段 patch，允许 Agent / supervisor 直接写入 Plan、Validation、Blockers、Review Feedback、Retry Reason。
+- 把 review agent 结果、PR comments、human request changes 和 checks / branch sync / conflict 推荐动作进一步持久化为 rework checklist，并让 Rework Agent 和 Retry API 直接消费。
+- Approve 只推进 checkpoint approved；merge 作为单独 job 运行并展示 checks、branch sync、conflict、merge output 和失败原因。
+
+## 2026-04-29: Runtime Logs 基础版
+
+### 目标
+
+把本地 runtime 的关键行为写成可查询的 append-only 日志，优先解决本地联调时“API failed 但不知道真实后端原因”的问题。
+
+### 产品入口
+
+- Operator `Views` 页面新增 `Runtime logs` 区块，展示最近 INFO / DEBUG / ERROR 事件、时间和关联 work item / pipeline / attempt / request id。
+- `/observability` 返回 `recentErrors` 和 runtime log 计数，Operator 可直接看到最近失败。
+
+### 数据/API
+
+新增 SQLite 表：
+
+```text
+runtime_logs
+```
+
+新增 API：
+
+```text
+GET /runtime-logs
+```
+
+支持按 `level`、`eventType`、`entityType`、`entityId`、`projectId`、`repositoryTargetId`、`workItemId`、`pipelineId`、`attemptId`、`stageId`、`agentId`、`requestId`、`createdAfter`、`createdBefore` 和 `limit` 查询。
+
+### 运行时行为
+
+- API request 自动记录 request id、method、path、status、bytes、duration。
+- DevFlow job 记录 start / complete / fail、attempt backfill、agent invocation、checkpoint decision、PR merge 相关事件。
+- Page Pilot apply / deliver / discard 记录 requested、invalid、preflight、runner、persist、sync、applied/delivered/discarded 等事件。
+- checkpoint approve 兼容旧数据缺少 attempt 的情况，并把缺失 attempt 写入 ERROR 日志，避免 UI 只显示泛化失败。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRuntimeLogsAPIListsAndFiltersRecords|TestCompleteDevFlowCycleBackfillsMissingAttempt|TestDevFlowCheckpointApprovalToleratesMissingAttempt'
+npm run lint
+```
+
+### 后续工作
+
+- 补齐 cursor pagination、Requirement 维度、全文搜索和导出。
+- 把 runtime log、attempt events、stage timeline、runner process telemetry 聚合为单个 Run Timeline。
+- 继续把 git operation、checks polling、rebase/conflict/retry 细节写入日志。
+
+## 2026-04-29: JobSupervisor Integrity Tick
+
+### 目标
+
+修复 Human Review checkpoint 和具体 Attempt 之间的断链风险。Human Review 不是一个独立的 Pipeline 状态按钮，它必须指向一次真实执行记录，才能继续使用 workspace、branch、PR 和 proof 做交付动作。
+
+### 数据/API
+
+新增 API：
+
+```text
+POST /job-supervisor/tick
+```
+
+Checkpoint 记录新增兼容字段：
+
+```text
+attemptId
+```
+
+### 运行时行为
+
+- 创建 pending checkpoint 时写入当前 pipeline 的 latest attempt id。
+- `GET /checkpoints` 和 checkpoint decision 前执行轻量 integrity reconciliation。
+- 如果 pending checkpoint 没有 attempt link，优先链接同 pipeline 的 latest attempt。
+- 如果同 pipeline 没有 attempt，但仍是可修复的 DevFlow human gate，则 backfill `supervisor-repair` attempt，并记录 `attempt.recovered` event。
+- approve 时优先使用 checkpoint 的 `attemptId`，不再只依赖 pipeline 反查最近 attempt。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorTickBackfillsPendingCheckpointAttemptLink|TestDevFlowCheckpointApprovalToleratesMissingAttempt|TestCompleteDevFlowCycleBackfillsMissingAttempt'
+npm run lint
+```
+
+### 后续工作
+
+- 把 JobSupervisor 从手动 tick 推进到常驻扫描。
+- 增加 runner process stream heartbeat、retry、cancel 和 timeout。
+- 把 Run Timeline 建在 checkpoint/attempt/runtime log 的统一视图上。
+
+## 2026-04-29: JobSupervisor Heartbeat / Stalled Detection 基础版
+
+### 目标
+
+让运行中的 Attempt 有可查询的健康信号，并让长期没有心跳的运行进入明确的 `stalled` 状态，而不是一直停留在 `running`。
+
+### 数据/API
+
+沿用：
+
+```text
+POST /job-supervisor/tick
+```
+
+请求可选：
+
+```json
+{
+  "staleAfterSeconds": 900
+}
+```
+
+Attempt 新增动态字段：
+
+```text
+lastSeenAt
+stalledAt
+statusReason
+```
+
+### 运行时行为
+
+- `makeAttemptRecord` 创建 Attempt 时写入 `lastSeenAt`。
+- Agent invocation 持久化时刷新 Attempt `lastSeenAt`。
+- Attempt complete / fail 时同步刷新 `lastSeenAt`。
+- `job-supervisor/tick` 扫描 `status = running` 的 Attempt；如果 `lastSeenAt` 超过阈值未更新，则：
+  - Attempt 标记为 `stalled`。
+  - Pipeline 标记为 `stalled`。
+  - Work Item 标记为 `Blocked`。
+  - Attempt events 写入 `attempt.stalled`。
+  - runtime logs 写入 `job_supervisor.attempt.stalled` ERROR。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorTickBackfillsPendingCheckpointAttemptLink|TestJobSupervisorTickMarksStalledRunningAttempt|TestCompleteDevFlowCycleBackfillsMissingAttempt'
+npm run lint
+```
+
+### 后续工作
+
+- runner process stdout/stderr 流刷新 heartbeat。
+- stalled attempt 的 retry / resume / cancel / timeout 策略。
+- Operator Run Timeline 中展示 heartbeat age 和 stalled 原因。
+
+## 2026-04-29: Runner Context Cancel / Attempt Cancel API 基础版
+
+### 目标
+
+补齐 cancel / timeout 的第一层真实执行能力：Agent runner 子进程必须能被 context deadline 或 operator cancel 终止，Attempt cancel 不能只是 UI 状态变化。
+
+### 数据/API
+
+新增 API：
+
+```text
+POST /attempts/{id}/cancel
+```
+
+请求可选：
+
+```json
+{
+  "reason": "Canceled by operator."
+}
+```
+
+返回：
+
+```json
+{
+  "attempt": {},
+  "cancelSignalSent": true
+}
+```
+
+### 运行时行为
+
+- Codex / opencode / Claude Code runner 改用 `runSupervisedCommandContext`。
+- context deadline exceeded 时，runner process 返回 `status = timed-out`。
+- context canceled 时，runner process 返回 `status = canceled`。
+- DevFlow background job 会注册 `attemptId -> cancel func`。
+- `POST /attempts/{id}/cancel` 会调用注册 cancel func；若当前进程仍在本机运行，`cancelSignalSent = true`。
+- Attempt 标记为 `canceled`，Pipeline 标记为 `canceled`，Work Item 标记为 `Blocked`。
+- Pending checkpoint 若绑定该 attempt，会同步标记为 `canceled`，避免取消后的 Human Review 继续误导用户。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestCancelAttemptAPIUpdatesStateAndSignalsRunningJob|TestRunSupervisedCommandContextTimesOutProcess|TestJobSupervisorTickMarksStalledRunningAttempt'
+npm run lint
+```
+
+### 后续工作
+
+- Git / GitHub command 也要接入 context-aware execution。
+- Runner stdout/stderr streaming heartbeat。
+- Retry / resume / cancel reason taxonomy。
+- Operator UI 暴露 cancel 按钮和 canceled/stalled recovery actions。
+
 ## 2026-04-28: Page Pilot MVP
 
 ### 目标
@@ -114,16 +400,13 @@ apps/web/src/components/PortalHome.tsx:template-card-{index}
 新增 API：
 
 ```text
-POST /page-pilot/preview-runtime/resolve
-POST /page-pilot/preview-runtime/start
-POST /page-pilot/preview-runtime/restart
 POST /page-pilot/apply
 POST /page-pilot/deliver
 GET /page-pilot/runs
 POST /page-pilot/runs/{id}/discard
 ```
 
-Preview runtime API 仍为计划项。目标是让 Agent 为每个 repository workspace 生成 Preview Runtime Profile，例如 install command、dev command、preview URL、health check 和 reload strategy，再由 Go runtime 的 process supervisor 执行。
+Preview runtime API 仍为计划项，尚未在 OpenAPI / Go runtime 中作为真实接口暴露。目标是让 Agent 为每个 repository workspace 生成 Preview Runtime Profile，例如 install command、dev command、preview URL、health check 和 reload strategy，再由 Go runtime 的 process supervisor 执行。
 
 `/page-pilot/apply` 的返回值新增功能一 linkage：
 
@@ -642,4 +925,392 @@ node --check apps/desktop/src/pilot-preload.cjs
 
 ```bash
 node --check apps/desktop/src/pilot-preload.cjs
+```
+
+## 2026-04-29: Requirement 创建链路拆分
+
+### 目标
+
+降低 `App.tsx` 和 Go `server.go` 的维护压力，先把最近反复调试的 Requirement 创建 / Work Item 写入链路拆成独立模块，方便后续补接口测试、重试和数据分析。
+
+### 入口
+
+- `apps/web/src/components/RequirementComposer.tsx`
+- `apps/web/src/components/ProjectSurface.tsx`
+- `apps/web/src/components/WorkspaceChrome.tsx`
+- `apps/web/src/core/manualWorkItem.ts`
+- `services/local-runtime/internal/omegalocal/work_items.go`
+- `services/local-runtime/internal/omegalocal/devflow_cycle.go`
+- `services/local-runtime/internal/omegalocal/pipeline_records.go`
+
+### 运行时行为
+
+- 前端创建 Requirement 的交互不变：仍从 Workboard 内填写标题/描述并写入当前 Repository Workspace。
+- `App.tsx` 只保留状态编排和提交动作，创建表单 UI 交给 `RequirementComposer`。
+- Project / Repository Workspace 总览交给 `ProjectSurface`，App 只传入当前项目、仓库列表和操作回调。
+- Workboard shell 交给 `WorkspaceChrome`，包括左侧导航、workspace 切换、顶部搜索、主题切换和详情页运行工具栏。
+- 手动 Work Item 的 id/key/title/default acceptance criteria 生成集中在 `manualWorkItem.ts`。
+- Go runtime 的 Work Item append、unique id/key、Requirement link/enrich 逻辑集中在 `work_items.go`，接口行为保持不变。
+- 未开始 Work Item 支持真实删除：列表左侧按钮调用 `DELETE /work-items/{itemId}`，runtime 只允许 `Ready` / `Backlog` 且没有执行历史的 item 删除，并同步移除未共享 Requirement。
+- DevFlow PR 长流程执行集中在 `devflow_cycle.go`，包括 attempt reset、后台 job、agent invocation、review/rework/human gate。
+- Pipeline record / workflow template 物化集中在 `pipeline_records.go`，包括 `devflow-pr` stage、agent contract、mission/operation record 构造。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/core/__tests__/manualWorkItem.test.ts apps/web/src/__tests__/App.operatorView.test.tsx -t "manual work item helpers|creates app requirements" --testTimeout=15000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
+npm run lint
+npm run build
+go test ./services/local-runtime/internal/omegalocal
+```
+
+### 后续工作
+
+- 继续拆 `App.tsx` 中 Work item list/detail、GitHub issue sync、runtime settings 三块。
+- 继续拆 `server.go` 中 HTTP handler 注册、delivery/PR API、workspace cleanup API。
+
+## 2026-04-29: Page Pilot Proof Records
+
+### 目标
+
+把 Page Pilot 的 apply / deliver / discard 结果从私有 run JSON 和 `.omega/page-pilot` 文件，补齐到 Omega 通用的 Mission / Operation / Proof records。这样 Page Pilot 创建出来的 Work Item 在详情页、Proof 面板和 Agent trace 中都能看到同一套执行证据，而不是只能回到 Electron 浮层或 `/page-pilot/runs` 查询。
+
+### 入口
+
+- `POST /page-pilot/apply`
+- `POST /page-pilot/deliver`
+- `POST /page-pilot/runs/{id}/discard`
+- Work item detail 的 Agent trace / Proof 面板
+
+### 运行时行为
+
+- apply 成功后，为对应 `page-pilot` Pipeline 写入 `Page Pilot Agent` Mission、`page_editing` Operation 和 proof records。
+- proof records 指向 `page-pilot-prompt.md`、`page-pilot-agent-note.md`、`page-pilot.diff`、`page-pilot-summary.md` 等真实 proof 文件。
+- deliver 成功后补写 `delivery` Operation，并把 Pipeline 状态更新为 `delivered`，PR URL 会作为 proof URL 进入通用 proof stream。
+- discard 后同样记录 `delivery` 阶段失败/丢弃事件，保留可审计状态。
+- Pipeline stage 会同步写入 `evidence`，因此现有详情页无需 Page Pilot 专用逻辑即可展示 artifact。
+
+### 验证
+
+已执行：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget
+```
+
+## 2026-04-29 14:53 CST: Run Timeline API / Work Item Detail 基础版
+
+### 目标
+
+给功能一补一条按 Attempt 聚合的真实运行时间线，让 Human Review、失败排障和本地联调不再只依赖分散的 proof 文件或前端快照。
+
+### 入口
+
+- `GET /attempts/{id}/timeline`
+- Work Item detail -> Current attempt -> Run timeline
+
+### 实现架构
+
+- Go runtime 新增 `AttemptTimelineResponse` / `AttemptTimelineItem`，`attempt_timeline.go` 只读 SQLite 中已持久化的 Attempt、Pipeline run、Checkpoint、Operation、Proof 和 Runtime log。
+- 时间线按 `attemptId` 和 `pipelineId` 归集记录，去重后按事件时间排序；不存在的记录不会生成占位数据。
+- 前端 `omegaControlApiClient` 增加 `fetchAttemptTimeline`，`App.tsx` 在打开 Work Item 详情时按当前 attempt 拉取时间线。
+- `WorkItemAttemptPanel` 增加 `RunTimeline` 区块，展示最近真实事件的 source、event type、stage、agent 和时间，支持 light / dark。
+
+### 验证
+
+已执行：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestAttemptTimelineAggregatesRunRecords|TestCancelAttemptAPIUpdatesStateAndSignalsRunningJob|TestRuntimeLogsAPIListsAndFiltersRecords'
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "shows review packet details" --testTimeout=15000
+```
+
+后续仍需在全量验证中覆盖 lint、build 和完整 Go 测试。
+
+## 2026-04-29: Attempt Retry API 基础版
+
+### 旧做法
+
+Workboard 列表上的 Retry 主要按 Work Item / Pipeline 重新触发运行，旧 Attempt 会保留，但新旧 Attempt 之间没有明确 retry 关系，后续排障需要人工对时间和 pipeline 记录。
+
+### 新做法
+
+- 新增 `POST /attempts/{id}/retry`，只允许 `failed` / `stalled` / `canceled` Attempt 重试。
+- 新 Attempt 继承同一个 Work Item、Pipeline、Repository Workspace，并写入 `retryOfAttemptId`、`retryRootAttemptId`、`retryIndex`、`retryReason`。
+- 旧 Attempt 写入 `retryAttemptId` 和 `attempt.retry.requested` event，保留完整审计链。
+- Work Item detail 对可重试 Attempt 展示 `Retry attempt`，调用真实 API 后刷新 control plane。
+
+### 验证
+
+已新增：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run TestPrepareDevFlowAttemptRetryLinksAttempts
+```
+
+## 2026-04-29: PR Lifecycle Detail 基础版
+
+### 旧做法
+
+Work Item detail 和 Human Review packet 主要展示 PR URL、branch 和 proof 文件；checks、review decision、mergeable、delivery gate 虽然已有 `/github/pr-status` API，但没有进入详情页主视图。
+
+### 新做法
+
+- 当当前 Attempt 有真实 `pullRequestUrl` 时，前端调用 `/github/pr-status`。
+- API 成功后才渲染 PR lifecycle 卡片，展示 review decision、mergeable、head/base branch、delivery gate 和 check 列表。
+- API 失败或没有 PR URL 时不展示该卡片，避免假状态。
+
+### 验证
+
+已新增/更新前端详情页测试覆盖，随常用验证执行：
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "shows review packet details" --testTimeout=15000
+```
+
+## 2026-04-29: P0 JobSupervisor / Preflight / Run Report 基础版
+
+### 旧做法
+
+- `job-supervisor/tick` 主要做 checkpoint integrity 和 stalled detection，不扫描 Ready Work Item。
+- DevFlow 运行前的检查分散在 handler、Agent runner preflight 和运行中错误里。
+- Human Review 材料分散在 proof 文件、PR URL、timeline 和 runtime log 中，没有单页报告。
+
+### 新做法
+
+- 新增 JobSupervisor daemon：Go Local Runtime 启动时默认运行后台维护 tick，启动后立即执行一次，之后按固定 interval 执行。
+- daemon 默认只做安全维护：checkpoint integrity、running attempt stalled detection、Ready item preflight scan；不会隐式启动 Ready item，除非显式传入 `job-supervisor-auto-run-ready`。
+- `job-supervisor/tick` 增加 runnable scan：扫描 `Ready` 且绑定 repository target 的 Work Item，统一执行 DevFlow preflight；显式传 `autoRunReady=true` 时创建 Attempt 并交给后台 job。
+- 新增 `devflow_preflight.go`：集中检查 repository target、workspace root、git/gh、runner availability、local dirty state，并被 manual run、Attempt retry、JobSupervisor scan 复用。
+- 新增 `devflow_report.go`：DevFlow 进入 Human Review 前生成 `attempt-run-report.md`，聚合需求、PR、changed files、测试、remote checks、review verdict 和 artifact 清单。
+
+### 验证
+
+已新增/更新：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorTickReportsRunnableReadyWork|TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof|TestPrepareDevFlowAttemptRetryLinksAttempts'
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorTickBackfillsPendingCheckpointAttemptLink|TestJobSupervisorTickMarksStalledRunningAttempt|TestJobSupervisorLoopRunsMaintenanceTicks|TestJobSupervisorTickReportsRunnableReadyWork|TestCancelAttemptAPIUpdatesStateAndSignalsRunningJob'
+```
+
+## 2026-04-29: Omega CLI 基础版
+
+### 旧做法
+
+只能通过 Workboard UI 或直接 curl Runtime API 做 operator 操作；已有命令入口只负责启动 Go Local Runtime，不是可直接使用的控制 CLI。
+
+### 新做法
+
+- 新增 `services/local-runtime/cmd/omega` 作为命令行入口，可通过 `go install ./services/local-runtime/cmd/omega` 安装成 `omega` 命令。
+- 新增 `services/local-runtime/internal/omegacli`，作为薄 HTTP client 调用 Go Local Runtime API。
+- 支持 `health`、`status`、`logs`、`work-items list/run`、`attempts list/timeline/retry/cancel`、`checkpoints list/approve/changes`、`supervisor tick`。
+- `work-items run` 会读取真实 workspace，查找或创建 `devflow-pr` Pipeline，再调用现有 DevFlow run API；CLI 不直接读写 SQLite，也不复制 server 编排逻辑。
+- 新增独立说明文档：`docs/omega-cli.md`。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegacli ./services/local-runtime/cmd/omega
+npm run omega -- status
+```
+
+## 2026-04-29: P1 Observability Dashboard 基础版
+
+### 旧做法
+
+`/observability` 主要返回 counts、pipeline/checkpoint/operation/work item status、attention 和 recent errors。它适合确认当前状态，但不直接回答“哪些 run 最慢、失败集中在哪里、哪些 human gate 等待最久、operator 下一步该看哪里”。
+
+### 新做法
+
+- 保留旧 summary 字段，向后兼容 UI 和 CLI。
+- 新增 `counts.attempts` 和 `attemptStatus`，把 Attempt 也纳入 summary。
+- 新增 `dashboard`：
+  - `attempts`：Attempt total / terminal / active / successRate / status。
+  - `failureReasons`：按失败、stalled、canceled Attempt 的错误原因聚合。
+  - `slowStages`：从 Attempt stage snapshot 计算最慢阶段。
+  - `waitingHumanQueue`：按 pending checkpoint 生成待人工队列。
+  - `activeRuns`：展示 running / waiting-human Attempt 的 lastSeen age。
+  - `recommendedActions`：根据失败、stalled、pending gate、blocked item 生成 operator 动作建议。
+- `omega status` 消费 dashboard attempts 和 recommended actions，但仍只通过 Runtime API 读取真实数据。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegacli ./services/local-runtime/internal/omegalocal -run 'TestStatusPrintsObservabilitySummary|TestObservabilityDashboardMetrics|TestObservabilitySummary|TestRuntimeLogsAPIListsAndFiltersRecords'
+```
+
+## 2026-04-29: 正式 JobSupervisor v1
+
+### 旧做法
+
+P0 基础版已经有 daemon、checkpoint integrity、stalled detection、Ready item preflight scan、显式 `autoRunReady` 和手动 Attempt retry，但 JobSupervisor 还没有把 failed/stalled recovery、retry policy、workflow contract 状态纳入同一个调度 tick。因此文档中保留了“正式 JobSupervisor”未完成项。
+
+### 新做法
+
+- `POST /job-supervisor/tick` 在同一次 tick 中处理：
+  - pending human gate integrity repair / attempt backfill。
+  - workflow contract metadata 校验和回填。
+  - running Attempt heartbeat stalled detection。
+  - Ready + repository target Work Item preflight scan。
+  - failed / stalled Attempt recovery scan。
+- 自动写仓库仍是显式策略：
+  - `autoRunReady=true` 才会启动 Ready Work Item。
+  - `autoRetryFailed=true` 才会对 failed / stalled Attempt 创建 retry Attempt。
+- 自动恢复策略基础版：
+  - `maxRetryAttempts` 控制每个 retry root 的最大 retry 次数。
+  - `retryBackoffSeconds` 控制失败/卡住后多久才可重试。
+  - retry 仍调用 `prepareDevFlowAttemptRetry`，复用 repository target、preflight、retry metadata 和后台 job。
+- Workflow contract 基础消费：
+  - Pipeline run metadata 保存 workflow source、runtime、review rounds、transitions。
+  - JobSupervisor tick 会校验/回填 devflow pipeline 的 workflow contract metadata。
+  - summary/log 暴露 workflow contract pipeline 数、缺失数和 contract 摘要。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorTickBackfillsWorkflowContractMetadata|TestJobSupervisorScanRecoverableAttempts|TestJobSupervisorTickReportsRunnableReadyWork|TestPrepareDevFlowAttemptRetryLinksAttempts|TestWorkflowTemplateLoadsDevFlowMarkdown'
+```
+
+## 2026-04-29: DevFlow Production Core P1
+
+### 旧做法
+
+- Workflow runtime 只驱动 review cycle，Attempt timeout、runner heartbeat、retry 上限和 backoff 仍主要来自 Go 常量、CLI flag 或 API payload。
+- 长时间 runner 子进程没有 stdout/stderr 级别的 Attempt heartbeat，排障主要看最终 process result。
+- PR status 读取 checks，但没有缺失 required checks、branch sync、merge conflict 和推荐动作的统一输出。
+- Workboard manual run / retry 的并发保护主要依赖 active Attempt；execution lock 覆盖不如 issue auto-run 路径完整。
+- Workspace root、repo path、cleanup 意图和锁信息分散在运行逻辑和 proof 中。
+
+### 新做法
+
+- `devflow-pr` workflow runtime 增加 `runnerHeartbeatSeconds`、`attemptTimeoutMinutes`、`maxRetryAttempts`、`retryBackoffSeconds`、`requiredChecks`。
+- DevFlow 执行器消费 runtime policy：runner heartbeat、Attempt timeout、JobSupervisor retry 上限和 backoff 不再只靠硬编码默认值。
+- supervised runner command 输出 stdout / stderr / heartbeat event；Attempt `lastSeenAt`、Attempt events 和 runtime DEBUG log 会随子进程输出刷新。
+- `/github/pr-status` 输出 `checkSummary`、`branchSync`、`recommendedActions`，可区分 failed / pending / missing required checks、behind 和 conflict。
+- 新增 `workspace_lifecycle.go`：manual run、retry、JobSupervisor auto run 会声明 workspace execution lock；运行时写入 `.omega/workspace-lifecycle.json`。
+- 新增 `docs/devflow-production-core.md`，把功能一生产化内核从大文档中拆出来维护。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/...
+```
+
+## 2026-04-29: DevFlow Contract / Cleanup / Worker Lease P1
+
+### 旧做法
+
+- workspace lifecycle 已能写入 spec 和 execution lock，但没有和数据库状态联动的 cleanup 策略。
+- workflow contract 主要来自默认 Markdown 模板；目标仓库自己的运行协议还没有被 runtime 优先消费。
+- coding / review / rework prompt 仍主要由 Go 字符串拼接，workflow markdown 不能直接定义 Agent prompt section。
+- JobSupervisor 可以扫描 stalled / retry，但没有明确记录本机 worker host lease；runtime 重启或 job 丢失后，只能依赖 heartbeat 超时兜底。
+
+### 新做法
+
+- 新增 `POST /workspaces/cleanup` 和 JobSupervisor workspace cleanup scan：
+  - 已完成 Attempt 满足 retention 后可清理 `repo` checkout。
+  - `.omega` proof / lifecycle 默认保留。
+  - 失败、取消、stalled Attempt 默认保留，避免丢失排障材料。
+  - cleanup 结果写回 Attempt `workspaceCleanup` metadata，并追加 `workspace.cleaned` event。
+- 新增 repo-owned workflow contract：
+  - 目标仓库 `.omega/WORKFLOW.md` 优先于默认模板。
+  - Agent Profile 中带 front matter 的 workflow markdown 可作为 Project / Repository override。
+  - 加载时校验 stage、transition、review round、agent 和 runtime，失败时阻止运行。
+- Workflow Markdown body 支持 prompt sections：
+  - `## Prompt: coding`
+  - `## Prompt: rework`
+  - `## Prompt: review`
+  - runtime 会渲染变量后传给对应 Agent，并继续追加 Agent Profile policy。
+- JobSupervisor / DevFlow 增加 worker lease：
+  - background Attempt 会记录本机 worker host。
+  - execution lock 会记录 worker host 和 runner process state。
+  - JobSupervisor tick 会把没有本机 job 且锁无效的 running Attempt 标记为 `stalled`，后续 retry 策略可以接管。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/...
+```
+
+## 2026-04-29: Human Review Request Changes 进入真实 Rework
+
+### 旧做法
+
+- Human Review 点 Request changes 后，只把 checkpoint 写成 `rejected`，并把 pipeline stage 重置为 ready / waiting。
+- 人工反馈只出现在 run event 中，不会创建新的 Attempt，也不会稳定进入下一轮 Agent prompt。
+- 前端点击后只能看到 timeline 多了 rejected 事件，容易误判链路是假的。
+
+### 新做法
+
+- `POST /checkpoints/{id}/request-changes` 对 DevFlow Human Review checkpoint 会创建新的 `human-request-changes` Attempt。
+- 旧 Attempt 会标记为 `changes-requested`，并保存 `failureReviewFeedback`、`statusReason`、`retryAttemptId`。
+- 新 Attempt 会保存 `humanChangeRequest`、`retryReason`、`retryOfAttemptId`、`retryRootAttemptId` 和 retry index。
+- Pipeline run event 增加 `human.rework.requested` / `human.rework.started`，Run Workpad 的 Review Feedback / Retry Reason 会直接展示人工反馈。
+- DevFlow prompt 会把最新人工反馈追加到 requirement description，并写入 `reviewFeedback` 变量，下一轮 Agent 可以真实消费“需要改什么”。
+- Request changes 后前端立即做轻量刷新，并延迟再刷新一次，减少用户看到“没反应”的窗口。
+
+### 当前边界
+
+- 当前实现会启动新的完整 DevFlow Attempt，但复用同一 Work Item workspace 和分支名；下一步应继续收敛为只从 Rework 阶段续跑，减少不必要的 requirement / architect 重跑。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPrepareDevFlowHumanRequestedReworkStartsAttemptWithFeedback|TestPrepareDevFlowAttemptRetryLinksAttempts|TestApproveDevFlowCheckpointCanContinueDeliveryAsync'
+go test ./services/local-runtime/internal/omegalocal
+npm run lint
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
+npm run build
+```
+
+## 2026-04-30: Human Review Rework 续写同一 PR
+
+### 旧做法
+
+- Human Review Request changes 会创建新 Attempt，但 UI 还没有明确说明它是否基于第一次版本继续修改。
+- 如果本地隔离 workspace 不存在，delivery branch 恢复会退回 base branch，存在把人工 rework 当作新实现跑的风险。
+- 二次 review 只看当前 diff 和 requirement，没有明确提示“这是人工要求修改后的增量 diff”。
+- PR description 创建后不随人工 rework 更新，GitHub PR 可能缺少人工意见和本轮增量 diff。
+
+### 新做法
+
+- Human-requested rework Attempt 继承上一轮 `branchName`、`pullRequestUrl`、`workspacePath`。
+- Runtime checkout 时优先恢复本地同名 branch；本地 branch 不存在时优先从 `origin/{branch}` 恢复，再退回 base branch。
+- Review prompt 增加人工 / 上轮 review feedback，并提示 reviewer 按“上一版到本轮的增量 diff”核对人工意见。
+- PR description 在人工 rework 或自动 rework 后按需更新，加入人工意见、changed files、validation 和本轮增量 diff。
+- Human Review UI 去掉重复产品名前缀，PR/Changed/Validation/Artifacts 改为左右紧凑布局；Delivery Flow 的 passed/done 视觉改为轻量通过信号。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPrepareDevFlowHumanRequestedReworkStartsAttemptWithFeedback|TestEnsureDevFlowRepositoryWorkspaceRestoresRemoteDeliveryBranch|TestWorkflowTemplateLoadsDevFlowMarkdown'
+npm run lint
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=15000
+```
+
+## 2026-04-30: Human Review Request Changes 评估与分流
+
+### 旧做法
+
+- Request changes 会创建真实 `human-request-changes` Attempt，但默认更像“带人工意见的完整重跑”。
+- 局部 UI / 文案改动没有直接从 Rework 阶段续跑，导致响应慢、执行成本高。
+- 架构、接口、权限、数据模型变化没有显式重规划标记，review / retry 只能从事件和 artifact 里反推原因。
+- 人工意见为空或不明确时，系统仍可能继续启动 Agent，存在猜测需求的风险。
+
+### 新做法
+
+- 新增 Rework Assessment，详见 `docs/human-review-rework-assessment.md`。
+- Runtime 会根据人工意见生成 `reworkAssessment`，写入旧 Attempt、新 Attempt 和 Run Workpad。
+- `fast_rework`：直接进入 `rework` stage，复用上一轮 workspace / branch / PR，只生成本轮增量 diff、validation、review proof 和更新后的 PR description。
+- `replan_rework`：从 `todo` 重新整理 requirement / solution plan，再继续实现，但仍基于上一轮 delivery branch / PR 推进。
+- `needs_human_info`：不启动 Agent，Attempt 保持 `waiting-human`，Workpad 解释需要补充的人工信息。
+- Work Item 详情页 Run Workpad 新增 Rework Assessment 摘要区块，默认折叠，展开后显示 rationale、human feedback 和 checklist。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPrepareDevFlowHumanRequestedReworkStartsAttemptWithFeedback|TestPrepareDevFlowHumanRequestedReworkWaitsWhenFeedbackNeedsInfo|TestAssessHumanRequestedReworkRoutesByScope|TestResetDevFlowPipelineForAttemptFromStageFallsBackWhenStageMissing'
+npm run lint
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=15000
 ```

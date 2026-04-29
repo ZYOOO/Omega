@@ -64,6 +64,89 @@ paths:
       responses:
         '200':
           description: Attempt records returned
+  /attempts/{id}/timeline:
+    get:
+      summary: Read an attempt run timeline
+      description: >
+        Returns a chronological, read-only timeline for one concrete execution attempt.
+        The timeline is assembled from persisted Attempt events, Pipeline run events and
+        stage snapshots, Checkpoints, Operations, Proof records, and Runtime logs that
+        match the attempt or its pipeline.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Attempt timeline returned
+        '404':
+          description: Attempt not found
+  /attempts/{id}/retry:
+    post:
+      summary: Retry a failed, stalled, or canceled attempt
+      description: >
+        Creates a new concrete DevFlow attempt for the same Work Item and Repository
+        Workspace, links it to the previous attempt with retry metadata, resets the
+        pipeline stages, and starts a new background run. Previous attempt records are
+        preserved for audit and timeline review.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                autoApproveHuman:
+                  type: boolean
+                autoMerge:
+                  type: boolean
+                wait:
+                  type: boolean
+      responses:
+        '202':
+          description: Retry attempt accepted
+        '409':
+          description: Attempt status is not retryable or another attempt is active
+        '404':
+          description: Attempt or pipeline not found
+  /attempts/{id}/cancel:
+    post:
+      summary: Cancel a running attempt
+      description: >
+        Sends a cancel signal to the registered background attempt job when one is active,
+        marks the Attempt as canceled, marks the Pipeline as canceled, moves the Work Item
+        to Blocked, and records an attempt.canceled event. If no local job is currently
+        registered, the database state still records the operator cancellation.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Canceled attempt returned with cancelSignalSent
+        '404':
+          description: Attempt not found
   /checkpoints:
     get:
       summary: List checkpoints
@@ -88,6 +171,115 @@ paths:
       responses:
         '200':
           description: Proof records returned
+  /run-workpads:
+    get:
+      summary: List Run Workpad records
+      description: >
+        Returns structured Workpad records bound to concrete Attempts. Each record
+        contains Plan, Acceptance Criteria, Validation, Notes, Blockers, PR,
+        Review Feedback, and Retry Reason fields. Supports filters for attemptId,
+        pipelineId, workItemId, repositoryTargetId, and status.
+      parameters:
+        - in: query
+          name: attemptId
+          schema:
+            type: string
+        - in: query
+          name: pipelineId
+          schema:
+            type: string
+        - in: query
+          name: workItemId
+          schema:
+            type: string
+        - in: query
+          name: repositoryTargetId
+          schema:
+            type: string
+        - in: query
+          name: status
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Run Workpad records returned
+  /runtime-logs:
+    get:
+      summary: List append-only runtime logs
+      description: >
+        Returns structured runtime log records from the local SQLite log stream. Supports
+        filters for level, eventType, entityType/entityId, projectId, repositoryTargetId,
+        workItemId, pipelineId, attemptId, stageId, agentId, requestId, createdAfter,
+        createdBefore, and limit.
+      parameters:
+        - in: query
+          name: level
+          schema:
+            type: string
+            enum: [INFO, DEBUG, ERROR]
+        - in: query
+          name: eventType
+          schema:
+            type: string
+        - in: query
+          name: entityType
+          schema:
+            type: string
+        - in: query
+          name: entityId
+          schema:
+            type: string
+        - in: query
+          name: projectId
+          schema:
+            type: string
+        - in: query
+          name: repositoryTargetId
+          schema:
+            type: string
+        - in: query
+          name: workItemId
+          schema:
+            type: string
+        - in: query
+          name: pipelineId
+          schema:
+            type: string
+        - in: query
+          name: attemptId
+          schema:
+            type: string
+        - in: query
+          name: stageId
+          schema:
+            type: string
+        - in: query
+          name: agentId
+          schema:
+            type: string
+        - in: query
+          name: requestId
+          schema:
+            type: string
+        - in: query
+          name: createdAfter
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: createdBefore
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 100
+            maximum: 500
+      responses:
+        '200':
+          description: Runtime log records returned
   /migrations:
     get:
       summary: List applied local database migrations
@@ -117,6 +309,76 @@ paths:
           description: Released execution lock returned
         '404':
           description: Execution lock not found
+  /job-supervisor/tick:
+    post:
+      summary: Run one local JobSupervisor reconciliation tick
+      description: >
+        Runs the local JobSupervisor reconciliation and scheduling tick. The tick
+        repairs pending human checkpoints that lost their concrete attempt link,
+        backfills a recoverable attempt record when needed, checks workflow contract
+        metadata, marks stale running attempts as stalled, scans Ready repository-bound
+        Work Items through DevFlow preflight, and scans failed/stalled Attempts for
+        retry recovery. Repository-writing actions remain explicit: Ready work only
+        starts when autoRunReady is true, and failed/stalled Attempts only retry when
+        autoRetryFailed is true.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                staleAfterSeconds:
+                  type: integer
+                  description: Attempt heartbeat age threshold before a running attempt is marked stalled. Defaults to 900 seconds.
+                autoRunReady:
+                  type: boolean
+                  description: When true, runnable Ready Work Items that pass preflight are started as new Attempts.
+                autoRetryFailed:
+                  type: boolean
+                  description: When true, failed or stalled Attempts that pass retry policy are retried as new Attempts.
+                autoCleanupWorkspaces:
+                  type: boolean
+                  description: 为 true 时，满足清理策略的 completed Attempt 会删除 repo checkout，并保留 proof。
+                maxRetryAttempts:
+                  type: integer
+                  description: Maximum automatic retries per retry root. Defaults to 2.
+                retryBackoffSeconds:
+                  type: integer
+                  description: Minimum age before a failed or stalled Attempt can be retried.
+                workspaceRetentionSeconds:
+                  type: integer
+                  description: completed workspace 成为 cleanup candidate 前需要等待的秒数；默认读取 workflow runtime。
+                limit:
+                  type: integer
+                  description: Maximum Ready Work Items and recoverable Attempts to inspect in this tick. Defaults to 10.
+      responses:
+        '200':
+          description: Supervisor tick summary returned
+  /workspaces/cleanup:
+    post:
+      summary: 规划或执行 workspace cleanup
+      description: >
+        扫描带 workspacePath 的 terminal Attempt。默认只返回 dry-run 计划。
+        当 apply 为 true 时，满足 retention policy 的 completed Attempt 会删除 repo checkout，
+        同时保留 .omega proof 和 lifecycle artifacts。failed / canceled / stalled Attempt
+        默认保留，方便后续排障。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                apply:
+                  type: boolean
+                retentionSeconds:
+                  type: integer
+                limit:
+                  type: integer
+      responses:
+        '200':
+          description: 返回 workspace cleanup summary
   /pipeline-templates:
     get:
       summary: List pipeline templates
@@ -320,10 +582,14 @@ paths:
           description: Run is missing, already delivered, or cannot be reverted
   /observability:
     get:
-      summary: Return pipeline, checkpoint, operation, proof, and attention summary
+      summary: Return runtime observability summary and dashboard data
+      description: >
+        Preserves the original counts/status/attention summary and adds dashboard data
+        for attempt success rate, failure reasons, slow stages, active runs, pending
+        human review queue, and recommended operator actions.
       responses:
         '200':
-          description: Observability summary returned
+          description: Observability summary and dashboard data returned
   /work-items:
     post:
       summary: Create an executable item from a requirement source
@@ -341,6 +607,22 @@ paths:
         '200':
           description: Workspace snapshot after creation
   /work-items/{itemId}:
+    delete:
+      summary: Delete a not-started work item
+      description: >
+        Deletes only not-started work items that have no pipeline, attempt, checkpoint,
+        mission, operation, or proof history. Also removes an unshared Requirement record.
+      parameters:
+        - in: path
+          name: itemId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Workspace snapshot after delete
+        '409':
+          description: Work item has already started or has execution history
     patch:
       summary: Patch a work item status or priority
       parameters:
@@ -841,13 +1123,21 @@ paths:
                   type: string
                 repositoryName:
                   type: string
+                repositoryPath:
+                  type: string
+                workspacePath:
+                  type: string
+                requiredChecks:
+                  type: array
+                  items:
+                    type: string
                 number:
                   type: integer
                 url:
                   type: string
       responses:
         '200':
-          description: Pull request status, checks, delivery gate, and proof records
+          description: Pull request status, checks, check summary, branch sync, delivery gate, recommended actions, and proof records
         '502':
           description: gh pr view or gh pr checks failed
   /feishu/notify:

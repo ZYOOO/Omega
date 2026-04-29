@@ -5,6 +5,7 @@ export * from "./catalog";
 export * from "./connections";
 export * from "./workItemProjection";
 export * from "./masterAgent";
+export * from "./manualWorkItem";
 export * from "./pipeline";
 export * from "./projectHierarchy";
 export * from "./releaseAudit";

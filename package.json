@@ -13,6 +13,7 @@
     "preview": "vite preview --config apps/web/vite.config.ts",
     "local:runner:demo": "node scripts/local-runner-demo.mjs",
     "local-runtime:dev": "go run ./services/local-runtime/cmd/omega-local-runtime",
+    "omega": "go run ./services/local-runtime/cmd/omega",
     "mission-control:api": "go run ./services/local-runtime/cmd/omega-local-runtime",
     "mission-control:api:node": "node scripts/local-runner-api.mjs",
     "go:test": "go test ./...",
