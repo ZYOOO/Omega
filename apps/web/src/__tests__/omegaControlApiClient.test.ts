@@ -21,6 +21,8 @@ import {
   fetchPagePilotRuns,
   fetchPipelines,
   fetchPipelineTemplates,
+  fetchRunWorkpads,
+  patchRunWorkpad,
   requestCheckpointChanges,
   runCurrentPipelineStage,
   sendFeishuNotification,
@@ -39,6 +41,40 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("omegaControlApiClient", () => {
+  it("reads and patches Run Workpad records through the local control plane", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (!init) {
+        expect(String(input)).toBe("http://omega.local/run-workpads?attemptId=attempt_1");
+        return Promise.resolve(jsonResponse([{ id: "attempt_1:workpad", workpad: { retryReason: "Review feedback" } }]));
+      }
+      expect(String(input)).toBe("http://omega.local/run-workpads/attempt_1%3Aworkpad");
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(String(init.body))).toMatchObject({
+        updatedBy: "job-supervisor",
+        reason: "CI gate changed",
+        source: { kind: "ci-check", id: "lint" },
+        workpad: { blockers: ["Required check pending"] }
+      });
+      return Promise.resolve(jsonResponse({
+        id: "attempt_1:workpad",
+        workpad: { blockers: ["Required check pending"], updatedBy: "job-supervisor" },
+        fieldPatches: { blockers: ["Required check pending"] },
+        fieldPatchSources: { blockers: { kind: "ci-check", id: "lint" } },
+        fieldPatchHistory: [{ updatedBy: "job-supervisor", fields: ["blockers"] }]
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchRunWorkpads("http://omega.local", { attemptId: "attempt_1" }, fetchImpl)).resolves.toHaveLength(1);
+    await expect(
+      patchRunWorkpad("http://omega.local", "attempt_1:workpad", {
+        updatedBy: "job-supervisor",
+        reason: "CI gate changed",
+        source: { kind: "ci-check", id: "lint" },
+        workpad: { blockers: ["Required check pending"] }
+      }, fetchImpl)
+    ).resolves.toMatchObject({ workpad: { updatedBy: "job-supervisor" }, fieldPatchHistory: [{ updatedBy: "job-supervisor" }] });
+  });
+
   it("loads control-plane summaries and configuration", async () => {
     const fetchImpl = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);

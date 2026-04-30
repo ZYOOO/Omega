@@ -981,11 +981,12 @@ func TestPrepareDevFlowAttemptRetryLinksAttempts(t *testing.T) {
 	attempt["id"] = "attempt_retry_old"
 	attempt["status"] = "failed"
 	attempt["errorMessage"] = "Coding agent produced no repository changes."
+	attempt["failureReviewFeedback"] = "Review found missing proof and asked for a focused validation note."
 	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
 	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
 
-	updated, retryPipeline, retryAttempt, err := server.prepareDevFlowAttemptRetry(ctx, *database, "attempt_retry_old", "Operator retry after failed diff.")
+	updated, retryPipeline, retryAttempt, err := server.prepareDevFlowAttemptRetry(ctx, *database, "attempt_retry_old", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -995,9 +996,19 @@ func TestPrepareDevFlowAttemptRetryLinksAttempts(t *testing.T) {
 	if text(retryPipeline, "status") != "running" {
 		t.Fatalf("retry pipeline = %+v", retryPipeline)
 	}
+	if !strings.Contains(text(retryAttempt, "retryReason"), "Review found missing proof") {
+		t.Fatalf("retry reason should come from the rework checklist = %+v", retryAttempt)
+	}
+	reworkChecklist := mapValue(retryAttempt["reworkChecklist"])
+	if text(reworkChecklist, "status") != "needs-rework" || !strings.Contains(text(reworkChecklist, "prompt"), "focused validation note") {
+		t.Fatalf("retry attempt should carry rework checklist = %+v", reworkChecklist)
+	}
 	oldAttempt := updated.Tables.Attempts[findByID(updated.Tables.Attempts, "attempt_retry_old")]
 	if text(oldAttempt, "retryAttemptId") != text(retryAttempt, "id") {
 		t.Fatalf("old attempt retry link = %+v", oldAttempt)
+	}
+	if text(mapValue(oldAttempt["reworkChecklist"]), "status") != "needs-rework" {
+		t.Fatalf("old attempt checklist = %+v", oldAttempt)
 	}
 	itemAfter := findWorkItem(updated, "item_retry")
 	if text(itemAfter, "status") != "In Review" {
@@ -3311,6 +3322,10 @@ func TestGitHubPRStatusUsesGhViewAndChecks(t *testing.T) {
 	bin := t.TempDir()
 	gh := filepath.Join(bin, "gh")
 	script := `#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ] && echo "$*" | grep -q 'comments,reviews'; then
+  printf '%s' '{"comments":[{"author":{"login":"reviewer"},"body":"Please tighten empty-state copy.","createdAt":"2026-04-30T08:00:00Z","url":"https://github.com/acme/demo/pull/12#issuecomment-1"}],"reviews":[{"author":{"login":"lead"},"state":"CHANGES_REQUESTED","body":"Update the retry explanation.","submittedAt":"2026-04-30T08:01:00Z","url":"https://github.com/acme/demo/pull/12#pullrequestreview-1"}]}'
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s' '{"number":12,"title":"Omega delivery","state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","headRefName":"omega/OMG-1-coding","baseRefName":"main","url":"https://github.com/acme/demo/pull/12"}'
   exit 0
@@ -3352,9 +3367,34 @@ exit 1
 	if len(actions) != 1 || actions[0]["type"] != "checks-pending" {
 		t.Fatalf("recommended actions = %+v", actions)
 	}
+	feedback := arrayMaps(result["reviewFeedback"])
+	if len(feedback) != 2 || feedback[0]["kind"] != "pr-comment" || feedback[1]["kind"] != "pr-review" {
+		t.Fatalf("review feedback = %+v", feedback)
+	}
 	branchSync := mapValue(result["branchSync"])
 	if branchSync["status"] != "unknown" {
 		t.Fatalf("branch sync = %+v", branchSync)
+	}
+}
+
+func TestGitHubPullRequestFeedbackFromView(t *testing.T) {
+	feedback := githubPullRequestFeedbackFromView(map[string]any{
+		"comments": []any{
+			map[string]any{"author": map[string]any{"login": "designer"}, "body": "The secondary button contrast is too low.", "url": "https://example.test/comment"},
+		},
+		"reviews": []any{
+			map[string]any{"author": map[string]any{"login": "reviewer"}, "state": "CHANGES_REQUESTED", "body": "Add validation proof before merge."},
+			map[string]any{"author": map[string]any{"login": "maintainer"}, "state": "COMMENTED"},
+		},
+	})
+	if len(feedback) != 3 {
+		t.Fatalf("feedback = %+v", feedback)
+	}
+	prompt := githubPullRequestFeedbackPrompt(feedback)
+	for _, expected := range []string{"secondary button contrast", "Add validation proof", "Review state: COMMENTED"} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("prompt missing %q in:\n%s", expected, prompt)
+		}
 	}
 }
 
@@ -3372,6 +3412,10 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   printf '%s' '[{"name":"lint","state":"FAILURE","link":"https://github.com/acme/demo/actions/runs/3"},{"name":"test","state":"SUCCESS","link":"https://github.com/acme/demo/actions/runs/4"}]'
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "view" ] && [ "$3" = "3" ]; then
+  printf '%s' 'lint	Failing test output: expected button text to be shorter'
   exit 0
 fi
 exit 1
@@ -3393,6 +3437,10 @@ exit 1
 	actions := arrayMaps(result["recommendedActions"])
 	if len(actions) == 0 || actions[0]["type"] != "checks-failed" {
 		t.Fatalf("recommended actions = %+v", actions)
+	}
+	checkFeedback := arrayMaps(result["checkLogFeedback"])
+	if len(checkFeedback) != 1 || !strings.Contains(text(checkFeedback[0], "message"), "expected button text") {
+		t.Fatalf("check log feedback = %+v", checkFeedback)
 	}
 }
 

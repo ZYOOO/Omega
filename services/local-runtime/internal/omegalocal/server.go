@@ -123,6 +123,8 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.listTable(response, request, "proofRecords")
 	case request.Method == http.MethodGet && path == "/run-workpads":
 		server.listTable(response, request, "runWorkpads")
+	case request.Method == http.MethodPatch && strings.HasPrefix(path, "/run-workpads/"):
+		server.patchRunWorkpad(response, request)
 	case request.Method == http.MethodGet && path == "/execution-locks":
 		server.listExecutionLocks(response, request)
 	case request.Method == http.MethodPost && strings.HasPrefix(path, "/execution-locks/") && strings.HasSuffix(path, "/release"):

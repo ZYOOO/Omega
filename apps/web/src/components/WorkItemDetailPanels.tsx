@@ -506,6 +506,8 @@ export function AgentTraceList({
 }: Pick<LabelHelpers, "agentShortLabel" | "operationStatusLabel" | "pipelineStageClassName"> & {
   operations: OperationRecordInfo[];
 }) {
+  const [activeOperationId, setActiveOperationId] = useState<string | null>(null);
+  const activeOperation = operations.find((operation) => operation.id === activeOperationId);
   if (!operations.length) {
     return <p className="muted-copy">Agent trace will appear as soon as the local orchestrator starts assigning stage work.</p>;
   }
@@ -513,44 +515,74 @@ export function AgentTraceList({
   return (
     <div className="agent-trace-list">
       {operations.map((operation) => (
-        <details key={operation.id} className={`agent-trace-row ${pipelineStageClassName(operation.status)}`}>
-          <summary>
+        <button
+          key={operation.id}
+          type="button"
+          className={`agent-trace-row ${pipelineStageClassName(operation.status)}`}
+          onClick={() => setActiveOperationId(operation.id)}
+        >
+          <span className="agent-trace-card-main">
             <div className="agent-trace-summary-copy">
               <span>{operation.stageId ?? "stage"}</span>
               <strong>{agentShortLabel(operation.agentId ?? "agent")}</strong>
               <em>{agentOperationPreview(operation)}</em>
             </div>
             <small className="agent-trace-status">{operationStatusLabel(operation.status)}</small>
-          </summary>
-          {operation.summary ? <p>{operation.summary}</p> : null}
-          {operation.runnerProcess ? (
-            <div className="agent-runner-meta">
-              <span>{operation.runnerProcess.runner ?? "runner"}</span>
-              {operation.runnerProcess.status ? <span>{operation.runnerProcess.status}</span> : null}
-              {typeof operation.runnerProcess.exitCode === "number" ? <span>exit {operation.runnerProcess.exitCode}</span> : null}
-              {typeof operation.runnerProcess.durationMs === "number" ? <span>{operation.runnerProcess.durationMs}ms</span> : null}
-            </div>
-          ) : null}
-          {operation.prompt ? (
-            <section className="agent-detail-block">
-              <strong>Prompt</strong>
-              <code>{operation.prompt}</code>
-            </section>
-          ) : null}
-          {operation.runnerProcess?.stdout ? (
-            <section className="agent-detail-block">
-              <strong>Stdout</strong>
-              <code>{operation.runnerProcess.stdout}</code>
-            </section>
-          ) : null}
-          {operation.runnerProcess?.stderr ? (
-            <section className="agent-detail-block">
-              <strong>Stderr</strong>
-              <code>{operation.runnerProcess.stderr}</code>
-            </section>
-          ) : null}
-        </details>
+          </span>
+          <span className="agent-trace-open" aria-hidden="true">Open</span>
+        </button>
       ))}
+      {activeOperation ? (
+        <section className="detail-popover-backdrop" role="presentation" onClick={() => setActiveOperationId(null)}>
+          <article
+            className="detail-popover agent-operation-popover"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${agentShortLabel(activeOperation.agentId ?? "agent")} operation detail`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header>
+              <div>
+                <span>{activeOperation.stageId ?? "stage"}</span>
+                <strong>{agentShortLabel(activeOperation.agentId ?? "agent")}</strong>
+              </div>
+              <button type="button" onClick={() => setActiveOperationId(null)}>Close</button>
+            </header>
+            <div className="detail-popover-body">
+              <div className="agent-operation-dialog-summary">
+                <strong>{operationStatusLabel(activeOperation.status)}</strong>
+                <p>{activeOperation.summary || agentOperationPreview(activeOperation)}</p>
+              </div>
+              {activeOperation.runnerProcess ? (
+                <div className="agent-runner-meta">
+                  <span>{activeOperation.runnerProcess.runner ?? "runner"}</span>
+                  {activeOperation.runnerProcess.status ? <span>{activeOperation.runnerProcess.status}</span> : null}
+                  {typeof activeOperation.runnerProcess.exitCode === "number" ? <span>exit {activeOperation.runnerProcess.exitCode}</span> : null}
+                  {typeof activeOperation.runnerProcess.durationMs === "number" ? <span>{activeOperation.runnerProcess.durationMs}ms</span> : null}
+                </div>
+              ) : null}
+              {activeOperation.prompt ? (
+                <section className="agent-detail-block">
+                  <strong>Prompt</strong>
+                  <code>{activeOperation.prompt}</code>
+                </section>
+              ) : null}
+              {activeOperation.runnerProcess?.stdout ? (
+                <section className="agent-detail-block">
+                  <strong>Stdout</strong>
+                  <code>{activeOperation.runnerProcess.stdout}</code>
+                </section>
+              ) : null}
+              {activeOperation.runnerProcess?.stderr ? (
+                <section className="agent-detail-block">
+                  <strong>Stderr</strong>
+                  <code>{activeOperation.runnerProcess.stderr}</code>
+                </section>
+              ) : null}
+            </div>
+          </article>
+        </section>
+      ) : null}
     </div>
   );
 }

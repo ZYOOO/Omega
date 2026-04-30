@@ -2,6 +2,40 @@
 
 这个文档用于记录每个功能的落地方式。后续每完成一个功能，都按相同结构补一节：目标、入口、数据/API、运行时行为、验证、后续工作。
 
+## 2026-04-30: PR 评审反馈进入 Rework Checklist
+
+### 目标
+
+让 request changes、PR 评论、PR review state、Review Agent 输出和交付门禁汇成同一份可执行 rework 输入。旧做法已经能创建真实 Rework Attempt，但 PR 侧评论没有进入 Attempt，用户看到“已拒绝”后不容易判断下一轮 Agent 到底会依据什么修改。
+
+### 数据/API
+
+- `/github/pr-status` 在读取 PR 基础状态和 checks 后，额外读取 `comments,reviews`，返回 `reviewFeedback`。
+- DevFlow PR cycle 在创建或更新 PR 后同步读取 PR feedback，并把 `pullRequestFeedback` 写入 Attempt result。
+- `/github/pr-status` 和 DevFlow PR cycle 会从 failed check link 抽取 Actions run id，优先读取 `gh run view --log-failed`，返回 / 写入 `checkLogFeedback`。
+- `reworkChecklist.sources` 新增 `pr-review`、`pr-comment`、`ci-check-log` 类型，和人工反馈、Review Agent 反馈、checks / branch sync / conflict 建议一起生成 checklist。
+
+### 运行时行为
+
+- Human Review request changes 后，新 Rework Attempt 会继续复用上一轮 workspace / branch / PR，并消费当前 Attempt 上的 `reworkChecklist.prompt`。
+- 自动 review / rework loop 在 review prompt 中附带 PR feedback，避免 PR 上的 comment 与本地 Review Agent 结果脱节。
+- 自动 review / rework loop 在 review prompt 中附带 failed check log，避免只告诉 Agent “CI 失败”却不给失败输出。
+- `attempt-run-report.md` 增加 Pull Request Feedback 和 Failed Check Logs 小节，Human Review 可看到 PR 评论和 CI 失败输出是否已经进入运行上下文。
+- Workpad 的 Rework Checklist 展开后会显示 source drilldown，用户可以看到每条 action 背后的 human / review / PR comment / check log / gate 来源摘要。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestGitHubPRStatusUsesGhViewAndChecks|TestGitHubPullRequestFeedbackFromView|TestGitHubPRStatusClassifiesFailedChecks|TestBuildReworkChecklistMergesReviewHumanAndDeliveryGateSignals|TestRunWorkpadRecordTracksAttemptRetryContext'
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+```
+
+### 后续工作
+
+- PR review thread 的 resolved/unresolved 状态和行级 diff 上下文仍需后续接入。
+- CI/check 日志分页、job/step 结构化解析和 source drilldown 仍需后续接入。
+- Workpad source drilldown 当前是摘要级；后续补从 source 反跳到具体 Timeline event、PR comment、check log step 或 artifact 的深链。
+
 ## 2026-04-29: Work Item 详情页 / Run Workpad Record 基础版
 
 ### 目标
@@ -44,6 +78,7 @@ runWorkpads
 
 ```text
 GET /run-workpads
+PATCH /run-workpads/{id}
 ```
 
 支持按 `attemptId`、`pipelineId`、`workItemId`、`repositoryTargetId`、`status` 过滤。
@@ -58,6 +93,8 @@ Workpad 的每个字段都从现有真实记录生成：
 - PR：proof PR URL 和 `/github/pr-status` 返回的检查结果。
 - Review Feedback：review agent 结果、checkpoint decision、human request changes 相关记录。
 - Retry Reason：runtime 归并出的失败和重试依据；前端缺失 record 时才使用本地兜底。
+- Field patches：Agent / supervisor 可通过 `PATCH /run-workpads/{id}` 写入 Plan、Validation、Blockers、Review Feedback、Retry Reason 等字段。旧做法每次 runtime 刷新都会覆盖整份 Workpad；新做法把 patch 保存为 `fieldPatches`，刷新时先派生真实状态，再叠加字段级 patch。
+- Field patch audit：2026-04-30 新增 `fieldPatchSources` / `fieldPatchHistory` 和 `updatedBy` 写入边界。旧做法只能看到最终覆盖值；新做法可以追踪每个被覆盖字段的来源、原因、写入者和时间，并在 Work Item 详情页以默认折叠的 Patch history 卡片展示。
 
 ### 运行时行为
 
@@ -87,7 +124,7 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestRunWorkpadRecordT
 ### 后续工作
 
 - 把当前 runtime 刷新的 Run Workpad 升级为按字段 patch，允许 Agent / supervisor 直接写入 Plan、Validation、Blockers、Review Feedback、Retry Reason。
-- 把 review agent 结果、PR comments、human request changes 和 checks / branch sync / conflict 推荐动作进一步持久化为 rework checklist，并让 Rework Agent 和 Retry API 直接消费。
+- 已完成基础版：review agent 结果、PR comments / reviews、human request changes 和 checks / branch sync / conflict 推荐动作会进入 rework checklist，并让 Rework Agent 和 Retry API 消费；后续继续补 thread resolved 状态和 CI/check 详细日志。
 - Approve 只推进 checkpoint approved；merge 作为单独 job 运行并展示 checks、branch sync、conflict、merge output 和失败原因。
 
 ## 2026-04-29: Runtime Logs 基础版
@@ -1313,4 +1350,28 @@ npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx ap
 go test ./services/local-runtime/internal/omegalocal -run 'TestPrepareDevFlowHumanRequestedReworkStartsAttemptWithFeedback|TestPrepareDevFlowHumanRequestedReworkWaitsWhenFeedbackNeedsInfo|TestAssessHumanRequestedReworkRoutesByScope|TestResetDevFlowPipelineForAttemptFromStageFallsBackWhenStageMissing'
 npm run lint
 npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=15000
+```
+
+## 2026-04-30: DevFlow Rework Checklist
+
+### 旧做法
+
+- Retry Reason、Review Feedback、PR/check 推荐动作和人工 request changes 虽然都能显示，但来源分散。
+- Rework Agent prompt 主要消费当轮 feedback 字符串；失败重试时需要调用方重新拼接上下文。
+- 用户看到 “Retry” 时仍需要打开 timeline、artifact 或 PR status 自己判断下一轮该改什么。
+
+### 新做法
+
+- 新增 `services/local-runtime/internal/omegalocal/rework_checklist.go`，集中生成 `reworkChecklist`。
+- Checklist 来源包括人工反馈、Review Agent 输出、失败原因、runner stderr、operation/event、checks/rebase/conflict 推荐动作。
+- Attempt 失败、取消、Human Review request changes、手动 retry、Run Workpad 刷新都会生成或继承 checklist。
+- Retry API 在没有显式 reason 时会使用 checklist 的 `retryReason`。
+- Rework prompt 优先使用 checklist 的 `prompt`，并在自动 review rework 时追加最新 review feedback。
+- Run Workpad 新增 `reworkChecklist` 字段，后续 UI 可以直接展开来源和执行清单。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestBuildReworkChecklistMergesReviewHumanAndDeliveryGateSignals|TestRunWorkpadRecordTracksAttemptRetryContext|TestPrepareDevFlowAttemptRetryLinksAttempts|TestPrepareDevFlowHumanRequestedReworkStartsAttemptWithFeedback'
+go test ./services/local-runtime/internal/omegalocal
 ```

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorkItem } from "../../core";
 import { parseWorkItemDetailHash, workItemDetailHash } from "../../workItemRoutes";
@@ -58,7 +58,33 @@ describe("WorkItemDetailPage", () => {
         }]}
         repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
         repositoryLabel="ZYOOO/TestRepo"
-        runWorkpads={[]}
+        runWorkpads={[{
+          id: "attempt_21:workpad",
+          attemptId: "attempt_21",
+          pipelineId: "pipeline_21",
+          workItemId: "item_manual_21",
+          repositoryTargetId: "repo_test",
+          status: "waiting-human",
+          workpad: {
+            reworkChecklist: {
+              status: "needs-rework",
+              retryReason: "Review agent requested a clearer loading state.",
+              checklist: ["处理 Review Agent 指出的阻塞问题：Add loading feedback before merge."],
+              sources: [
+                { kind: "review", label: "Review feedback", message: "Add loading feedback before merge." },
+                { kind: "ci-check-log", label: "lint", message: "Expected visible loading text before approval.", url: "https://github.com/ZYOOO/TestRepo/actions/runs/21" }
+              ]
+            }
+          },
+          fieldPatchHistory: [{
+            id: "attempt_21:workpad:patch:1",
+            updatedAt: "2026-04-29T14:40:00Z",
+            updatedBy: "job-supervisor",
+            fields: ["blockers", "reviewFeedback"],
+            reason: "Required check changed state.",
+            source: { kind: "ci-check", label: "lint" }
+          }]
+        }]}
         pipeline={{
           id: "pipeline_21",
           workItemId: "item_manual_21",
@@ -107,9 +133,21 @@ describe("WorkItemDetailPage", () => {
     );
 
     expect(screen.getByLabelText("Run workpad")).toBeInTheDocument();
+    expect(screen.getByText("Rework checklist")).toBeInTheDocument();
+    expect(screen.getByText("1 action")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Rework checklist/i }));
+    expect(screen.getByLabelText("Checklist sources")).toBeInTheDocument();
+    expect(screen.getByText("Check log")).toBeInTheDocument();
+    expect(screen.getByText("Expected visible loading text before approval.")).toBeInTheDocument();
+    expect(screen.getByText("Open source")).toHaveAttribute("href", "https://github.com/ZYOOO/TestRepo/actions/runs/21");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: /Patch history/i }));
+    expect(screen.getByText("Required check changed state.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(container.querySelector(".requirement-source-scroll")).toBeTruthy();
     expect(container.querySelector(".detail-stage-grid .stage-running")).toBeTruthy();
     expect(screen.getByText("Agent operations")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /implementation.*coding/i }));
     expect(screen.getByText("Prompt")).toBeInTheDocument();
     expect(screen.getByText("/tmp/implementation-summary.md")).toBeInTheDocument();
   });

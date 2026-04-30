@@ -242,6 +242,21 @@ export interface GitHubPullRequestStatusResult {
     sourceUrl?: string;
     status?: string;
   }>;
+  reviewFeedback?: Array<{
+    kind?: string;
+    label?: string;
+    message?: string;
+    createdAt?: string;
+    url?: string;
+  }>;
+  checkLogFeedback?: Array<{
+    kind?: string;
+    label?: string;
+    message?: string;
+    state?: string;
+    runId?: string;
+    url?: string;
+  }>;
 }
 
 export interface RequirementDecompositionInput {
@@ -338,6 +353,9 @@ export interface AttemptRecordInfo {
   failureDetail?: string;
   failureReviewFeedback?: string;
   humanChangeRequest?: string;
+  pullRequestFeedback?: Array<Record<string, unknown>>;
+  checkLogFeedback?: Array<Record<string, unknown>>;
+  reworkChecklist?: Record<string, unknown>;
   reworkAssessment?: Record<string, unknown>;
   stdoutSummary?: string;
   stderrSummary?: string;
@@ -378,9 +396,13 @@ export interface RunWorkpadRecordInfo {
     pr?: Record<string, unknown>;
     reviewFeedback?: string[];
     retryReason?: string;
+    reworkChecklist?: Record<string, unknown>;
     reworkAssessment?: Record<string, unknown>;
     updatedBy?: string;
   };
+  fieldPatches?: Record<string, unknown>;
+  fieldPatchSources?: Record<string, unknown>;
+  fieldPatchHistory?: Array<Record<string, unknown>>;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -913,6 +935,29 @@ export async function fetchRunWorkpads(
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return fetchJson<RunWorkpadRecordInfo[]>(apiUrl, `/run-workpads${suffix}`, fetchImpl);
+}
+
+export async function patchRunWorkpad(
+  apiUrl: string,
+  runWorkpadId: string,
+  input: {
+    workpad: Partial<RunWorkpadRecordInfo["workpad"]>;
+    updatedBy?: string;
+    reason?: string;
+    source?: Record<string, unknown>;
+  },
+  fetchImpl: typeof fetch = fetch
+): Promise<RunWorkpadRecordInfo> {
+  const path = `/run-workpads/${encodeURIComponent(runWorkpadId)}`;
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}${path}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Omega control API failed: ${path}`));
+  }
+  return response.json() as Promise<RunWorkpadRecordInfo>;
 }
 
 export async function cancelAttempt(

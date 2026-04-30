@@ -3332,74 +3332,25 @@ kbd {
   margin-top: 12px;
 }
 
-.run-workpad-grid details {
+.workpad-card {
   min-width: 0;
   border: 1px solid #26262b;
   border-radius: 8px;
   background: #111115;
   padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+  text-align: left;
 }
 
-.run-workpad-grid details.workpad-warning {
+.workpad-card.workpad-warning {
   border-color: rgba(245, 158, 11, 0.54);
   background: rgba(120, 74, 18, 0.14);
 }
 
-.run-workpad-grid details.workpad-success {
+.workpad-card.workpad-success {
   border-color: rgba(72, 203, 128, 0.42);
   background: rgba(41, 128, 76, 0.12);
-}
-
-.run-workpad-grid summary {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px;
-  gap: 8px;
-  align-items: start;
-  min-height: 42px;
-  padding: 0;
-  cursor: pointer;
-  list-style: none;
-}
-
-.run-workpad-grid summary > div {
-  min-width: 0;
-  display: flex;
-  flex-wrap: nowrap;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.run-workpad-grid summary::after {
-  align-self: start;
-  justify-self: end;
-  margin-top: 0;
-}
-
-.run-workpad-grid summary > div > span,
-.run-workpad-grid summary > div > strong {
-  min-width: 0;
-}
-
-.run-workpad-grid summary > div > span {
-  flex: 0 1 auto;
-}
-
-.run-workpad-grid summary > div > strong {
-  flex: 1 1 auto;
-  text-align: right;
-}
-
-@media (max-width: 900px) {
-  .run-workpad-grid summary > div {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 3px;
-  }
-
-  .run-workpad-grid summary > div > strong {
-    text-align: left;
-  }
 }
 
 .run-workpad-grid span {
@@ -3411,21 +3362,12 @@ kbd {
 
 .run-workpad-grid strong {
   display: block;
-  margin-top: 4px;
   color: #f1f1f3;
   font-size: 0.94rem;
   line-height: 1.3;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.workpad-detail-body {
-  margin-top: 10px;
-  max-height: 190px;
-  overflow: auto;
-  border-top: 1px solid rgba(143, 144, 153, 0.18);
-  padding-top: 10px;
 }
 
 .run-workpad-grid p,
@@ -3437,7 +3379,12 @@ kbd {
 }
 
 .run-workpad-grid p {
-  margin: 8px 0 0;
+  min-height: 2.8em;
+  margin: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 
 .run-workpad-grid ul {
@@ -3452,6 +3399,160 @@ kbd {
   border-left: 3px solid rgba(76, 130, 255, 0.66);
   padding: 6px 0 6px 10px;
   color: #d8deec;
+}
+
+.detail-popover-backdrop {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(7, 10, 18, 0.48);
+  backdrop-filter: blur(8px);
+}
+
+.detail-popover {
+  width: min(860px, 100%);
+  max-height: min(760px, calc(100vh - 56px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  border: 1px solid #344155;
+  border-radius: 12px;
+  background: #0d1117;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.42);
+  overflow: hidden;
+}
+
+.detail-popover > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+  border-bottom: 1px solid #263244;
+  padding: 14px 16px;
+}
+
+.detail-popover > header div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.detail-popover > header span {
+  color: #9aa7b8;
+  font-size: 0.74rem;
+  font-weight: 850;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.detail-popover > header strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #f8fafc;
+  font-size: 1.05rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-popover > header button {
+  min-width: 76px;
+  min-height: 34px;
+}
+
+.detail-popover-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 16px;
+}
+
+.detail-popover-body p,
+.detail-popover-body li,
+.detail-popover-body a {
+  color: #dbe5f2;
+  line-height: 1.55;
+}
+
+.workpad-source-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.workpad-source-list > span {
+  color: #a6abb8;
+  font-size: 0.68rem;
+  font-weight: 850;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.workpad-source-list article {
+  border: 1px solid rgba(143, 144, 153, 0.22);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 8px;
+}
+
+.workpad-patch-history {
+  display: grid;
+  gap: 8px;
+}
+
+.workpad-patch-history article {
+  border: 1px solid rgba(143, 144, 153, 0.22);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 8px;
+}
+
+.workpad-patch-history article > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.workpad-patch-history strong,
+.workpad-patch-history span,
+.workpad-patch-history small {
+  min-width: 0;
+}
+
+.workpad-patch-history span,
+.workpad-patch-history small {
+  color: #9ea0aa;
+  font-size: 0.72rem;
+}
+
+.workpad-patch-history span {
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workpad-source-list article > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.workpad-source-list article strong {
+  margin: 0;
+  font-size: 0.76rem;
+  white-space: normal;
+}
+
+.workpad-source-list article small {
+  min-width: 0;
+  color: #9ea0aa;
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .run-workpad-grid a {
@@ -3966,8 +4067,7 @@ kbd {
   list-style: none;
 }
 
-.proof-card summary::-webkit-details-marker,
-.agent-trace-row summary::-webkit-details-marker {
+.proof-card summary::-webkit-details-marker {
   display: none;
 }
 
@@ -4046,10 +4146,11 @@ kbd {
   border-radius: 8px;
   background: #0d0d0f;
   padding: 9px 10px;
-}
-
-.agent-trace-row[open] {
-  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  text-align: left;
 }
 
 .agent-trace-row.stage-running {
@@ -4067,15 +4168,12 @@ kbd {
   border-color: rgba(255, 107, 107, 0.5);
 }
 
-.agent-trace-row summary {
+.agent-trace-card-main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: center;
   min-height: 54px;
-  padding: 0;
-  cursor: pointer;
-  list-style: none;
 }
 
 .agent-trace-summary-copy {
@@ -4084,7 +4182,7 @@ kbd {
   gap: 2px;
 }
 
-.agent-trace-row summary span,
+.agent-trace-summary-copy span,
 .agent-runner-meta span {
   color: #8f9099;
   font-size: 0.72rem;
@@ -4092,7 +4190,7 @@ kbd {
   text-transform: uppercase;
 }
 
-.agent-trace-row summary strong {
+.agent-trace-summary-copy strong {
   display: block;
   color: #f0f0f1;
   font-size: 0.9rem;
@@ -4102,10 +4200,19 @@ kbd {
   white-space: nowrap;
 }
 
-.agent-trace-row summary small {
+.agent-trace-status {
   color: #b8cfff;
   font-size: 0.74rem;
   font-weight: 700;
+}
+
+.agent-trace-open {
+  border: 1px solid #303034;
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: #9ea0aa;
+  font-size: 0.72rem;
+  font-weight: 800;
 }
 
 .agent-trace-summary-copy em {
@@ -4160,6 +4267,20 @@ kbd {
   border-radius: 999px;
   padding: 3px 7px;
   text-transform: none;
+}
+
+.agent-operation-dialog-summary {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+
+.agent-operation-dialog-summary strong {
+  color: #f8fafc;
+}
+
+.agent-operation-dialog-summary p {
+  margin: 0;
 }
 
 .attempt-error {
@@ -4337,7 +4458,7 @@ kbd {
 .issue-row {
   min-height: 56px;
   display: grid;
-  grid-template-columns: 42px minmax(260px, 620px) minmax(260px, 1fr) 148px;
+  grid-template-columns: 42px minmax(240px, 0.75fr) minmax(440px, 1.45fr) 168px;
   align-items: center;
   gap: 12px;
   padding: 8px 12px;
@@ -4458,7 +4579,6 @@ kbd {
 
 .issue-main {
   min-width: 0;
-  max-width: 620px;
   display: grid;
   gap: 4px;
 }
@@ -4625,12 +4745,12 @@ kbd {
 .issue-progress-slot {
   min-width: 0;
   display: flex;
-  justify-content: flex-end;
+  justify-content: stretch;
 }
 
 .issue-trailing {
-  width: 148px;
-  min-width: 148px;
+  width: 168px;
+  min-width: 168px;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -4672,7 +4792,7 @@ kbd {
 }
 
 .review-inline {
-  width: 142px;
+  width: 100%;
   min-height: 26px;
   border-color: rgba(229, 190, 87, 0.55);
   border-radius: 999px;
@@ -4704,8 +4824,8 @@ kbd {
 
 .issue-trailing .status-pill,
 .issue-trailing .run-inline {
-  width: 142px;
-  min-width: 142px;
+  width: 100%;
+  min-width: 0;
 }
 
 .status-pill.status-ready {
@@ -6693,7 +6813,7 @@ kbd,
 .issue-title-line strong,
 .pipeline-step strong,
 .proof-card strong,
-.agent-trace-row summary strong,
+.agent-trace-summary-copy strong,
 .attempt-stage-flow strong {
   color: #172033;
 }
@@ -6706,7 +6826,7 @@ kbd,
 .pipeline-step small,
 .proof-card small,
 .agent-trace-row p,
-.agent-trace-row summary small,
+.agent-trace-status,
 .attempt-stage-flow small,
 .attempt-stage-flow em,
 .runner-status,
@@ -6973,13 +7093,12 @@ kbd,
 
 .issue-progress-track {
   width: 100%;
-  max-width: 720px;
   border: 1px solid #dbe7f7;
   border-radius: 12px;
   background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
   padding: 8px 10px;
   display: grid;
-  grid-template-columns: minmax(96px, 190px) minmax(130px, 1fr);
+  grid-template-columns: minmax(108px, 168px) minmax(220px, 1fr);
   align-items: center;
   gap: 12px;
 }
@@ -7781,7 +7900,7 @@ kbd,
 .product-shell.theme-light .run-workpad-grid strong,
 .product-shell.theme-light .requirement-source-card strong,
 .product-shell.theme-light .attempt-card header strong,
-.product-shell.theme-light .agent-trace-row summary strong,
+.product-shell.theme-light .agent-trace-summary-copy strong,
 .product-shell.theme-light .attempt-history strong {
   color: #172033;
 }
@@ -7825,7 +7944,7 @@ kbd,
 .product-shell.theme-light .requirement-source-card,
 .product-shell.theme-light .requirement-source-scroll,
 .product-shell.theme-light .run-workpad,
-.product-shell.theme-light .run-workpad-grid details,
+.product-shell.theme-light .workpad-card,
 .product-shell.theme-light .detail-stage-list article,
 .product-shell.theme-light .detail-stage-grid article,
 .product-shell.theme-light .attempt-card,
@@ -7844,12 +7963,56 @@ kbd,
 }
 
 .product-shell.theme-light .run-workpad-grid span,
+.product-shell.theme-light .workpad-source-list article small,
 .product-shell.theme-light .detail-stage-grid small,
 .product-shell.theme-light .detail-stage-grid em,
-.product-shell.theme-light .agent-trace-row summary span,
+.product-shell.theme-light .agent-trace-summary-copy span,
+.product-shell.theme-light .agent-trace-open,
 .product-shell.theme-light .agent-runner-meta span,
 .product-shell.theme-light .agent-detail-block > strong {
   color: #667085;
+}
+
+.product-shell.theme-light .workpad-source-list article {
+  border-color: #d7e3f2;
+  background: #ffffff;
+}
+
+.product-shell.theme-light .workpad-patch-history article {
+  border-color: #d7e3f2;
+  background: #ffffff;
+}
+
+.product-shell.theme-light .workpad-patch-history span,
+.product-shell.theme-light .workpad-patch-history small {
+  color: #667085;
+}
+
+.product-shell.theme-light .detail-popover-backdrop {
+  background: rgba(210, 224, 245, 0.45);
+}
+
+.product-shell.theme-light .detail-popover {
+  border-color: #d7e3f2;
+  background: #ffffff;
+  box-shadow: 0 24px 70px rgba(44, 78, 134, 0.18);
+}
+
+.product-shell.theme-light .detail-popover > header {
+  border-color: #e7eef7;
+}
+
+.product-shell.theme-light .detail-popover > header span,
+.product-shell.theme-light .detail-popover-body p,
+.product-shell.theme-light .detail-popover-body li,
+.product-shell.theme-light .detail-popover-body a,
+.product-shell.theme-light .agent-operation-dialog-summary p {
+  color: #516077;
+}
+
+.product-shell.theme-light .detail-popover > header strong,
+.product-shell.theme-light .agent-operation-dialog-summary strong {
+  color: #172033;
 }
 
 .product-shell.theme-light .detail-stage-grid article.stage-running,
@@ -7871,14 +8034,14 @@ kbd,
   color: #167346;
 }
 
-.product-shell.theme-light .run-workpad-grid details.workpad-success {
+.product-shell.theme-light .workpad-card.workpad-success {
   border-color: #b7ebcf;
   background: #f0fff6;
 }
 
 .product-shell.theme-light .detail-stage-grid article.stage-failed,
 .product-shell.theme-light .detail-stage-grid article.stage-blocked,
-.product-shell.theme-light .run-workpad-grid details.workpad-warning {
+.product-shell.theme-light .workpad-card.workpad-warning {
   border-color: #f8cf7a;
   background: #fffaf0;
 }

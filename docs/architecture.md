@@ -232,6 +232,8 @@ Requirement intake
 
 Human Review 是真实阻塞点，不再由服务端默认自动通过。`run-devflow-cycle` 最多推进到 `waiting-human`：此时 PR 已创建，Review Agent 的 verdict 已记录，Pipeline 停在 `human_review` stage。Pending checkpoint 会绑定具体 `attemptId`，确保人工审核继续的是同一次真实执行的 workspace / branch / PR / proof。只有调用 `POST /checkpoints/:id/approve` 后，后端才继续执行 merge / delivery；`request-changes` 会携带拒绝原因回退流程。
 
+Review / Rework / Retry 的反馈不再只散落在日志和 artifact 中。Runtime 会为失败、取消、人工 request changes、retry 和 Workpad 刷新生成 `reworkChecklist`，把 Review Agent 输出、人工意见、失败原因、operation/event 和 PR/check 推荐动作合并为下一轮可执行清单。Retry API 和 Rework Agent prompt 会优先消费这份 checklist，避免用户或调用方重新拼接原因。详细说明见 `docs/devflow-rework-checklist.md`。
+
 这已经解决“HTTP 请求等待整条流程完成”的问题，并完成第一版 `AgentRunner` 抽象。`JobSupervisor` 已进入 v1：integrity tick、Attempt heartbeat、runner stdout/stderr heartbeat、stalled detection、retry、Attempt cancel、contract-driven timeout/retry、workspace execution lock、workspace cleanup、worker host lease 和 continuation policy metadata 基础版已接入；Codex / opencode / Claude Code runner 已接入 context-aware supervisor，可在 deadline/cancel 时终止子进程。`GET /attempts/:id/timeline` 会按一次 Attempt 聚合 attempt events、pipeline events、stage snapshots、operations、proof records、checkpoints 和 runtime logs，作为排障和人工审核的真实运行时间线。下一步继续补 GitHub polling heartbeat、Git/GitHub command timeout、远端 worker 分配和远端崩溃恢复。功能一生产化内核的当前口径见 `docs/devflow-production-core.md`。
 
 ## 6. 执行安全边界
@@ -285,6 +287,8 @@ POST /checkpoints/:id/request-changes
 GET  /missions
 GET  /operations
 GET  /proof-records
+GET  /run-workpads
+PATCH /run-workpads/:id
 GET  /execution-locks
 POST /execution-locks/:id/release
 GET  /attempts/:id/timeline

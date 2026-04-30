@@ -203,6 +203,45 @@ paths:
       responses:
         '200':
           description: Run Workpad records returned
+  /run-workpads/{id}:
+    patch:
+      summary: Patch selected Run Workpad fields
+      description: >
+        对 Run Workpad 做字段级 patch，不替换 runtime 派生出的整份记录。
+        patch 会存入 fieldPatches，并在后续 runtime 刷新后重新叠加。
+        允许字段包括 plan、acceptanceCriteria、validation、notes、blockers、pr、
+        reviewFeedback、retryReason、reworkChecklist、reworkAssessment 和 updatedBy。
+        每次 patch 会记录 fieldPatchSources 和 fieldPatchHistory，方便后续 UI
+        与 Agent 解释哪个字段由谁、在何时、基于哪个运行时来源更新。
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                updatedBy:
+                  type: string
+                  enum: [operator, agent, job-supervisor, human-review, review-agent, delivery-agent, test]
+                reason:
+                  type: string
+                source:
+                  type: object
+                workpad:
+                  type: object
+      responses:
+        '200':
+          description: Patched Run Workpad record returned
+        '400':
+          description: Invalid patch payload
+        '404':
+          description: Run Workpad record not found
   /runtime-logs:
     get:
       summary: List append-only runtime logs

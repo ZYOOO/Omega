@@ -51,6 +51,10 @@ Requirement / Work Item
 - Workflow Markdown body 支持 `## Prompt: requirement`、`## Prompt: architect`、`## Prompt: coding`、`## Prompt: testing`、`## Prompt: rework`、`## Prompt: review`、`## Prompt: delivery`，运行时会渲染变量后交给对应 Agent 或本地 orchestrator 记录为真实阶段交接。
 - 旧做法只强化 coding / rework / review，导致 requirement、architect、testing、delivery 的输出契约不够统一；当前默认 `devflow-pr` 已把所有 Agent 的交接输出固定为可被下一阶段消费的小节。
 - 后台 Attempt 会记录本机 worker host lease；JobSupervisor 能把“数据库仍 running，但本机没有 job 且锁无效”的 orphan Attempt 标为 stalled，后续 retry 策略可以接管。
+- Review / Rework / Retry 的反馈输入已经收束为 `reworkChecklist`：
+  - 旧做法：review feedback、人工 request changes、失败原因、PR/check 推荐动作分散在不同字段和 UI 区块。
+  - 新做法：Attempt 失败、取消、人工 request changes、retry 和 Workpad 刷新都会生成统一 checklist；Retry API 默认使用 checklist 的主因，Rework Agent prompt 优先消费 checklist prompt。
+  - 详细数据结构见 `docs/devflow-rework-checklist.md`。
 
 ## 架构
 
@@ -102,7 +106,8 @@ tick
 ## 剩余工作
 
 - GitHub polling 在 checks pending 时还需要刷新 Attempt heartbeat。
-- branch sync / conflict 目前能检测和推荐动作，自动回到 Rework 暂缓。
+- branch sync / conflict 目前能检测并进入 Rework Checklist；自动下载冲突上下文并触发 Rework 仍需后续增强。
+- PR review comments / reviews 和 failed check log 基础内容已进入 checklist source；thread 级 resolved/unresolved 状态、行级上下文、日志分页和 source drilldown 仍需后续补齐。
 - workspace cleanup 当前清理 repo checkout 并保留 proof；归档、压缩、删除整个 workspace 仍需后续策略。
 - workflow contract 仍需更完整的 DAG、artifact、runner policy、stage-specific timeout 校验。
 - worker host 当前是本机 lease；远端 worker 分配和远端崩溃恢复仍需后续增强。

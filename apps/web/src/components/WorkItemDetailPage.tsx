@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { retryReasonForAttempt } from "../attemptRetryReason";
 import type { RepositoryTarget, WorkItem, WorkItemStatus } from "../core";
 import type {
@@ -32,8 +32,25 @@ type WorkpadSection = {
   id: string;
   label: string;
   title: string;
+  preview: string;
   body: ReactNode;
   tone?: "default" | "warning" | "success";
+};
+
+type WorkpadSourceRecord = {
+  kind: string;
+  label: string;
+  message: string;
+  url?: string;
+};
+
+type WorkpadPatchHistoryEntry = {
+  id: string;
+  updatedAt: string;
+  updatedBy: string;
+  fields: string[];
+  reason: string;
+  sourceLabel: string;
 };
 
 type DetailHelpers = {
@@ -285,6 +302,8 @@ export function WorkItemDetailPage({
 }
 
 function RunWorkpad({ sections }: { sections: WorkpadSection[] }) {
+  const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
+  const activeSection = sections.find((section) => section.id === activeSectionId);
   return (
     <section className="run-workpad" aria-label="Run workpad">
       <header>
@@ -292,21 +311,42 @@ function RunWorkpad({ sections }: { sections: WorkpadSection[] }) {
           <span className="section-label">Run workpad</span>
           <h3>Execution brief</h3>
         </div>
-        <small>{sections.length} live sections</small>
+        <small>{workpadSignalSummary(sections)}</small>
       </header>
       <div className="run-workpad-grid">
         {sections.map((section) => (
-          <details key={section.id} className={section.tone ? `workpad-${section.tone}` : undefined}>
-            <summary>
-              <div>
-                <span>{section.label}</span>
-                <strong>{section.title}</strong>
-              </div>
-            </summary>
-            <div className="workpad-detail-body">{section.body}</div>
-          </details>
+          <button
+            key={section.id}
+            type="button"
+            className={section.tone ? `workpad-card workpad-${section.tone}` : "workpad-card"}
+            onClick={() => setActiveSectionId(section.id)}
+          >
+            <span>{section.label}</span>
+            <strong>{section.title}</strong>
+            <p>{section.preview}</p>
+          </button>
         ))}
       </div>
+      {activeSection ? (
+        <section className="detail-popover-backdrop" role="presentation" onClick={() => setActiveSectionId(null)}>
+          <article
+            className="detail-popover"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${activeSection.label} detail`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header>
+              <div>
+                <span>{activeSection.label}</span>
+                <strong>{activeSection.title}</strong>
+              </div>
+              <button type="button" onClick={() => setActiveSectionId(null)}>Close</button>
+            </header>
+            <div className="detail-popover-body">{activeSection.body}</div>
+          </article>
+        </section>
+      ) : null}
     </section>
   );
 }
@@ -377,9 +417,19 @@ function buildRunWorkpadSections({
     pullRequestStatus?.deliveryGate && pullRequestStatus.deliveryGate !== "passed" ? `PR gate: ${pullRequestStatus.deliveryGate}` : ""
   ].filter(Boolean) as string[];
   const recordedFeedback = asStringArray(workpad?.reviewFeedback);
+  const prFeedback = [
+    ...feedbackRecordsToStrings(attempt?.pullRequestFeedback),
+    ...feedbackRecordsToStrings(pullRequestStatus?.reviewFeedback)
+  ];
+  const checkFeedback = [
+    ...feedbackRecordsToStrings(attempt?.checkLogFeedback),
+    ...feedbackRecordsToStrings(pullRequestStatus?.checkLogFeedback)
+  ];
   const reviewFeedback =
     recordedFeedback[0] ||
     attempt?.failureReviewFeedback ||
+    prFeedback[0] ||
+    checkFeedback[0] ||
     reviewOps.map((operation) => operation.summary || operation.runnerProcess?.stderr || "").find(Boolean) ||
     reviewEvents.map((event) => event.message).find(Boolean);
   const retryReason =
@@ -390,15 +440,38 @@ function buildRunWorkpadSections({
     ? acceptanceCriteria
     : (workItem.acceptanceCriteria.length ? workItem.acceptanceCriteria : requirement?.acceptanceCriteria ?? ["No acceptance criteria captured."]);
   const validationStatus = recordString(workpad?.validation, "status");
+  const runtimeReworkChecklist = recordValue(workpad?.reworkChecklist) || recordValue(attempt?.reworkChecklist);
+  const runtimeReworkChecklistItems = asStringArray(runtimeReworkChecklist?.checklist);
+  const runtimeReworkSources = sourceRecordsFromValue(runtimeReworkChecklist?.sources);
   const reworkAssessment = recordValue(workpad?.reworkAssessment) || recordValue(attempt?.reworkAssessment);
   const reworkStrategy = recordString(reworkAssessment, "strategy");
   const reworkChecklist = asStringArray(recordValue(reworkAssessment)?.checklist);
+  const patchHistory = patchHistoryFromRecord(runWorkpad);
   const sections: WorkpadSection[] = [
+    ...(runtimeReworkChecklistItems.length
+      ? [{
+          id: "rework-checklist",
+          label: "Rework checklist",
+          title: `${runtimeReworkChecklistItems.length} action${runtimeReworkChecklistItems.length === 1 ? "" : "s"}`,
+          preview: shortText(runtimeReworkChecklistItems[0] ?? recordString(runtimeReworkChecklist, "retryReason"), 120),
+          tone: "warning" as const,
+          body: (
+            <div className="workpad-rework-assessment">
+              {recordString(runtimeReworkChecklist, "retryReason") ? <p>{shortText(recordString(runtimeReworkChecklist, "retryReason"), 280)}</p> : null}
+              <ul>
+                {runtimeReworkChecklistItems.slice(0, 5).map((item) => <li key={item}>{item}</li>)}
+              </ul>
+              {runtimeReworkSources.length ? <ChecklistSourceList sources={runtimeReworkSources} /> : null}
+            </div>
+          )
+        }]
+      : []),
     ...(reworkStrategy
       ? [{
           id: "rework-assessment",
           label: "Rework assessment",
           title: reworkStrategyLabel(reworkStrategy),
+          preview: shortText(recordString(reworkAssessment, "rationale") || recordString(reworkAssessment, "humanFeedback") || "Rework route selected.", 120),
           tone: reworkStrategy === "needs_human_info" ? "warning" as const : undefined,
           body: (
             <div className="workpad-rework-assessment">
@@ -413,16 +486,29 @@ function buildRunWorkpadSections({
           )
         }]
       : []),
+    ...(patchHistory.length
+      ? [{
+          id: "patch-history",
+          label: "Patch history",
+          title: `${patchHistory.length} update${patchHistory.length === 1 ? "" : "s"}`,
+          preview: patchHistory[0] ? `${patchHistory[0].updatedBy} updated ${patchHistory[0].fields.join(", ")}` : "No field patch recorded.",
+          body: <WorkpadPatchHistory entries={patchHistory.slice(0, 5)} />
+        }]
+      : []),
     {
       id: "plan",
       label: "Plan",
       title: recordString(workpad?.plan, "currentStageId") || planArtifacts[0]?.label || pipeline?.templateId || "Plan pending",
+      preview: planArtifacts.length
+        ? `${planArtifacts.length} plan artifact${planArtifacts.length === 1 ? "" : "s"} captured.`
+        : shortText(requirement?.rawText ?? workItem.description, 120),
       body: planArtifacts.length ? <ArtifactList artifacts={planArtifacts.slice(0, 3)} /> : <p>{shortText(requirement?.rawText ?? workItem.description)}</p>
     },
     {
       id: "acceptance",
       label: "Acceptance criteria",
       title: `${criteria.length} criteria`,
+      preview: shortText(criteria[0] ?? "No acceptance criteria captured.", 120),
       body: (
         <ul>
           {criteria.slice(0, 5).map((criterion) => <li key={criterion}>{criterion}</li>)}
@@ -433,6 +519,11 @@ function buildRunWorkpadSections({
       id: "validation",
       label: "Validation status",
       title: validationStatus || pullRequestStatus?.deliveryGate || (validationOps.length ? "Validation captured" : "Pending"),
+      preview: validationOps[0]?.summary
+        ? shortText(validationOps[0].summary, 120)
+        : validationStatus
+          ? `Validation is ${validationStatus}.`
+          : "Waiting for test reports or checks.",
       tone: validationStatus === "passed" || pullRequestStatus?.deliveryGate === "passed" ? "success" : undefined,
       body: validationOps.length ? <OperationSummaryList operations={validationOps.slice(-3)} /> : <p>Test reports and checks will appear here after validation runs.</p>
     },
@@ -440,6 +531,7 @@ function buildRunWorkpadSections({
       id: "pr",
       label: "PR",
       title: attempt?.pullRequestUrl ? "Pull request ready" : attempt?.branchName ? "Branch ready" : "Not created",
+      preview: attempt?.pullRequestUrl || attempt?.branchName || "No delivery branch or pull request yet.",
       body: attempt?.pullRequestUrl ? (
         <a href={attempt.pullRequestUrl} target="_blank" rel="noreferrer">Open PR</a>
       ) : (
@@ -450,12 +542,14 @@ function buildRunWorkpadSections({
       id: "feedback",
       label: "Review Feedback",
       title: reviewFeedback ? "Feedback captured" : "No feedback yet",
+      preview: reviewFeedback ? shortText(reviewFeedback, 120) : "No review, PR, or human feedback captured.",
       body: reviewFeedback ? <p>{shortText(reviewFeedback, 360)}</p> : <p>Review agent, PR comments and human requested changes will be merged here.</p>
     },
     {
       id: "blockers",
       label: "Blockers",
       title: blockers.length ? `${blockers.length} active signal${blockers.length === 1 ? "" : "s"}` : "No active blockers",
+      preview: blockers.length ? shortText(blockers[0], 120) : "No blocking failure is recorded.",
       tone: blockers.length ? "warning" : "success",
       body: blockers.length ? (
         <ul>{blockers.slice(0, 4).map((blocker) => <li key={blocker}>{shortText(blocker, 220)}</li>)}</ul>
@@ -467,17 +561,29 @@ function buildRunWorkpadSections({
       id: "retry",
       label: "Retry Reason",
       title: retryReason ? "Ready for retry" : "No retry needed",
+      preview: retryReason ? shortText(retryReason, 120) : "Current run has no retry reason.",
       body: retryReason ? <p>{shortText(retryReason, 420)}</p> : <p>Retry will reuse the captured blocker and review feedback when needed.</p>
     },
     {
       id: "notes",
       label: "Notes",
       title: `${operations.length} operation${operations.length === 1 ? "" : "s"}`,
+      preview: operations.length ? shortText(operations[operations.length - 1]?.summary ?? "Latest operation recorded.", 120) : "No operation notes yet.",
       body: operations.length ? <OperationSummaryList operations={operations.slice(-3)} /> : <p>Agent notes will appear as operations are recorded.</p>
     }
   ];
 
   return sections;
+}
+
+function workpadSignalSummary(sections: WorkpadSection[]): string {
+  const blocker = sections.find((section) => section.id === "blockers" && section.tone === "warning");
+  const retry = sections.find((section) => section.id === "retry" && !/No retry/i.test(section.title));
+  const feedback = sections.find((section) => section.id === "feedback" && !/No feedback/i.test(section.title));
+  if (blocker) return blocker.title;
+  if (retry) return retry.title;
+  if (feedback) return feedback.title;
+  return `${sections.length} signals`;
 }
 
 function ArtifactList({ artifacts }: { artifacts: DetailProofCard[] }) {
@@ -497,6 +603,41 @@ function OperationSummaryList({ operations }: { operations: OperationRecordInfo[
         <li key={operation.id}>{operation.summary || `${operation.stageId ?? "stage"} ${operation.status}`}</li>
       ))}
     </ul>
+  );
+}
+
+function ChecklistSourceList({ sources }: { sources: WorkpadSourceRecord[] }) {
+  return (
+    <div className="workpad-source-list" aria-label="Checklist sources">
+      <span>Sources</span>
+      {sources.slice(0, 6).map((source, index) => (
+        <article key={`${source.kind}:${source.label}:${index}`}>
+          <div>
+            <strong>{sourceLabel(source.kind)}</strong>
+            <small>{source.label}</small>
+          </div>
+          <p>{shortText(source.message, 220)}</p>
+          {source.url ? <a href={source.url} target="_blank" rel="noreferrer">Open source</a> : null}
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function WorkpadPatchHistory({ entries }: { entries: WorkpadPatchHistoryEntry[] }) {
+  return (
+    <div className="workpad-patch-history" aria-label="Workpad patch history">
+      {entries.map((entry) => (
+        <article key={entry.id}>
+          <div>
+            <strong>{entry.updatedBy}</strong>
+            <span>{entry.fields.join(", ")}</span>
+          </div>
+          {entry.reason ? <p>{shortText(entry.reason, 180)}</p> : null}
+          <small>{[entry.sourceLabel, formatTimestamp(entry.updatedAt)].filter(Boolean).join(" · ")}</small>
+        </article>
+      ))}
+    </div>
   );
 }
 
@@ -523,10 +664,69 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
 }
 
+function feedbackRecordsToStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const record = recordValue(entry);
+    if (!record) return [];
+    const message = typeof record.message === "string" ? record.message.trim() : "";
+    if (!message) return [];
+    const label = typeof record.label === "string" && record.label.trim() ? `${record.label.trim()}: ` : "";
+    return `${label}${message}`;
+  });
+}
+
+function sourceRecordsFromValue(value: unknown): WorkpadSourceRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const record = recordValue(entry);
+    if (!record) return [];
+    const message = typeof record.message === "string" ? record.message.trim() : "";
+    if (!message) return [];
+    return [{
+      kind: typeof record.kind === "string" && record.kind.trim() ? record.kind.trim() : "source",
+      label: typeof record.label === "string" && record.label.trim() ? record.label.trim() : "Captured source",
+      message,
+      url: typeof record.url === "string" && record.url.trim() ? record.url.trim() : undefined
+    }];
+  });
+}
+
+function patchHistoryFromRecord(record?: RunWorkpadRecordInfo): WorkpadPatchHistoryEntry[] {
+  if (!Array.isArray(record?.fieldPatchHistory)) return [];
+  return record.fieldPatchHistory.flatMap((entry, index) => {
+    const value = recordValue(entry);
+    if (!value) return [];
+    const source = recordValue(value.source);
+    const fields = asStringArray(value.fields);
+    return [{
+      id: recordString(value, "id") || `${record.id}:patch:${index}`,
+      updatedAt: recordString(value, "updatedAt"),
+      updatedBy: recordString(value, "updatedBy") || "unknown",
+      fields: fields.length ? fields : ["workpad"],
+      reason: recordString(value, "reason") || recordString(source, "reason"),
+      sourceLabel: recordString(source, "label") || recordString(source, "kind") || "api"
+    }];
+  }).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
 function recordString(value: unknown, key: string): string {
   if (!value || typeof value !== "object" || Array.isArray(value)) return "";
   const raw = (value as Record<string, unknown>)[key];
   return typeof raw === "string" ? raw : "";
+}
+
+function formatTimestamp(value: string): string {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(parsed);
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
@@ -544,6 +744,31 @@ function reworkStrategyLabel(strategy: string): string {
       return "Needs human info";
     default:
       return strategy;
+  }
+}
+
+function sourceLabel(kind: string): string {
+  switch (kind) {
+    case "human":
+      return "Human";
+    case "review":
+      return "Review";
+    case "pr-review":
+      return "PR review";
+    case "pr-comment":
+      return "PR comment";
+    case "ci-check-log":
+      return "Check log";
+    case "delivery-gate":
+      return "Gate";
+    case "runner":
+      return "Runner";
+    case "operation":
+      return "Operation";
+    case "event":
+      return "Event";
+    default:
+      return kind;
   }
 }
 

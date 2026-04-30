@@ -157,13 +157,15 @@ func (server *Server) prepareDevFlowAttemptRetry(ctx context.Context, database W
 
 	timestamp := nowISO()
 	retryRootAttemptID := stringOr(text(previousAttempt, "retryRootAttemptId"), text(previousAttempt, "id"))
-	retryReason := stringOr(reason, "Retry requested by operator.")
+	reworkChecklist := buildReworkChecklist(database, pipeline, previousAttempt)
+	retryReason := stringOr(reason, stringOr(text(reworkChecklist, "retryReason"), "Retry requested by operator."))
 	retryIndex := nextRetryIndex(database, retryRootAttemptID)
 	database, pipeline, retryAttempt := beginDevFlowAttempt(database, pipelineIndex, stageItem, pipeline, "retry")
 	retryAttempt["retryOfAttemptId"] = text(previousAttempt, "id")
 	retryAttempt["retryRootAttemptId"] = retryRootAttemptID
 	retryAttempt["retryIndex"] = retryIndex
 	retryAttempt["retryReason"] = retryReason
+	retryAttempt["reworkChecklist"] = reworkChecklist
 	retryAttempt["retryRequestedAt"] = timestamp
 	retryEvents := arrayMaps(retryAttempt["events"])
 	retryEvents = append(retryEvents, map[string]any{
@@ -181,6 +183,7 @@ func (server *Server) prepareDevFlowAttemptRetry(ctx context.Context, database W
 		previousAttempt = cloneMap(database.Tables.Attempts[previousIndex])
 		previousAttempt["retryAttemptId"] = text(retryAttempt, "id")
 		previousAttempt["retryRequestedAt"] = timestamp
+		previousAttempt["reworkChecklist"] = reworkChecklist
 		previousAttempt["updatedAt"] = timestamp
 		previousEvents := arrayMaps(previousAttempt["events"])
 		previousEvents = append(previousEvents, map[string]any{
@@ -266,6 +269,14 @@ func (server *Server) prepareDevFlowHumanRequestedRework(ctx context.Context, da
 	appendRunEvent(run, "human.rework.assessed", fmt.Sprintf("Rework assessment selected %s: %s", text(assessment, "strategy"), text(assessment, "rationale")), entryStageID, "master")
 	pipeline["run"] = run
 	database.Tables.Pipelines[pipelineIndex] = pipeline
+	reworkChecklist := buildReworkChecklist(database, pipeline, previousAttempt)
+	reworkChecklistItems := stringSlice(reworkChecklist["checklist"])
+	if len(reworkChecklistItems) > 0 {
+		assessment["checklist"] = compactStringList(append(stringSlice(assessment["checklist"]), reworkChecklistItems...))
+		previousAttempt["reworkAssessment"] = assessment
+		previousAttempt["reworkChecklist"] = reworkChecklist
+		database.Tables.Attempts[previousAttemptIndex] = previousAttempt
+	}
 
 	database, pipeline, reworkAttempt := beginDevFlowAttemptFromStage(database, pipelineIndex, stageItem, pipeline, "human-request-changes", entryStageID)
 	reworkReason := "Human requested changes: " + changeRequest
@@ -275,6 +286,7 @@ func (server *Server) prepareDevFlowHumanRequestedRework(ctx context.Context, da
 	reworkAttempt["retryReason"] = reworkReason
 	reworkAttempt["humanChangeRequest"] = changeRequest
 	reworkAttempt["reworkAssessment"] = assessment
+	reworkAttempt["reworkChecklist"] = reworkChecklist
 	reworkAttempt["retryRequestedAt"] = timestamp
 	if branchName := text(previousAttempt, "branchName"); branchName != "" {
 		reworkAttempt["branchName"] = branchName

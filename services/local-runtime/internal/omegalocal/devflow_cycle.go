@@ -729,6 +729,12 @@ func completeAttemptRecord(database WorkspaceDatabase, attemptID string, pipelin
 	attempt["workspacePath"] = stringOr(result["workspacePath"], text(attempt, "workspacePath"))
 	attempt["branchName"] = stringOr(result["branchName"], text(attempt, "branchName"))
 	attempt["pullRequestUrl"] = stringOr(result["pullRequestUrl"], text(attempt, "pullRequestUrl"))
+	if feedback := arrayMaps(result["pullRequestFeedback"]); len(feedback) > 0 {
+		attempt["pullRequestFeedback"] = feedback
+	}
+	if feedback := arrayMaps(result["checkLogFeedback"]); len(feedback) > 0 {
+		attempt["checkLogFeedback"] = feedback
+	}
 	attempt["stdoutSummary"] = truncateForProof(stringOr(result["stdout"], ""), 800)
 	attempt["stderrSummary"] = truncateForProof(stringOr(result["stderr"], ""), 800)
 	attempt["stages"] = attemptStageSnapshot(pipeline)
@@ -779,6 +785,12 @@ func failAttemptRecord(database WorkspaceDatabase, attemptID string, pipeline ma
 		attempt["workspacePath"] = stringOr(result["workspacePath"], text(attempt, "workspacePath"))
 		attempt["branchName"] = stringOr(result["branchName"], text(attempt, "branchName"))
 		attempt["pullRequestUrl"] = stringOr(result["pullRequestUrl"], text(attempt, "pullRequestUrl"))
+		if feedback := arrayMaps(result["pullRequestFeedback"]); len(feedback) > 0 {
+			attempt["pullRequestFeedback"] = feedback
+		}
+		if feedback := arrayMaps(result["checkLogFeedback"]); len(feedback) > 0 {
+			attempt["checkLogFeedback"] = feedback
+		}
 		attempt["stdoutSummary"] = truncateForProof(stringOr(result["stdout"], ""), 800)
 	}
 	attempt["stderrSummary"] = truncateForProof(message, 800)
@@ -795,6 +807,7 @@ func failAttemptRecord(database WorkspaceDatabase, attemptID string, pipeline ma
 		"createdAt": timestamp,
 	})
 	attempt["events"] = events
+	attempt["reworkChecklist"] = buildReworkChecklist(database, pipeline, attempt)
 	database.Tables.Attempts[index] = attempt
 	return database, attempt
 }
@@ -832,6 +845,8 @@ func markAttemptCanceled(database WorkspaceDatabase, attemptID string, reason st
 		pipeline["status"] = "canceled"
 		pipeline["updatedAt"] = timestamp
 		database.Tables.Pipelines[pipelineIndex] = pipeline
+		attempt["reworkChecklist"] = buildReworkChecklist(database, pipeline, attempt)
+		database.Tables.Attempts[index] = attempt
 	}
 	if item := findWorkItem(database, text(attempt, "itemId")); item != nil {
 		database = updateWorkItem(database, text(item, "id"), map[string]any{"status": "Blocked"})
@@ -1079,6 +1094,21 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 	runnerHeartbeatInterval := devFlowRunnerHeartbeatInterval(template)
 	agentInvocations := []map[string]any{}
 	stageArtifacts := []map[string]any{}
+	pullRequestFeedback := []map[string]any{}
+	checkLogFeedback := []map[string]any{}
+	combinedFeedback := func(primary string) string {
+		parts := []string{}
+		if strings.TrimSpace(primary) != "" {
+			parts = append(parts, strings.TrimSpace(primary))
+		}
+		if feedback := githubPullRequestFeedbackPrompt(pullRequestFeedback); strings.TrimSpace(feedback) != "" {
+			parts = append(parts, "PR feedback:\n"+strings.TrimSpace(feedback))
+		}
+		if feedback := githubPullRequestFeedbackPrompt(checkLogFeedback); strings.TrimSpace(feedback) != "" {
+			parts = append(parts, "CI/check failure logs:\n"+strings.TrimSpace(feedback))
+		}
+		return strings.Join(parts, "\n\n")
+	}
 	recordAgent := func(stageID string, agentID string, status string, prompt string, artifact string, summary string, proofFiles []string, process map[string]any) {
 		startedAt := nowISO()
 		finishedAt := nowISO()
@@ -1104,7 +1134,7 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		_ = server.persistDevFlowAgentInvocation(context.Background(), text(pipeline, "id"), text(item, "id"), attemptID, invocation)
 	}
 	failureResult := func(stageID string, agentID string, reason string, detail string, reviewFeedback string) map[string]any {
-		return map[string]any{
+		result := map[string]any{
 			"status":                "failed",
 			"workspacePath":         workspace,
 			"repositoryPath":        repoWorkspace,
@@ -1116,12 +1146,20 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 			"failureDetail":         detail,
 			"failureReviewFeedback": reviewFeedback,
 		}
+		if len(pullRequestFeedback) > 0 {
+			result["pullRequestFeedback"] = pullRequestFeedback
+		}
+		if len(checkLogFeedback) > 0 {
+			result["checkLogFeedback"] = checkLogFeedback
+		}
+		return result
 	}
 
 	humanChangeRequest := latestHumanChangeRequestFromPipeline(pipeline)
+	reworkFeedbackInput := reworkChecklistPromptFromAttempt(currentAttempt, humanChangeRequest)
 	effectiveDescription := text(item, "description")
-	if humanChangeRequest != "" {
-		effectiveDescription = strings.TrimSpace(effectiveDescription + "\n\nHuman requested changes:\n" + humanChangeRequest)
+	if reworkFeedbackInput != "" {
+		effectiveDescription = strings.TrimSpace(effectiveDescription + "\n\nRework input:\n" + reworkFeedbackInput)
 	}
 	promptVariables := map[string]string{
 		"repository":     repoSlug,
@@ -1134,7 +1172,7 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		"codingNotePath": filepath.Join(proofDir, "coding-agent-note.md"),
 		"reworkNotePath": "",
 		"pullRequestUrl": "",
-		"reviewFeedback": humanChangeRequest,
+		"reviewFeedback": reworkFeedbackInput,
 		"changedFiles":   "",
 		"testOutput":     "",
 		"checksOutput":   "",
@@ -1159,7 +1197,7 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		promptPath := filepath.Join(proofDir, "human-rework-prompt.md")
 		reworkVariables := cloneStringMap(promptVariables)
 		reworkVariables["pullRequestUrl"] = prURL
-		reworkVariables["reviewFeedback"] = humanChangeRequest
+		reworkVariables["reviewFeedback"] = reworkFeedbackInput
 		reworkVariables["reworkNotePath"] = notePath
 		reworkFallback := fmt.Sprintf(`You are the rework coding agent for Omega.
 
@@ -1172,7 +1210,7 @@ Pull request: %s
 Requirement:
 %s
 
-Human feedback to address:
+Rework checklist to address:
 %s
 
 Rules:
@@ -1187,7 +1225,7 @@ Rules:
   - Files changed
   - Validation run
   - Remaining risk
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, humanChangeRequest, notePath)
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, reworkFeedbackInput, notePath)
 		reworkPrompt := renderWorkflowPromptSection(template, "rework", reworkVariables, reworkFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
 		if err := os.WriteFile(promptPath, []byte(reworkPrompt), 0o644); err != nil {
 			return nil, err
@@ -1280,6 +1318,8 @@ Rules:
 		}
 		prDiff, _ := runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
 		checksOutput, _ := runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+		pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
+		checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, nil)
 
 		reviewRounds := defaultDevFlowReviewRounds()
 		if template != nil && len(template.ReviewRounds) > 0 {
@@ -1303,9 +1343,9 @@ Rules:
 			reviewVariables["testOutput"] = testOutput
 			reviewVariables["checksOutput"] = reviewChecks
 			reviewVariables["reviewFocus"] = reviewRound.Focus
-			reviewVariables["reviewFeedback"] = humanChangeRequest
+			reviewVariables["reviewFeedback"] = combinedFeedback(reworkFeedbackInput)
 			reviewVariables["diff"] = reviewDiff
-			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, humanChangeRequest)
+			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(reworkFeedbackInput))
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
 				Role:              "review",
@@ -1352,15 +1392,17 @@ Rules:
 		recordAgent("human_review", "human", "waiting-human", "Review the human-requested rework, PR diff, proof, and agent verdicts. Approve to continue delivery or request changes to send the run back.", "human-review-request.md", "Waiting for explicit human approval after fast rework.", []string{humanReviewRequestPath}, map[string]any{"runner": "human", "status": "waiting-human"})
 
 		if reportPath, err := writeDevFlowRunReport(proofDir, devFlowRunReportInput{
-			Item:             item,
-			Repository:       repoSlug,
-			BranchName:       branchName,
-			PullRequestURL:   prURL,
-			ChangedFiles:     changedFiles,
-			TestOutput:       testOutput,
-			ChecksOutput:     checksOutput,
-			StageArtifacts:   stageArtifacts,
-			AgentInvocations: agentInvocations,
+			Item:                item,
+			Repository:          repoSlug,
+			BranchName:          branchName,
+			PullRequestURL:      prURL,
+			ChangedFiles:        changedFiles,
+			TestOutput:          testOutput,
+			ChecksOutput:        checksOutput,
+			PullRequestFeedback: pullRequestFeedback,
+			CheckLogFeedback:    checkLogFeedback,
+			StageArtifacts:      stageArtifacts,
+			AgentInvocations:    agentInvocations,
 		}); err != nil {
 			return nil, err
 		} else {
@@ -1401,19 +1443,21 @@ Rules:
 		recordAgent("done", "delivery", "waiting-human", deliveryPrompt, "handoff-bundle.json", "Delivery is blocked by the human review checkpoint after fast rework.", []string{filepath.Join(proofDir, "handoff-bundle.json")}, map[string]any{"runner": "local-orchestrator", "status": "waiting-human"})
 		proofFiles, _ := collectFiles(proofDir)
 		return map[string]any{
-			"status":             "waiting-human",
-			"workflow":           mapValue(mapValue(pipeline["run"])["workflow"]),
-			"workspacePath":      workspace,
-			"repositoryPath":     repoWorkspace,
-			"branchName":         branchName,
-			"pullRequestUrl":     prURL,
-			"merged":             false,
-			"changedFiles":       changedFiles,
-			"stageArtifacts":     stageArtifacts,
-			"agentInvocations":   agentInvocations,
-			"proofFiles":         proofFiles,
-			"reworkAssessment":   reworkAssessment,
-			"humanChangeRequest": humanChangeRequest,
+			"status":              "waiting-human",
+			"workflow":            mapValue(mapValue(pipeline["run"])["workflow"]),
+			"workspacePath":       workspace,
+			"repositoryPath":      repoWorkspace,
+			"branchName":          branchName,
+			"pullRequestUrl":      prURL,
+			"merged":              false,
+			"changedFiles":        changedFiles,
+			"stageArtifacts":      stageArtifacts,
+			"agentInvocations":    agentInvocations,
+			"proofFiles":          proofFiles,
+			"reworkAssessment":    reworkAssessment,
+			"humanChangeRequest":  humanChangeRequest,
+			"pullRequestFeedback": pullRequestFeedback,
+			"checkLogFeedback":    checkLogFeedback,
 		}, nil
 	}
 
@@ -1577,6 +1621,8 @@ Rules:
 	}
 	prDiff, _ := runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
 	checksOutput, _ := runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+	pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
+	checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, nil)
 
 	reviewRounds := defaultDevFlowReviewRounds()
 	if template != nil && len(template.ReviewRounds) > 0 {
@@ -1592,7 +1638,11 @@ Rules:
 		promptPath := filepath.Join(proofDir, fmt.Sprintf("rework-prompt-%d.md", cycle))
 		reworkVariables := cloneStringMap(promptVariables)
 		reworkVariables["pullRequestUrl"] = prURL
-		reworkVariables["reviewFeedback"] = feedback
+		roundFeedback := strings.TrimSpace(feedback)
+		if checklistPrompt := reworkChecklistPromptFromAttempt(currentAttempt, ""); checklistPrompt != "" {
+			roundFeedback = strings.TrimSpace(checklistPrompt + "\n\nLatest review feedback:\n" + feedback)
+		}
+		reworkVariables["reviewFeedback"] = roundFeedback
 		reworkVariables["reworkNotePath"] = notePath
 		reworkFallback := fmt.Sprintf(`You are the rework coding agent for Omega.
 
@@ -1605,7 +1655,7 @@ Pull request: %s
 Requirement:
 %s
 
-Review feedback to address:
+Rework checklist to address:
 %s
 
 Rules:
@@ -1619,7 +1669,7 @@ Rules:
   - Files changed
   - Validation run
   - Remaining risk
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, feedback, notePath)
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, roundFeedback, notePath)
 		reworkPrompt := renderWorkflowPromptSection(template, "rework", reworkVariables, reworkFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
 		if err := os.WriteFile(promptPath, []byte(reworkPrompt), 0o644); err != nil {
 			return err
@@ -1702,6 +1752,8 @@ Rules:
 		}
 		prDiff, _ = runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
 		checksOutput, _ = runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+		pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
+		checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, nil)
 		return nil
 	}
 	reviewCycle := 1
@@ -1728,7 +1780,8 @@ Rules:
 			reviewVariables["checksOutput"] = reviewChecks
 			reviewVariables["reviewFocus"] = reviewRound.Focus
 			reviewVariables["diff"] = reviewDiff
-			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, stringOr(reviewFeedback, humanChangeRequest))
+			reviewVariables["reviewFeedback"] = combinedFeedback(stringOr(reviewFeedback, humanChangeRequest))
+			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(stringOr(reviewFeedback, humanChangeRequest)))
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
 				Role:              "review",
@@ -1796,15 +1849,17 @@ Rules:
 	recordAgent("human_review", "human", "waiting-human", "Review the PR, proof, and agent verdicts. Approve to continue delivery or request changes to send the run back.", "human-review-request.md", "Waiting for explicit human approval before delivery.", []string{humanReviewRequestPath}, map[string]any{"runner": "human", "status": "waiting-human"})
 
 	if reportPath, err := writeDevFlowRunReport(proofDir, devFlowRunReportInput{
-		Item:             item,
-		Repository:       repoSlug,
-		BranchName:       branchName,
-		PullRequestURL:   prURL,
-		ChangedFiles:     changedFiles,
-		TestOutput:       testOutput,
-		ChecksOutput:     checksOutput,
-		StageArtifacts:   stageArtifacts,
-		AgentInvocations: agentInvocations,
+		Item:                item,
+		Repository:          repoSlug,
+		BranchName:          branchName,
+		PullRequestURL:      prURL,
+		ChangedFiles:        changedFiles,
+		TestOutput:          testOutput,
+		ChecksOutput:        checksOutput,
+		PullRequestFeedback: pullRequestFeedback,
+		CheckLogFeedback:    checkLogFeedback,
+		StageArtifacts:      stageArtifacts,
+		AgentInvocations:    agentInvocations,
 	}); err != nil {
 		return nil, err
 	} else {
@@ -1842,17 +1897,19 @@ Rules:
 	recordAgent("done", "delivery", "waiting-human", deliveryPrompt, "handoff-bundle.json", "Delivery is blocked by the human review checkpoint.", []string{filepath.Join(proofDir, "handoff-bundle.json")}, map[string]any{"runner": "local-orchestrator", "status": "waiting-human"})
 	proofFiles, _ := collectFiles(proofDir)
 	return map[string]any{
-		"status":           "waiting-human",
-		"workflow":         mapValue(mapValue(pipeline["run"])["workflow"]),
-		"workspacePath":    workspace,
-		"repositoryPath":   repoWorkspace,
-		"branchName":       branchName,
-		"pullRequestUrl":   prURL,
-		"merged":           merged,
-		"changedFiles":     changedFiles,
-		"stageArtifacts":   stageArtifacts,
-		"agentInvocations": agentInvocations,
-		"proofFiles":       proofFiles,
+		"status":              "waiting-human",
+		"workflow":            mapValue(mapValue(pipeline["run"])["workflow"]),
+		"workspacePath":       workspace,
+		"repositoryPath":      repoWorkspace,
+		"branchName":          branchName,
+		"pullRequestUrl":      prURL,
+		"merged":              merged,
+		"changedFiles":        changedFiles,
+		"stageArtifacts":      stageArtifacts,
+		"agentInvocations":    agentInvocations,
+		"proofFiles":          proofFiles,
+		"pullRequestFeedback": pullRequestFeedback,
+		"checkLogFeedback":    checkLogFeedback,
 	}, nil
 }
 

@@ -81,7 +81,8 @@ Item
 - [x] 增加 CI/checks 处理基础版：`/github/pr-status` 汇总 passed / pending / failed / missing required checks，并输出 delivery gate 和推荐动作；旧做法只透传 `gh pr checks` 原始列表。
 - [x] 增加 rebase / branch sync 检测基础版：`/github/pr-status` 在提供 repository/workspace path 时用真实 git fetch / merge-base / merge-tree 判断 current / behind / conflict；旧做法不判断 PR 分支是否落后。
 - [x] 增加 merge conflict 检测基础版：发现冲突时 delivery recommended action 输出 merge-conflict，供 Human Review / Rework 决策；自动生成 rework instruction 仍是后续项。
-- [ ] 暂缓：增加自动回归 / 自动修复重试：Review Agent 或 CI 发现问题时，在最大次数内自动进入 Rework，再回到测试与评审。
+- [x] 增加 Rework Checklist 运行时基础版：旧做法把 review、人工反馈、失败原因和 PR/check 推荐动作分散展示；新做法生成 Attempt / Workpad 级 `reworkChecklist`，Retry API 和 Rework prompt 会直接消费。
+- [ ] 扩展自动回归 / 自动修复重试：Review Agent 或 CI 发现问题时，在最大次数内自动进入 Rework，再回到测试与评审；基础 checklist、PR comments/reviews 和 failed check log 已落地，仍需 thread 状态和自动重试策略。
 - [x] 让 JobSupervisor 消费 workflow contract 基础版：tick 校验/回填 devflow pipeline 的 workflow source、runtime、review rounds、transitions，并在 summary/log 中暴露 contract 状态。
 - [x] 把 workflow contract 升级为 repo-owned 运行协议：目标仓库 `.omega/WORKFLOW.md` 优先于默认模板；Agent Profile 中的 front matter workflow markdown 可作为 Project / Repository override。
 - [x] 扩展 workflow contract 消费基础版：timeout、retry、required checks 和 runner heartbeat 已从 `devflow-pr` runtime 读取；旧做法保留在 Go 常量、CLI flag 或 API payload 中。
@@ -93,10 +94,15 @@ Item
 - [ ] 扩展 run report / review packet：补结构化 diff/test/check preview、风险分级、下一步推荐动作和前端一页预览。
 - [x] 增加 Run Workpad UI 基础版：旧做法把 Requirement、Attempt、Agent trace、Proof 分散展示；新做法先在 Work Item 详情页聚合 Plan、Acceptance Criteria、Validation、Notes、Blockers、PR、Review Feedback、Retry Reason，并全部来自真实 Requirement / Pipeline / Attempt / Operation / Proof / Checkpoint / PR status 记录。
 - [x] 扩展一等 Run Workpad record 基础版：runtime 新增 `runWorkpads` 记录和 `GET /run-workpads`，Attempt 创建、Agent invocation、完成/失败/取消、retry、Human Review approve 后进入 merging 时都会刷新 Plan、Acceptance Criteria、Validation、Notes、Blockers、PR、Review Feedback、Retry Reason。
-- [ ] 扩展一等 Run Workpad record：继续把 Agent / supervisor 的写入从当前 runtime 派生刷新升级为按字段 patch，并让 Rework Agent 直接消费 checklist。
+- [x] 扩展一等 Run Workpad record：新增 `PATCH /run-workpads/{id}` 字段级 patch 基础版，Agent / supervisor 可写入 Plan、Validation、Blockers、Review Feedback、Retry Reason 等字段；runtime 刷新后会重新叠加 `fieldPatches`。
+- [x] 扩展一等 Run Workpad record：字段级 patch 增加 `updatedBy` 权限边界、`fieldPatchSources` 来源归因和 `fieldPatchHistory` 变更历史；旧做法只保存最终覆盖值。
+- [x] 扩展一等 Run Workpad record：Work Item 详情页新增默认折叠的 Patch history 卡片，展示字段级 patch 的写入者、字段、来源和原因。
+- [ ] 扩展一等 Run Workpad record：继续补字段级 patch 的 UI 编辑入口。
 - [x] 拆分 Work Item 详情页：旧做法由 `App.tsx` 内嵌详情大面板；新做法使用独立 item 路由和独立详情组件，减少入口文件耦合。
 - [x] 增强 Review/Rework feedback sweep UI 基础版：旧做法失败原因、review 意见、PR/check 推荐动作分散；新做法在 Workpad 汇总 Review Feedback / Retry Reason，让用户先看到为什么要 rework / retry。
-- [ ] 扩展 Review/Rework feedback sweep 运行时：把 review agent 结果、PR comments、human request changes 和 checks/rebase/conflict 推荐动作持久化成 rework checklist，并让 Rework Agent 和 Retry API 直接消费。
+- [x] 扩展 Review/Rework feedback sweep 运行时基础版：review agent 结果、human request changes、失败原因、operation/event 和 checks/rebase/conflict 推荐动作会持久化成 `reworkChecklist`，并让 Rework Agent 和 Retry API 直接消费。
+- [x] 扩展 Review/Rework feedback sweep：Workpad Rework Checklist 增加 source drilldown 基础版，展开后可看到 human / review / PR comment / check log / gate 等来源摘要。
+- [ ] 扩展 Review/Rework feedback sweep：PR comments/reviews 和 failed check log 基础采集已完成；继续接入 PR thread resolved 状态、行级上下文、check source drilldown 深链和自动 checklist 去重分组。
 - [ ] 减少人工盯守成本：失败、等待、重试、PR/checks 状态都通过 Workboard/Operator 明确给出推荐操作，而不是只暴露原始日志。
 - [ ] 打通两个真实 runner/provider 的端到端执行映射：Project Agent Profile 中的 runner/model/policy 必须实际影响 Codex / opencode / Claude Code 执行。
 - [ ] 固定功能一标准演示脚本：从输入 Requirement 到 PR/checks/human gate/proof/report 的流程可重复跑，并纳入测试报告。
@@ -368,7 +374,11 @@ Item
 - [x] Human Review rework 后按需更新 PR description，并让二次 review 核对人工意见和本轮增量 diff
 - [x] Human Review Request changes 增加 Rework Assessment：局部修改走 fast rework，需求 / 架构 / 接口变化走 replan rework，信息不足时等待人工补充
 - [x] Human Review Request changes 对 fast rework 跳过无需重复的 requirement / architect 阶段，直接复用上一轮 branch / PR 从 Rework 阶段续跑
+- [x] PR comments / reviews 基础采集进入 Rework Checklist，下一轮 Rework Agent 可同时消费人工意见、Review Agent 结果、PR 评论和交付门禁建议
+- [x] Failed CI/check log 基础采集进入 Rework Checklist：从 check link 抽取 Actions run id，优先读取 failed log，并进入 Workpad Review Feedback / Attempt run report
+- [x] Rework Checklist source drilldown 基础版：Workpad 展开后显示每条 checklist 来源的 kind、label 和摘要，避免只看到 action 看不到依据
 - [ ] Human Review Rework Assessment 继续增强为可配置策略：按项目/仓库配置关键词、风险阈值和是否强制重新规划
+- [ ] PR review thread resolved/unresolved 状态、行级上下文、CI/check 日志分页和 source drilldown 进入 Rework Checklist
 
 ## 产品 / 体验缺口
 
