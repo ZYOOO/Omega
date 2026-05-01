@@ -74,6 +74,14 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 	}
 	summary := server.reconcileAttemptIntegrityInDatabase(ctx, &database)
 	mergeSupervisorSummary(summary, server.scanWorkflowContracts(ctx, &database))
+	mergeSupervisorSummary(summary, server.scanRemoteAttemptSignals(ctx, &database, options))
+	if feishuReviewTaskBridgeEnabled() {
+		if bridgeResult, _, err := server.tickFeishuReviewTaskBridge(ctx, "", options.Limit, false); err == nil {
+			summary["feishuReviewTaskBridge"] = bridgeResult
+		} else {
+			summary["feishuReviewTaskBridge"] = map[string]any{"status": "failed", "error": err.Error()}
+		}
+	}
 	mergeSupervisorSummary(summary, server.markStalledAttempts(ctx, &database, options.StaleAfterSeconds))
 	mergeSupervisorSummary(summary, server.scanWorkerHostLeases(ctx, &database))
 	jobs := []map[string]any{}
@@ -89,6 +97,114 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 		server.startDevFlowCycleJob(text(job, "pipelineId"), text(job, "attemptId"), false, false, mapValue(job["lock"]))
 	}
 	return summary, nil
+}
+
+func (server *Server) scanRemoteAttemptSignals(ctx context.Context, database *WorkspaceDatabase, options jobSupervisorTickOptions) map[string]any {
+	summary := map[string]any{
+		"changed":                  0,
+		"checkedRemoteSignals":     0,
+		"refreshedRemoteHeartbeat": 0,
+		"polledPullRequests":       0,
+		"blockedRemoteChecks":      0,
+		"remoteSignalFailures":     []map[string]any{},
+		"remoteSignalObservations": []map[string]any{},
+	}
+	if database == nil {
+		return summary
+	}
+	limit := options.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	for index, attempt := range database.Tables.Attempts {
+		if intValue(summary["checkedRemoteSignals"]) >= limit {
+			break
+		}
+		status := text(attempt, "status")
+		if status != "running" && status != "waiting-human" {
+			continue
+		}
+		summary["checkedRemoteSignals"] = intValue(summary["checkedRemoteSignals"]) + 1
+		nextAttempt := cloneMap(attempt)
+		changed := false
+		worker := mapValue(nextAttempt["workerHost"])
+		if text(worker, "kind") != "" && text(worker, "kind") != "local-runtime" {
+			workerSeen := firstNonEmpty(text(worker, "lastSeenAt"), text(worker, "updatedAt"))
+			if workerSeen != "" && workerSeen > text(nextAttempt, "lastSeenAt") {
+				nextAttempt["lastSeenAt"] = workerSeen
+				nextAttempt["updatedAt"] = nowISO()
+				changed = true
+				summary["refreshedRemoteHeartbeat"] = intValue(summary["refreshedRemoteHeartbeat"]) + 1
+			}
+		}
+		prURL := text(nextAttempt, "pullRequestUrl")
+		repositoryPath := text(nextAttempt, "repositoryPath")
+		if repositoryPath == "" && text(nextAttempt, "workspacePath") != "" {
+			repositoryPath = filepath.Join(text(nextAttempt, "workspacePath"), "repo")
+		}
+		if prURL != "" && repositoryPath != "" {
+			pipeline := pipelineByID(*database, text(nextAttempt, "pipelineId"))
+			repoSlug := githubRepoSlugForRepositoryTargetID(*database, text(nextAttempt, "repositoryTargetId"))
+			checks, rawChecks := githubPullRequestChecks(ctx, repositoryPath, prURL, repoSlug)
+			if len(checks) > 0 || strings.TrimSpace(rawChecks) != "" {
+				summary["polledPullRequests"] = intValue(summary["polledPullRequests"]) + 1
+				checkSummary := githubCheckSummaryWithRequired(checks, workflowRuntimeRequiredChecks(pipeline))
+				nextAttempt["lastSeenAt"] = nowISO()
+				nextAttempt["remoteSignals"] = map[string]any{
+					"pullRequestUrl": prURL,
+					"checks":         checks,
+					"checkSummary":   checkSummary,
+					"observedAt":     nowISO(),
+				}
+				if intValue(checkSummary["failed"]) > 0 || intValue(checkSummary["missingRequired"]) > 0 {
+					summary["blockedRemoteChecks"] = intValue(summary["blockedRemoteChecks"]) + 1
+				}
+				summary["remoteSignalObservations"] = append(arrayMaps(summary["remoteSignalObservations"]), map[string]any{
+					"attemptId":    text(nextAttempt, "id"),
+					"pipelineId":   text(nextAttempt, "pipelineId"),
+					"checkSummary": checkSummary,
+				})
+				server.logInfo(ctx, "job_supervisor.remote_signals.polled", "Remote pull request checks polled by JobSupervisor.", map[string]any{"attemptId": text(nextAttempt, "id"), "pipelineId": text(nextAttempt, "pipelineId"), "pullRequestUrl": prURL, "checkSummary": checkSummary})
+				changed = true
+			}
+		}
+		if changed {
+			nextAttempt["updatedAt"] = nowISO()
+			database.Tables.Attempts[index] = nextAttempt
+			summary["changed"] = intValue(summary["changed"]) + 1
+		}
+	}
+	return summary
+}
+
+func githubRepoSlugForRepositoryTargetID(database WorkspaceDatabase, targetID string) string {
+	target := findRepositoryTarget(database, targetID)
+	if target == nil {
+		return ""
+	}
+	owner := strings.TrimSpace(text(target, "owner"))
+	repo := strings.TrimSpace(text(target, "repo"))
+	if owner != "" && repo != "" {
+		return owner + "/" + repo
+	}
+	if text(target, "kind") == "github" {
+		label := strings.TrimSpace(repositoryTargetLabel(target))
+		if strings.Count(label, "/") == 1 && !strings.HasPrefix(label, "/") {
+			return label
+		}
+	}
+	return ""
+}
+
+func workflowRuntimeRequiredChecks(pipeline map[string]any) []string {
+	runtime := workflowRuntimeFromPipeline(pipeline)
+	values := []string{}
+	for _, value := range arrayValues(runtime["requiredChecks"]) {
+		if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+			values = append(values, strings.TrimSpace(text))
+		}
+	}
+	return values
 }
 
 func (server *Server) scanWorkerHostLeases(ctx context.Context, database *WorkspaceDatabase) map[string]any {

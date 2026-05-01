@@ -194,6 +194,30 @@ func githubPullRequestFeedback(ctx context.Context, repositoryPath string, selec
 	return feedback
 }
 
+func githubPullRequestChecks(ctx context.Context, repositoryPath string, selector string, repo string) ([]map[string]any, string) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return nil, ""
+	}
+	args := []string{"pr", "checks", selector, "--json", "name,state,link"}
+	if strings.TrimSpace(repo) != "" {
+		args = append(args, "--repo", strings.TrimSpace(repo))
+	}
+	command := exec.CommandContext(ctx, "gh", args...)
+	if strings.TrimSpace(repositoryPath) != "" {
+		command.Dir = strings.TrimSpace(repositoryPath)
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, strings.TrimSpace(string(output))
+	}
+	var checks []map[string]any
+	if err := json.Unmarshal(output, &checks); err != nil {
+		return nil, strings.TrimSpace(string(output))
+	}
+	return checks, strings.TrimSpace(string(output))
+}
+
 func githubPullRequestFeedbackFromView(pr map[string]any) []map[string]any {
 	feedback := []map[string]any{}
 	add := func(kind string, label string, message string, createdAt string, url string) {

@@ -10,7 +10,8 @@ export const workspacePersistenceSchemaVersion = 1;
 
 export type InspectorPanelPersistence = "properties" | "provider";
 export type PrimaryNavPersistence = "Projects" | "Views" | "Issues" | "Page Pilot";
-export type RunnerPresetPersistence = "local-proof" | "demo-code" | "codex";
+export type RunnerPresetPersistence = "local-proof" | "demo-code" | "codex" | "opencode" | "claude-code" | "trae-agent";
+type LegacyRunnerPresetPersistence = RunnerPresetPersistence | "claude";
 
 export interface ProjectRecord extends WorkboardProject {
   createdAt: string;
@@ -76,11 +77,19 @@ export interface UiPreferenceRecord {
   selectedWorkItemId: string;
   inspectorOpen: boolean;
   activeInspectorPanel: InspectorPanelPersistence;
-  runnerPreset: RunnerPresetPersistence;
+  runnerPreset: LegacyRunnerPresetPersistence;
   statusFilter: "All" | WorkItemStatus;
   assigneeFilter: string;
   sortDirection: "asc" | "desc";
   collapsedGroups: WorkItemStatus[];
+}
+
+function normalizeRunnerPreset(runner: string | undefined): RunnerPresetPersistence {
+  if (runner === "demo-code" || runner === "codex" || runner === "opencode" || runner === "claude-code" || runner === "trae-agent") {
+    return runner;
+  }
+  if (runner === "claude") return "claude-code";
+  return "local-proof";
 }
 
 export type PipelineLifecycleStatus =
@@ -427,7 +436,7 @@ export function workspaceSessionFromDatabase(run: PipelineRun, database: Workspa
     selectedWorkItemId: ui?.selectedWorkItemId ?? initial.selectedWorkItemId,
     inspectorOpen: ui?.inspectorOpen ?? initial.inspectorOpen,
     activeInspectorPanel: ui?.activeInspectorPanel ?? initial.activeInspectorPanel,
-    runnerPreset: ui?.runnerPreset ?? initial.runnerPreset,
+    runnerPreset: normalizeRunnerPreset(ui?.runnerPreset),
     statusFilter: ui?.statusFilter ?? initial.statusFilter,
     assigneeFilter: ui?.assigneeFilter ?? initial.assigneeFilter,
     sortDirection: ui?.sortDirection ?? initial.sortDirection,

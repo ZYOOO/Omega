@@ -59,7 +59,7 @@ Item
 
 这些是功能一从“可演示闭环”升级到“可托管运行”的核心缺口，优先级高于继续扩展功能二体验。
 
-当前执行优先级：先完成 workspace cleanup / repo-owned workflow contract / prompt sections / JobSupervisor worker-host 与恢复基础版。CI 自动 rework、Run Timeline 深挖、统一 E2E 报告暂缓，不从清单删除。
+当前执行优先级：workspace cleanup / repo-owned workflow contract / prompt sections / JobSupervisor worker-host 与恢复基础版已完成；CI 自动 rework、远端 signal polling 和 Workflow Template 一等化已在 2026-05-02 补齐。第四项按当前决策暂缓，Run Timeline 深挖、统一 E2E 报告不从清单删除。
 
 - [x] 建立正式 JobSupervisor v1：常驻扫描 Ready Work Item、running attempt、failed/stalled attempt、waiting-human gate 和 workflow contract；危险写仓库动作由显式策略开关控制。
 - [x] JobSupervisor daemon 基础版：Go Local Runtime 启动时默认开启后台维护 tick，周期性执行 checkpoint integrity、stalled detection 和 Ready item preflight scan；默认不自动启动 Ready item，必须显式开启 `job-supervisor-auto-run-ready`。
@@ -68,7 +68,7 @@ Item
 - [x] JobSupervisor heartbeat 基础版：Attempt 创建、Agent invocation、完成/失败会写入 `lastSeenAt`，作为运行健康判断的主字段。
 - [x] JobSupervisor stalled detection 基础版：`POST /job-supervisor/tick` 会扫描 running attempts，超过阈值未更新 heartbeat 时标记为 `stalled`，Pipeline 进入 `stalled`，Work Item 进入 `Blocked`，并写 runtime ERROR log。
 - [x] 扩展 heartbeat 基础版：runner process stdout/stderr 流和长时间 Codex/opencode/Claude Code 子进程会写入 attempt event、runtime DEBUG log，并周期性刷新 `lastSeenAt`；旧做法只在 Attempt 创建、Agent invocation 和完成/失败时刷新。
-- [ ] 扩展 heartbeat：GitHub API polling、CI watch 和远端 runner host 仍需周期性刷新 `lastSeenAt`。
+- [x] 扩展 heartbeat：JobSupervisor 会对 running / waiting-human Attempt 轮询 PR checks / required checks，并消费远端 worker host `lastSeenAt` 刷新运行心跳；旧做法只依赖本机 runner 进程和 attempt event。
 - [x] Attempt retry API 基础版：`POST /attempts/{id}/retry` 支持 failed / stalled / canceled attempt 创建新 Attempt，保留旧 Attempt，并写入 retry metadata。
 - [x] 扩展 stalled recovery 基础版：JobSupervisor 可扫描 stalled / failed Attempt，按 retry 上限和 backoff 生成 recoverable summary，并在 `autoRetryFailed=true` 时创建真实 retry Attempt。
 - [x] 增加自动恢复策略基础版：`autoRetryFailed` + `maxRetryAttempts` + `retryBackoffSeconds` 支持有限次数自动 retry 和 backoff；更细的失败分类仍保留为后续项。
@@ -95,7 +95,7 @@ Item
 - [x] 增加 rebase / branch sync 检测基础版：`/github/pr-status` 在提供 repository/workspace path 时用真实 git fetch / merge-base / merge-tree 判断 current / behind / conflict；旧做法不判断 PR 分支是否落后。
 - [x] 增加 merge conflict 检测基础版：发现冲突时 delivery recommended action 输出 merge-conflict，供 Human Review / Rework 决策；自动生成 rework instruction 仍是后续项。
 - [x] 增加 Rework Checklist 运行时基础版：旧做法把 review、人工反馈、失败原因和 PR/check 推荐动作分散展示；新做法生成 Attempt / Workpad 级 `reworkChecklist`，Retry API 和 Rework prompt 会直接消费。
-- [ ] 扩展自动回归 / 自动修复重试：Review Agent 或 CI 发现问题时，在最大次数内自动进入 Rework，再回到测试与评审；基础 checklist、PR comments/reviews 和 failed check log 已落地，仍需 thread 状态和自动重试策略。
+- [x] 扩展自动回归 / 自动修复重试：Review Agent 或 CI / required checks 发现阻塞问题时，在 `maxReviewCycles` 内自动进入 Rework，再回到测试与评审；PR comments/reviews、failed check log、required checks 和 checklist 会汇入 rework input。
 - [x] 让 JobSupervisor 消费 workflow contract 基础版：tick 校验/回填 devflow pipeline 的 workflow source、runtime、review rounds、transitions，并在 summary/log 中暴露 contract 状态。
 - [x] 把 workflow contract 升级为 repo-owned 运行协议：目标仓库 `.omega/WORKFLOW.md` 优先于默认模板；Agent Profile 中的 front matter workflow markdown 可作为 Project / Repository override。
 - [x] 扩展 workflow contract 消费基础版：timeout、retry、required checks 和 runner heartbeat 已从 `devflow-pr` runtime 读取；旧做法保留在 Go 常量、CLI flag 或 API payload 中。
@@ -105,7 +105,7 @@ Item
 - [x] 扩展 workflow transition 消费：Agent invocation 后的 stage 推进优先读取 Pipeline snapshot transitions，缺失时才回退旧 DevFlow 顺序；旧做法完全依赖固定 Go switch。
 - [x] 迁移通用 action executor 阶段 2 基础版：新增 `GET /attempts/{attemptId}/action-plan`，从 Pipeline workflow snapshot 生成当前 state、current action、state actions、可达 transitions、retry action 和恢复策略，不执行真实写仓库动作。
 - [x] 迁移通用 action executor 阶段 2 增强：JobSupervisor recovery summary / accepted retry job 会附带 action plan 摘要，自动恢复决策与 workflow snapshot 对齐。
-- [ ] 迁移通用 action executor 阶段 2 UI：让 Work Item 详情页直接消费 action plan，替代局部分散的状态推断。
+- [x] 迁移通用 action executor 阶段 2 UI：Work Item 详情页的 Delivery flow、Attempt stage、Retry / Rework signal 已直接消费 `/attempts/{attemptId}/action-plan`，旧的 stage / attempt 状态推断只作为兼容 fallback。
 - [ ] 迁移通用 action executor 阶段 3：先把 review / rework / merging 从 DevFlow 固定函数迁到 action handler，保留现有真实 PR/check/proof 行为。
 - [x] 增强 Review / Rework 交接契约：Review Prompt 必须输出 Summary、Blocking findings、Validation gaps、Rework instructions、Residual risks；旧做法主要依赖 verdict line，容易让 retry/rework 缺少可执行原因。
 - [x] 补齐全 Agent 交接契约：Requirement、Architect、Testing、Delivery 的 prompt section 和 Agent output contract 已统一为结构化 handoff，避免只在 Review 阶段有明确原因和下一步。
@@ -124,7 +124,7 @@ Item
 - [x] 扩展 Review/Rework feedback sweep：Workpad Rework Checklist 增加 source drilldown 基础版，展开后可看到 human / review / PR comment / check log / gate 等来源摘要。
 - [x] 扩展 Review/Rework feedback sweep：PR comments/reviews 和 failed check log 基础采集已完成；继续接入 PR thread resolved 状态、行级上下文、check source drilldown 深链和自动 checklist 去重分组。
 - [ ] 减少人工盯守成本：失败、等待、重试、PR/checks 状态都通过 Workboard/Operator 明确给出推荐操作，而不是只暴露原始日志。
-- [ ] 打通两个真实 runner/provider 的端到端执行映射：Project Agent Profile 中的 runner/model/policy 必须实际影响 Codex / opencode / Claude Code 执行。
+- [x] 打通两个真实 runner/provider 的端到端执行映射：Project Agent Profile 中的 runner/model/policy 会实际影响 Codex / opencode / Claude Code / Trae Agent 执行；Trae Agent 账号凭据可加密落库并在运行时注入 provider 环境变量。
 - [ ] 固定功能一标准演示脚本：从输入 Requirement 到 PR/checks/human gate/proof/report 的流程可重复跑，并纳入测试报告。
 
 ## 已完成
@@ -227,6 +227,9 @@ Item
 - [x] Workspace Config 支持本地 workspace root 配置 UI：路径输入、默认路径、目录选择器兜底和保存入口
 - [x] Project Agent Profile 配置入口基础版：可编辑 workflow、runner、Skill allowlist、MCP allowlist、stage policy、`.codex` policy，并生成 runtime spec preview
 - [x] Project Agent Profile UI 拆成 Workflow / Agents / Runtime files 三层：支持 workflow markdown 草稿、按 Agent 配置 runner/model/Skills/MCP，以及 `.omega` / `.codex` / `.claude` 运行时文件预览
+  - 旧做法保留说明：该版本把 workflow markdown、Agent runner、prompt/policy 和 runtime preview 放在同一块编辑器内，能用但信息密度和入口层次不够清晰。
+- [x] Workspace Agent Studio 基础版：在 Workspace Config 内提供工作区级共享的 Workflow 图形编排、Prompt 设置、Agent runner/model/Skills/MCP 选择和 Runtime files 预览；继续复用 Agent Profile / workflow markdown / runtime policy 保存链路。
+- [x] Workspace Agent Studio runner / 凭据边界修正：runner 编排保留 Codex 优先、opencode、Claude Code、Trae Agent；页面内账号 / Key 配置只面向 opencode / Trae Agent，Codex / Claude Code 走本机 CLI 登录态。
 - [x] Project Agent Profile 接入 Go API / SQLite：支持 `/agent-profile` 读写、Project / Repository scope 解析、Pipeline run metadata 绑定和 runner runtime bundle 写入
 - [x] Agent Profile runner 配置接入本机 capability 预检：前端阻止保存不可用 runner，Go runtime 在创建 attempt / operation workspace 前拒绝未安装 runner
 - [x] 建立 Agent / Workflow 配置方案文档：`docs/agent-workflow-configuration-plan.md`
@@ -259,7 +262,7 @@ Item
 - [x] DevFlow 编排重构：由 workflow markdown 定义状态、review outcome、rework 回流和 human gate，Go runtime 读取该契约执行
 - [x] DevFlow 编排重构：Review `changes_requested` 不再把 Attempt 标为失败，而是进入 Rework，同一 workspace / branch / PR 上继续修改后回到 Code Review
 - [x] DevFlow 编排重构：一个 Item 的执行复用稳定 workspace、稳定 branch 和同一个 PR；Attempt 只记录一次执行轮次和事件
-- [x] DevFlow 编排重构：抽象 AgentRunner，当前默认 Codex，后续可切换 opencode / Claude Code / local runner
+- [x] DevFlow 编排重构：抽象 AgentRunner；默认和 profile / auto fallback 保持 Codex 优先，并支持 opencode / Claude Code / Trae Agent / local runner。
 - [x] DevFlow 编排重构：前端详情页展示真实 Agent turn、输入/输出 artifact、状态流转和 runner telemetry，弱化单纯 proof 数字
 - [x] DevFlow 编排重构：JobSupervisor 已接入 heartbeat、stall retry、cancel、contract-driven timeout/retry 和 workspace lock 基础版
 - [x] DevFlow 编排重构：补 worker host 分配、本地 worker lease、continuation policy metadata 和 orphan running Attempt crash recovery 基础版
@@ -270,25 +273,28 @@ Item
 - [x] 把 Agent handoff bundle 建成基础 artifact：每个 stage 有输入/输出 artifact contract，`devflow-pr` 生成 handoff bundle
 - [ ] 把 Agent handoff bundle 从文件 proof 继续升级为可查询的一等表记录
 - [x] 增加 Agent runtime spec 基础版：每个 operation / DevFlow cycle 写入 `.omega/agent-runtime.json`
-- [ ] 增加 runner-specific runtime 模板：为 Codex / opencode / Claude Code 生成对应 `.codex` / prompt / tool policy 文件，并消费 Project Agent Profile
-- [ ] 扩展 runner process supervisor：为 opencode / Claude Code / demo-code 统一接入 timeout、cancel、retry、exit status、stdout/stderr 持久化
+- [x] 增加 runner-specific runtime 模板基础版：Codex / Claude Code 继续生成本机 CLI policy 文件；opencode / Trae Agent 已补账号配置入口、runner/model/prompt/Skills/MCP 配置和 Project Agent Profile 消费链路，后续继续增强更细的 tool policy 文件。
+- [x] 扩展 runner process supervisor：opencode / Trae Agent / demo-code 已接入 runner registry、capability preflight、exit status、stdout/stderr 持久化；timeout / cancel 继续沿用 context-aware supervisor。
 - [x] `run-devflow-cycle` 产品主路径异步化：点击 Run 先创建 Attempt 并立即返回，后端 background job 继续执行，前端通过轮询更新状态
 - [x] `orchestrator/tick autoRun` 异步化：认领后创建 Attempt，后台 job 执行并在完成/失败后释放 execution lock
 - [x] Human Review checkpoint 产品主路径真实化：默认不 auto approve / auto merge，Review Agent 通过后停在 `waiting-human`
-- [ ] 把 Workflow Template 从文件默认值继续升级为 SQLite 一等记录，并支持 Project / Repository Workspace 覆盖
-- [ ] 增加 Workflow Template 编辑 API：读取、保存、校验、恢复默认、导入/导出 Markdown
+- [x] 把 Workflow Template 从文件默认值继续升级为 SQLite 一等记录，并支持 Project / Repository Workspace 覆盖
+- [x] 增加 Workflow Template 编辑 API 基础版：读取、保存、校验、恢复默认，并由 Agent Profile 运行时消费覆盖
+- [ ] 后续：Workflow Template Markdown 文件导入/导出、版本对比和恢复历史
 - [x] 把 coding / rework / review prompt sections 从 Workflow Markdown body 渲染到 Agent prompt，进一步减少 Go 里的 prompt hardcode
 - [x] 增加正式 JobSupervisor v1：扫描 ready work items / failed attempts / stalled attempts / human gates / workflow contract，并按显式策略调度下一步
 - [x] JobSupervisor 增加 heartbeat、stall detection、retry、cancel、timeout 基础版
 - [x] JobSupervisor 增加 worker host 分配、多 turn continuation policy metadata 和本地 orphan crash recovery 基础版
-- [ ] JobSupervisor 增加远端崩溃恢复和 GitHub polling
-- [ ] 增加 issue/work item preflight checks：repo target、workspace root、branch 权限、dirty state、重复执行锁、必要 CLI 能力检查
+- [x] JobSupervisor 增加远端 runner heartbeat 和 GitHub / CI polling 基础版
+- [x] 增加 issue/work item preflight checks：repo target、workspace root、branch 权限、dirty state、重复执行锁、必要 CLI 能力检查
+  - 2026-05-02 核对：DevFlow preflight 已被 manual run / retry / JobSupervisor scan 复用；GitHub delivery contract preflight 已覆盖 PR 权限和 checks 读取能力。
 - [x] 增加 GitHub delivery contract preflight：issue source 可选，但 repository target、branch 权限、PR 创建权限、checks 读取权限必须在运行前验证
 - [x] DevFlow preflight 基础版：运行前集中检查 repository target、workspace root、git/gh、runner availability、local dirty state，并被 manual run / retry / JobSupervisor scan 复用。
 - [x] 增加 orchestrator execution lock：同一个 GitHub issue / Work item / repository target 不能被多个本地 App 重复认领或重复执行
 - [x] 增加 Agent runner registry：按 stage/agent/runner 选择 Codex、opencode、Claude Code 或 local runner，并注入不同 issue、workspace、prompt、artifact 上下文
 - [x] 增加 Agent runner availability preflight：按 Agent Profile 配置检查 Codex / opencode / Claude Code / demo-code 所需 CLI，缺失时阻止启动而不是生成假失败流程
-- [ ] 清理遗留外部参考命名：内部文件、类型、测试、历史文档统一使用 Omega Workboard / DevFlow 语言，外部产品名只出现在“参考来源”说明中
+- [x] 清理遗留外部参考命名：内部文件、类型、测试、历史文档统一使用 Omega Workboard / DevFlow 语言，外部产品名只出现在“参考来源”说明中
+  - 2026-05-02 核对：当前 `services` / `apps` / `docs` 中未发现需避开的历史参考命名；后续新增文档继续按 Omega Workboard / DevFlow 语言维护。
 - [x] 把 Product Layer 持久化从 workspace 快照推进到 missions / operations / checkpoints / proof_records 等一等表基础版
 - [ ] 按新的 Work Model 继续把 Project / Repository target / Work item / Pipeline run 的 SQLite 结构从 JSON snapshot 推进为可查询表
 - [x] 先把 Requirement 从 snapshot 中抽成服务端一等表，并在本地 SQLite / 前端本地 fallback SQLite 中持久化
@@ -302,20 +308,22 @@ Item
 - [x] Work item 详情页展示 Attempt stages / Agent turns / artifacts / Human Review 基础版，可看到真实状态流转
 - [x] 把 Checkpoint Reject 的“回退重做”做成更清晰的 stage timeline 可视化，突出 rejected -> rework -> review 回流；后续继续增强动画和筛选，但主链路已能展示 rejected -> rework -> review 的原因与回流。
 - [x] Operator 视图增加基础 stage timeline，可看到当前 Pipeline 每个阶段的状态
-- [ ] 按赛题要求持续维护 Must-have / Good-to-have 对照与完成度
+- [x] 按赛题要求持续维护 Must-have / Good-to-have 对照与完成度
+  - 2026-05-02 核对：`docs/competition-requirements-matrix.md` 与本清单的 Must-have / Good-to-have 已同步到当前完成度；后续作为常规维护项继续更新。
 - [x] Page Pilot：将 proof 从 run JSON / proof 文件升级为通用 Mission / Operation / Proof records，并在 Work Item 详情的 Agent trace / Proof 面板展示
 - [x] Page Pilot：Electron Desktop Shell 增加本地服务自动启动基础版，可启动 Go local runtime、Omega Web Vite dev server，并在显式 `OMEGA_PREVIEW_REPO_PATH` 下启动目标 repo preview dev server
 - [ ] Page Pilot：扩展 `data-omega-source` 到 Workboard 关键可编辑区域，不只覆盖 Portal Home
 - [ ] Page Pilot：增加 patch preview、selection history、discard/revert 的更完整 UI 状态（基础 selection history / process panel 已落地，仍缺完整 diff preview）
 - [x] Page Pilot：把 Electron direct pilot 的 target URL、projectId、repositoryTargetId 从 env/default 升级为用户可选配置；Page Pilot 启动器负责选择 repo / 预览来源，目标页内继续使用已验证的 direct pilot preload。
-- [ ] ~~Page Pilot：把 Electron preview webview、repository target、local worktree 绑定成一等配置~~（旧大项已拆分：Electron 基础版已完成；服务端 Preview Runtime Profile 持久化继续由下方 Go 一等化任务跟踪）
+- [x] ~~Page Pilot：把 Electron preview webview、repository target、local worktree 绑定成一等配置~~（旧大项已拆分并完成主路径：Page Pilot 启动器选择 Repository Workspace，Electron direct pilot 接收明确 target，Go Preview Runtime 保存 profile）
 - [x] Page Pilot：定义单一 Page Pilot Agent 的 stage contracts：preview-runtime / page-editing / delivery
-- [ ] ~~Page Pilot：增加 Preview Runtime stage，读取 repo 文件并生成 install/start/preview URL/health/reload 的可审计运行档案~~（旧大项已拆分：Electron 基础版 Preview Runtime Agent/Profile 已完成；Go 持久化运行档案继续由下方任务跟踪）
-- [ ] ~~Page Pilot：增加 Preview Runtime Profile API：resolve/start/restart，所有命令锁定到明确 repository workspace~~（旧大项已拆分：Electron IPC 基础版已完成；Go API 继续由下方任务跟踪）
-- [ ] Page Pilot：把当前 Electron preview process supervisor 下沉为 Go runtime 一等能力，记录目标项目 dev server 的 pid、stdout/stderr、端口、健康检查和失败诊断
+- [x] ~~Page Pilot：增加 Preview Runtime stage，读取 repo 文件并生成 install/start/preview URL/health/reload 的可审计运行档案~~（旧大项已拆分并完成基础版：Preview Runtime Agent/Profile 生成启动档案并驱动打开/刷新）
+- [x] ~~Page Pilot：增加 Preview Runtime Profile API：resolve/start/restart，所有命令锁定到明确 repository workspace~~（旧大项已拆分并完成基础版：Go runtime 已暴露 `/page-pilot/preview-runtime/resolve|start|restart`）
+- [x] Page Pilot：把当前 Electron preview process supervisor 下沉为 Go runtime 一等能力，记录目标项目 dev server 的 pid、stdout/stderr、端口、健康检查和失败诊断
+  - 2026-05-02 核对：Go Preview Runtime supervisor 基础版已完成；跨进程恢复、持久 process table、日志分页和更完整失败诊断继续作为后续增强。
 - [x] Page Pilot：在 UI 中展示 session 对应的 Work Item / Page Pilot pipeline run 基础版；Page Pilot 页面展示 Recent runs 并支持回跳 Work Item，Work Item 可带 repository target 打开 Page Pilot
 - [x] Page Pilot：增加 live-preview repository write lock，`apply` 持锁等待 Confirm/Discard，`deliver` / `discard` 终态释放，避免同一预览工作区被并发写入
-- [ ] Page Pilot：设计 isolated-devflow mode，让预览可以指向隔离 operation workspace 或在确认后回写原 workspace
+- [x] Page Pilot：实现 isolated-devflow mode 基础版。GitHub Repository target 会解析或自动准备 Omega-managed isolated preview workspace，apply 写隔离 workspace，Confirm 后从隔离 workspace 创建 branch / commit / PR，Discard 对隔离 workspace 做安全 reset/clean。
 - [x] Page Pilot：Electron 基础版 Preview Runtime stage 落地后，apply / Reload 会按 profile 做 health check、HMR 等待或必要的目标项目 dev server restart
 - [x] Page Pilot：Electron direct pilot 结果面板升级为完整 diff preview / PR body preview / Work Item 回跳基础版；Recent runs 详情弹窗展示真实 run artifact，后续继续补行级 diff drilldown。
 - [x] Page Pilot：支持同一 Page Pilot run 的多轮追加批注 / 追加说明 / 重新 apply
@@ -323,7 +331,7 @@ Item
 - [x] Page Pilot：增加 source mapping 覆盖率报告基础版，Page Pilot run 会记录强源码映射、DOM-only 选区、缺失文件映射和覆盖率；按页面/组件聚合继续后续扩展。
 - [x] Page Pilot：增加修改前/修改后截图或 DOM snapshot 证据，并把视觉 proof 关联到 Work Item、PR body 和 run report；当前基础版为 DOM snapshot，截图证据继续保留为后续增强。
 - [x] Page Pilot：为 DOM-only 批注增加源码候选定位能力基础版，缺少 `data-omega-source` 时按文本、selector、DOM tag 和批注 token 搜索候选源码，并写入 Agent prompt / run artifacts。
-- [ ] ~~Page Pilot：把 `/page-pilot-target` 调试代理替换为 Electron bridge 或显式开发配置~~（产品主路径已切到 Electron bridge；该代理仅作为 Vite 开发 fallback 保留，不再作为独立产品任务）
+- [x] ~~Page Pilot：把 `/page-pilot-target` 调试代理替换为 Electron bridge 或显式开发配置~~（产品主路径已切到 Electron bridge；该代理仅作为 Vite 开发 fallback 保留，不再作为独立产品任务）
 - [x] Page Pilot：实现 Electron direct pilot preload bridge，支持跨 origin / file URL 目标页内真实元素圈选、多批注、Apply、Confirm、Discard 和返回。
 - [x] Page Pilot：把 React Page Pilot 页面接入 Electron `omegaDesktop.openPreview`，但页面只作为 direct pilot 启动器，不再承载目标页内圈选交互。
 - [x] Page Pilot：增加 Go target dev server start/restart API，支持修改后重启用户项目 dev server；基础版为 `/page-pilot/preview-runtime/resolve|start|restart`。
@@ -342,13 +350,14 @@ Item
 ## 下一步
 
 - [ ] 增加 App 内可编辑 Workflow Template：在 UI/API 中编辑阶段、Agent、Gate、review rounds、默认 repo/workspace 配置，替代散落的 md/env 文件
+  - 2026-05-02 更新：Workflow Template 已有 SQLite 一等记录和读取/保存/校验/恢复默认 API；Workspace Agent Studio 已完成图形化查看和基础编辑入口。阶段增删、连线编辑、导入/导出和版本恢复仍未完成。
 - [x] Project Agent Profile 从 `omega_settings` 继续升级为一等 SQLite 表
 - [ ] Project Agent Profile 继续补充版本历史展示、恢复默认、导入/导出，以及更完整的 workflow/schema 校验
 - [ ] 持久化 connector sync report，而不只是 sync intent
   - 2026-05-01 更新：GitHub Issue 出站同步已先落地 sync report；其他 connector 仍待补齐。
 - [ ] 增加新项目的 workspace bootstrap API
-- [ ] 把 LLM Provider selection 真正映射到 Codex / opencode / compatible provider runner
-- [ ] 把 `run-current-stage` 的 runner 继续扩展为 opencode 和更完整的 provider selection 映射
+- [x] 把 LLM Provider / runner account selection 真正映射到 opencode / Trae Agent / compatible provider runner；Codex / Claude Code 继续走本机 CLI 登录态。
+- [x] 把 `run-current-stage` 的 runner 扩展为 Codex / opencode / Claude Code / Trae Agent，并保留 `local-proof` / `demo-code` 兜底。
 - [ ] 设计 shared sync API：本地/远端/GitHub/飞书创建 requirement 后双向同步状态
 - [ ] 在 Go Local Runtime 中扩展 `lark-cli` adapter，支持发送 checkpoint 卡片通知和 pipeline 结果通知
   - 2026-05-01：Human Review 已新增飞书 review-request / callback 链路；机器人 webhook 和 `lark-cli` chatId 都支持 interactive card。Pipeline 结果通知仍可继续扩展为 delivery summary 卡片。
@@ -375,9 +384,13 @@ Item
   - 2026-05-01：`POST /feishu/review-request` 会从 checkpoint 读取 Requirement / Work Item / Attempt / Review Packet，生成飞书 interactive card；无 webhook 时可走 `lark-cli im +messages-send --msg-type interactive`。
 - [x] 增加 Feishu webhook / 回调到 checkpoint 状态迁移
   - 2026-05-01：`POST /feishu/review-callback` 与本地 Approve / Request changes 使用同一 checkpoint decision helper；真实公网 callback 需要配置 `OMEGA_PUBLIC_API_URL` 和可选 `OMEGA_FEISHU_REVIEW_TOKEN`。
+- [x] 增加无公网 Feishu Task 审核桥接
+  - 2026-05-01：`POST /feishu/review-request` 支持 `mode=task`，通过 `lark-cli task +create` 创建审核任务；任务完成后 `/feishu/review-task/sync` 同步为 approve，任务评论通过 `/feishu/review-task/comment` 同步为 request changes 或 need-info。
+- [ ] 增加 Feishu Task 本地常驻事件桥
+  - 当前已完成本机 API 和同步语义；后续把任务评论 / 完成事件自动轮询或订阅并转发到本机 runtime，减少手动 sync。
 - [ ] 把 Feishu 群聊 requirement 入口建模成 Product Layer 的一等事件源
 - [x] 持久化 Feishu message/card/doc external reference，方便从 Workboard 回跳
-  - 2026-05-01：发送结果写入 checkpoint.`feishuReview`，包含 provider、tool、format、message id 或 card/doc preview；后续可继续提升为一等 Connector Sync Report 表。
+  - 2026-05-01：发送结果写入 checkpoint.`feishuReview`，包含 provider、tool、format、message id、task id、task url、nonce 或 card/doc preview；后续可继续提升为一等 Connector Sync Report 表。
 
 ## 执行层缺口
 
@@ -391,8 +404,9 @@ Item
 - [x] 增加显式的 run attempts 表
 - [x] AutoRun 会形成一条正式 Attempt，并把 workspace、branch、PR、proof、错误和耗时写入持久化记录
 - [x] Done Item 在列表禁用 Run；详情页提供显式 Rerun；失败状态显示 Retry 入口
-- [ ] 增加 attempts 的 retry / cancel / timeout 策略，并接入 JobSupervisor（旧做法：列表 Retry 重新触发 item；新做法：优先按 concrete Attempt 建立 retry 链路，后续继续补自动 retry policy）
-- [ ] 增加 timeout / retry policy 持久化
+- [x] 增加 attempts 的 retry / cancel / timeout 策略，并接入 JobSupervisor（旧做法：列表 Retry 重新触发 item；新做法：按 concrete Attempt 建立 retry 链路；自动回归 / 自动修复重试仍由上方独立项跟踪）
+- [x] 增加 timeout / retry policy 持久化
+  - 2026-05-02 核对：workflow runtime 已持久化 Attempt timeout、retry 上限、backoff、heartbeat、cleanup retention，并被 DevFlow / JobSupervisor 消费。
 - [x] 增加与数据库状态联动的 workspace cleanup 策略
 - [x] Work item 详情页增加 Proof 一等展示，按 Requirement / Solution / Diff / Test / Review / PR / Merge 等类型展示证据
 - [ ] 增加 proof 内容解析和预览，不只停留在文件路径层
@@ -410,7 +424,7 @@ Item
 
 ## 产品 / 体验缺口
 
-- [ ] 增加项目创建与 repository target 配置
+- [x] 增加项目创建与 repository target 配置基础版：新增 `POST /projects` 和 Projects 页面创建入口，`github/bind-repository-target` 支持按 `projectId` 绑定；前端绑定仓库时携带当前 Project，后续继续补多项目切换和更完整 onboarding UI。
 - [ ] 增加由服务端数据驱动的 activity / event timeline 页面
 - [x] 增加 Operator 视图基础版（队列 / waiting-human / proof / runtime model / checkpoint）
 - [ ] 增强 Operator 视图（失败队列 / 重试 / token 耗时 / runner cost）
@@ -433,19 +447,21 @@ Item
 - [x] 需求拆分作为真实能力，而不是只靠手动创建 Work item
 - [x] 支持从 APP 内部 requirement/work item 开始执行本地链路，GitHub issue 不再是唯一入口
 - [x] Agent 协作与 handoff artifact 基础版贯穿各阶段：master dispatch、stage contracts、dataFlow、proof bundle
-- [ ] Agent 编排满足 2 个真实可切换模型提供商（provider registry 与运行时选择已完成，runner 映射未完成）
+- [x] Agent 编排满足 2 个真实可切换模型提供商：Codex 走本机 CLI 登录态；opencode / Trae Agent 支持页面账号配置、model/provider 选择和运行时环境变量注入。
 - [x] 至少 2 个人工检查点，支持 Approve / Reject / 重做
 - [x] API-first 架构与 OpenAPI 文档
 - [x] 覆盖全部阶段的端到端 Pipeline 演示基础版：GitHub issue claim 后完成 intake / implementation / review / human / merge / done，并产生 proof artifacts
 - [x] 端到端演示加入飞书通知/审核链路
-  - 2026-05-01：DevFlow 进入 Human Review 后会按配置自动发送飞书审核卡片；飞书 callback approve / request changes 与 Omega Web 本地审核同级。真实飞书群体验见 `docs/manual-testing-needed.md`，实现说明见 `docs/feishu-review-chain.md`。
+  - 2026-05-01：DevFlow 进入 Human Review 后会按配置自动发送飞书审核卡片，或创建飞书 Task 审核；飞书 callback / task sync approve / task comment request changes 与 Omega Web 本地审核同级。真实飞书体验见 `docs/manual-testing-needed.md`，实现说明见 `docs/feishu-review-chain.md`。
+  - 2026-05-02：新增飞书 Task 本地常驻事件桥基础版，`POST /feishu/review-task/bridge/tick` 可 dry-run 或同步待审 Task，JobSupervisor 可通过 `OMEGA_FEISHU_TASK_BRIDGE_ENABLED=true` 自动 tick，减少手动 sync。
 - [x] 本地端到端演示基础链路：Work item -> Pipeline -> local stage execution -> proof -> checkpoint
 
 ### Good-to-have
 
 - [x] 多 Agent 协作基础版：Pipeline stage 支持 `agentIds`，DevFlow PR 模板在 implementation / human review 阶段绑定多个 Agent
-- [ ] 自动回归 / 自动修复重试
+- [x] 自动回归 / 自动修复重试基础版
 - [x] 可观测性面板基础版（summary API + Operator UI）
+- [x] 可观测性面板增强：`/observability` 支持时间窗口、分组统计、最近失败、慢阶段 drilldown 和趋势数据；Views 页面可切换窗口与分组，定位失败和慢阶段更直接。
 - [ ] 代码库语义索引
 - [x] Pipeline 模板
 - [x] Git 集成基础版：隔离 clone、创建本地 branch、commit、生成 diff/summary proof

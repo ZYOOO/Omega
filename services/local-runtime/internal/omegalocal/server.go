@@ -44,6 +44,7 @@ type GitHubOAuthConfig struct {
 }
 
 func NewServer(databasePath, workspaceRoot, openAPIPath string) *Server {
+	ensureCommonLocalToolPaths()
 	return &Server{
 		Repo:          NewSQLiteRepository(databasePath),
 		WorkspaceRoot: workspaceRoot,
@@ -57,6 +58,36 @@ func NewServer(databasePath, workspaceRoot, openAPIPath string) *Server {
 		HTTPClient:     http.DefaultClient,
 		attemptCancels: map[string]context.CancelFunc{},
 		previewRuntime: map[string]*previewRuntimeSession{},
+	}
+}
+
+func ensureCommonLocalToolPaths() {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return
+	}
+	current := os.Getenv("PATH")
+	parts := strings.Split(current, string(os.PathListSeparator))
+	seen := map[string]bool{}
+	for _, part := range parts {
+		seen[part] = true
+	}
+	candidates := []string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".npm-global", "bin"),
+		filepath.Join(home, ".bun", "bin"),
+	}
+	prefix := []string{}
+	for _, candidate := range candidates {
+		if seen[candidate] {
+			continue
+		}
+		if info, statErr := os.Stat(candidate); statErr == nil && info.IsDir() {
+			prefix = append(prefix, candidate)
+		}
+	}
+	if len(prefix) > 0 {
+		_ = os.Setenv("PATH", strings.Join(append(prefix, current), string(os.PathListSeparator)))
 	}
 }
 
@@ -102,6 +133,8 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.getWorkspace(response, request)
 	case request.Method == http.MethodPut && path == "/workspace":
 		server.putWorkspace(response, request)
+	case request.Method == http.MethodPost && path == "/projects":
+		server.createProject(response, request)
 	case request.Method == http.MethodGet && path == "/requirements":
 		server.listTable(response, request, "requirements")
 	case request.Method == http.MethodGet && path == "/events":
@@ -143,7 +176,13 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 	case request.Method == http.MethodGet && path == "/pipeline-templates":
 		writeJSON(response, http.StatusOK, pipelineTemplates())
 	case request.Method == http.MethodGet && path == "/workflow-templates":
-		writeJSON(response, http.StatusOK, pipelineTemplates())
+		server.listWorkflowTemplates(response, request)
+	case request.Method == http.MethodPost && path == "/workflow-templates/validate":
+		server.validateWorkflowTemplate(response, request)
+	case request.Method == http.MethodPut && strings.HasPrefix(path, "/workflow-templates/"):
+		server.putWorkflowTemplate(response, request)
+	case request.Method == http.MethodPost && strings.HasPrefix(path, "/workflow-templates/") && strings.HasSuffix(path, "/restore-default"):
+		server.restoreWorkflowTemplateDefault(response, request)
 	case request.Method == http.MethodPost && path == "/pipelines/from-template":
 		server.createPipelineFromTemplate(response, request)
 	case request.Method == http.MethodGet && path == "/llm-providers":
@@ -152,6 +191,10 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.getProviderSelection(response, request)
 	case request.Method == http.MethodPut && path == "/llm-provider-selection":
 		server.putProviderSelection(response, request)
+	case request.Method == http.MethodGet && path == "/runner-credentials":
+		server.listRunnerCredentials(response, request)
+	case request.Method == http.MethodPut && path == "/runner-credentials":
+		server.putRunnerCredential(response, request)
 	case request.Method == http.MethodGet && path == "/agent-definitions":
 		server.listAgentDefinitions(response, request)
 	case request.Method == http.MethodGet && path == "/agent-profile":
@@ -214,6 +257,12 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.feishuNotify(response, request)
 	case request.Method == http.MethodPost && path == "/feishu/review-request":
 		server.feishuReviewRequest(response, request)
+	case request.Method == http.MethodPost && path == "/feishu/review-task/sync":
+		server.feishuReviewTaskSync(response, request)
+	case request.Method == http.MethodPost && path == "/feishu/review-task/comment":
+		server.feishuReviewTaskComment(response, request)
+	case request.Method == http.MethodPost && path == "/feishu/review-task/bridge/tick":
+		server.feishuReviewTaskBridgeTick(response, request)
 	case request.Method == http.MethodPost && path == "/feishu/review-callback":
 		server.feishuReviewCallback(response, request)
 	case request.Method == http.MethodPost && path == "/requirements/decompose":
@@ -276,7 +325,7 @@ func (server *Server) observability(response http.ResponseWriter, request *http.
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	summary := observabilitySummary(*database)
+	summary := observabilitySummaryWithOptions(*database, observabilityOptionsFromQuery(request.URL.Query()))
 	if logs, logErr := server.Repo.ListRuntimeLogs(request.Context(), map[string]string{}, 50); logErr == nil {
 		mapValue(summary["counts"])["runtimeLogs"] = len(logs)
 	}
@@ -284,6 +333,71 @@ func (server *Server) observability(response http.ResponseWriter, request *http.
 		summary["recentErrors"] = errors
 	}
 	writeJSON(response, http.StatusOK, summary)
+}
+
+func (server *Server) createProject(response http.ResponseWriter, request *http.Request) {
+	var payload struct {
+		ID          string   `json:"id"`
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Team        string   `json:"team"`
+		Labels      []string `json:"labels"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
+	name := strings.TrimSpace(payload.Name)
+	if name == "" {
+		writeError(response, http.StatusBadRequest, fmt.Errorf("project name is required"))
+		return
+	}
+	database, err := mustLoad(server, request.Context())
+	if err != nil {
+		writeError(response, http.StatusNotFound, err)
+		return
+	}
+	projectID := strings.TrimSpace(payload.ID)
+	if projectID == "" {
+		projectID = "project_" + slugForID(name)
+	}
+	if findByID(database.Tables.Projects, projectID) >= 0 {
+		writeError(response, http.StatusConflict, fmt.Errorf("project %s already exists", projectID))
+		return
+	}
+	timestamp := nowISO()
+	labels := make([]any, 0, len(payload.Labels))
+	for _, label := range payload.Labels {
+		if trimmed := strings.TrimSpace(label); trimmed != "" {
+			labels = append(labels, trimmed)
+		}
+	}
+	project := map[string]any{
+		"id":                projectID,
+		"name":              name,
+		"description":       strings.TrimSpace(payload.Description),
+		"team":              stringOr(payload.Team, name),
+		"status":            "Active",
+		"labels":            labels,
+		"repositoryTargets": []any{},
+		"createdAt":         timestamp,
+		"updatedAt":         timestamp,
+	}
+	database.Tables.Projects = append(database.Tables.Projects, project)
+	database.Tables.MissionControlStates = append(database.Tables.MissionControlStates, map[string]any{
+		"runId":       "run_" + projectID,
+		"projectId":   projectID,
+		"workItems":   []any{},
+		"events":      []any{},
+		"syncIntents": []any{},
+		"updatedAt":   timestamp,
+	})
+	touch(&database)
+	if err := server.Repo.Save(request.Context(), database); err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, database)
 }
 
 func (server *Server) localCapabilities(response http.ResponseWriter, request *http.Request) {
@@ -1312,6 +1426,7 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 	targetRepo := strings.TrimSpace(text(mission, "target"))
 	if targetRepo == "" || targetRepo == "No target" {
 		prompt := text(operation, "prompt") + "\n\n" + agentPolicyBlock(profile, agentID)
+		model, env := server.runnerCredentialModelAndEnv(context.Background(), resolvedRunnerID, stringOr(agent.Model, "gpt-5.4-mini"))
 		turn := agentRunner.RunTurn(context.Background(), AgentTurnRequest{
 			Role:       agentID,
 			StageID:    text(operation, "stageId"),
@@ -1320,7 +1435,8 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 			Prompt:     prompt,
 			OutputPath: filepath.Join(proofDir, resolvedRunnerID+"-last-message.txt"),
 			Sandbox:    "workspace-write",
-			Model:      stringOr(agent.Model, "gpt-5.4-mini"),
+			Model:      model,
+			Env:        env,
 		})
 		return demoCodeRunResult{stdout: text(turn.Process, "stdout"), stderr: text(turn.Process, "stderr"), runnerProcess: turn.Process}, turn.Error
 	}
@@ -1340,6 +1456,7 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 	_, _ = runCommand(repoWorkspace, "git", "config", "user.name", "Omega Codex Runner")
 
 	prompt := fmt.Sprintf("%s\n\nRepository target: %s\nCreate the requested code change in this repository. Leave generated proof in %s.\n\n%s", text(operation, "prompt"), targetRepo, proofDir, agentPolicyBlock(profile, agentID))
+	model, env := server.runnerCredentialModelAndEnv(context.Background(), resolvedRunnerID, stringOr(agent.Model, "gpt-5.4-mini"))
 	turn := agentRunner.RunTurn(context.Background(), AgentTurnRequest{
 		Role:       agentID,
 		StageID:    text(operation, "stageId"),
@@ -1348,7 +1465,8 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 		Prompt:     prompt,
 		OutputPath: filepath.Join(proofDir, resolvedRunnerID+"-last-message.txt"),
 		Sandbox:    "workspace-write",
-		Model:      stringOr(agent.Model, "gpt-5.4-mini"),
+		Model:      model,
+		Env:        env,
 	})
 	process := turn.Process
 	stdout := text(process, "stdout")
@@ -1654,6 +1772,7 @@ type SupervisedCommandEvent struct {
 type SupervisedCommandOptions struct {
 	HeartbeatInterval time.Duration
 	OnEvent           func(SupervisedCommandEvent)
+	Env               map[string]string
 }
 
 type supervisedStreamWriter struct {
@@ -1673,6 +1792,18 @@ func (writer supervisedStreamWriter) Write(chunk []byte) (int, error) {
 	return len(chunk), nil
 }
 
+func envMapToList(values map[string]string) []string {
+	items := make([]string, 0, len(values))
+	for key, value := range values {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		items = append(items, key+"="+value)
+	}
+	return items
+}
+
 func runSupervisedCommandContextWithOptions(ctx context.Context, options SupervisedCommandOptions, dir string, stdin string, name string, args ...string) (map[string]any, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1680,6 +1811,9 @@ func runSupervisedCommandContextWithOptions(ctx context.Context, options Supervi
 	started := time.Now()
 	command := exec.CommandContext(ctx, name, args...)
 	command.Dir = dir
+	if len(options.Env) > 0 {
+		command.Env = append(os.Environ(), envMapToList(options.Env)...)
+	}
 	if stdin != "" {
 		command.Stdin = strings.NewReader(stdin)
 	}
@@ -2164,6 +2298,7 @@ func (server *Server) githubRepositories(response http.ResponseWriter, request *
 
 func (server *Server) githubBindRepositoryTarget(response http.ResponseWriter, request *http.Request) {
 	var payload struct {
+		ProjectID     string `json:"projectId"`
 		Owner         string `json:"owner"`
 		Repo          string `json:"repo"`
 		NameWithOwner string `json:"nameWithOwner"`
@@ -2187,7 +2322,11 @@ func (server *Server) githubBindRepositoryTarget(response http.ResponseWriter, r
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
-	upsertGitHubRepositoryTarget(&database, repo, payload.DefaultBranch, payload.URL)
+	if payload.ProjectID != "" && findByID(database.Tables.Projects, payload.ProjectID) < 0 {
+		writeError(response, http.StatusNotFound, fmt.Errorf("project %s not found", payload.ProjectID))
+		return
+	}
+	upsertGitHubRepositoryTargetForProject(&database, payload.ProjectID, repo, payload.DefaultBranch, payload.URL)
 	touch(&database)
 	if err := server.Repo.Save(request.Context(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
@@ -3046,6 +3185,15 @@ func repositoryTargetID(repo string) string {
 	return "repo_" + safeSegment(strings.ReplaceAll(repo, "/", "_"))
 }
 
+func slugForID(value string) string {
+	slug := safeSegment(strings.ToLower(strings.TrimSpace(value)))
+	slug = strings.Trim(slug, "_-.")
+	if slug == "" {
+		return "untitled"
+	}
+	return slug
+}
+
 func findRepositoryTarget(database WorkspaceDatabase, targetID string) map[string]any {
 	for _, project := range database.Tables.Projects {
 		for _, target := range arrayMaps(project["repositoryTargets"]) {
@@ -3142,6 +3290,10 @@ func (server *Server) resolveMissionRepositoryTarget(ctx context.Context, missio
 }
 
 func upsertGitHubRepositoryTarget(database *WorkspaceDatabase, repo string, defaultBranch string, repositoryURL string) {
+	upsertGitHubRepositoryTargetForProject(database, "", repo, defaultBranch, repositoryURL)
+}
+
+func upsertGitHubRepositoryTargetForProject(database *WorkspaceDatabase, projectID string, repo string, defaultBranch string, repositoryURL string) {
 	if len(database.Tables.Projects) == 0 {
 		database.Tables.Projects = append(database.Tables.Projects, map[string]any{
 			"id":                "project_omega",
@@ -3154,6 +3306,13 @@ func upsertGitHubRepositoryTarget(database *WorkspaceDatabase, repo string, defa
 			"createdAt":         nowISO(),
 			"updatedAt":         nowISO(),
 		})
+	}
+	projectIndex := 0
+	if projectID != "" {
+		projectIndex = findByID(database.Tables.Projects, projectID)
+		if projectIndex < 0 {
+			projectIndex = 0
+		}
 	}
 	parts := strings.SplitN(repo, "/", 2)
 	owner := repo
@@ -3176,7 +3335,7 @@ func upsertGitHubRepositoryTarget(database *WorkspaceDatabase, repo string, defa
 		"defaultBranch": defaultBranch,
 		"url":           repositoryURL,
 	}
-	project := cloneMap(database.Tables.Projects[0])
+	project := cloneMap(database.Tables.Projects[projectIndex])
 	targets := arrayMaps(project["repositoryTargets"])
 	for _, candidate := range targets {
 		if text(candidate, "id") == text(target, "id") {
@@ -3193,7 +3352,7 @@ func upsertGitHubRepositoryTarget(database *WorkspaceDatabase, repo string, defa
 		project["defaultRepositoryTargetId"] = target["id"]
 	}
 	project["updatedAt"] = nowISO()
-	database.Tables.Projects[0] = project
+	database.Tables.Projects[projectIndex] = project
 }
 
 func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (WorkspaceDatabase, bool) {

@@ -22,6 +22,7 @@ import {
   fetchPagePilotRuns,
   fetchPipelines,
   fetchPipelineTemplates,
+  fetchWorkflowTemplates,
   fetchRunWorkpads,
   exportRuntimeLogs,
   patchRunWorkpad,
@@ -32,7 +33,10 @@ import {
   startGitHubOAuth,
   startPipeline,
   updateGitHubOAuthConfig,
-  updateLlmProviderSelection
+  updateLlmProviderSelection,
+  updateWorkflowTemplate,
+  validateWorkflowTemplate,
+  restoreWorkflowTemplateDefault
 } from "../omegaControlApiClient";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -151,6 +155,32 @@ describe("omegaControlApiClient", () => {
         fetchImpl
       )
     ).resolves.toMatchObject({ model: "qwen-plus" });
+  });
+
+  it("manages first-class workflow templates", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!init) {
+        expect(url).toBe("http://omega.local/workflow-templates?projectId=project_omega&repositoryTargetId=repo_1");
+        return Promise.resolve(jsonResponse([{ id: "workflow_template_project_omega", templateId: "devflow-pr", validation: { status: "passed" } }]));
+      }
+      if (url.endsWith("/workflow-templates/validate")) {
+        expect(init.method).toBe("POST");
+        return Promise.resolve(jsonResponse({ validation: { status: "passed" }, template: { id: "devflow-pr", stages: [] } }));
+      }
+      if (url.endsWith("/workflow-templates/devflow-pr/restore-default")) {
+        expect(init.method).toBe("POST");
+        return Promise.resolve(jsonResponse({ id: "workflow_template_project_omega", templateId: "devflow-pr", source: "restored-default" }));
+      }
+      expect(url).toBe("http://omega.local/workflow-templates/devflow-pr");
+      expect(init.method).toBe("PUT");
+      return Promise.resolve(jsonResponse({ id: "workflow_template_project_omega", templateId: "devflow-pr", version: 2 }));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchWorkflowTemplates("http://omega.local", { projectId: "project_omega", repositoryTargetId: "repo_1" }, fetchImpl)).resolves.toHaveLength(1);
+    await expect(validateWorkflowTemplate("http://omega.local", { templateId: "devflow-pr", markdown: "---\nid: devflow-pr\n---" }, fetchImpl)).resolves.toMatchObject({ validation: { status: "passed" } });
+    await expect(updateWorkflowTemplate("http://omega.local", "devflow-pr", { projectId: "project_omega", markdown: "---\nid: devflow-pr\n---" }, fetchImpl)).resolves.toMatchObject({ version: 2 });
+    await expect(restoreWorkflowTemplateDefault("http://omega.local", "devflow-pr", { projectId: "project_omega" }, fetchImpl)).resolves.toMatchObject({ source: "restored-default" });
   });
 
   it("sends Feishu notifications through the local service", async () => {

@@ -1307,6 +1307,7 @@ Rules:
 			return nil, err
 		}
 		recordAgent("rework", "coding", "running", reworkPrompt, "", "Fast rework agent is applying human feedback on the existing PR branch.", []string{promptPath}, map[string]any{"runner": codingRunnerID, "status": "running", "strategy": text(reworkAssessment, "strategy")})
+		reworkModel, reworkEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
 		reworkTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
 			Role:              "rework",
 			StageID:           "rework",
@@ -1315,7 +1316,8 @@ Rules:
 			Prompt:            reworkPrompt,
 			OutputPath:        notePath,
 			Sandbox:           "workspace-write",
-			Model:             codingProfile.Model,
+			Model:             reworkModel,
+			Env:               reworkEnv,
 			HeartbeatInterval: runnerHeartbeatInterval,
 			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "rework", "coding", codingRunnerID),
 		})
@@ -1423,6 +1425,7 @@ Rules:
 			reviewVariables["diff"] = reviewDiff
 			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(reworkFeedbackInput))
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
+			reviewModel, reviewEnv := server.runnerCredentialModelAndEnv(ctx, reviewRunnerID, reviewProfile.Model)
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
 				Role:              "review",
 				StageID:           stageID,
@@ -1431,8 +1434,9 @@ Rules:
 				Prompt:            reviewPrompt,
 				OutputPath:        reviewPath,
 				Sandbox:           "read-only",
-				Model:             reviewProfile.Model,
+				Model:             reviewModel,
 				Effort:            "medium",
+				Env:               reviewEnv,
 				HeartbeatInterval: runnerHeartbeatInterval,
 				OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "review", reviewRunnerID),
 			})
@@ -1617,6 +1621,7 @@ Rules:
 		return nil, err
 	}
 	recordAgent("in_progress", "coding", "running", codingPrompt, "", "Coding agent is editing the repository workspace.", []string{filepath.Join(proofDir, "coding-prompt.md")}, map[string]any{"runner": codingRunnerID, "status": "running"})
+	codingModel, codingEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
 	codingTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
 		Role:              "coding",
 		StageID:           "in_progress",
@@ -1625,7 +1630,8 @@ Rules:
 		Prompt:            codingPrompt,
 		OutputPath:        filepath.Join(proofDir, "coding-agent-note.md"),
 		Sandbox:           "workspace-write",
-		Model:             codingProfile.Model,
+		Model:             codingModel,
+		Env:               codingEnv,
 		HeartbeatInterval: runnerHeartbeatInterval,
 		OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "in_progress", "coding", codingRunnerID),
 	})
@@ -1709,8 +1715,13 @@ Rules:
 	}
 	prDiff, _ := runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
 	checksOutput, _ := runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+	remoteChecks, remoteChecksRaw := githubPullRequestChecks(ctx, repoWorkspace, prURL, repoSlug)
+	if strings.TrimSpace(remoteChecksRaw) != "" {
+		checksOutput = remoteChecksRaw
+	}
+	remoteCheckSummary := githubCheckSummaryWithRequired(remoteChecks, template.Runtime.RequiredChecks)
 	pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
-	checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, nil)
+	checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, remoteChecks)
 
 	reviewRounds := defaultDevFlowReviewRounds()
 	if template != nil && len(template.ReviewRounds) > 0 {
@@ -1763,6 +1774,7 @@ Rules:
 			return err
 		}
 		recordAgent(stageID, "coding", "running", reworkPrompt, "", "Rework agent is applying review feedback in the same workspace.", []string{promptPath}, map[string]any{"runner": codingRunnerID, "status": "running", "reviewCycle": cycle})
+		reworkModel, reworkEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
 		turn := codingRunner.RunTurn(ctx, AgentTurnRequest{
 			Role:              "rework",
 			StageID:           stageID,
@@ -1771,7 +1783,8 @@ Rules:
 			Prompt:            reworkPrompt,
 			OutputPath:        notePath,
 			Sandbox:           "workspace-write",
-			Model:             codingProfile.Model,
+			Model:             reworkModel,
+			Env:               reworkEnv,
 			HeartbeatInterval: runnerHeartbeatInterval,
 			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "coding", codingRunnerID),
 		})
@@ -1840,11 +1853,32 @@ Rules:
 		}
 		prDiff, _ = runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
 		checksOutput, _ = runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+		remoteChecks, remoteChecksRaw = githubPullRequestChecks(ctx, repoWorkspace, prURL, repoSlug)
+		if strings.TrimSpace(remoteChecksRaw) != "" {
+			checksOutput = remoteChecksRaw
+		}
+		remoteCheckSummary = githubCheckSummaryWithRequired(remoteChecks, template.Runtime.RequiredChecks)
 		pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
-		checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, nil)
+		checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, remoteChecks)
 		return nil
 	}
-	reviewCycle := 1
+	remoteReworkCycle := 0
+	for {
+		remoteFeedback, needsRemoteRework := devFlowRemoteGateFeedback(remoteCheckSummary, checkLogFeedback)
+		if !needsRemoteRework {
+			break
+		}
+		if remoteReworkCycle >= maxReviewCycles {
+			recordAgent("rework", "testing", "waiting-human", remoteFeedback, "remote-checks-feedback.md", "Remote checks still require attention after automated rework attempts.", []string{}, map[string]any{"runner": "github", "status": "waiting-human", "checkSummary": remoteCheckSummary})
+			break
+		}
+		remoteReworkCycle++
+		if err := runReworkTurn(remoteReworkCycle, remoteFeedback); err != nil {
+			reason := "Rework agent failed while applying remote check feedback."
+			return failureResult("rework", "coding", reason, err.Error(), remoteFeedback), err
+		}
+	}
+	reviewCycle := remoteReworkCycle + 1
 	for {
 		var reviewFeedback string
 		needsRework := false
@@ -1871,6 +1905,7 @@ Rules:
 			reviewVariables["reviewFeedback"] = combinedFeedback(stringOr(reviewFeedback, humanChangeRequest))
 			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(stringOr(reviewFeedback, humanChangeRequest)))
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
+			reviewModel, reviewEnv := server.runnerCredentialModelAndEnv(ctx, reviewRunnerID, reviewProfile.Model)
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
 				Role:              "review",
 				StageID:           stageID,
@@ -1879,8 +1914,9 @@ Rules:
 				Prompt:            reviewPrompt,
 				OutputPath:        reviewPath,
 				Sandbox:           "read-only",
-				Model:             reviewProfile.Model,
+				Model:             reviewModel,
 				Effort:            "medium",
+				Env:               reviewEnv,
 				HeartbeatInterval: runnerHeartbeatInterval,
 				OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "review", reviewRunnerID),
 			})

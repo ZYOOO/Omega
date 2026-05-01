@@ -19,6 +19,7 @@ type AgentTurnRequest struct {
 	Sandbox           string
 	Model             string
 	Effort            string
+	Env               map[string]string
 	HeartbeatInterval time.Duration
 	OnProcessEvent    func(SupervisedCommandEvent)
 }
@@ -41,6 +42,8 @@ func NewAgentRunnerRegistry() AgentRunnerRegistry {
 	return AgentRunnerRegistry{runners: map[string]AgentRunner{
 		"codex":       CodexExecAgentRunner{},
 		"opencode":    OpenCodeAgentRunner{},
+		"trae":        TraeAgentRunner{},
+		"trae-agent":  TraeAgentRunner{},
 		"claude-code": ClaudeCodeAgentRunner{},
 		"claude":      ClaudeCodeAgentRunner{},
 	}}
@@ -59,7 +62,7 @@ func (registry AgentRunnerRegistry) Resolve(runnerID string) (AgentRunner, strin
 
 func isAIRunnerID(runnerID string) bool {
 	switch strings.ToLower(strings.TrimSpace(runnerID)) {
-	case "codex", "opencode", "claude", "claude-code", "profile", "auto":
+	case "codex", "opencode", "trae", "trae-agent", "claude", "claude-code", "profile", "auto":
 		return true
 	default:
 		return false
@@ -83,6 +86,11 @@ func runnerAvailabilityError(runnerID string) error {
 		return nil
 	case "opencode":
 		if err := executableAvailable("opencode"); err != nil {
+			return fmt.Errorf("runner %q is not installed or not on PATH: %w", normalized, err)
+		}
+		return nil
+	case "trae", "trae-agent":
+		if err := executableAvailable("trae-cli"); err != nil {
 			return fmt.Errorf("runner %q is not installed or not on PATH: %w", normalized, err)
 		}
 		return nil
@@ -143,7 +151,7 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 	}
 	process, err := runSupervisedCommandContextWithOptions(
 		ctx,
-		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent},
+		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: request.Env},
 		request.Workspace,
 		request.Prompt,
 		"codex",
@@ -176,7 +184,7 @@ func (runner OpenCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurn
 		return AgentTurnResult{Status: "failed", Process: process, Error: err}
 	}
 	args := []string{"run", "--model", model, "-"}
-	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent}, request.Workspace, request.Prompt, "opencode", args...)
+	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: request.Env}, request.Workspace, request.Prompt, "opencode", args...)
 	if request.OutputPath != "" {
 		ensureAgentOutputFile(request.OutputPath, process)
 	}
@@ -186,6 +194,83 @@ func (runner OpenCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurn
 	}
 	process["runner"] = "opencode"
 	return AgentTurnResult{Status: status, Process: process, Error: err}
+}
+
+type TraeAgentRunner struct{}
+
+func (runner TraeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequest) AgentTurnResult {
+	if err := executableAvailable("trae-cli"); err != nil {
+		process := runnerProcessNotAvailable("trae-agent", "trae-cli", request.Workspace, err)
+		return AgentTurnResult{Status: "failed", Process: process, Error: err}
+	}
+	args := []string{"run", request.Prompt, "--working-dir", request.Workspace}
+	provider, model := traeProviderAndModel(request.Model)
+	if model != "" {
+		if provider != "" {
+			args = append(args, "--provider", provider)
+		}
+		args = append(args, "--model", model)
+	}
+	process, err := runSupervisedCommandContextWithOptions(
+		ctx,
+		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: mergeEnvMaps(traeProviderEnv(provider), request.Env)},
+		request.Workspace,
+		"",
+		"trae-cli",
+		args...,
+	)
+	if request.OutputPath != "" {
+		ensureAgentOutputFile(request.OutputPath, process)
+	}
+	status := "passed"
+	if err != nil {
+		status = "failed"
+	}
+	process["runner"] = "trae-agent"
+	return AgentTurnResult{Status: status, Process: process, Error: err}
+}
+
+func traeProviderAndModel(rawModel string) (string, string) {
+	model := strings.TrimSpace(rawModel)
+	if model == "" || model == "gpt-5.4-mini" {
+		return strings.TrimSpace(os.Getenv("OMEGA_TRAE_PROVIDER")), strings.TrimSpace(os.Getenv("OMEGA_TRAE_MODEL"))
+	}
+	if provider, configuredModel, ok := strings.Cut(model, ":"); ok && provider != "" && configuredModel != "" {
+		return strings.TrimSpace(provider), strings.TrimSpace(configuredModel)
+	}
+	provider := strings.TrimSpace(os.Getenv("OMEGA_TRAE_PROVIDER"))
+	if provider == "" {
+		lower := strings.ToLower(model)
+		switch {
+		case strings.HasPrefix(lower, "doubao"):
+			provider = "doubao"
+		case strings.HasPrefix(lower, "claude"):
+			provider = "anthropic"
+		case strings.HasPrefix(lower, "gpt"):
+			provider = "openai"
+		case strings.HasPrefix(lower, "gemini"):
+			provider = "google"
+		}
+	}
+	return provider, model
+}
+
+func traeProviderEnv(provider string) map[string]string {
+	env := map[string]string{}
+	normalized := strings.ToUpper(strings.TrimSpace(provider))
+	if normalized == "" {
+		normalized = strings.ToUpper(strings.TrimSpace(os.Getenv("OMEGA_TRAE_PROVIDER")))
+	}
+	if normalized == "" {
+		return env
+	}
+	if apiKey := strings.TrimSpace(os.Getenv("OMEGA_TRAE_API_KEY")); apiKey != "" {
+		env[normalized+"_API_KEY"] = apiKey
+	}
+	if baseURL := strings.TrimSpace(os.Getenv("OMEGA_TRAE_BASE_URL")); baseURL != "" {
+		env[normalized+"_BASE_URL"] = baseURL
+	}
+	return env
 }
 
 type ClaudeCodeAgentRunner struct{}
@@ -201,7 +286,7 @@ func (runner ClaudeCodeAgentRunner) RunTurn(ctx context.Context, request AgentTu
 		executable = "claude-code"
 	}
 	args := []string{"-p", "-", "--model", model}
-	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent}, request.Workspace, request.Prompt, executable, args...)
+	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: request.Env}, request.Workspace, request.Prompt, executable, args...)
 	if request.OutputPath != "" {
 		ensureAgentOutputFile(request.OutputPath, process)
 	}
@@ -211,6 +296,19 @@ func (runner ClaudeCodeAgentRunner) RunTurn(ctx context.Context, request AgentTu
 	}
 	process["runner"] = "claude-code"
 	return AgentTurnResult{Status: status, Process: process, Error: err}
+}
+
+func mergeEnvMaps(values ...map[string]string) map[string]string {
+	merged := map[string]string{}
+	for _, value := range values {
+		for key, item := range value {
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+			merged[key] = item
+		}
+	}
+	return merged
 }
 
 type UnsupportedAgentRunner struct {

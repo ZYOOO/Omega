@@ -53,7 +53,16 @@ stages:
   - rework: coding + testing, then code_review
   - human_review: human gate
   - delivery: delivery`,
-		StagePolicy:    "Repository target is mandatory. Review changes_requested routes to Rework. Human Review blocks delivery until approved.",
+		StagePolicy: strings.Join([]string{
+			"Requirement: clarify acceptance criteria, repository target, open questions, and acceptance risks before planning.",
+			"Architecture: list affected files, integration boundaries, risky assumptions, and validation strategy before coding.",
+			"Coding: edit only inside the bound repository workspace and keep the diff reviewable for a single Work Item.",
+			"Testing: run focused validation first, then broader checks when shared contracts, delivery, or UI behavior changed.",
+			"Review: changes_requested must route to Rework with a checklist; review feedback should not be treated as an infrastructure failure.",
+			"Rework: reuse the existing implementation workspace, apply the checklist, update PR notes when the behavior changed, and return to review.",
+			"Human Review: stop delivery until explicit approval; request changes becomes first-class feedback for the next rework attempt.",
+			"Delivery: after approval, run merge/check actions separately and record PR/check/proof output in the Run Workpad.",
+		}, "\n"),
 		SkillAllowlist: "browser-use\ngithub:github\ngithub:gh-fix-ci\ngithub:yeet",
 		MCPAllowlist:   "github\nfilesystem:repository-workspace\nbrowser:localhost-preview",
 		CodexPolicy:    "sandbox: workspace-write\napproval: never inside automated stage\nrepo-scope: require repositoryTargetId match",
@@ -138,11 +147,19 @@ func (server *Server) resolveAgentProfile(ctx context.Context, database Workspac
 	if repositoryTargetID == "" {
 		repositoryTargetID = text(item, "repositoryTargetId")
 	}
+	applyWorkflowOverride := func(profile ProjectAgentProfile) ProjectAgentProfile {
+		templateID := stringOr(profile.WorkflowTemplate, "devflow-pr")
+		if record := workflowTemplateOverride(database, projectID, repositoryTargetID, templateID); record != nil && strings.TrimSpace(text(record, "markdown")) != "" {
+			profile.WorkflowTemplate = stringOr(text(record, "templateId"), templateID)
+			profile.WorkflowMarkdown = text(record, "markdown")
+		}
+		return normalizeAgentProfile(profile)
+	}
 	if repositoryTargetID != "" {
 		if record, err := server.Repo.GetAgentProfile(ctx, projectID, repositoryTargetID); err == nil {
 			profile := profileFromMap(record)
 			profile.Source = "repository"
-			return profile
+			return applyWorkflowOverride(profile)
 		} else if !errorsIsNoRows(err) {
 			// Keep running with older settings-backed profiles if the first-class table is not readable.
 		}
@@ -150,21 +167,21 @@ func (server *Server) resolveAgentProfile(ctx context.Context, database Workspac
 			profile := profileFromMap(record)
 			profile.Source = "repository"
 			_ = server.Repo.SetAgentProfile(ctx, profile)
-			return profile
+			return applyWorkflowOverride(profile)
 		}
 	}
 	if record, err := server.Repo.GetAgentProfile(ctx, projectID, ""); err == nil {
 		profile := profileFromMap(record)
 		profile.Source = "project"
-		return profile
+		return applyWorkflowOverride(profile)
 	}
 	if record, err := server.Repo.GetSetting(ctx, agentProfileSettingKey(projectID, "")); err == nil {
 		profile := profileFromMap(record)
 		profile.Source = "project"
 		_ = server.Repo.SetAgentProfile(ctx, profile)
-		return profile
+		return applyWorkflowOverride(profile)
 	}
-	return defaultAgentProfile(projectID, repositoryTargetID)
+	return applyWorkflowOverride(defaultAgentProfile(projectID, repositoryTargetID))
 }
 
 func (server *Server) resolveAgentProfileForMission(ctx context.Context, mission map[string]any) ProjectAgentProfile {

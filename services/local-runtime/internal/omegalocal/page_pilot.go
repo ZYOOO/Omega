@@ -33,6 +33,7 @@ type pagePilotApplyRequest struct {
 	RunID                 string                    `json:"runId"`
 	ProjectID             string                    `json:"projectId"`
 	RepositoryTargetID    string                    `json:"repositoryTargetId"`
+	ExecutionMode         string                    `json:"executionMode"`
 	Instruction           string                    `json:"instruction"`
 	Selection             pagePilotSelectionContext `json:"selection"`
 	Runner                string                    `json:"runner"`
@@ -46,6 +47,7 @@ type pagePilotDeliverRequest struct {
 	RunID                 string                    `json:"runId"`
 	ProjectID             string                    `json:"projectId"`
 	RepositoryTargetID    string                    `json:"repositoryTargetId"`
+	ExecutionMode         string                    `json:"executionMode"`
 	Instruction           string                    `json:"instruction"`
 	Selection             pagePilotSelectionContext `json:"selection"`
 	BranchName            string                    `json:"branchName"`
@@ -182,6 +184,7 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 	} else {
 		runner, resolved := NewAgentRunnerRegistry().Resolve(effectiveRunner)
 		profileForRole := agentProfileForRole(profile, "coding")
+		model, env := server.runnerCredentialModelAndEnv(ctx, resolved, profileForRole.Model)
 		turn := runner.RunTurn(ctx, AgentTurnRequest{
 			Role:       "page-pilot",
 			StageID:    "page_pilot",
@@ -190,7 +193,8 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 			Prompt:     prompt,
 			OutputPath: notePath,
 			Sandbox:    "workspace-write",
-			Model:      profileForRole.Model,
+			Model:      model,
+			Env:        env,
 		})
 		process = turn.Process
 		if turn.Error != nil {
@@ -249,6 +253,7 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 	}
 	prPreview := pagePilotPRPreview(payload, changedFiles, diffSummary, lineSummary, target)
 	visualProof := pagePilotVisualProof(payload.Selection, annotations, changedFiles, diffSummary, "dom-snapshot")
+	executionMode := pagePilotExecutionMode(payload.ExecutionMode, target, repoPath)
 	result := map[string]any{
 		"id":                    runID,
 		"status":                "applied",
@@ -259,7 +264,8 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 		"pipelineId":            workRecord["pipelineId"],
 		"pipelineRunId":         workRecord["pipelineRunId"],
 		"agentMode":             "single-page-pilot-agent",
-		"executionMode":         "live-preview",
+		"executionMode":         executionMode,
+		"isolation":             pagePilotIsolationRecord(executionMode, target, repoPath),
 		"repositoryPath":        repoPath,
 		"repositoryTarget":      repositoryTargetLabel(target),
 		"runner":                effectiveRunner,
@@ -388,6 +394,7 @@ func (server *Server) executePagePilotDeliver(ctx context.Context, payload pageP
 		"instruction":        payload.Instruction,
 		"selection":          selectionRecord(payload.Selection),
 		"repositoryPath":     repoPath,
+		"executionMode":      pagePilotExecutionMode(payload.ExecutionMode, target, repoPath),
 		"branchName":         branchName,
 		"commitSha":          strings.TrimSpace(commitSha),
 		"pullRequestUrl":     prURL,
@@ -398,6 +405,7 @@ func (server *Server) executePagePilotDeliver(ctx context.Context, payload pageP
 		"executionLock":      lock,
 		"updatedAt":          nowISO(),
 	}
+	result["isolation"] = pagePilotIsolationRecord(text(result, "executionMode"), target, repoPath)
 	if payload.RunID != "" {
 		if existing, err := server.getPagePilotRun(ctx, payload.RunID); err == nil {
 			for key, value := range result {
@@ -453,13 +461,18 @@ func (server *Server) executePagePilotDiscard(ctx context.Context, runID string)
 	if len(changedFiles) == 0 {
 		return nil, errors.New("Page Pilot run has no changed files to discard")
 	}
-	for _, rawFile := range changedFiles {
-		file := strings.TrimSpace(fmt.Sprint(rawFile))
-		if file == "" {
-			continue
-		}
-		if _, err := runCommand(repoPath, "git", "checkout", "--", file); err != nil {
-			_, _ = runCommand(repoPath, "git", "clean", "-f", "--", file)
+	if text(record, "executionMode") == "isolated-devflow" {
+		_, _ = runCommand(repoPath, "git", "reset", "--hard")
+		_, _ = runCommand(repoPath, "git", "clean", "-fd")
+	} else {
+		for _, rawFile := range changedFiles {
+			file := strings.TrimSpace(fmt.Sprint(rawFile))
+			if file == "" {
+				continue
+			}
+			if _, err := runCommand(repoPath, "git", "checkout", "--", file); err != nil {
+				_, _ = runCommand(repoPath, "git", "clean", "-f", "--", file)
+			}
 		}
 	}
 	statusOutput, _ := runCommand(repoPath, "git", "status", "--short")
@@ -507,6 +520,18 @@ func (server *Server) resolvePagePilotWorkspace(ctx context.Context, projectID s
 		if candidate != "" {
 			if stat, statErr := os.Stat(filepath.Join(candidate, ".git")); statErr == nil && stat.IsDir() {
 				repoPath = candidate
+			} else if cloneTarget := repositoryTargetCloneTarget(target); cloneTarget != "" {
+				if err := os.MkdirAll(filepath.Dir(candidate), 0o755); err != nil {
+					return "", nil, ProjectAgentProfile{}, err
+				}
+				_ = os.RemoveAll(candidate)
+				if output, cloneErr := cloneTargetRepository(filepath.Dir(candidate), cloneTarget, candidate); cloneErr != nil {
+					return "", nil, ProjectAgentProfile{}, fmt.Errorf("prepare Page Pilot isolated workspace: %w\n%s", cloneErr, output)
+				}
+				repoPath = candidate
+				_, _ = runCommand(repoPath, "git", "checkout", stringOr(text(target, "defaultBranch"), "main"))
+				_, _ = runCommand(repoPath, "git", "config", "user.email", "omega-page-pilot@example.local")
+				_, _ = runCommand(repoPath, "git", "config", "user.name", "Omega Page Pilot")
 			}
 		}
 	}
@@ -529,6 +554,29 @@ func (server *Server) resolvePagePilotWorkspace(ctx context.Context, projectID s
 	item := map[string]any{"projectId": projectID, "repositoryTargetId": repositoryTargetID}
 	profile := server.resolveAgentProfile(ctx, database, item, target)
 	return absRepo, target, profile, nil
+}
+
+func pagePilotExecutionMode(requested string, target map[string]any, repoPath string) string {
+	if strings.TrimSpace(requested) != "" {
+		return strings.TrimSpace(requested)
+	}
+	if text(target, "kind") == "github" && filepath.Clean(repoPath) == filepath.Clean(pagePilotIsolatedWorkspacePath(target)) {
+		return "isolated-devflow"
+	}
+	return "live-preview"
+}
+
+func pagePilotIsolationRecord(mode string, target map[string]any, repoPath string) map[string]any {
+	if mode != "isolated-devflow" {
+		return map[string]any{"mode": mode, "repositoryPath": repoPath}
+	}
+	return map[string]any{
+		"mode":             "isolated-devflow",
+		"workspacePath":    repoPath,
+		"targetRepository": repositoryTargetLabel(target),
+		"confirmAction":    "branch-commit-pr",
+		"safetyBoundary":   "preview changes stay in the isolated workspace until delivery",
+	}
 }
 
 func pagePilotIsolatedWorkspacePath(target map[string]any) string {

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type {
   AttemptRecordInfo,
+  AttemptActionPlanInfo,
   AttemptTimelineItemInfo,
   CheckpointRecordInfo,
   GitHubPullRequestStatusResult,
@@ -45,6 +46,7 @@ type FailedStageSummary = {
 
 interface WorkItemAttemptPanelProps extends LabelHelpers {
   attempt?: AttemptRecordInfo;
+  actionPlan?: AttemptActionPlanInfo | null;
   pipeline?: PipelineRecordInfo;
   checkpoint?: CheckpointRecordInfo;
   failedStages: FailedStageSummary[];
@@ -60,6 +62,7 @@ interface WorkItemAttemptPanelProps extends LabelHelpers {
 }
 
 export function WorkItemAttemptPanel({
+  actionPlan,
   agentShortLabel,
   attempt,
   attemptStatusLabel,
@@ -104,7 +107,8 @@ export function WorkItemAttemptPanel({
     return <p className="muted-copy">No execution attempt yet. Run this item to create a traceable attempt.</p>;
   }
 
-  const stages = attempt.stages?.length ? attempt.stages : pipeline?.run?.stages ?? [];
+  const planStates = actionPlan?.states?.length ? actionPlan.states : [];
+  const stages = planStates.length ? planStates : attempt.stages?.length ? attempt.stages : pipeline?.run?.stages ?? [];
   const retryable = ["failed", "stalled", "canceled"].includes(attempt.status);
 
   return (
@@ -129,10 +133,12 @@ export function WorkItemAttemptPanel({
         ) : null}
       </header>
 
+      <ActionPlanSummary actionPlan={actionPlan} />
+
       <div className="attempt-stage-flow" aria-label={`Attempt ${attempt.id} stages`}>
         {stages.map((stage) => (
           <AttemptStageCard
-            key={`${attempt.id}-${stage.id}`}
+            key={`${attempt.id}-${String(stage.id)}`}
             agentShortLabel={agentShortLabel}
             pipelineStageClassName={pipelineStageClassName}
             pipelineStageLabel={pipelineStageLabel}
@@ -171,6 +177,35 @@ export function WorkItemAttemptPanel({
       {attempt.status !== "failed" && attempt.errorMessage ? <p className="attempt-error">{attempt.errorMessage}</p> : null}
       {attempt.workspacePath ? <p className="attempt-path">Workspace: {attempt.workspacePath}</p> : null}
     </article>
+  );
+}
+
+function ActionPlanSummary({ actionPlan }: { actionPlan?: AttemptActionPlanInfo | null }) {
+  if (!actionPlan?.currentAction && !actionPlan?.retry && !actionPlan?.transitions?.length) {
+    return null;
+  }
+  const action = actionPlan.currentAction ?? {};
+  const retry = actionPlan.retry ?? {};
+  const state = actionPlan.currentState ?? {};
+  const transitionLabels = (actionPlan.transitions ?? [])
+    .map((transition) => `${recordText(transition, "on")} -> ${recordText(transition, "to")}`.trim())
+    .filter((value) => value !== "->")
+    .slice(0, 3);
+  return (
+    <section className="action-plan-summary" aria-label="Attempt action plan">
+      <div>
+        <span>Action plan</span>
+        <strong>{recordText(action, "title") || recordText(action, "id") || recordText(state, "title") || "Runtime contract"}</strong>
+        <small>{recordText(action, "status") || recordText(state, "status") || actionPlan.attemptStatus || "ready"}</small>
+      </div>
+      {recordBool(retry, "available") ? (
+        <p>
+          Retry: {recordText(retry, "recommendedAction") || "retry_attempt"} · {recordText(retry, "reason")}
+        </p>
+      ) : transitionLabels.length ? (
+        <p>{transitionLabels.join(" · ")}</p>
+      ) : null}
+    </section>
   );
 }
 
@@ -257,23 +292,36 @@ function AttemptStageCard({
   pipelineStageLabel,
   stage
 }: Pick<LabelHelpers, "agentShortLabel" | "pipelineStageClassName" | "pipelineStageLabel"> & {
-  stage: AttemptStage | PipelineStage;
+  stage: AttemptStage | PipelineStage | Record<string, unknown>;
 }) {
-  const agentIds = stage.agentIds ?? [];
-  const evidence = "evidence" in stage && Array.isArray(stage.evidence) ? stage.evidence : [];
+  const status = recordText(stage, "status");
+  const title = recordText(stage, "title") || recordText(stage, "id");
+  const agent = recordText(stage, "agent") || recordText(stage, "agentId");
+  const stageRecord = stage as Record<string, unknown>;
+  const agentIds = Array.isArray(stageRecord.agentIds) ? stageRecord.agentIds.map(String) : agent ? [agent] : [];
+  const evidence = Array.isArray(stageRecord.evidence) ? stageRecord.evidence.map(String) : [];
   const artifactLabels = [
-    ...(stage.outputArtifacts ?? []),
-    ...evidence.map((item: string) => item.split("/").pop() ?? item)
+    ...(Array.isArray(stageRecord.outputArtifacts) ? stageRecord.outputArtifacts.map(String) : []),
+    ...evidence.map((item) => item.split("/").pop() ?? item)
   ];
 
   return (
-    <article className={pipelineStageClassName(stage.status)}>
-      <span>{pipelineStageLabel(stage.status)}</span>
-      <strong>{stage.title ?? stage.id}</strong>
+    <article className={pipelineStageClassName(status)}>
+      <span>{pipelineStageLabel(status)}</span>
+      <strong>{title}</strong>
       <small>{agentIds.length ? agentIds.map(agentShortLabel).join(" + ") : "Agent pending"}</small>
       {artifactLabels.length ? <em>{artifactLabels.slice(0, 2).join(", ")}</em> : null}
     </article>
   );
+}
+
+function recordText(record: Record<string, unknown> | undefined | null, key: string): string {
+  const value = record?.[key];
+  return typeof value === "string" ? value : typeof value === "number" ? String(value) : "";
+}
+
+function recordBool(record: Record<string, unknown> | undefined | null, key: string): boolean {
+  return record?.[key] === true;
 }
 
 interface HumanGateCardProps {

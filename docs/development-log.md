@@ -2,7 +2,74 @@
 
 本文记录当前 v0Beta 已完成的关键工程节点，方便后续整理仓库和演示材料。
 
+## 2026-05-02
+
+### P0 产品化补齐：Action Plan / Observability / Onboarding / 飞书桥 / Page Pilot 隔离
+
+完成：
+
+- Work Item 详情页接入 Attempt Action Plan：Delivery flow、Attempt stage、Retry / Rework signal 优先消费 `/attempts/{attemptId}/action-plan`，旧的 stage / attempt 推断只作为兼容 fallback。
+- Observability dashboard 增强：`GET /observability` 支持 `windowDays`、`groupBy`、`limit`、`from`、`to`，返回分组统计、最近失败、慢阶段 drilldown 和趋势；Views 页面增加窗口/分组切换。
+- Project onboarding 基础补齐：新增 `POST /projects` 和 Projects 页面创建入口；Repository target bind 支持 `projectId`，前端绑定仓库时携带当前 Project，避免多项目时误挂到默认项目。
+- 飞书 Task 本地事件桥基础版：新增 `/feishu/review-task/bridge/tick`，dry-run 可列出待同步任务；开启 `OMEGA_FEISHU_TASK_BRIDGE_ENABLED=true` 后 JobSupervisor tick 会自动触发飞书 Task 同步。
+- Page Pilot isolated-devflow mode 基础版：GitHub Repository target 会解析或自动准备 Omega-managed isolated preview workspace，apply 在隔离 workspace 修改，Confirm 后从隔离 workspace branch / commit / PR，Discard 对隔离 workspace reset/clean。
+
+验证：
+
+```bash
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
+npm run lint
+npm run build -- --mode development
+go test ./services/local-runtime/internal/omegalocal
+```
+
+### Todo 状态复核
+
+完成：
+
+- 逐项复核 `docs/todo.md` 中未勾选条目，把已经落地但仍停留在旧状态的任务改为完成。
+- 更新范围包括 DevFlow preflight、历史参考命名清理、赛题完成度维护、Page Pilot Preview Runtime Go 一等化、Attempt retry/cancel/timeout 策略和 timeout/retry policy 持久化。
+- 对仍未完成的条目补充边界说明，避免把基础版已完成和后续增强混在同一个状态里。
+- 同步修正 `docs/page-pilot-architecture.md`，明确 Go Preview Runtime supervisor 当前已经记录 profile、pid、stdout/stderr tail 和 health check，跨进程恢复与持久 process table 仍是后续增强。
+
+### Workspace Workflow Editor 目录式改版
+
+完成：
+
+- Workflow tab 从“左侧阶段卡片 + 右侧全量规则列表”改为“左侧目录 + 右侧单项编辑”。
+- 左侧目录包含 Template、各 Stage 和 Markdown contract，视觉收敛为窄列导航，不再使用大块按钮式卡片。
+- 右侧按当前选中项展示编辑内容：Template 展示模板选择和当前 contract 内容；Stage 只编辑当前 stage rule；Markdown contract 编辑完整 workflow markdown。
+- Stage rule 顶部合并为横向摘要，默认规则文案只作为说明展示，不再作为可编辑 textarea 的实际内容。
+- Prompts / Agents tab 也改为窄侧栏 + 右侧主编辑区：Prompts 拆成 Role instruction、Execution rules、Review notes；Agents 增加 runner 对应的 model preset、Skills/MCP chip 选择和 raw bindings 高级编辑。
+- 保留 `stagePolicy` 保存链路，单个 stage 规则编辑继续序列化回 Agent Profile。
+
+验证：
+
+```bash
+npm run lint
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
+npm run build
+```
+
 ## 2026-05-01
+
+### 飞书 Task 审核桥接
+
+完成：
+
+- `POST /feishu/review-request` 支持 `mode=task`，可通过 `lark-cli task +create` 创建绑定 checkpoint 的飞书审核任务。
+- 审核任务写入强绑定 token、Work Item、PR、branch、需求摘要和操作规则，降低多任务审核时串单风险。
+- 可选 `OMEGA_FEISHU_REVIEW_CREATE_DOC=true` 通过 `lark-cli docs +create` 发布长 review packet 文档，并把文档链接写入任务说明。
+- 新增 `/feishu/review-task/sync`：飞书任务完成后，同步为 checkpoint approved，并沿用本地 Human Review approve 决策链路。
+- 新增 `/feishu/review-task/comment`：任务评论中的明确修改意见同步为 request changes；问题类评论记录为 need-info，不直接拒绝。
+- 自动推送逻辑已支持 task 模式：没有 webhook/chatId 时，只要配置 task mode / assignee / tasklist，也会创建飞书审核任务。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding|TestFeishuReviewTaskSyncApprovesCompletedTask|TestFeishuReviewTaskCommentRequestsChanges|TestFeishuReviewTaskCommentNeedInfoRecordsOnly|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestUsesLarkCLIInteractiveCard|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestFeishuNotifyUsesLocalLarkCLI'
+```
 
 ### GitHub / CI 出站同步增强与飞书审核卡片本地 CLI 路径
 
@@ -1399,4 +1466,118 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestDevFlowTemplateLo
 ```bash
 go test ./services/local-runtime/internal/omegalocal -run 'TestBuildAttemptActionPlanUsesWorkflowSnapshot|TestAttemptActionPlanAPIIncludesRetryPolicy'
 go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorScanRecoverableAttemptsRetriesWithPolicy|TestBuildAttemptActionPlanUsesWorkflowSnapshot|TestAttemptActionPlanAPIIncludesRetryPolicy'
+```
+
+## 2026-05-01 19:14 CST
+
+### Workspace Agent Studio 基础版
+
+完成：
+
+- 将设置页中的 Agent Profile 大表单拆到 `apps/web/src/components/WorkspaceAgentStudio.tsx`，降低 `App.tsx` 继续膨胀的风险。
+- Workspace Config 新增工作区级共享配置体验：
+  - Workflow：图形化展示 workflow stages，并显示选中阶段的 Agent、Gate、Artifacts。
+  - Prompts：集中编辑每个 Agent 的 stage prompt、Codex policy、Claude policy，并保留 workflow prompt section 高级编辑。
+  - Agents：继续支持 runner / model / Skills / MCP 配置和本机 capability preflight。
+  - Runtime files：继续预览 `.omega` / `.codex` / `.claude` runner 文件。
+- 保持保存链路不变，仍通过现有 Agent Profile API / SQLite 保存，不做仅前端生效的临时配置。
+- 更新设置页测试，覆盖 Workflow graph、Prompts、Agent roster、Runtime file preview。
+
+验证：
+
+```bash
+npm run lint
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
+npm run build
+```
+
+## 2026-05-01 21:40 CST
+
+### Workspace Agent Runner 与账号配置边界修正
+
+完成：
+
+- 修正上一版误解：页面账号 / Key 配置只收敛到 `opencode` 和 `Trae Agent`，不是移除 Codex / Claude Code runner。
+- Workspace Agent Studio 的 runner 编排恢复 Codex 优先，并继续展示 Codex / opencode / Claude Code / Trae Agent。
+- Go runtime 默认 Agent Profile 和 `profile` / `auto` runner fallback 保持 Codex 优先。
+- 旧本地 session 或旧 Agent Profile 中保存的 `codex` runner 会继续保留；`claude` 会归一化为 `claude-code`。
+- 新增 `trae-agent` capability 和 Trae Agent runner 测试，runner 使用 `trae-cli run <prompt> --working-dir <workspace>`，并支持 `provider:model` 或 `OMEGA_TRAE_PROVIDER` / `OMEGA_TRAE_MODEL` 注入。
+- `run-current-stage`、workspace operation API 和 Mission Control API 的前端类型已扩展为 Codex / opencode / Claude Code / Trae Agent，设置页保存和本机 capability preflight 使用同一套 runner 选项。
+
+验证：
+
+```bash
+npm run lint
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/__tests__/missionControlApiClient.test.ts --testTimeout=15000
+npm run build
+GOCACHE=/private/tmp/omega-go-build-cache go test ./services/local-runtime/internal/omegalocal -run 'TestTraeAgentRunnerUsesTraeCLI|TestProfileRunnerRegistrySelectsConfiguredAgentRunner|TestProfileRunnerPreflightRejectsUnavailableRunner|TestLocalCapabilitiesReportsInstalledCliTools'
+```
+
+## 2026-05-01 23:52 CST
+
+### Workspace Config 与 Workflow Rules 编辑体验整理
+
+完成：
+
+- Workspace Config 的本地 workspace folder 与 repository scope 改成上下结构，去掉 scope 卡片里重复的 Workflow / Agents / Prompts / Runtime 快捷入口，避免和下方 Workspace Agent Studio 重复。
+- Workflow Rules 不再只展示一段压缩 textarea，改成按阶段拆分的可编辑规则行，仍保存到 Agent Profile 的 `stagePolicy` 并由 runtime profile 消费。
+- 前端和 Go runtime 的默认 `stagePolicy` 从旧的一句压缩说明扩展为 Requirement、Architecture、Coding、Testing、Review、Rework、Human Review、Delivery 八段规则。
+- 清理 Workspace Agent Studio 高级 Markdown contract 区域的浅色主题残留深色背景。
+
+验证：
+
+```bash
+npm run lint
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
+npm run build
+go test ./services/local-runtime/internal/omegalocal -run 'TestProjectAgentProfilePersistsAndFeedsRuntimeBundle|TestProfileRunnerRegistrySelectsConfiguredAgentRunner'
+```
+
+## 2026-05-02 03:20 CST
+
+### Runner 账号凭据加密配置
+
+完成：
+
+- 新增 `GET /runner-credentials` / `PUT /runner-credentials`，用于保存 opencode / Trae Agent 的本地账号配置。
+- API Key 使用本机 AES-GCM 加密后写入 SQLite；接口返回只包含 configured / masked 状态，不回显明文。
+- Runner 执行链路增加 `Env` 注入能力，Trae Agent 会在运行前解密账号凭据并注入 `DOUBAO_API_KEY` / `DOUBAO_BASE_URL`，不把密钥放进命令参数或 process args。
+- Trae Agent model 支持从账号配置里的 EP ID 自动补齐；Agent Profile 里显式写 `provider:model` 时仍可覆盖。
+- Workspace Agent Studio 的 Runtime files 页新增 opencode / Trae Agent 账号卡片，支持 provider、EP ID / model、base URL、API Key 密码框和眼睛显示开关。
+- Go runtime 启动时补齐常见用户级安装目录到 PATH，避免 Desktop 环境检测不到 `~/.local/bin/trae-cli`。
+- 新增单测覆盖：接口不泄漏密钥、SQLite 不保存明文、Trae 子进程拿到环境变量、命令参数不包含密钥。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunnerCredentialEncryptsAndInjectsTraeEnv|TestTraeAgentRunnerUsesTraeCLI|TestLocalCapabilitiesReportsInstalledCliTools'
+npm run lint
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
+```
+
+## 2026-05-02 16:20 CST
+
+### P0 自动回归、远端信号轮询与 Workflow Template 一等化
+
+旧做法：
+
+- JobSupervisor 的心跳主要来自本机 runner 进程、Attempt event 和 runtime log，远端 runner host / PR checks 不会主动刷新 `lastSeenAt`。
+- PR 创建后的 CI / required checks 主要进入报告和人工审核视图；如果 checks 失败，更多依赖人工点 Retry 或后续手动 rework。
+- Workflow Template 主要来自默认文件、目标仓库 `.omega/WORKFLOW.md` 或 Agent Profile 内嵌 markdown，没有独立的 SQLite 记录和编辑 API。
+
+新做法：
+
+- JobSupervisor tick 会扫描 running / waiting-human Attempt，对绑定 PR 轮询真实 GitHub checks / required checks，写入 `remoteSignals`，并用远端 worker host heartbeat 刷新 `lastSeenAt`。
+- DevFlow PR 创建后会读取 structured checks、required checks 和失败日志；如果 CI / required checks 阻塞，会在 `maxReviewCycles` 内自动进入 Rework，再回到测试和评审，继续复用同一隔离 workspace、同一 branch 和同一 PR。
+- Review Agent、PR comments/reviews、failed check log 和 required checks 统一汇入 rework input / checklist，避免 retry 时只看到底层 stderr 而看不到业务修复原因。
+- 新增 SQLite 一等表 `workflow_templates`，支持 Project / Repository Workspace 覆盖；新增读取、校验、保存、恢复默认 API，运行时通过 Agent Profile 解析并消费覆盖后的 workflow markdown。
+- 第四项按当前计划暂缓，保留在 todo 中，不在本轮实现。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+npm run lint
+npm run build
 ```

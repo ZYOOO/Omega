@@ -1,3 +1,5 @@
+import type { MissionControlRunnerPreset } from "./missionControlApiClient";
+
 export interface ObservabilitySummary {
   counts: {
     workItems: number;
@@ -29,6 +31,11 @@ export interface ObservabilitySummary {
     checkpointWaitTimes?: Record<string, unknown>;
     pullRequests?: Record<string, unknown>;
     trends?: Array<Record<string, unknown>>;
+    window?: Record<string, unknown>;
+    groupBy?: string;
+    groups?: Array<Record<string, unknown>>;
+    recentFailures?: Array<Record<string, unknown>>;
+    slowStageDrilldown?: Array<Record<string, unknown>>;
     waitingHumanQueue?: Array<Record<string, unknown>>;
     activeRuns?: Array<Record<string, unknown>>;
     recommendedActions?: Array<Record<string, unknown>>;
@@ -77,6 +84,29 @@ export interface LlmProviderSelection {
   reasoningEffort: string;
 }
 
+export interface RunnerCredentialInfo {
+  id: string;
+  runner: string;
+  provider: string;
+  label: string;
+  model: string;
+  baseUrl: string;
+  secretConfigured: boolean;
+  secretMasked?: string;
+  updatedAt?: string;
+}
+
+export interface RunnerCredentialUpdate {
+  id?: string;
+  runner: string;
+  provider: string;
+  label?: string;
+  model?: string;
+  baseUrl?: string;
+  secret?: string;
+  apiKey?: string;
+}
+
 export interface PipelineTemplateInfo {
   id: string;
   name: string;
@@ -87,6 +117,35 @@ export interface PipelineTemplateInfo {
     agentId: string;
     humanGate: boolean;
   }>;
+}
+
+export interface WorkflowTemplateRecordInfo {
+  id: string;
+  templateId: string;
+  name?: string;
+  description?: string;
+  source?: string;
+  scope?: string;
+  projectId?: string;
+  repositoryTargetId?: string;
+  version?: number;
+  markdown?: string;
+  workflowMarkdown?: string;
+  validation?: {
+    status?: string;
+    errors?: string[];
+    warnings?: string[];
+  };
+  default?: boolean;
+}
+
+export interface WorkflowTemplateValidationInfo {
+  template?: PipelineTemplateInfo;
+  validation: {
+    status?: string;
+    errors?: string[];
+    warnings?: string[];
+  };
 }
 
 export interface AgentDefinitionInfo {
@@ -584,6 +643,27 @@ export interface AttemptTimelineInfo {
   generatedAt: string;
 }
 
+export interface AttemptActionPlanInfo {
+  attemptId: string;
+  pipelineId?: string;
+  workItemId?: string;
+  templateId?: string;
+  workflowId?: string;
+  executionMode?: string;
+  attemptStatus?: string;
+  pipelineStatus?: string;
+  currentState?: Record<string, unknown>;
+  currentAction?: Record<string, unknown> | null;
+  actions?: Array<Record<string, unknown>>;
+  transitions?: Array<Record<string, unknown>>;
+  states?: Array<Record<string, unknown>>;
+  taskClasses?: unknown;
+  hooks?: unknown;
+  retry?: Record<string, unknown>;
+  source?: string;
+  contractActionCount?: number;
+}
+
 export interface PagePilotSelectionContext {
   elementKind: "button" | "title" | "card-copy" | "other" | string;
   stableSelector: string;
@@ -778,9 +858,18 @@ async function apiErrorMessage(response: Response, prefix: string): Promise<stri
 
 export async function fetchObservability(
   apiUrl: string,
+  filtersOrFetch: { windowDays?: number; groupBy?: string; limit?: number; from?: string; to?: string } | typeof fetch = {},
   fetchImpl: typeof fetch = fetch
 ): Promise<ObservabilitySummary> {
-  return fetchJson<ObservabilitySummary>(apiUrl, "/observability", fetchImpl);
+  const filters = typeof filtersOrFetch === "function" ? {} : filtersOrFetch;
+  const effectiveFetch = typeof filtersOrFetch === "function" ? filtersOrFetch : fetchImpl;
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<ObservabilitySummary>(apiUrl, `/observability${suffix}`, effectiveFetch);
 }
 
 export async function fetchRuntimeLogs(
@@ -859,11 +948,75 @@ export async function updateLlmProviderSelection(
   return response.json() as Promise<LlmProviderSelection>;
 }
 
+export async function fetchRunnerCredentials(
+  apiUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<RunnerCredentialInfo[]> {
+  return fetchJson<RunnerCredentialInfo[]>(apiUrl, "/runner-credentials", fetchImpl);
+}
+
+export async function updateRunnerCredential(
+  apiUrl: string,
+  credential: RunnerCredentialUpdate,
+  fetchImpl: typeof fetch = fetch
+): Promise<RunnerCredentialInfo> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/runner-credentials`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(credential)
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, "Omega control API failed: /runner-credentials"));
+  }
+  return response.json() as Promise<RunnerCredentialInfo>;
+}
+
 export async function fetchPipelineTemplates(
   apiUrl: string,
   fetchImpl: typeof fetch = fetch
 ): Promise<PipelineTemplateInfo[]> {
   return fetchJson<PipelineTemplateInfo[]>(apiUrl, "/pipeline-templates", fetchImpl);
+}
+
+export async function fetchWorkflowTemplates(
+  apiUrl: string,
+  scope: { projectId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkflowTemplateRecordInfo[]> {
+  const search = new URLSearchParams();
+  if (scope.projectId) search.set("projectId", scope.projectId);
+  if (scope.repositoryTargetId) search.set("repositoryTargetId", scope.repositoryTargetId);
+  const suffix = search.toString() ? `?${search.toString()}` : "";
+  return fetchJson<WorkflowTemplateRecordInfo[]>(apiUrl, `/workflow-templates${suffix}`, fetchImpl);
+}
+
+export async function validateWorkflowTemplate(
+  apiUrl: string,
+  payload: { templateId?: string; markdown: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkflowTemplateValidationInfo> {
+  return postJson<WorkflowTemplateValidationInfo>(apiUrl, "/workflow-templates/validate", payload, fetchImpl);
+}
+
+export async function updateWorkflowTemplate(
+  apiUrl: string,
+  templateId: string,
+  payload: { projectId?: string; repositoryTargetId?: string; templateId?: string; markdown: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkflowTemplateRecordInfo> {
+  return putJson<WorkflowTemplateRecordInfo>(apiUrl, `/workflow-templates/${encodeURIComponent(templateId)}`, payload, fetchImpl);
+}
+
+export async function restoreWorkflowTemplateDefault(
+  apiUrl: string,
+  templateId: string,
+  scope: { projectId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkflowTemplateRecordInfo> {
+  return postJson<WorkflowTemplateRecordInfo>(apiUrl, `/workflow-templates/${encodeURIComponent(templateId)}/restore-default`, {
+    ...scope,
+    templateId
+  }, fetchImpl);
 }
 
 export async function fetchAgentDefinitions(
@@ -1038,6 +1191,14 @@ export async function fetchAttemptTimeline(
   return fetchJson<AttemptTimelineInfo>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/timeline`, fetchImpl);
 }
 
+export async function fetchAttemptActionPlan(
+  apiUrl: string,
+  attemptId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<AttemptActionPlanInfo> {
+  return fetchJson<AttemptActionPlanInfo>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/action-plan`, fetchImpl);
+}
+
 export async function fetchRunWorkpads(
   apiUrl: string,
   filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string; status?: string } = {},
@@ -1151,7 +1312,7 @@ export async function startPipeline(
 export async function runCurrentPipelineStage(
   apiUrl: string,
   pipelineId: string,
-  runner: "local-proof" | "demo-code" | "codex" = "local-proof",
+  runner: MissionControlRunnerPreset = "local-proof",
   fetchImpl: typeof fetch = fetch
 ): Promise<RunCurrentStageResult> {
   return postJson<RunCurrentStageResult>(apiUrl, `/pipelines/${pipelineId}/run-current-stage`, { runner }, fetchImpl);

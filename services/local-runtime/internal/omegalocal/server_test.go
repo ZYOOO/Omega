@@ -2905,6 +2905,24 @@ func TestObservabilityDashboardMetrics(t *testing.T) {
 	if len(actions) == 0 {
 		t.Fatalf("recommended actions missing: %+v", dashboard)
 	}
+	groups := arrayMaps(dashboard["groups"])
+	if len(groups) == 0 {
+		t.Fatalf("grouped observability missing: %+v", dashboard)
+	}
+	recentFailures := arrayMaps(dashboard["recentFailures"])
+	if len(recentFailures) == 0 || text(recentFailures[0], "attemptId") != "attempt_failed" {
+		t.Fatalf("recent failures = %+v", recentFailures)
+	}
+	drilldown := arrayMaps(dashboard["slowStageDrilldown"])
+	if len(drilldown) == 0 || text(drilldown[0], "stageId") != "code_review" {
+		t.Fatalf("slow stage drilldown = %+v", drilldown)
+	}
+	var grouped map[string]any
+	decode(t, mustGet(t, api.URL+"/observability?windowDays=30&groupBy=runner&limit=2"), &grouped)
+	groupedDashboard := mapValue(grouped["dashboard"])
+	if text(groupedDashboard, "groupBy") != "runner" || len(arrayMaps(groupedDashboard["groups"])) == 0 {
+		t.Fatalf("runner grouping missing: %+v", groupedDashboard)
+	}
 }
 
 func TestGitHubIssueImportUsesGhAndPersistsWorkItems(t *testing.T) {
@@ -3956,6 +3974,49 @@ func TestGitHubBindRepositoryTargetPersistsProjectTarget(t *testing.T) {
 	}
 }
 
+func TestCreateProjectAndBindRepositoryTarget(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	var created WorkspaceDatabase
+	decode(t, postJSON(t, api.URL+"/projects", map[string]any{
+		"name":        "Pilot Project",
+		"description": "Repository onboarding",
+	}), &created)
+	createdProject := map[string]any{}
+	for _, project := range created.Tables.Projects {
+		if text(project, "id") == "project_pilot-project" {
+			createdProject = project
+			break
+		}
+	}
+	if text(createdProject, "name") != "Pilot Project" {
+		t.Fatalf("project was not created: %+v", created.Tables.Projects)
+	}
+
+	var bound WorkspaceDatabase
+	decode(t, postJSON(t, api.URL+"/github/bind-repository-target", map[string]any{
+		"projectId":     "project_pilot-project",
+		"owner":         "acme",
+		"repo":          "pilot",
+		"nameWithOwner": "acme/pilot",
+		"defaultBranch": "main",
+		"url":           "https://github.com/acme/pilot",
+	}), &bound)
+	for _, project := range bound.Tables.Projects {
+		if text(project, "id") != "project_pilot-project" {
+			continue
+		}
+		targets := arrayMaps(project["repositoryTargets"])
+		if len(targets) != 1 || text(targets[0], "id") != "repo_acme_pilot" {
+			t.Fatalf("repository target not scoped to project: %+v", project)
+		}
+		return
+	}
+	loaded, _ := repo.Load(context.Background())
+	t.Fatalf("created project missing after bind: %+v", loaded.Tables.Projects)
+}
+
 func TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)
@@ -4028,8 +4089,8 @@ func TestLocalCapabilitiesReportsInstalledCliTools(t *testing.T) {
 	if byID["lark-cli"]["available"] != true || byID["lark-cli"]["category"] != "feishu" {
 		t.Fatalf("lark-cli capability = %+v", byID["lark-cli"])
 	}
-	if byID["codex"]["available"] != false || byID["opencode"]["available"] != false {
-		t.Fatalf("ai cli capabilities = codex:%+v opencode:%+v", byID["codex"], byID["opencode"])
+	if byID["codex"]["available"] != false || byID["opencode"]["available"] != false || byID["trae-agent"]["available"] != false {
+		t.Fatalf("ai cli capabilities = codex:%+v opencode:%+v trae-agent:%+v", byID["codex"], byID["opencode"], byID["trae-agent"])
 	}
 }
 
@@ -4239,6 +4300,158 @@ func TestProfileRunnerRegistrySelectsConfiguredAgentRunner(t *testing.T) {
 	}
 }
 
+func TestTraeAgentRunnerUsesTraeCLI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake trae-cli script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	trae := filepath.Join(bin, "trae-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > trae-args.txt\nprintf '%s\\n' 'trae agent runner ok'\n"
+	if err := os.WriteFile(trae, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "trae-agent",
+			"model":  "doubao-seed-1.6",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+	if saved.AgentProfiles[0].Runner != "trae-agent" {
+		t.Fatalf("saved profile = %+v", saved)
+	}
+
+	mission := map[string]any{
+		"id":               "mission_OMG-91_coding",
+		"sourceIssueKey":   "OMG-91",
+		"sourceWorkItemId": "item_manual_91",
+		"title":            "Use configured trae runner",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run using Trae Agent.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	if result.RunnerProcess["runner"] != "trae-agent" || result.RunnerProcess["command"] != "trae-cli" {
+		t.Fatalf("runner process = %+v", result.RunnerProcess)
+	}
+	if !strings.Contains(result.Stdout, "trae agent runner ok") {
+		t.Fatalf("stdout = %q", result.Stdout)
+	}
+	args, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "run Run using Trae Agent.") || !strings.Contains(string(args), "--working-dir") || !strings.Contains(string(args), "--provider doubao") {
+		t.Fatalf("trae args = %s", args)
+	}
+}
+
+func TestRunnerCredentialEncryptsAndInjectsTraeEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake trae-cli script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	trae := filepath.Join(bin, "trae-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > trae-args.txt\nprintf '%s\\n' \"$DOUBAO_API_KEY\" \"$DOUBAO_BASE_URL\" > trae-env.txt\nprintf '%s\\n' 'trae env ok'\n"
+	if err := os.WriteFile(trae, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var credential map[string]any
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
+		"runner":   "trae-agent",
+		"provider": "doubao",
+		"label":    "Trae Doubao",
+		"model":    "ep-test-001",
+		"baseUrl":  "https://ark.example.test/api/v3",
+		"apiKey":   "secret-trae-key",
+	}), &credential)
+	if credential["secretConfigured"] != true {
+		t.Fatalf("credential response leaked secret or was not configured: %+v", credential)
+	}
+	if _, ok := credential["apiKey"]; ok {
+		t.Fatalf("credential response leaked apiKey: %+v", credential)
+	}
+	if _, ok := credential["secret"]; ok {
+		t.Fatalf("credential response leaked secret: %+v", credential)
+	}
+	stored, err := repo.GetSetting(context.Background(), "runnerCredential:trae-agent-doubao")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprint(stored), "secret-trae-key") {
+		t.Fatalf("stored credential contains plaintext: %+v", stored)
+	}
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "trae-agent",
+			"model":  "gpt-5.4-mini",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+
+	mission := map[string]any{
+		"id":               "mission_OMG-92_coding",
+		"sourceIssueKey":   "OMG-92",
+		"sourceWorkItemId": "item_manual_92",
+		"title":            "Use encrypted Trae account",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run with encrypted account.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	envOutput, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-env.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(envOutput)); got != "secret-trae-key\nhttps://ark.example.test/api/v3" {
+		t.Fatalf("trae env = %q", got)
+	}
+	args, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(args), "secret-trae-key") || !strings.Contains(string(args), "--model ep-test-001") {
+		t.Fatalf("trae args = %s", args)
+	}
+}
+
 func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)
@@ -4249,7 +4462,7 @@ func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 		"agentProfiles": []map[string]any{{
 			"id":     "coding",
 			"label":  "Coding",
-			"runner": "opencode",
+			"runner": "trae-agent",
 			"model":  "gpt-5.4-mini",
 		}},
 	}
@@ -4263,7 +4476,7 @@ func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 	if err := os.Symlink(sqlite, filepath.Join(bin, "sqlite3")); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PATH", bin)
 
 	mission := map[string]any{
 		"id":               "mission_OMG-90_coding",
@@ -4288,7 +4501,7 @@ func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text(body, "error"), "opencode") || !strings.Contains(text(body, "error"), "cannot start") {
+	if !strings.Contains(text(body, "error"), "trae-agent") || !strings.Contains(text(body, "error"), "cannot start") {
 		t.Fatalf("error body = %+v", body)
 	}
 }
@@ -5003,6 +5216,161 @@ func TestFeishuReviewRequestUsesLarkCLIInteractiveCard(t *testing.T) {
 	}
 }
 
+func TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, nil)
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args.txt")
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argsFile + "\ncase \"$*\" in\n*\"docs +create\"*) printf '%s' '{\"data\":{\"document\":{\"url\":\"https://docs.example/review\",\"document_id\":\"doc_123\"}}}' ;;\n*\"task +create\"*) printf '%s' '{\"task\":{\"guid\":\"task_123\",\"task_id\":\"task_123\",\"url\":\"https://task.example/task_123\"}}' ;;\n*\"task +comment\"*) printf '%s' '{\"comment_id\":\"comment_123\"}' ;;\n*) printf '%s' '{}' ;;\nesac\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OMEGA_FEISHU_REVIEW_CREATE_DOC", "true")
+
+	response := postJSON(t, api.URL+"/feishu/review-request", map[string]any{
+		"checkpointId": "pipeline_1:human_review",
+		"mode":         "task",
+		"assigneeId":   "ou_reviewer",
+		"tasklistId":   "tasklist_1",
+	})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "status") != "sent" || text(result, "format") != "task-review" || text(result, "taskGuid") != "task_123" {
+		t.Fatalf("task review result = %+v", result)
+	}
+	nonce := text(result, "nonce")
+	if !strings.Contains(nonce, "pipeline_1-human_review") || !strings.Contains(nonce, "attempt_1") {
+		t.Fatalf("nonce should bind checkpoint and attempt, got %q", nonce)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argsText := string(args)
+	for _, expected := range []string{"docs +create", "task +create", "--assignee ou_reviewer", "--tasklist-id tasklist_1", "task +comment"} {
+		if !strings.Contains(argsText, expected) {
+			t.Fatalf("lark-cli args missing %q: %s", expected, argsText)
+		}
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := mapValue(loaded.Tables.Checkpoints[0]["feishuReview"])
+	if text(review, "taskGuid") != "task_123" || text(review, "docMode") != "created" {
+		t.Fatalf("checkpoint task review = %+v", review)
+	}
+}
+
+func TestFeishuReviewTaskSyncApprovesCompletedTask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	bin := t.TempDir()
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\ncase \"$*\" in\n*\"task tasks get\"*) printf '%s' '{\"task\":{\"guid\":\"task_123\",\"status\":\"done\",\"completed_at\":\"2026-05-01T10:00:00Z\"}}' ;;\n*\"task +comment\"*) printf '%s' '{\"comment_id\":\"comment_123\"}' ;;\n*) printf '%s' '{}' ;;\nesac\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	response := postJSON(t, api.URL+"/feishu/review-task/sync", map[string]any{"checkpointId": "pipeline_1:human_review"})
+	var result map[string]any
+	decode(t, response, &result)
+	synced := arrayMaps(result["synced"])
+	if len(synced) != 1 || text(synced[0], "state") != "synced" || text(synced[0], "decision") != "approved" {
+		t.Fatalf("sync result = %+v", result)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(loaded.Tables.Checkpoints[0], "status") != "approved" {
+		t.Fatalf("checkpoint after sync = %+v", loaded.Tables.Checkpoints[0])
+	}
+}
+
+func TestFeishuReviewTaskBridgeDryRunListsPendingTasks(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+
+	response := postJSON(t, api.URL+"/feishu/review-task/bridge/tick", map[string]any{"dryRun": true, "limit": 5})
+	var result map[string]any
+	decode(t, response, &result)
+	pending := arrayMaps(result["pending"])
+	if text(result, "status") != "dry-run" || len(pending) != 1 || text(pending[0], "checkpointId") != "pipeline_1:human_review" {
+		t.Fatalf("bridge dry-run result = %+v", result)
+	}
+}
+
+func TestFeishuReviewTaskCommentRequestsChanges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	bin := t.TempDir()
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s' '{\"comment_id\":\"comment_123\"}'\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	response := postJSON(t, api.URL+"/feishu/review-task/comment", map[string]any{
+		"taskGuid": "task_123",
+		"comment":  "请改成章四，并同步页面文案",
+		"reviewer": "ou_reviewer",
+		"eventId":  "evt_1",
+	})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "classification") != "request_changes" || text(result, "decision") != "rejected" {
+		t.Fatalf("comment result = %+v", result)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := loaded.Tables.Checkpoints[0]
+	if text(checkpoint, "status") != "rejected" || !strings.Contains(text(checkpoint, "decisionNote"), "章四") {
+		t.Fatalf("checkpoint after comment = %+v", checkpoint)
+	}
+}
+
+func TestFeishuReviewTaskCommentNeedInfoRecordsOnly(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+
+	response := postJSON(t, api.URL+"/feishu/review-task/comment", map[string]any{
+		"taskGuid": "task_123",
+		"comment":  "这个字段从哪里来？",
+		"reviewer": "ou_reviewer",
+		"eventId":  "evt_2",
+	})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "classification") != "need_info" || text(result, "decision") != "need_info" {
+		t.Fatalf("comment result = %+v", result)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := loaded.Tables.Checkpoints[0]
+	review := mapValue(checkpoint["feishuReview"])
+	if text(checkpoint, "status") != "pending" || text(mapValue(review["lastComment"]), "state") != "need-info" {
+		t.Fatalf("checkpoint after need-info = %+v", checkpoint)
+	}
+}
+
 func TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath(t *testing.T) {
 	api, repo := newTestAPI(t)
 	database := WorkspaceDatabase{
@@ -5148,6 +5516,9 @@ func TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget(t *testing.T) {
 	if applied["status"] != "applied" || applied["repositoryPath"] != targetRepo {
 		t.Fatalf("applied = %+v", applied)
 	}
+	if text(applied, "executionMode") != "isolated-devflow" || text(mapValue(applied["isolation"]), "confirmAction") != "branch-commit-pr" {
+		t.Fatalf("isolated execution metadata missing: %+v", applied)
+	}
 	raw, err := os.ReadFile(sourceFile)
 	if err != nil {
 		t.Fatal(err)
@@ -5168,6 +5539,47 @@ func newTestAPI(t *testing.T) (*httptest.Server, *SQLiteRepository) {
 	api := httptest.NewServer(server.Handler())
 	t.Cleanup(api.Close)
 	return api, server.Repo
+}
+
+func seedFeishuReviewCheckpoint(t *testing.T, repo *SQLiteRepository, feishuReview map[string]any) {
+	t.Helper()
+	checkpoint := map[string]any{
+		"id":         "pipeline_1:human_review",
+		"pipelineId": "pipeline_1",
+		"attemptId":  "attempt_1",
+		"stageId":    "human_review",
+		"status":     "pending",
+		"title":      "Human Review",
+		"summary":    "Waiting for approval.",
+		"createdAt":  nowISO(),
+		"updatedAt":  nowISO(),
+	}
+	if feishuReview != nil {
+		checkpoint["feishuReview"] = feishuReview
+	}
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       nowISO(),
+		Tables: WorkspaceTables{
+			Projects: []map[string]any{{"id": "project_omega", "name": "Omega", "status": "Active", "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Requirements: []map[string]any{{
+				"id": "req_1", "title": "Add review task", "description": "Requirement detail.", "status": "converted", "structured": map[string]any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			WorkItems: []map[string]any{{
+				"id": "item_1", "projectId": "project_omega", "requirementId": "req_1", "key": "OMG-1", "title": "Add review task", "description": "Send review task.", "status": "In Review", "labels": []any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "status": "waiting-human", "templateId": "manual-review", "run": map[string]any{"stages": []any{map[string]any{"id": "human_review", "title": "Human Review", "status": "needs-human"}, map[string]any{"id": "done", "title": "Done", "status": "waiting"}}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Attempts: []map[string]any{{
+				"id": "attempt_1", "itemId": "item_1", "pipelineId": "pipeline_1", "status": "waiting-human", "branchName": "omega/OMG-1-devflow", "pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/1", "reviewPacket": map[string]any{"summary": "Review packet ready.", "risk": map[string]any{"level": "medium"}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Checkpoints: []map[string]any{checkpoint},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func seedWorkspace(t *testing.T, repo *SQLiteRepository) {

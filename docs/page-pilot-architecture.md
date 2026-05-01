@@ -281,12 +281,12 @@ Workspace 关系需要严格区分：
 1. `live-preview` mode：直接在绑定的 local Repository Workspace 中修改，优先保证 Electron 预览能立即 reload/HMR。适合演示和本地快速迭代，但必须加 repository lock，避免同时有其他 pipeline 写同一 worktree。
 2. `isolated-devflow` mode：把 Page Pilot session 创建为 Requirement/Work Item 后，交给功能一在隔离 operation workspace 中执行。预览要么打开该 operation workspace 的 dev server，要么在用户确认后把 patch 应用回原 workspace。
 
-MVP 优先走 `live-preview` mode，并同时创建 Requirement/Work Item 记录，保持功能一的数据审计和交付闭环。后续再把 `isolated-devflow` 做成更强的团队协作路径。
+2026-05-02 起，`isolated-devflow` 已有基础主路径：当目标是 GitHub Repository target 时，Go runtime 会解析或自动准备 Omega-managed isolated preview workspace。Page Pilot apply 写入该隔离 workspace；Confirm 时从同一隔离 workspace 创建 branch / commit / PR；Discard 时对隔离 workspace 做 `git reset --hard` 和 `git clean -fd`。local Repository target 仍保留 `live-preview`，因为用户通常期望直接看 HMR 结果。
 
 当前已落地的最小功能一接入：
 
 - `/page-pilot/apply` 成功后创建 `source = page_pilot` 的 Requirement 和 Work Item。
-- Work Item 绑定当前 `repositoryTargetId`，并记录 selection context、用户 instruction、`agentMode = single-page-pilot-agent` 和 `executionMode = live-preview`。
+- Work Item 绑定当前 `repositoryTargetId`，并记录 selection context、用户 instruction、`agentMode = single-page-pilot-agent`、`executionMode` 和 `isolation`。
 - runtime 创建 `templateId = page-pilot` 的轻量 pipeline run，包含 `preview_runtime`、`page_editing`、`delivery` 三个 stage。
 - Page Pilot run 返回并持久化 `requirementId`、`workItemId`、`pipelineId` 和 `pipelineRunId`。
 - apply / deliver / discard 会同步写入通用 Mission / Operation / Proof records，Work Item 详情页可以直接展示 Page Pilot Agent trace 和 proof。
@@ -394,7 +394,7 @@ POST /page-pilot/runs/{id}/discard
 - `start` 根据 profile 在目标 workspace 内启动 dev server；如果 health check 已通过，则复用现有服务。
 - `restart` 先停止当前 runtime session，再按最新 profile 重新启动。
 - session summary 会记录 profile、pid、preview URL、working directory、stdout/stderr tail、health check 和启动来源。
-- 当前为 Go runtime 基础版 supervisor；跨进程恢复、持久 process table 和更完整失败诊断继续作为后续增强。
+- 当前为 Go runtime 基础版 supervisor；已经覆盖明确 Repository Workspace、profile、pid、preview URL、stdout/stderr tail 和 health check。跨进程恢复、持久 process table、日志分页和更完整失败诊断继续作为后续增强。
 
 `/page-pilot/runs/{id}/discard` 行为：
 
@@ -440,12 +440,12 @@ replace text with "New headline"
 
 ## 后续工作
 
-- 增强 Preview Runtime supervisor：补跨进程恢复、持久 process table、日志分页和失败诊断。
+- 增强 Preview Runtime supervisor：补跨进程恢复、持久 process table、日志分页和更完整失败诊断。
 - 在 direct pilot 中继续优化 patch preview / 用户确认 / deliver / discard 的浮层密度。
-- 将 direct pilot 的 target URL、project id、repository target id、local worktree 绑定成一等配置，替代 env/default。
+- 继续完善 direct pilot 的配置体验：当前 target URL、project id、repository target id 和隔离 preview workspace 已进入主路径，后续补 profile 版本管理和最近运行回填。
 - 扩展同一 Page Pilot run 的多轮对话 UI：当前服务端已支持多轮 apply，后续继续增强目标页内的轮次切换和对比视图。
 - 增加 DOM-only source locating 辅助能力：当缺少 `data-omega-source` 时，用 selector、文本、样式和 repository 搜索生成候选源码位置，但仍以显式 metadata 为优先。
-- 扩展 Go target dev server start/restart API：基础 resolve/start/restart 已完成，后续补持久 session 表和更多框架检测。
+- 扩展 Go target dev server start/restart API：基础 resolve/start/restart 已完成，后续补持久 session 表、更多框架检测和失败诊断 drilldown。
 - 扩展 `data-omega-source` 到 Workboard 关键可编辑区域。
 - 增加 selection history 和更完整 patch preview。
 - 将 Page Pilot proof 从 run JSON 和 proof 文件继续拆成可查询的一等 proof 记录。

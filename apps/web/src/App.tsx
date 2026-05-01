@@ -23,10 +23,12 @@ import { navigateToExternalUrl } from "./browserNavigation";
 import { openExternalUrlInNewTab } from "./browserNavigation";
 import { retryReasonForAttempt } from "./attemptRetryReason";
 import { PagePilotPreview } from "./components/PagePilotPreview";
+import { ObservabilityDashboard } from "./components/ObservabilityDashboard";
 import { PortalHome } from "./components/PortalHome";
 import { ProjectSurface } from "./components/ProjectSurface";
 import { RequirementComposer } from "./components/RequirementComposer";
 import { WorkspaceChrome, type PrimaryNav, type UiTheme } from "./components/WorkspaceChrome";
+import { WorkspaceAgentStudio } from "./components/WorkspaceAgentStudio";
 import { WorkItemDetailPage } from "./components/WorkItemDetailPage";
 import { isWorkItemDetailHash, parseWorkItemDetailHash, workItemDetailHash } from "./workItemRoutes";
 import {
@@ -36,6 +38,7 @@ import {
   deliverPagePilotChange,
   discardPagePilotRun,
   fetchAttempts,
+  fetchAttemptActionPlan,
   fetchAttemptTimeline,
   fetchExecutionLocks,
   fetchCheckpoints,
@@ -59,6 +62,7 @@ import {
   fetchRequirements,
   fetchRunWorkpads,
   fetchRuntimeLogs,
+  fetchRunnerCredentials,
   patchRunWorkpad,
   releaseExecutionLock,
   requestCheckpointChanges,
@@ -74,7 +78,9 @@ import {
   updateLlmProviderSelection,
   updateOrchestratorWatcher,
   updateProjectAgentProfile,
+  updateRunnerCredential,
   type AgentDefinitionInfo,
+  type AttemptActionPlanInfo,
   type AttemptRecordInfo,
   type AttemptTimelineInfo,
   type CheckpointRecordInfo,
@@ -97,10 +103,12 @@ import {
   type ProofRecordInfo,
   type RequirementRecordInfo,
   type RunWorkpadRecordInfo,
-  type RuntimeLogRecordInfo
+  type RuntimeLogRecordInfo,
+  type RunnerCredentialInfo
 } from "./omegaControlApiClient";
 import {
   bindGitHubRepositoryTargetViaApi,
+  createProjectViaApi,
   createWorkItemViaApi,
   deleteWorkItemViaApi,
   deleteRepositoryTargetViaApi,
@@ -116,12 +124,12 @@ import "./styles.css";
 
 type InspectorPanel = "properties" | "provider";
 type AppSurface = "home" | "workboard";
-type AgentConfigTab = "workflow" | "agents" | "runtime";
-type RuntimeConfigTab = "omega" | "codex" | "claude";
+type AgentConfigTab = "workflow" | "prompts" | "agents" | "runtime";
+type RuntimeConfigTab = "omega" | "codex" | "opencode" | "claude" | "trae";
 type AgentProfileDraft = {
   id: string;
   label: string;
-  runner: MissionControlRunnerPreset | "opencode" | "claude-code";
+  runner: MissionControlRunnerPreset;
   model: string;
   skills: string;
   mcp: string;
@@ -132,7 +140,7 @@ type AgentProfileDraft = {
 type AgentConfigurationDraft = {
   projectId?: string;
   repositoryTargetId?: string;
-  runner: MissionControlRunnerPreset | "opencode" | "claude-code";
+  runner: MissionControlRunnerPreset;
   workflowTemplate: string;
   workflowMarkdown: string;
   stagePolicy: string;
@@ -149,12 +157,20 @@ const agentRunnerOptions: Array<{
   capabilityId?: string;
   setupHint?: string;
 }> = [
-  { value: "codex", label: "Codex", capabilityId: "codex", setupHint: "Install codex or switch this Agent to an available runner." },
-  { value: "opencode", label: "opencode", capabilityId: "opencode", setupHint: "Install opencode or choose Codex." },
-  { value: "claude-code", label: "Claude Code", capabilityId: "claude-code", setupHint: "Install Claude Code CLI or choose Codex." },
-  { value: "demo-code", label: "demo-code", capabilityId: "git", setupHint: "demo-code needs git." },
-  { value: "local-proof", label: "local-proof" }
+  { value: "codex", label: "Codex", capabilityId: "codex", setupHint: "Sign in to the local Codex CLI or choose another installed runner." },
+  { value: "opencode", label: "opencode", capabilityId: "opencode", setupHint: "Configure opencode account keys or choose a local runner." },
+  { value: "claude-code", label: "Claude Code", capabilityId: "claude-code", setupHint: "Sign in to the local Claude Code CLI or choose another installed runner." },
+  { value: "trae-agent", label: "Trae Agent", capabilityId: "trae-agent", setupHint: "Configure Trae Agent account keys or choose a local runner." }
 ];
+
+function normalizeWorkspaceAgentRunner(runner: string | undefined): AgentProfileDraft["runner"] {
+  const normalized = runner?.trim().toLowerCase();
+  if (normalized === "codex") return "codex";
+  if (normalized === "opencode") return "opencode";
+  if (normalized === "claude" || normalized === "claude-code") return "claude-code";
+  if (normalized === "trae" || normalized === "trae-agent") return "trae-agent";
+  return "codex";
+}
 
 function InfoIcon() {
   return (
@@ -194,6 +210,9 @@ function initialUiTheme(): UiTheme {
 
 const agentConfigurationStorageKey = "omega-agent-configuration-draft";
 
+const legacyCompactStagePolicy =
+  "Repository target is mandatory. Review changes_requested routes to Rework. Human Review blocks delivery until approved.";
+
 const defaultWorkflowMarkdown = `workflow: devflow-pr
 stages:
   - requirement: requirement
@@ -209,6 +228,17 @@ artifacts:
   - test-report
   - review-report
   - handoff-bundle`;
+
+const defaultStagePolicy = [
+  "Requirement: clarify acceptance criteria, repository target, open questions, and acceptance risks before planning.",
+  "Architecture: list affected files, integration boundaries, risky assumptions, and validation strategy before coding.",
+  "Coding: edit only inside the bound repository workspace and keep the diff reviewable for a single Work Item.",
+  "Testing: run focused validation first, then broader checks when shared contracts, delivery, or UI behavior changed.",
+  "Review: changes_requested must route to Rework with a checklist; review feedback should not be treated as an infrastructure failure.",
+  "Rework: reuse the existing implementation workspace, apply the checklist, update PR notes when the behavior changed, and return to review.",
+  "Human Review: stop delivery until explicit approval; request changes becomes first-class feedback for the next rework attempt.",
+  "Delivery: after approval, run merge/check actions separately and record PR/check/proof output in the Run Workpad."
+].join("\n");
 
 const defaultAgentProfiles: AgentProfileDraft[] = [
   {
@@ -283,8 +313,7 @@ const defaultAgentConfigurationDraft: AgentConfigurationDraft = {
   runner: "codex",
   workflowTemplate: "devflow-pr",
   workflowMarkdown: defaultWorkflowMarkdown,
-  stagePolicy:
-    "Requirement: clarify acceptance criteria and repository target before planning.\nArchitecture: list affected files and risky integration points.\nCoding: only edit inside the bound repository workspace.\nTesting: run focused tests first, then broaden when shared contracts change.\nReview: changes_requested must route to Rework, not fail the attempt.\nHuman Review: stop until explicit approval.",
+  stagePolicy: defaultStagePolicy,
   skillAllowlist: "browser-use\ngithub:github\ngithub:gh-fix-ci\ngithub:yeet",
   mcpAllowlist: "github\nfilesystem:repository-workspace\nbrowser:localhost-preview",
   codexPolicy:
@@ -308,14 +337,19 @@ function initialAgentConfigurationDraft(): AgentConfigurationDraft {
 
 function normalizeAgentConfigurationDraft(profile: Partial<ProjectAgentProfileInfo> | Partial<AgentConfigurationDraft>): AgentConfigurationDraft {
   const rawProfile = profile as Partial<ProjectAgentProfileInfo> & Partial<AgentConfigurationDraft>;
+  const rawStagePolicy = typeof rawProfile.stagePolicy === "string" ? rawProfile.stagePolicy.trim() : "";
   return {
     ...defaultAgentConfigurationDraft,
     ...rawProfile,
-    runner: (rawProfile.runner as AgentConfigurationDraft["runner"]) || defaultAgentConfigurationDraft.runner,
+    runner: normalizeWorkspaceAgentRunner(rawProfile.runner),
+    stagePolicy:
+      !rawStagePolicy || rawStagePolicy === legacyCompactStagePolicy
+        ? defaultStagePolicy
+        : rawProfile.stagePolicy ?? defaultStagePolicy,
     agentProfiles: rawProfile.agentProfiles?.length
       ? rawProfile.agentProfiles.map((agent) => ({
           ...agent,
-          runner: agent.runner as AgentProfileDraft["runner"]
+          runner: normalizeWorkspaceAgentRunner(agent.runner)
         }))
       : defaultAgentProfiles
   };
@@ -328,13 +362,6 @@ function capabilityAvailable(capabilities: LocalCapabilityInfo[], capabilityId?:
 
 function runnerOptionFor(runner: string) {
   return agentRunnerOptions.find((option) => option.value === runner);
-}
-
-function runnerAvailabilityLabel(runner: string, capabilities: LocalCapabilityInfo[]) {
-  const option = runnerOptionFor(runner);
-  if (!option) return `Unsupported runner: ${runner}`;
-  if (capabilityAvailable(capabilities, option.capabilityId)) return `${option.label} ready`;
-  return option.setupHint ?? `${option.label} is not available.`;
 }
 
 function unavailableAgentProfiles(profile: AgentConfigurationDraft, capabilities: LocalCapabilityInfo[]) {
@@ -684,6 +711,22 @@ function emptyObservability(): ObservabilitySummary {
   };
 }
 
+function normalizeObservability(summary?: Partial<ObservabilitySummary> | null): ObservabilitySummary {
+  const fallback = emptyObservability();
+  if (!summary) return fallback;
+  return {
+    ...fallback,
+    ...summary,
+    counts: { ...fallback.counts, ...(summary.counts ?? {}) },
+    attention: { ...fallback.attention, ...(summary.attention ?? {}) },
+    pipelineStatus: summary.pipelineStatus ?? fallback.pipelineStatus,
+    checkpointStatus: summary.checkpointStatus ?? fallback.checkpointStatus,
+    operationStatus: summary.operationStatus ?? fallback.operationStatus,
+    workItemStatus: summary.workItemStatus ?? fallback.workItemStatus,
+    recentErrors: summary.recentErrors ?? fallback.recentErrors
+  };
+}
+
 function formatShortTimestamp(value?: string): string {
   if (!value) return "";
   const date = new Date(value);
@@ -708,6 +751,8 @@ function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeInspectorPanel, setActiveInspectorPanel] = useState<InspectorPanel>(persistedSession.activeInspectorPanel);
   const [projects, setProjects] = useState<ProjectRecord[]>(persistedSession.projects);
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectDescription, setNewProjectDescription] = useState("");
   const [requirements, setRequirements] = useState<RequirementRecordInfo[]>(persistedSession.requirements);
   const [workItems, setWorkItems] = useState<WorkItem[]>(persistedSession.workItems);
   const [selectedWorkItemId, setSelectedWorkItemId] = useState(persistedSession.selectedWorkItemId);
@@ -732,6 +777,8 @@ function App() {
   const [githubIssuesCollapsed, setGithubIssuesCollapsed] = useState(false);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(!missionControlApiUrl);
   const [observability, setObservability] = useState<ObservabilitySummary>(() => emptyObservability());
+  const [observabilityWindowDays, setObservabilityWindowDays] = useState(14);
+  const [observabilityGroupBy, setObservabilityGroupBy] = useState("stage");
   const [llmProviders, setLlmProviders] = useState<LlmProviderInfo[]>([]);
   const [llmSelection, setLlmSelection] = useState<LlmProviderSelection>({
     providerId: "openai",
@@ -740,6 +787,7 @@ function App() {
   });
   const [pipelines, setPipelines] = useState<PipelineRecordInfo[]>([]);
   const [attempts, setAttempts] = useState<AttemptRecordInfo[]>([]);
+  const [activeAttemptActionPlan, setActiveAttemptActionPlan] = useState<AttemptActionPlanInfo | null>(null);
   const [activeAttemptTimeline, setActiveAttemptTimeline] = useState<AttemptTimelineInfo | null>(null);
   const [activePullRequestStatus, setActivePullRequestStatus] = useState<GitHubPullRequestStatusResult | null>(null);
   const [proofRecords, setProofRecords] = useState<ProofRecordInfo[]>([]);
@@ -747,6 +795,7 @@ function App() {
   const [checkpoints, setCheckpoints] = useState<CheckpointRecordInfo[]>([]);
   const [operations, setOperations] = useState<OperationRecordInfo[]>([]);
   const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogRecordInfo[]>([]);
+  const [runnerCredentials, setRunnerCredentials] = useState<RunnerCredentialInfo[]>([]);
   const [executionLocks, setExecutionLocks] = useState<ExecutionLockInfo[]>([]);
   const [orchestratorWatchers, setOrchestratorWatchers] = useState<OrchestratorWatcherInfo[]>([]);
   const [localCapabilities, setLocalCapabilities] = useState<LocalCapabilityInfo[]>([]);
@@ -781,7 +830,7 @@ function App() {
   const [agentConfigDraft, setAgentConfigDraft] = useState<AgentConfigurationDraft>(initialAgentConfigurationDraft);
   const [agentConfigTab, setAgentConfigTab] = useState<AgentConfigTab>("workflow");
   const [selectedAgentProfileId, setSelectedAgentProfileId] = useState(defaultAgentProfiles[0].id);
-  const [runtimeConfigTab, setRuntimeConfigTab] = useState<RuntimeConfigTab>("codex");
+  const [runtimeConfigTab, setRuntimeConfigTab] = useState<RuntimeConfigTab>("omega");
   const [workspaceFolderPickerMessage, setWorkspaceFolderPickerMessage] = useState("");
   const [workspaceSectionOpen, setWorkspaceSectionOpen] = useState(true);
   const [connectionsSectionOpen, setConnectionsSectionOpen] = useState(true);
@@ -963,10 +1012,22 @@ function App() {
     : false;
   useEffect(() => {
     if (!missionControlApiUrl || !activeDetailAttempt?.id) {
+      setActiveAttemptActionPlan(null);
       setActiveAttemptTimeline(null);
       return;
     }
     let cancelled = false;
+    void fetchAttemptActionPlan(missionControlApiUrl, activeDetailAttempt.id)
+      .then((actionPlan) => {
+        if (!cancelled) {
+          setActiveAttemptActionPlan(actionPlan);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setActiveAttemptActionPlan(null);
+        }
+      });
     void fetchAttemptTimeline(missionControlApiUrl, activeDetailAttempt.id)
       .then((timeline) => {
         if (!cancelled) {
@@ -1075,6 +1136,9 @@ function App() {
         .slice(0, 10),
     [runtimeLogs]
   );
+  const observabilityFallback = useMemo(() => emptyObservability(), []);
+  const observabilityCounts = observability.counts ?? observabilityFallback.counts;
+  const observabilityAttention = observability.attention ?? observabilityFallback.attention;
 
   async function refreshControlPlane() {
     if (!missionControlApiUrl) return;
@@ -1092,6 +1156,7 @@ function App() {
       nextCheckpoints,
       nextOperations,
       nextRuntimeLogs,
+      nextRunnerCredentials,
       nextExecutionLocks,
       nextOrchestratorWatchers,
       nextCapabilities,
@@ -1099,7 +1164,7 @@ function App() {
       nextGitHubOAuthConfig,
       nextGitHubStatus
     ] = await Promise.all([
-      fetchObservability(missionControlApiUrl),
+      fetchObservability(missionControlApiUrl, { windowDays: observabilityWindowDays, groupBy: observabilityGroupBy, limit: 10 }),
       fetchLlmProviders(missionControlApiUrl),
       fetchLlmProviderSelection(missionControlApiUrl),
       fetchPipelineTemplates(missionControlApiUrl),
@@ -1112,6 +1177,7 @@ function App() {
       fetchCheckpoints(missionControlApiUrl),
       fetchOperations(missionControlApiUrl).catch(() => []),
       fetchRuntimeLogs(missionControlApiUrl, { limit: 80 }).catch(() => []),
+      fetchRunnerCredentials(missionControlApiUrl).catch(() => []),
       fetchExecutionLocks(missionControlApiUrl).catch(() => []),
       fetchOrchestratorWatchers(missionControlApiUrl).catch(() => []),
       fetchLocalCapabilities(missionControlApiUrl),
@@ -1119,7 +1185,7 @@ function App() {
       fetchGitHubOAuthConfig(missionControlApiUrl).catch(() => defaultGitHubOAuthConfig),
       fetchGitHubStatus(missionControlApiUrl).catch(() => null)
     ]);
-    setObservability(nextObservability);
+    setObservability(normalizeObservability(nextObservability));
     setLlmProviders(nextProviders);
     setLlmSelection(nextSelection);
     setPipelineTemplates(nextTemplates);
@@ -1132,6 +1198,7 @@ function App() {
     setCheckpoints(nextCheckpoints);
     setOperations(nextOperations);
     setRuntimeLogs(nextRuntimeLogs);
+    setRunnerCredentials(nextRunnerCredentials);
     setExecutionLocks(nextExecutionLocks);
     setOrchestratorWatchers(nextOrchestratorWatchers);
     setLocalCapabilities(nextCapabilities);
@@ -1150,7 +1217,13 @@ function App() {
     setLocalRunner((currentRunner) =>
       currentRunner === "local-proof" && nextCapabilities.some((capability) => capability.id === "codex" && capability.available)
         ? "codex"
-        : currentRunner
+        : currentRunner === "local-proof" && nextCapabilities.some((capability) => capability.id === "opencode" && capability.available)
+          ? "opencode"
+          : currentRunner === "local-proof" && nextCapabilities.some((capability) => capability.id === "claude-code" && capability.available)
+            ? "claude-code"
+            : currentRunner === "local-proof" && nextCapabilities.some((capability) => capability.id === "trae-agent" && capability.available)
+              ? "trae-agent"
+              : currentRunner
     );
   }
 
@@ -1163,6 +1236,39 @@ function App() {
     setWorkItems(session.workItems);
     setMissionState(session.missionState);
     setConnections(session.connections);
+  }
+
+  async function createProject() {
+    if (!missionControlApiUrl) {
+      setRepositorySyncMessage("Project creation needs the local runtime API.");
+      return;
+    }
+    const name = newProjectName.trim();
+    if (!name) {
+      setRepositorySyncMessage("Project name is required.");
+      return;
+    }
+    try {
+      setRepositorySyncMessage(`Creating project ${name}...`);
+      const session = await createProjectViaApi(missionControlApiUrl, run, {
+        name,
+        description: newProjectDescription.trim()
+      });
+      setProjects(session.projects);
+      setRequirements(session.requirements);
+      setWorkItems(session.workItems);
+      setMissionState(session.missionState);
+      setConnections(session.connections);
+      setNewProjectName("");
+      setNewProjectDescription("");
+      setActiveRepositoryWorkspaceTargetId("");
+      setRepositorySyncMessage(`Project ${name} created. Attach a repository workspace next.`);
+      await refreshControlPlane().catch((error) => {
+        console.warn("Control plane refresh after project create failed", error);
+      });
+    } catch (error) {
+      setRepositorySyncMessage(error instanceof Error ? error.message : "Project creation failed.");
+    }
   }
 
   async function refreshExecutionState(options: { includeArtifacts?: boolean } = {}) {
@@ -1295,6 +1401,13 @@ function App() {
       cancelled = true;
     };
   }, [run]);
+
+  useEffect(() => {
+    if (!missionControlApiUrl || activeNav !== "Views") return;
+    refreshControlPlane().catch((error) => {
+      console.warn("Observability refresh failed", error);
+    });
+  }, [activeNav, missionControlApiUrl, observabilityGroupBy, observabilityWindowDays]);
 
   useEffect(() => {
     if (!workspaceLoaded) return;
@@ -1904,6 +2017,7 @@ function App() {
     }
     try {
       const session = await bindGitHubRepositoryTargetViaApi(missionControlApiUrl, run, {
+        projectId: primaryProject?.id,
         owner: githubRepoOwner,
         repo: githubRepoName,
         nameWithOwner: selectedRepositoryNameWithOwner,
@@ -2043,7 +2157,7 @@ function App() {
     if (!chatId) return;
     const text = pendingCheckpoint
       ? `Omega checkpoint waiting: ${pendingCheckpoint.title}. ${pendingCheckpoint.summary}`
-      : `Omega pipeline status: ${observability.counts.pipelines} pipeline(s), ${observability.attention.waitingHuman} waiting for human review.`;
+      : `Omega pipeline status: ${observabilityCounts.pipelines} pipeline(s), ${observabilityAttention.waitingHuman} waiting for human review.`;
     try {
       const result = await sendFeishuNotification(missionControlApiUrl, chatId, text);
       setRunnerMessage(`Feishu notification ${result.status}${result.messageId ? `: ${result.messageId}` : ""}.`);
@@ -2098,59 +2212,6 @@ function App() {
     .join(" ");
   const selectedProvider =
     visibleConnectionProviders.find((provider) => provider.id === selectedProviderId) ?? visibleConnectionProviders[0];
-  const selectedAgentProfile =
-    agentConfigDraft.agentProfiles.find((profile) => profile.id === selectedAgentProfileId) ??
-    agentConfigDraft.agentProfiles[0] ??
-    defaultAgentProfiles[0];
-  const selectedRunnerReady = capabilityAvailable(
-    localCapabilities,
-    runnerOptionFor(selectedAgentProfile.runner)?.capabilityId
-  );
-  const selectedRunnerAvailability = runnerAvailabilityLabel(selectedAgentProfile.runner, localCapabilities);
-  const workflowStagePreview = [
-    { id: "requirement", title: "Requirement", agents: "requirement", gate: "auto" },
-    { id: "implementation", title: "Implementation", agents: "architect + coding + testing", gate: "auto" },
-    { id: "code_review", title: "Code Review", agents: "review", gate: "changes requested -> rework" },
-    { id: "rework", title: "Rework", agents: "coding + testing", gate: "loops to review" },
-    { id: "human_review", title: "Human Review", agents: "human + review + delivery", gate: "manual gate" },
-    { id: "delivery", title: "Delivery", agents: "delivery", gate: "after approval" }
-  ];
-  const runtimeConfigPreview =
-    runtimeConfigTab === "omega"
-      ? JSON.stringify(
-          {
-            project: primaryProject?.name ?? "Omega",
-            repositoryTarget: activeRepositoryWorkspaceLabel || "project-default",
-            workflow: agentConfigDraft.workflowTemplate,
-            profileSource: agentConfigDraft.repositoryTargetId ? "repository" : "project",
-            agent: selectedAgentProfile.id,
-            runner: selectedAgentProfile.runner,
-            model: selectedAgentProfile.model,
-            skills: selectedAgentProfile.skills.split("\n").filter(Boolean),
-            mcp: selectedAgentProfile.mcp.split("\n").filter(Boolean),
-            sandbox: "repository-workspace"
-          },
-          null,
-          2
-        )
-      : runtimeConfigTab === "codex"
-        ? [
-            `# .codex/OMEGA.md`,
-            `agent: ${selectedAgentProfile.id}`,
-            `runner: ${selectedAgentProfile.runner}`,
-            `model: ${selectedAgentProfile.model}`,
-            "",
-            selectedAgentProfile.codexPolicy || agentConfigDraft.codexPolicy
-          ].join("\n")
-        : [
-            `# .claude/CLAUDE.md`,
-            `agent: ${selectedAgentProfile.id}`,
-            `runner: ${selectedAgentProfile.runner}`,
-            `model: ${selectedAgentProfile.model}`,
-            "",
-            selectedAgentProfile.claudePolicy || agentConfigDraft.claudePolicy
-          ].join("\n");
-
   function openWorkboard() {
     setAppSurface("workboard");
     window.history.replaceState(null, "", "#workboard");
@@ -2252,23 +2313,6 @@ function App() {
       : runs;
   }
 
-  function updateAgentConfigDraft<Key extends keyof AgentConfigurationDraft>(key: Key, value: AgentConfigurationDraft[Key]) {
-    setAgentConfigDraft((current) => ({ ...current, [key]: value }));
-    setAgentConfigSavedMessage("");
-  }
-
-  function updateAgentProfileDraft<Key extends keyof AgentProfileDraft>(
-    profileId: string,
-    key: Key,
-    value: AgentProfileDraft[Key]
-  ) {
-    setAgentConfigDraft((current) => ({
-      ...current,
-      agentProfiles: current.agentProfiles.map((profile) => (profile.id === profileId ? { ...profile, [key]: value } : profile))
-    }));
-    setAgentConfigSavedMessage("");
-  }
-
   async function saveAgentConfigurationDraft() {
     const unavailableProfiles = unavailableAgentProfiles(agentConfigDraft, localCapabilities);
     if (unavailableProfiles.length > 0) {
@@ -2297,6 +2341,31 @@ function App() {
       setAgentConfigSavedMessage("Saved to local runtime. New pipeline runs will use this profile.");
     } catch (error) {
       setAgentConfigSavedMessage(error instanceof Error ? error.message : "Agent profile save failed.");
+    }
+  }
+
+  async function saveRunnerAccountCredential(input: {
+    id?: string;
+    runner: string;
+    provider: string;
+    label?: string;
+    model?: string;
+    baseUrl?: string;
+    secret?: string;
+  }) {
+    if (!missionControlApiUrl) {
+      setAgentConfigSavedMessage("Runner account keys require the local runtime.");
+      return;
+    }
+    try {
+      const saved = await updateRunnerCredential(missionControlApiUrl, input);
+      setRunnerCredentials((current) => {
+        const next = current.filter((credential) => credential.id !== saved.id);
+        return [saved, ...next];
+      });
+      setAgentConfigSavedMessage(`${saved.label || saved.runner} account saved. Future runs will inject it only at runner start.`);
+    } catch (error) {
+      setAgentConfigSavedMessage(error instanceof Error ? error.message : "Runner account save failed.");
     }
   }
 
@@ -2445,6 +2514,8 @@ function App() {
             activeRepositoryWorkspacePipelines={activeRepositoryWorkspacePipelines}
             repositorySyncMessage={repositorySyncMessage}
             syncingRepositoryKey={syncingRepositoryKey}
+            newProjectName={newProjectName}
+            newProjectDescription={newProjectDescription}
             githubRepositoriesLoading={githubRepositoriesLoading}
             githubRepositoryQuery={githubRepositoryQuery}
             githubRepoOwner={githubRepoOwner}
@@ -2462,6 +2533,9 @@ function App() {
               }
             }}
             onOpenWorkItems={() => setActiveNav("Issues")}
+            onNewProjectNameChange={setNewProjectName}
+            onNewProjectDescriptionChange={setNewProjectDescription}
+            onCreateProject={() => void createProject()}
             onRefreshRepositories={loadGitHubRepositories}
             onRepositoryQueryChange={setGitHubRepositoryQuery}
             onCreateOrOpenWorkspace={openSelectedRepositoryWorkspace}
@@ -2487,21 +2561,29 @@ function App() {
               <article className="metric-strip">
                 <div>
                   <span>Work items</span>
-                  <strong>{observability.counts.workItems}</strong>
+                  <strong>{observabilityCounts.workItems}</strong>
                 </div>
                 <div>
                   <span>Pipelines</span>
-                  <strong>{observability.counts.pipelines}</strong>
+                  <strong>{observabilityCounts.pipelines}</strong>
                 </div>
                 <div>
                   <span>Waiting</span>
-                  <strong>{observability.attention.waitingHuman}</strong>
+                  <strong>{observabilityAttention.waitingHuman}</strong>
                 </div>
                 <div>
                   <span>Proof</span>
-                  <strong>{observability.counts.proofRecords}</strong>
+                  <strong>{observabilityCounts.proofRecords}</strong>
                 </div>
               </article>
+              <ObservabilityDashboard
+                observability={observability}
+                windowDays={observabilityWindowDays}
+                groupBy={observabilityGroupBy}
+                onWindowDaysChange={setObservabilityWindowDays}
+                onGroupByChange={setObservabilityGroupBy}
+                onRefresh={() => refreshControlPlane()}
+              />
             </section>
 
             <section className="operator-section">
@@ -2548,7 +2630,16 @@ function App() {
                           demo-code
                         </option>
                         <option value="codex" disabled={!localCapabilities.some((capability) => capability.id === "codex" && capability.available)}>
-                          codex
+                          Codex
+                        </option>
+                        <option value="opencode" disabled={!localCapabilities.some((capability) => capability.id === "opencode" && capability.available)}>
+                          opencode
+                        </option>
+                        <option value="claude-code" disabled={!localCapabilities.some((capability) => capability.id === "claude-code" && capability.available)}>
+                          Claude Code
+                        </option>
+                        <option value="trae-agent" disabled={!localCapabilities.some((capability) => capability.id === "trae-agent" && capability.available)}>
+                          Trae Agent
                         </option>
                       </select>
                     </label>
@@ -2776,7 +2867,7 @@ function App() {
                   <div className="control-card-header">
                     <div>
                       <span className="section-label">Runtime logs</span>
-                      <h2>{observability.counts.runtimeLogs ?? runtimeLogs.length} entries</h2>
+                      <h2>{observabilityCounts.runtimeLogs ?? runtimeLogs.length} entries</h2>
                     </div>
                   </div>
                   <div className="runtime-log-list">
@@ -2934,48 +3025,17 @@ function App() {
                       <strong>{agentConfigDraft.workflowTemplate}</strong>
                     </span>
                     <span>
-                      <small>Runner</small>
+                      <small>Default runner</small>
                       <strong>{agentConfigDraft.runner}</strong>
                     </span>
                     <span>
-                      <small>Contracts</small>
+                      <small>Agent contracts</small>
                       <strong>{agentDefinitions.length}</strong>
                     </span>
-                  </div>
-                  <div className="agent-config-map-list">
-                    <button
-                      type="button"
-                      className="agent-config-map-entry"
-                      onClick={() => {
-                        setAgentConfigOpen(true);
-                        setAgentConfigTab("workflow");
-                      }}
-                    >
-                      <strong>Workflow</strong>
-                      <small>Stage markdown</small>
-                    </button>
-                    <button
-                      type="button"
-                      className="agent-config-map-entry"
-                      onClick={() => {
-                        setAgentConfigOpen(true);
-                        setAgentConfigTab("agents");
-                      }}
-                    >
-                      <strong>Tools</strong>
-                      <small>MCP / Skills</small>
-                    </button>
-                    <button
-                      type="button"
-                      className="agent-config-map-entry"
-                      onClick={() => {
-                        setAgentConfigOpen(true);
-                        setAgentConfigTab("runtime");
-                      }}
-                    >
-                      <strong>Runtime</strong>
-                      <small>Policy files</small>
-                    </button>
+                    <span>
+                      <small>Editor</small>
+                      <strong>{agentConfigOpen ? "Open below" : "Collapsed"}</strong>
+                    </span>
                   </div>
                 </article>
               </div>
@@ -3040,245 +3100,45 @@ function App() {
               ) : null}
             </section>
 
-            <section className="operator-section agent-config-section">
-              <div className="operator-section-heading">
-                <div>
-                  <span className="section-label">Agent profile</span>
-                  <h2>Project Agent Profile</h2>
-                </div>
-                <button type="button" onClick={() => setAgentConfigOpen((current) => !current)}>
-                  {agentConfigOpen ? "Collapse editor" : "Edit profile"}
-                </button>
-              </div>
-
-              <article className="control-card agent-config-card">
-                <div className="control-card-header">
-                  <div>
-                    <span className="section-label">DevFlow defaults</span>
-                    <h2>{primaryProject?.name ?? "Omega"} Agent orchestration</h2>
-                    <p>Draft workflow, per-Agent tools, and local runtime policy for this project.</p>
-                  </div>
-                  <button type="button" className="primary-action" onClick={saveAgentConfigurationDraft}>
-                    Save draft
-                  </button>
-                </div>
-
-                {agentConfigOpen ? (
-                  <div className="agent-config-shell">
-                    <div className="agent-config-summary-grid" aria-label="Agent profile summary">
-                      <span>
-                        <strong>{agentConfigDraft.workflowTemplate}</strong>
-                        <small>workflow draft</small>
-                      </span>
-                      <span>
-                        <strong>{agentConfigDraft.agentProfiles.length}</strong>
-                        <small>agent profiles</small>
-                      </span>
-                      <span>
-                        <strong>{agentConfigDraft.agentProfiles.reduce((count, profile) => count + profile.skills.split("\n").filter(Boolean).length, 0)}</strong>
-                        <small>skill bindings</small>
-                      </span>
-                      <span>
-                        <strong>.omega + .codex + .claude</strong>
-                        <small>runtime files</small>
-                      </span>
-                    </div>
-
-                    <div className="agent-config-tabs" role="tablist" aria-label="Project Agent Profile sections">
-                      {(["workflow", "agents", "runtime"] as AgentConfigTab[]).map((tab) => (
-                        <button
-                          key={tab}
-                          type="button"
-                          className={agentConfigTab === tab ? "active" : ""}
-                          onClick={() => setAgentConfigTab(tab)}
-                        >
-                          {tab === "workflow" ? "Workflow" : tab === "agents" ? "Agents" : "Runtime files"}
-                        </button>
-                      ))}
-                    </div>
-
-                    {agentConfigTab === "workflow" ? (
-                      <div className="workflow-builder">
-                        <div className="workflow-stage-flow" aria-label="Workflow parser draft">
-                          {workflowStagePreview.map((stage, index) => (
-                            <article key={stage.id} className="workflow-stage-card">
-                              <span>{String(index + 1).padStart(2, "0")}</span>
-                              <strong>{stage.title}</strong>
-                              <small>{stage.agents}</small>
-                              <em>{stage.gate}</em>
-                            </article>
-                          ))}
-                        </div>
-                        <div className="control-form workflow-markdown-editor">
-                          <label>
-                            <span>Template</span>
-                            <select
-                              value={agentConfigDraft.workflowTemplate}
-                              onChange={(event) => updateAgentConfigDraft("workflowTemplate", event.currentTarget.value)}
-                            >
-                              <option value="devflow-pr">devflow-pr</option>
-                              {pipelineTemplates
-                                .filter((template) => template.id !== "devflow-pr")
-                                .map((template) => (
-                                  <option key={template.id} value={template.id}>
-                                    {template.name}
-                                  </option>
-                                ))}
-                            </select>
-                          </label>
-                          <label>
-                            <span>Markdown</span>
-                            <textarea
-                              value={agentConfigDraft.workflowMarkdown}
-                              onChange={(event) => updateAgentConfigDraft("workflowMarkdown", event.currentTarget.value)}
-                            />
-                          </label>
-                          <label>
-                            <span>Rules</span>
-                            <textarea
-                              value={agentConfigDraft.stagePolicy}
-                              onChange={(event) => updateAgentConfigDraft("stagePolicy", event.currentTarget.value)}
-                            />
-                          </label>
-                        </div>
-                      </div>
-                    ) : null}
-
-                    {agentConfigTab === "agents" ? (
-                      <div className="agent-profile-layout">
-                        <div className="agent-roster" aria-label="Agent roster">
-                          {agentConfigDraft.agentProfiles.map((profile) => (
-                            <button
-                              key={profile.id}
-                              type="button"
-                              className={[
-                                profile.id === selectedAgentProfile.id ? "active" : "",
-                                unavailableAgentProfiles({ ...agentConfigDraft, agentProfiles: [profile] }, localCapabilities).length > 0
-                                  ? "runner-missing"
-                                  : ""
-                              ]
-                                .filter(Boolean)
-                                .join(" ")}
-                              onClick={() => setSelectedAgentProfileId(profile.id)}
-                            >
-                              <strong>{profile.label}</strong>
-                              <span>{profile.runner} · {profile.model}</span>
-                            </button>
-                          ))}
-                        </div>
-                        <div className="control-form agent-profile-editor">
-                          <div className="agent-profile-editor-header">
-                            <span className="section-label">Agent override</span>
-                            <strong>{selectedAgentProfile.label}</strong>
-                          </div>
-                          <label>
-                            <span>Runner</span>
-                            <select
-                              value={selectedAgentProfile.runner}
-                              onChange={(event) =>
-                                updateAgentProfileDraft(
-                                  selectedAgentProfile.id,
-                                  "runner",
-                                  event.currentTarget.value as AgentProfileDraft["runner"]
-                                )
-                              }
-                            >
-                              {agentRunnerOptions.map((option) => (
-                                <option
-                                  key={option.value}
-                                  value={option.value}
-                                  disabled={!capabilityAvailable(localCapabilities, option.capabilityId)}
-                                >
-                                  {option.label}
-                                  {!capabilityAvailable(localCapabilities, option.capabilityId) ? " (missing)" : ""}
-                                </option>
-                              ))}
-                            </select>
-                            <small className={selectedRunnerReady ? "runner-availability ready" : "runner-availability missing"}>
-                              {selectedRunnerAvailability}
-                            </small>
-                          </label>
-                          <label>
-                            <span>Model</span>
-                            <input
-                              value={selectedAgentProfile.model}
-                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "model", event.currentTarget.value)}
-                            />
-                          </label>
-                          <label>
-                            <span>Skills</span>
-                            <textarea
-                              value={selectedAgentProfile.skills}
-                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "skills", event.currentTarget.value)}
-                            />
-                          </label>
-                          <label>
-                            <span>MCP</span>
-                            <textarea
-                              value={selectedAgentProfile.mcp}
-                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "mcp", event.currentTarget.value)}
-                            />
-                          </label>
-                          <label>
-                            <span>Stage note</span>
-                            <textarea
-                              value={selectedAgentProfile.stageNotes}
-                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "stageNotes", event.currentTarget.value)}
-                            />
-                          </label>
-                        </div>
-                      </div>
-                    ) : null}
-
-                    {agentConfigTab === "runtime" ? (
-                      <div className="runtime-config-layout">
-                        <div className="runtime-file-tabs" role="tablist" aria-label="Runtime file templates">
-                          {(["omega", "codex", "claude"] as RuntimeConfigTab[]).map((tab) => (
-                            <button
-                              key={tab}
-                              type="button"
-                              className={runtimeConfigTab === tab ? "active" : ""}
-                              onClick={() => setRuntimeConfigTab(tab)}
-                            >
-                              {tab === "omega" ? ".omega/agent-runtime.json" : tab === "codex" ? ".codex/OMEGA.md" : ".claude/CLAUDE.md"}
-                            </button>
-                          ))}
-                        </div>
-                        <div className="control-form runtime-policy-editor">
-                          <label>
-                            <span>.codex</span>
-                            <textarea
-                              value={selectedAgentProfile.codexPolicy}
-                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "codexPolicy", event.currentTarget.value)}
-                            />
-                          </label>
-                          <label>
-                            <span>.claude</span>
-                            <textarea
-                              value={selectedAgentProfile.claudePolicy}
-                              onChange={(event) => updateAgentProfileDraft(selectedAgentProfile.id, "claudePolicy", event.currentTarget.value)}
-                            />
-                          </label>
-                        </div>
-                        <div className="agent-config-preview">
-                          <span className="section-label">Runtime file preview</span>
-                          <pre>{runtimeConfigPreview}</pre>
-                        </div>
-                      </div>
-                    ) : null}
-
-                    {agentConfigSavedMessage ? <p className="agent-config-save-status" role="status">{agentConfigSavedMessage}</p> : null}
-                  </div>
-                ) : (
-                  <div className="agent-profile-summary">
-                    <span>Workflow: {agentConfigDraft.workflowTemplate}</span>
-                    <span>Agents: {agentConfigDraft.agentProfiles.length}</span>
-                    <span>Runtime: .omega / .codex / .claude</span>
-                    <span>Draft: local only</span>
-                  </div>
-                )}
-              </article>
-            </section>
+            <WorkspaceAgentStudio
+              activeRepositoryWorkspaceLabel={activeRepositoryWorkspaceLabel}
+              agentConfigDraft={agentConfigDraft}
+              agentConfigOpen={agentConfigOpen}
+              agentConfigSavedMessage={agentConfigSavedMessage}
+              agentConfigTab={agentConfigTab}
+              agentRunnerOptions={agentRunnerOptions}
+              localCapabilities={localCapabilities}
+              pipelineTemplates={pipelineTemplates}
+              primaryProjectName={primaryProject?.name ?? "Omega"}
+              runnerCredentials={runnerCredentials}
+              runtimeConfigTab={runtimeConfigTab}
+              selectedAgentProfileId={selectedAgentProfileId}
+              onSave={saveAgentConfigurationDraft}
+              onSelectAgentProfile={setSelectedAgentProfileId}
+              onSaveRunnerCredential={saveRunnerAccountCredential}
+              onSetAgentConfigOpen={setAgentConfigOpen}
+              onSetAgentConfigTab={setAgentConfigTab}
+              onSetRuntimeConfigTab={setRuntimeConfigTab}
+              onUpdateAgentProfile={(profileId, patch) => {
+                setAgentConfigDraft((current) => ({
+                  ...current,
+                  agentProfiles: current.agentProfiles.map((profile) =>
+                    profile.id === profileId
+                      ? ({
+                          ...profile,
+                          ...patch,
+                          runner: (patch.runner as AgentProfileDraft["runner"] | undefined) ?? profile.runner
+                        } as AgentProfileDraft)
+                      : profile
+                  )
+                }));
+                setAgentConfigSavedMessage("");
+              }}
+              onUpdateDraft={(patch) => {
+                setAgentConfigDraft((current) => ({ ...current, ...patch } as AgentConfigurationDraft));
+                setAgentConfigSavedMessage("");
+              }}
+            />
           </section>
         ) : null}
 
@@ -3307,6 +3167,7 @@ function App() {
             {activeWorkItemDetail ? (
               <WorkItemDetailPage
                 agentShortLabel={agentShortLabel}
+                attemptActionPlan={activeAttemptActionPlan}
                 attemptStatusLabel={attemptStatusLabel}
                 attemptTimeline={activeAttemptTimeline}
                 attempts={activeDetailAttempts}

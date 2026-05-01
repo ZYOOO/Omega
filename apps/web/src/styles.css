@@ -1747,6 +1747,35 @@ kbd {
   text-align: center;
 }
 
+.project-create-form {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(220px, 1.2fr) auto;
+  gap: 10px;
+  align-items: end;
+  border-top: 1px solid #242428;
+  padding-top: 12px;
+}
+
+.project-create-form label {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  color: #8a8a93;
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.project-create-form input {
+  min-height: 42px;
+  border: 1px solid #303034;
+  border-radius: 6px;
+  background: #101013;
+  color: #f3f3f1;
+  padding: 0 12px;
+  font: inherit;
+}
+
 .repository-panel {
   display: grid;
   gap: 12px;
@@ -2011,7 +2040,7 @@ kbd {
 }
 
 .operator-grid.settings-grid {
-  grid-template-columns: minmax(380px, 1fr) minmax(300px, 0.62fr);
+  grid-template-columns: 1fr;
 }
 
 .operator-grid.collaboration-grid {
@@ -2284,6 +2313,54 @@ kbd {
   gap: 14px;
 }
 
+.workspace-agent-studio {
+  overflow: hidden;
+}
+
+.studio-hero {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.45fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+}
+
+.studio-hero h3 {
+  margin: 4px 0 0;
+  color: #f3f3f1;
+  font-size: 1.08rem;
+}
+
+.studio-status-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.studio-status-strip span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid #303034;
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: #101013;
+}
+
+.studio-status-strip small {
+  color: #8a8a93;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.studio-status-strip strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #f3f3f1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-config-summary-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2340,6 +2417,234 @@ kbd {
   align-items: start;
 }
 
+.workflow-studio-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 230px) minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.workflow-graph {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 3px;
+  align-content: start;
+  border-right: 1px solid #303034;
+  padding-right: 14px;
+}
+
+.workflow-node-card {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  justify-items: start;
+  min-height: 42px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: #c9c9d1;
+  text-align: left;
+  box-shadow: none;
+}
+
+.workflow-node-card.active {
+  border-color: #78a6ff;
+  background: #102345;
+  box-shadow: none;
+}
+
+.workflow-node-card:hover:not(:disabled),
+.workflow-node-card:focus-visible {
+  border-color: rgba(120, 166, 255, 0.4);
+  background: rgba(120, 166, 255, 0.08);
+}
+
+.workflow-node-index {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: #15284d;
+  color: #9bbcff;
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.workflow-node-main {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.workflow-node-main strong {
+  font-size: 0.92rem;
+}
+
+.workflow-node-main strong,
+.workflow-node-main small,
+.workflow-node-card em {
+  min-width: 0;
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-node-main small,
+.workflow-node-card em {
+  color: #8a8a93;
+  font-style: normal;
+}
+
+.workflow-details-panel,
+.prompt-editor {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  min-height: 620px;
+  border: 1px solid #303034;
+  border-radius: 14px;
+  padding: 14px;
+  background: #101013;
+}
+
+.workflow-editor-section {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 14px;
+  min-height: 590px;
+}
+
+.workflow-template-section {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.workflow-details-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.workflow-details-heading strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #f3f3f1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-stage-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.workflow-stage-facts.compact {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.workflow-stage-facts div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid #242428;
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.workflow-stage-facts dt {
+  color: #8a8a93;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.workflow-stage-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: #f3f3f1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.advanced-config-details {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #303034;
+  border-radius: 14px;
+  padding: 10px;
+  background: #101013;
+}
+
+.advanced-config-details summary {
+  cursor: pointer;
+  width: fit-content;
+  border: 1px solid #303034;
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: #c9c9d1;
+  font-weight: 800;
+}
+
+.advanced-config-details textarea {
+  width: 100%;
+  min-height: 180px;
+  margin-top: 8px;
+}
+
+.prompt-studio-grid {
+  display: grid;
+  grid-template-columns: minmax(170px, 210px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.agent-side-list {
+  display: grid;
+  gap: 5px;
+  align-content: start;
+}
+
+.agent-side-item {
+  display: grid;
+  gap: 2px;
+  justify-items: start;
+  min-height: 44px;
+  border-color: transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: #f3f3f1;
+  text-align: left;
+}
+
+.agent-side-item.active {
+  border-color: #78a6ff;
+  background: #102345;
+}
+
+.agent-side-item.runner-missing {
+  border-color: rgba(255, 185, 70, 0.65);
+  background: rgba(255, 185, 70, 0.08);
+}
+
+.agent-side-item small {
+  min-width: 0;
+  overflow: hidden;
+  color: #8a8a93;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-prompt-section-grid {
+  display: grid;
+  gap: 10px;
+}
+
 .workflow-stage-flow {
   display: grid;
   gap: 8px;
@@ -2380,47 +2685,177 @@ kbd {
 }
 
 .workflow-markdown-editor textarea,
+.workflow-contract-editor textarea,
 .agent-profile-editor textarea,
-.runtime-policy-editor textarea {
+.runtime-policy-editor textarea,
+.prompt-editor textarea {
   min-height: 120px;
 }
 
-.agent-profile-layout {
-  display: grid;
-  grid-template-columns: minmax(220px, 0.42fr) minmax(360px, 1fr);
+.workflow-contract-editor {
   gap: 14px;
+}
+
+.workflow-contract-editor .workflow-template-field {
+  grid-template-columns: 112px minmax(0, 1fr);
+}
+
+.workflow-template-help {
+  margin: -6px 0 0;
+  color: #8a8a93;
+}
+
+.workflow-policy-editor {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.workflow-rule-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 0.45fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.workflow-rule-summary div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid #303034;
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: #0d0d0f;
+}
+
+.workflow-rule-summary span {
+  color: #8a8a93;
+  font-size: 0.76rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.workflow-rule-summary strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #f3f3f1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-rule-summary small {
+  min-width: 0;
+  color: #8a8a93;
+}
+
+.workflow-default-rule-note {
+  user-select: none;
+}
+
+.workflow-policy-heading {
+  display: grid;
+  gap: 2px;
+}
+
+.workflow-policy-heading span {
+  color: #8a8a93;
+  font-size: 0.76rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.workflow-policy-heading small {
+  color: #8a8a93;
+}
+
+.workflow-policy-list {
+  display: grid;
+  gap: 8px;
+  max-height: 340px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.workflow-policy-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.28fr) minmax(0, 1fr);
+  gap: 8px;
   align-items: start;
 }
 
-.agent-roster {
-  display: grid;
-  gap: 8px;
-}
-
-.agent-roster button {
-  display: grid;
-  gap: 4px;
-  justify-items: start;
-  min-height: 54px;
-  border-radius: 12px;
-  border-color: #303034;
+.workflow-policy-row input,
+.workflow-policy-row textarea {
+  min-width: 0;
+  border: 1px solid #303034;
+  border-radius: 10px;
   background: #101013;
   color: #f3f3f1;
 }
 
-.agent-roster button.active {
-  border-color: #78a6ff;
-  background: #102345;
+.workflow-policy-row input {
+  min-height: 40px;
+  padding: 8px 10px;
+  font-weight: 800;
 }
 
-.agent-roster button.runner-missing {
-  border-color: rgba(255, 185, 70, 0.65);
-  background: rgba(255, 185, 70, 0.08);
+.workflow-policy-row textarea {
+  min-height: 66px;
+  padding: 8px 10px;
+  resize: vertical;
 }
 
-.agent-roster button span {
+.control-form .workflow-policy-single {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.workflow-policy-single > span {
   color: #8a8a93;
-  font-size: 0.82rem;
+  font-size: 0.76rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.workflow-policy-single textarea {
+  grid-column: 1;
+  min-height: 430px;
+  border-radius: 12px;
+  padding: 12px 14px;
+  resize: vertical;
+}
+
+.workflow-context-note {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #303034;
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: #0d0d0f;
+}
+
+.workflow-context-note strong {
+  color: #f3f3f1;
+}
+
+.workflow-context-note span {
+  color: #8a8a93;
+}
+
+.workflow-contract-textarea {
+  min-height: 440px;
+  height: 100%;
+  border-radius: 12px;
+  padding: 12px 14px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  line-height: 1.55;
+}
+
+.agent-profile-layout {
+  display: grid;
+  grid-template-columns: minmax(170px, 210px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
 }
 
 .runner-availability {
@@ -2444,9 +2879,11 @@ kbd {
 }
 
 .agent-profile-editor {
+  display: grid;
+  gap: 14px;
   border: 1px solid #303034;
   border-radius: 14px;
-  padding: 12px;
+  padding: 14px;
   background: #101013;
 }
 
@@ -2455,6 +2892,87 @@ kbd {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.prompt-workspace {
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.prompt-field-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.control-form .prompt-field,
+.control-form .agent-setting-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 6px;
+}
+
+.prompt-field span,
+.agent-setting-field span {
+  color: #f3f3f1;
+  font-weight: 800;
+}
+
+.prompt-field small {
+  color: #8a8a93;
+}
+
+.prompt-field textarea {
+  min-height: 132px;
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.agent-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 260px);
+  justify-content: start;
+  align-items: start;
+  column-gap: 34px;
+  row-gap: 12px;
+}
+
+.agent-setting-field select {
+  width: 100%;
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
+  border-radius: 12px;
+  padding: 0 38px 0 12px;
+  font-size: 0.96rem;
+  line-height: 44px;
+}
+
+.agent-picker-section {
+  display: grid;
+  gap: 8px;
+}
+
+.chip-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip-picker button {
+  min-height: 34px;
+  border: 1px solid #303034;
+  border-radius: 999px;
+  padding: 6px 12px;
+  background: #0d0d0f;
+  color: #c9c9d1;
+  font-weight: 800;
+}
+
+.chip-picker button.active {
+  border-color: #78a6ff;
+  background: #102345;
+  color: #9bbcff;
 }
 
 .runtime-config-layout {
@@ -2473,6 +2991,96 @@ kbd {
   border-radius: 14px;
   padding: 12px;
   background: #101013;
+}
+
+.runner-account-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 12px;
+  border: 1px solid #303034;
+  border-radius: 14px;
+  padding: 14px;
+  background: #101013;
+}
+
+.runner-account-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runner-account-heading div {
+  display: grid;
+  gap: 2px;
+}
+
+.runner-account-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 360px));
+  gap: 12px;
+  align-items: end;
+}
+
+.runner-account-grid label {
+  display: grid;
+  gap: 6px;
+}
+
+.runner-account-grid label > span:first-child {
+  color: #f3f3f1;
+  font-weight: 800;
+}
+
+.runner-account-grid input,
+.runner-account-grid select {
+  width: 100%;
+  min-height: 44px;
+  border-radius: 12px;
+}
+
+.secret-input-shell {
+  position: relative;
+  display: block;
+}
+
+.secret-input-shell input {
+  padding-right: 48px;
+}
+
+.secret-toggle-button {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  transform: translateY(-50%);
+  border-radius: 10px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+}
+
+.secret-toggle-button svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.runner-account-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.runner-account-actions small {
+  color: #8a8a93;
 }
 
 .agent-config-editor {
@@ -2559,6 +3167,10 @@ kbd {
 
 .settings-surface .operator-grid {
   gap: 20px;
+}
+
+.settings-surface .agent-config-map {
+  min-height: auto;
 }
 
 .settings-surface .control-card {
@@ -5905,6 +6517,10 @@ summary small {
 
   .agent-config-summary-grid,
   .workflow-builder,
+  .workflow-studio-grid,
+  .workflow-graph,
+  .workflow-rule-summary,
+  .prompt-studio-grid,
   .agent-profile-layout,
   .runtime-config-layout {
     grid-template-columns: 1fr;
@@ -6053,6 +6669,10 @@ summary small {
 
   .project-flow-strip {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .project-create-form {
+    grid-template-columns: 1fr;
   }
 
   .repository-workspace-grid,
@@ -6414,6 +7034,20 @@ kbd,
   color: #315783;
 }
 
+.product-shell.theme-light .project-create-form {
+  border-color: #dbe7f6;
+}
+
+.product-shell.theme-light .project-create-form label {
+  color: #667085;
+}
+
+.product-shell.theme-light .project-create-form input {
+  border-color: #d7e3f2;
+  background: #fff;
+  color: #172033;
+}
+
 .product-shell.theme-light .target-chip-list span {
   border-color: #cfe0f6;
   background: #f7fbff;
@@ -6584,6 +7218,13 @@ kbd,
   color: #667085;
 }
 
+.product-shell.theme-light .studio-hero h3,
+.product-shell.theme-light .workflow-details-heading strong,
+.product-shell.theme-light .workflow-rule-summary strong,
+.product-shell.theme-light .workflow-stage-facts dd {
+  color: #172033;
+}
+
 .product-shell.theme-light .metric-strip strong,
 .product-shell.theme-light .control-card h2,
 .product-shell.theme-light .template-list strong,
@@ -6599,10 +7240,18 @@ kbd,
 
 .product-shell.theme-light .control-form input,
 .product-shell.theme-light .control-form select,
-.product-shell.theme-light .control-form textarea {
+.product-shell.theme-light .control-form textarea,
+.product-shell.theme-light .workflow-policy-row input,
+.product-shell.theme-light .workflow-policy-row textarea {
   border-color: #d7e3f2;
   background: #ffffff;
   color: #172033;
+}
+
+.product-shell.theme-light .workflow-policy-heading span,
+.product-shell.theme-light .workflow-policy-heading small,
+.product-shell.theme-light .workflow-template-help {
+  color: #667085;
 }
 
 .product-shell.theme-light .template-list div,
@@ -6616,7 +7265,15 @@ kbd,
 .product-shell.theme-light .agent-config-chip-row span,
 .product-shell.theme-light .agent-config-summary-grid span,
 .product-shell.theme-light .workflow-stage-card,
+.product-shell.theme-light .studio-status-strip span,
+.product-shell.theme-light .workflow-details-panel,
+.product-shell.theme-light .workflow-rule-summary div,
+.product-shell.theme-light .workflow-stage-facts div,
+.product-shell.theme-light .advanced-config-details,
+.product-shell.theme-light .workflow-context-note,
+.product-shell.theme-light .prompt-editor,
 .product-shell.theme-light .agent-profile-editor,
+.product-shell.theme-light .runner-account-panel,
 .product-shell.theme-light .runtime-policy-editor {
   border-color: #dfe8f5;
   background: #f8fbff;
@@ -6627,7 +7284,12 @@ kbd,
 .product-shell.theme-light .agent-config-chip-row strong,
 .product-shell.theme-light .agent-config-map-entry strong,
 .product-shell.theme-light .workflow-stage-card strong,
-.product-shell.theme-light .agent-roster button strong {
+.product-shell.theme-light .studio-status-strip strong,
+.product-shell.theme-light .workflow-node-main strong,
+.product-shell.theme-light .agent-side-item strong,
+.product-shell.theme-light .prompt-field span,
+.product-shell.theme-light .agent-setting-field span,
+.product-shell.theme-light .runner-account-grid label > span:first-child {
   color: #172033;
 }
 
@@ -6636,8 +7298,22 @@ kbd,
 .product-shell.theme-light .agent-config-map-entry small,
 .product-shell.theme-light .workflow-stage-card small,
 .product-shell.theme-light .workflow-stage-card em,
-.product-shell.theme-light .agent-roster button span {
+.product-shell.theme-light .studio-status-strip small,
+.product-shell.theme-light .workflow-node-main small,
+.product-shell.theme-light .workflow-node-card em,
+.product-shell.theme-light .workflow-rule-summary span,
+.product-shell.theme-light .workflow-rule-summary small,
+.product-shell.theme-light .workflow-stage-facts dt,
+.product-shell.theme-light .workflow-policy-single > span,
+.product-shell.theme-light .workflow-context-note span,
+.product-shell.theme-light .agent-side-item small,
+.product-shell.theme-light .prompt-field small,
+.product-shell.theme-light .runner-account-actions small {
   color: #667085;
+}
+
+.product-shell.theme-light .workflow-context-note strong {
+  color: #172033;
 }
 
 .product-shell.theme-light .agent-config-map-entry {
@@ -6654,21 +7330,45 @@ kbd,
 
 .product-shell.theme-light .agent-config-tabs button,
 .product-shell.theme-light .runtime-file-tabs button,
-.product-shell.theme-light .agent-roster button {
+.product-shell.theme-light .workflow-node-card,
+.product-shell.theme-light .agent-side-item,
+.product-shell.theme-light .chip-picker button,
+.product-shell.theme-light .advanced-config-details summary,
+.product-shell.theme-light .agent-setting-field select,
+.product-shell.theme-light .runner-account-grid input,
+.product-shell.theme-light .runner-account-grid select,
+.product-shell.theme-light .secret-toggle-button {
   border-color: #d7e3f2;
   background: #ffffff;
   color: #516077;
 }
 
+.product-shell.theme-light .workflow-graph {
+  border-right-color: #dfe8f5;
+}
+
+.product-shell.theme-light .workflow-node-card {
+  border-color: transparent;
+  background: transparent;
+}
+
 .product-shell.theme-light .agent-config-tabs button.active,
 .product-shell.theme-light .runtime-file-tabs button.active,
-.product-shell.theme-light .agent-roster button.active {
+.product-shell.theme-light .workflow-node-card.active,
+.product-shell.theme-light .agent-side-item.active,
+.product-shell.theme-light .chip-picker button.active {
   border-color: #9bbcff;
   background: #edf5ff;
   color: #155eef;
 }
 
-.product-shell.theme-light .agent-roster button.runner-missing {
+.product-shell.theme-light .workflow-node-card:hover:not(:disabled),
+.product-shell.theme-light .workflow-node-card:focus-visible {
+  border-color: #c7dcff;
+  background: #f3f7ff;
+}
+
+.product-shell.theme-light .agent-side-item.runner-missing {
   border-color: #ffd08a;
   background: #fff8ed;
 }
@@ -6686,6 +7386,11 @@ kbd,
 }
 
 .product-shell.theme-light .workflow-stage-card span {
+  background: #eaf2ff;
+  color: #155eef;
+}
+
+.product-shell.theme-light .workflow-node-index {
   background: #eaf2ff;
   color: #155eef;
 }
@@ -9575,4 +10280,148 @@ kbd,
 .product-shell.theme-dark ~ .page-pilot-overlay .page-pilot-button-help span {
   background: #18243a;
   color: #b8c7df;
+}
+
+.observability-dashboard {
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface);
+}
+
+.observability-dashboard-header,
+.observability-controls,
+.observability-panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.observability-controls label {
+  display: grid;
+  gap: 4px;
+  min-width: 120px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.observability-controls select,
+.observability-controls button {
+  min-height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-strong);
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+}
+
+.observability-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.observability-panel {
+  min-height: 190px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface-soft);
+}
+
+.observability-panel.ready {
+  border-color: rgba(52, 199, 123, 0.35);
+  background: rgba(52, 199, 123, 0.08);
+}
+
+.observability-panel.danger {
+  border-color: rgba(235, 87, 87, 0.35);
+  background: rgba(235, 87, 87, 0.07);
+}
+
+.observability-panel > header span,
+.observability-panel small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.observability-panel > header strong {
+  color: var(--text);
+  font-size: 1.35rem;
+}
+
+.observability-bars,
+.observability-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.observability-bars article,
+.observability-list article {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.observability-bars article > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.observability-bars meter {
+  width: 100%;
+  height: 8px;
+}
+
+.observability-list strong {
+  color: var(--text);
+}
+
+.observability-list span,
+.observability-panel p {
+  color: var(--muted);
+}
+
+.observability-trend {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  min-height: 86px;
+  margin-top: 18px;
+}
+
+.observability-trend span {
+  display: flex;
+  align-items: end;
+  width: 18px;
+  height: 64px;
+  border-radius: 999px;
+  background: rgba(47, 108, 246, 0.12);
+}
+
+.observability-trend i {
+  width: 100%;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #2f6cf6, #46c995);
+}
+
+@media (max-width: 980px) {
+  .observability-dashboard-header,
+  .observability-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .observability-grid {
+    grid-template-columns: 1fr;
+  }
 }

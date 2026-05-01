@@ -28,6 +28,7 @@ var sqliteMigrations = []struct {
 	{Version: "20260428_001", Name: "page_pilot_runs_first_class_table"},
 	{Version: "20260429_001", Name: "runtime_logs_append_only_table"},
 	{Version: "20260501_001", Name: "runtime_logs_query_extensions"},
+	{Version: "20260502_001", Name: "workflow_templates_first_class_table"},
 }
 
 func NewSQLiteRepository(path string) *SQLiteRepository {
@@ -82,6 +83,20 @@ CREATE TABLE IF NOT EXISTS run_workpads (
 );
 CREATE INDEX IF NOT EXISTS idx_run_workpads_attempt ON run_workpads(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_run_workpads_work_item ON run_workpads(work_item_id, updated_at);
+CREATE TABLE IF NOT EXISTS workflow_templates (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  repository_target_id TEXT,
+  template_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  markdown TEXT NOT NULL,
+  validation_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_templates_scope ON workflow_templates(project_id, scope, COALESCE(repository_target_id, ''), template_id);
 CREATE TABLE IF NOT EXISTS agent_profiles (
   id TEXT PRIMARY KEY,
   scope TEXT NOT NULL,
@@ -214,6 +229,7 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 		"DELETE FROM operations;",
 		"DELETE FROM missions;",
 		"DELETE FROM run_workpads;",
+		"DELETE FROM workflow_templates;",
 		fmt.Sprintf("INSERT INTO workspace_snapshots (id, database_json, saved_at) VALUES ('default', %s, %s);", sqlQuote(string(raw)), sqlQuote(database.SavedAt)),
 	}
 
@@ -299,6 +315,12 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 		sqlText = append(sqlText, fmt.Sprintf("INSERT OR REPLACE INTO run_workpads VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);",
 			q(workpad, "id"), q(workpad, "attemptId"), q(workpad, "pipelineId"), q(workpad, "workItemId"), nullableQ(workpad["repositoryTargetId"]),
 			q(workpad, "status"), jsonQ(workpad["workpad"]), q(workpad, "createdAt"), q(workpad, "updatedAt")))
+	}
+	for _, workflowTemplate := range database.Tables.WorkflowTemplates {
+		sqlText = append(sqlText, fmt.Sprintf("INSERT OR REPLACE INTO workflow_templates VALUES (%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%s);",
+			q(workflowTemplate, "id"), q(workflowTemplate, "scope"), q(workflowTemplate, "projectId"), nullableQ(workflowTemplate["repositoryTargetId"]),
+			q(workflowTemplate, "templateId"), q(workflowTemplate, "source"), intValue(workflowTemplate["version"]), q(workflowTemplate, "markdown"),
+			jsonQ(workflowTemplate["validation"]), q(workflowTemplate, "createdAt"), q(workflowTemplate, "updatedAt")))
 	}
 	sqlText = append(sqlText, "COMMIT;")
 	return repo.exec(ctx, strings.Join(sqlText, "\n"))
@@ -884,6 +906,9 @@ func ensureTables(database *WorkspaceDatabase) {
 	}
 	if database.Tables.RunWorkpads == nil {
 		database.Tables.RunWorkpads = []map[string]any{}
+	}
+	if database.Tables.WorkflowTemplates == nil {
+		database.Tables.WorkflowTemplates = []map[string]any{}
 	}
 }
 

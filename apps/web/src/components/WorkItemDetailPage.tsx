@@ -4,6 +4,7 @@ import { retryReasonForAttempt } from "../attemptRetryReason";
 import type { RepositoryTarget, WorkItem, WorkItemStatus } from "../core";
 import type {
   AttemptRecordInfo,
+  AttemptActionPlanInfo,
   AttemptTimelineInfo,
   CheckpointRecordInfo,
   GitHubPullRequestStatusResult,
@@ -124,6 +125,7 @@ type DetailHelpers = {
 
 export interface WorkItemDetailPageProps extends DetailHelpers {
   attemptTimeline?: AttemptTimelineInfo | null;
+  attemptActionPlan?: AttemptActionPlanInfo | null;
   attempts: AttemptRecordInfo[];
   checkpoints: CheckpointRecordInfo[];
   operations: OperationRecordInfo[];
@@ -147,6 +149,7 @@ export function WorkItemDetailPage({
   agentShortLabel,
   attemptStatusLabel,
   attemptTimeline,
+  attemptActionPlan,
   attempts,
   checkpoints,
   operationStatusLabel,
@@ -278,12 +281,13 @@ export function WorkItemDetailPage({
         <section className="issue-detail-section detail-flow-priority">
           <h3>Delivery flow</h3>
           <DeliveryFlowGrid
+            actionPlan={attemptActionPlan}
             agentShortLabel={agentShortLabel}
             pipeline={pipeline}
             pipelineStageClassName={pipelineStageClassName}
             pipelineStageLabel={pipelineStageLabel}
           />
-          <ReworkReturnSignal attempt={attempt} pipeline={pipeline} runWorkpad={runWorkpad} />
+          <ReworkReturnSignal actionPlan={attemptActionPlan} attempt={attempt} pipeline={pipeline} runWorkpad={runWorkpad} />
         </section>
 
         <RunWorkpad onPatch={onPatchRunWorkpad} record={runWorkpad} sections={workpadSections} />
@@ -314,6 +318,7 @@ export function WorkItemDetailPage({
           <h3>Current attempt</h3>
           <WorkItemAttemptPanel
             agentShortLabel={agentShortLabel}
+            actionPlan={attemptActionPlan}
             attempt={attempt}
             attemptStatusLabel={attemptStatusLabel}
             checkpoint={checkpoint}
@@ -600,29 +605,35 @@ function linesFromDraft(value: string): string[] {
 }
 
 function DeliveryFlowGrid({
+  actionPlan,
   agentShortLabel,
   pipeline,
   pipelineStageClassName,
   pipelineStageLabel
 }: Pick<DetailHelpers, "agentShortLabel" | "pipelineStageClassName" | "pipelineStageLabel"> & {
+  actionPlan?: AttemptActionPlanInfo | null;
   pipeline?: PipelineRecordInfo;
 }) {
-  const stages = pipeline?.run?.stages ?? [];
+  const planStates = actionPlan?.states?.length ? actionPlan.states : [];
+  const stages = planStates.length ? planStates : pipeline?.run?.stages ?? [];
   if (!stages.length) {
     return <p className="muted-copy">Delivery stages will appear after a pipeline is created.</p>;
   }
   return (
     <div className="detail-stage-grid">
       {stages.map((stage, index) => {
-        const agentIds = stage.agentIds ?? (stage.agentId ? [stage.agentId] : []);
+        const stageRecord = stage as Record<string, unknown>;
+        const agent = recordString(stageRecord, "agent") || recordString(stageRecord, "agentId");
+        const agentIds = Array.isArray(stageRecord.agentIds) ? stageRecord.agentIds.map(String) : agent ? [agent] : [];
+        const status = recordString(stageRecord, "status");
         return (
-          <article key={stage.id} className={pipelineStageClassName(stage.status)}>
+          <article key={recordString(stageRecord, "id") || String(index)} className={pipelineStageClassName(status)}>
             <span>{index + 1}</span>
             <div>
-              <strong>{stage.title ?? stage.id}</strong>
+              <strong>{recordString(stageRecord, "title") || recordString(stageRecord, "id")}</strong>
               <small>{agentIds.length ? agentIds.map(agentShortLabel).join(" + ") : "Agent pending"}</small>
             </div>
-            <em>{pipelineStageLabel(stage.status)}</em>
+            <em>{pipelineStageLabel(status)}</em>
           </article>
         );
       })}
@@ -631,27 +642,34 @@ function DeliveryFlowGrid({
 }
 
 function ReworkReturnSignal({
+  actionPlan,
   attempt,
   pipeline,
   runWorkpad
 }: {
+  actionPlan?: AttemptActionPlanInfo | null;
   attempt?: AttemptRecordInfo;
   pipeline?: PipelineRecordInfo;
   runWorkpad?: RunWorkpadRecordInfo;
 }) {
-  const stages = pipeline?.run?.stages ?? attempt?.stages ?? [];
-  const hasReworkStage = stages.some((stage) => /rework/i.test(`${stage.id} ${stage.title ?? ""}`));
+  const stages = actionPlan?.states?.length ? actionPlan.states : pipeline?.run?.stages ?? attempt?.stages ?? [];
+  const hasReworkStage = stages.some((stage) => {
+    const stageRecord = stage as Record<string, unknown>;
+    return /rework/i.test(`${recordString(stageRecord, "id")} ${recordString(stageRecord, "title")}`);
+  });
   const rejectedEvent = pipeline?.run?.events?.find((event) => /rejected|changes requested|request changes/i.test(`${event.type ?? ""} ${event.message ?? ""}`));
   const assessment = recordValue(runWorkpad?.workpad?.reworkAssessment) || recordValue(attempt?.reworkAssessment);
   const checklist = recordValue(runWorkpad?.workpad?.reworkChecklist) || recordValue(attempt?.reworkChecklist);
+  const retry = recordValue(actionPlan?.retry);
   const checklistItems = asStringArray(checklist?.checklist);
-  if (!hasReworkStage && !rejectedEvent && !assessment && !checklistItems.length && !attempt?.humanChangeRequest) {
+  if (!hasReworkStage && !rejectedEvent && !assessment && !checklistItems.length && !attempt?.humanChangeRequest && !recordString(retry, "reason")) {
     return null;
   }
   const route = recordString(assessment, "strategy") || (hasReworkStage ? "rework" : "waiting");
   const reason =
     recordString(assessment, "rationale") ||
     recordString(checklist, "retryReason") ||
+    recordString(retry, "reason") ||
     attempt?.humanChangeRequest ||
     rejectedEvent?.message ||
     "Human or review feedback will be routed into rework before returning to review.";

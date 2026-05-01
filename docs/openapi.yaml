@@ -479,6 +479,62 @@ paths:
       responses:
         '200':
           description: Workflow templates returned
+  /workflow-templates/validate:
+    post:
+      summary: Validate workflow template markdown
+      description: Parses workflow markdown and returns validation errors without saving.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                templateId:
+                  type: string
+                workflowMarkdown:
+                  type: string
+      responses:
+        '200':
+          description: Validation result returned
+  /workflow-templates/{templateId}:
+    put:
+      summary: Save workflow template override
+      description: Saves a Project or Repository Workspace scoped workflow template record after validation.
+      parameters:
+        - name: templateId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workflow template saved
+  /workflow-templates/{templateId}/restore-default:
+    post:
+      summary: Restore default workflow template
+      description: Removes the matching Project or Repository Workspace scoped override and returns the default template.
+      parameters:
+        - name: templateId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workflow template restored
   /pipelines/from-template:
     post:
       summary: Create a pipeline from a work item and template
@@ -514,6 +570,48 @@ paths:
       responses:
         '200':
           description: Provider selection persisted
+  /runner-credentials:
+    get:
+      summary: List local runner account credentials
+      description: >
+        Returns runner account metadata for opencode and Trae Agent. API keys are never
+        returned; callers only receive `secretConfigured` and an optional masked marker.
+      responses:
+        '200':
+          description: Runner credential metadata returned
+    put:
+      summary: Save local runner account credential
+      description: >
+        Stores provider/model/base URL metadata and encrypts the submitted API key before
+        writing it to local SQLite. The local runtime decrypts the key only when launching
+        the matching runner process and injects it as environment variables.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: string
+                runner:
+                  type: string
+                  enum: [opencode, trae-agent]
+                provider:
+                  type: string
+                label:
+                  type: string
+                model:
+                  type: string
+                baseUrl:
+                  type: string
+                apiKey:
+                  type: string
+                secret:
+                  type: string
+      responses:
+        '200':
+          description: Runner credential metadata returned
   /agent-definitions:
     get:
       summary: List stage agent definitions and IO contracts
@@ -551,7 +649,7 @@ paths:
   /local-capabilities:
     get:
       summary: Inspect locally available execution tools
-      description: Reports whether local commands such as codex, opencode, claude, git, gh, and lark-cli are installed and runnable.
+      description: Reports whether local commands such as codex, opencode, trae-cli, claude, git, gh, and lark-cli are installed and runnable.
       responses:
         '200':
           description: Local capability list returned
@@ -825,6 +923,9 @@ paths:
                     - local-proof
                     - demo-code
                     - codex
+                    - opencode
+                    - trae-agent
+                    - claude-code
       responses:
         '200':
           description: Runner result returned
@@ -851,6 +952,9 @@ paths:
                     - local-proof
                     - demo-code
                     - codex
+                    - opencode
+                    - trae-agent
+                    - claude-code
       responses:
         '200':
           description: Runner result returned
@@ -949,6 +1053,9 @@ paths:
                     - local-proof
                     - demo-code
                     - codex
+                    - opencode
+                    - trae-agent
+                    - claude-code
       responses:
         '200':
           description: Pipeline and operation result returned
@@ -1252,8 +1359,8 @@ paths:
           description: lark-cli missing or failed
   /feishu/review-request:
     post:
-      summary: Send a Feishu Human Review card for a checkpoint
-      description: Builds a review card from checkpoint, work item, requirement, attempt, Run Workpad, and Review Packet. Sends through Feishu robot webhook when configured, otherwise uses lark-cli interactive card when chatId is provided.
+      summary: 为 checkpoint 发送飞书 Human Review 请求
+      description: 从 checkpoint、work item、requirement、attempt、Run Workpad 和 Review Packet 生成审核包。配置 webhook 时发送飞书机器人卡片；传入 chatId 时使用 lark-cli 发送卡片；mode 为 task 时创建飞书审核任务。
       requestBody:
         required: true
         content:
@@ -1267,15 +1374,73 @@ paths:
                   type: string
                 chatId:
                   type: string
+                mode:
+                  type: string
+                  enum: [card, task, task-bridge]
+                assigneeId:
+                  type: string
+                tasklistId:
+                  type: string
+                followerId:
+                  type: string
+                due:
+                  type: string
       responses:
         '200':
-          description: Review notification sent and recorded on the checkpoint
+          description: 审核通知或任务已发送，并记录到 checkpoint
         '202':
-          description: Feishu configuration is missing; card/doc preview was recorded for manual setup
+          description: 飞书配置缺失；已记录 card/doc preview 供人工配置
         '404':
-          description: Checkpoint not found
+          description: Checkpoint 不存在
         '503':
-          description: Feishu send failed
+          description: 飞书发送失败
+  /feishu/review-task/sync:
+    post:
+      summary: 将飞书 Task 审核状态同步回 checkpoint
+      description: 使用 lark-cli 读取已绑定的飞书任务。任务完成后，Omega 会执行与本地 Human Review UI 相同的 approved checkpoint 决策。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                checkpointId:
+                  type: string
+                  description: 可选 checkpoint id。缺省时扫描 pending 的飞书 Task 审核 checkpoint。
+      responses:
+        '200':
+          description: Task 审核同步完成
+        '404':
+          description: Checkpoint 或本地数据库不存在
+  /feishu/review-task/comment:
+    post:
+      summary: 将飞书 Task 审核评论写入 checkpoint
+      description: 接收本地桥转发的任务评论。明确修改意见会变成 request-changes；问题类评论会记录为 need-info，不直接拒绝 checkpoint。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                checkpointId:
+                  type: string
+                taskGuid:
+                  type: string
+                taskId:
+                  type: string
+                comment:
+                  type: string
+                reviewer:
+                  type: string
+                eventId:
+                  type: string
+      responses:
+        '200':
+          description: 评论已分类并写入或执行决策
+        '404':
+          description: 绑定的 checkpoint 不存在
   /feishu/review-callback:
     post:
       summary: Apply a Feishu Human Review decision to a checkpoint

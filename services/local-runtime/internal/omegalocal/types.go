@@ -24,6 +24,7 @@ type WorkspaceTables struct {
 	Operations           []map[string]any `json:"operations"`
 	ProofRecords         []map[string]any `json:"proofRecords"`
 	RunWorkpads          []map[string]any `json:"runWorkpads"`
+	WorkflowTemplates    []map[string]any `json:"workflowTemplates"`
 }
 
 type RuntimeLogRecord struct {

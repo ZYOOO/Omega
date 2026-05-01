@@ -78,6 +78,8 @@ Current UI shape:
 - `/#workboard` opens the real functional Workboard.
 - The Home page is implemented in `apps/web/src/components/PortalHome.tsx`.
 - Workboard keeps the existing execution features but now uses the same light blue / white visual system as the portal: repository workspace, GitHub Issues, Work item groups, runner status, and right-side rail are visually aligned.
+- Workspace Config contains a workspace-level Agent Studio for shared workflow orchestration, prompt policy, Agent runner/model selection, Skills/MCP bindings, and runtime file preview.
+- Workspace Agent Studio 的 runner 编排保留 Codex、opencode、Claude Code 和 Trae Agent，其中 Codex 是默认优先 runner。页面内账号 / Key 配置只面向 opencode 和 Trae Agent；Codex / Claude Code 按本机已登录 CLI 处理。opencode / Trae Agent 的 API Key 会本地加密落库，运行时只在启动子进程前解密并注入环境变量，不进入命令参数或 API 回包。
 
 ### 3.2 What the system does
 
@@ -163,7 +165,7 @@ Omega 的本地执行层必须遵守这些硬边界：
 - 每个 operation / DevFlow cycle 创建独立 workspace。
 - workspace 必须由配置的 `local_workspace_root` 派生，并经过 root 内路径校验，禁止通过 issue key、stage id 或自由文本逃逸到 root 外。
 - 每个 workspace 写入 `.omega/job.json`、`.omega/prompt.md` 和 `.omega/agent-runtime.json`，记录 runner、agent、operation、repo target、workspace root、workspace path 和 sandbox policy。
-- 默认 sandbox policy 是 `workspace-write`：Codex / opencode / Claude Code 等本地 Agent 只能在当前 operation workspace 内写入。
+- 默认 sandbox policy 是 `workspace-write`：Codex、opencode、Claude Code、Trae Agent 等本地 runner 都只能在当前 operation workspace 内写入。
 - 每个 Agent runner 独立进程执行，stdout/stderr/proof/exit status 要回写到 operation；后续需要补 timeout、cancel、retry、queue 和 execution lock。
 - Agent 启动不能只靠全局默认 prompt，必须消费当前 issue/work item、workspace、repo target、stage artifact 和 runner prompt。
 
@@ -299,7 +301,7 @@ These are the main gaps after the v0Beta audit:
 6. Workboard 数据已持久化，但 projects/missions/operations/checkpoints/proof 还没有全部从 snapshot-first 演进到 repository-first relational model。
 7. Product Layer 仍让前端承担部分业务 reducer 逻辑，服务端还没有成为 Mission Control 的唯一写入者。
 8. 当前 Workboard 仍是轻量 issue list，还不是完整的项目、视图、队列、operator workflow 系统。
-9. Feishu 已有文本通知、Human Review 卡片和 callback 到 checkpoint 状态迁移；后续仍需补飞书文档正式发布、飞书群聊 requirement 入口和 delivery summary 卡片。
+9. Feishu 已有文本通知、Human Review 卡片、callback 到 checkpoint 状态迁移，以及无公网 Task 审核桥；后续仍需补常驻本地事件桥、飞书群聊 requirement 入口和 delivery summary 卡片。
 10. Proof 虽然有文件和记录，但缺少 artifact 类型、diff/test/check/review 等结构化 proof 解析。
 11. Page Pilot 已有 direct pilot MVP，但 Preview Runtime Profile、source mapping 覆盖率、服务端多轮对话记录、视觉 proof 和目标 repo/worktree 配置仍需产品化。
 12. Shared sync 未实现，本地与远端/GitHub/Feishu 状态还不能双向 reconciled。

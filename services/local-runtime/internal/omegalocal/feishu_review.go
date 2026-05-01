@@ -20,12 +20,24 @@ func (server *Server) feishuReviewRequest(response http.ResponseWriter, request 
 	var payload struct {
 		CheckpointID string `json:"checkpointId"`
 		ChatID       string `json:"chatId"`
+		Mode         string `json:"mode"`
+		AssigneeID   string `json:"assigneeId"`
+		TasklistID   string `json:"tasklistId"`
+		FollowerID   string `json:"followerId"`
+		Due          string `json:"due"`
 	}
 	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
-	result, status, err := server.sendFeishuReviewForCheckpoint(request.Context(), payload.CheckpointID, payload.ChatID, true)
+	result, status, err := server.sendFeishuReviewForCheckpointWithOptions(request.Context(), payload.CheckpointID, feishuReviewSendOptions{
+		ChatID:     payload.ChatID,
+		Mode:       payload.Mode,
+		AssigneeID: payload.AssigneeID,
+		TasklistID: payload.TasklistID,
+		FollowerID: payload.FollowerID,
+		Due:        payload.Due,
+	}, true)
 	if err != nil {
 		writeJSON(response, status, map[string]any{"error": err.Error(), "result": result})
 		return
@@ -97,7 +109,8 @@ func (server *Server) sendFeishuReviewForPipelineIfConfigured(ctx context.Contex
 	if webhook == "" {
 		webhook = strings.TrimSpace(os.Getenv("FEISHU_BOT_WEBHOOK"))
 	}
-	if chatID == "" && webhook == "" {
+	taskOptions := feishuReviewSendOptions{ChatID: chatID}
+	if chatID == "" && webhook == "" && !feishuReviewTaskModeEnabled(taskOptions) {
 		server.logDebug(ctx, "feishu.review.skipped", "Feishu review notification skipped because no chat or webhook is configured.", map[string]any{"pipelineId": pipelineID})
 		return
 	}
@@ -108,13 +121,26 @@ func (server *Server) sendFeishuReviewForPipelineIfConfigured(ctx context.Contex
 	}
 	for _, checkpoint := range database.Tables.Checkpoints {
 		if text(checkpoint, "pipelineId") == pipelineID && text(checkpoint, "status") == "pending" && text(checkpoint, "stageId") == "human_review" {
-			_, _, _ = server.sendFeishuReviewForCheckpoint(ctx, text(checkpoint, "id"), chatID, false)
+			_, _, _ = server.sendFeishuReviewForCheckpointWithOptions(ctx, text(checkpoint, "id"), taskOptions, false)
 			return
 		}
 	}
 }
 
 func (server *Server) sendFeishuReviewForCheckpoint(ctx context.Context, checkpointID string, chatID string, manual bool) (map[string]any, int, error) {
+	return server.sendFeishuReviewForCheckpointWithOptions(ctx, checkpointID, feishuReviewSendOptions{ChatID: chatID}, manual)
+}
+
+type feishuReviewSendOptions struct {
+	ChatID     string
+	Mode       string
+	AssigneeID string
+	TasklistID string
+	FollowerID string
+	Due        string
+}
+
+func (server *Server) sendFeishuReviewForCheckpointWithOptions(ctx context.Context, checkpointID string, options feishuReviewSendOptions, manual bool) (map[string]any, int, error) {
 	checkpointID = strings.TrimSpace(checkpointID)
 	if checkpointID == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("checkpointId is required")
@@ -138,7 +164,7 @@ func (server *Server) sendFeishuReviewForCheckpoint(ctx context.Context, checkpo
 		attempt = cloneMap(database.Tables.Attempts[attemptIndex])
 	}
 	packet := feishuReviewPacketFromRecords(database, checkpoint, pipeline, item, attempt)
-	result, err := sendFeishuReviewPacket(ctx, packet, strings.TrimSpace(chatID))
+	result, err := sendFeishuReviewPacket(ctx, packet, options)
 	if err != nil {
 		server.logError(ctx, "feishu.review.send_failed", err.Error(), map[string]any{"checkpointId": checkpointID, "pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id")})
 		if manual {
@@ -194,12 +220,19 @@ func feishuReviewPacketFromRecords(database WorkspaceDatabase, checkpoint map[st
 	}
 }
 
-func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, chatID string) (map[string]any, error) {
+func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
 	card := buildFeishuReviewCard(packet)
 	docMarkdown := buildFeishuReviewDocMarkdown(packet)
 	webhook := strings.TrimSpace(os.Getenv("OMEGA_FEISHU_WEBHOOK_URL"))
 	if webhook == "" {
 		webhook = strings.TrimSpace(os.Getenv("FEISHU_BOT_WEBHOOK"))
+	}
+	if feishuReviewTaskModeEnabled(options) {
+		result, err := sendFeishuReviewTask(ctx, packet, options)
+		if result != nil {
+			result["docPreview"] = truncateForProof(docMarkdown, 1200)
+		}
+		return result, err
 	}
 	if webhook != "" {
 		result, err := sendFeishuWebhookInteractiveCard(ctx, webhook, card)
@@ -207,6 +240,7 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, chatID s
 		result["docPreview"] = truncateForProof(docMarkdown, 1200)
 		return result, err
 	}
+	chatID := strings.TrimSpace(options.ChatID)
 	if chatID != "" {
 		result, cardErr := sendFeishuInteractiveCard(ctx, chatID, card)
 		if result != nil {
@@ -227,7 +261,7 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, chatID s
 	return map[string]any{
 		"status":       "needs-configuration",
 		"provider":     "feishu",
-		"reason":       "Set OMEGA_FEISHU_WEBHOOK_URL or OMEGA_FEISHU_REVIEW_CHAT_ID with lark-cli installed.",
+		"reason":       "Set OMEGA_FEISHU_WEBHOOK_URL, OMEGA_FEISHU_REVIEW_CHAT_ID, or task review options with lark-cli installed.",
 		"cardPreview":  card,
 		"docPreview":   truncateForProof(docMarkdown, 2000),
 		"checkpointId": text(mapValue(packet["checkpoint"]), "id"),

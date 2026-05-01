@@ -33,6 +33,7 @@ func detectLocalCapabilities(ctx context.Context) []LocalCapability {
 		{ID: "gh", Command: "gh", Category: "github", Description: "GitHub auth, issue import, pull request creation, and repository metadata.", Required: false, VersionArgs: []string{"--version"}},
 		{ID: "codex", Command: "codex", Category: "ai-runner", Description: "OpenAI Codex local coding agent runner.", Required: false, VersionArgs: []string{"--version"}},
 		{ID: "opencode", Command: "opencode", Category: "ai-runner", Description: "OpenCode local coding agent runner.", Required: false, VersionArgs: []string{"--version"}},
+		{ID: "trae-agent", Command: "trae-cli", Category: "ai-runner", Description: "ByteDance Trae Agent local coding runner.", Required: false, VersionArgs: []string{"--version"}},
 		{ID: "claude-code", Command: "claude", Category: "ai-runner", Description: "Claude Code local coding agent runner.", Required: false, VersionArgs: []string{"--version"}},
 		{ID: "lark-cli", Command: "lark-cli", Category: "feishu", Description: "Feishu/Lark notification, review prompt, and collaboration CLI.", Required: false, VersionArgs: []string{"--version"}},
 	}
