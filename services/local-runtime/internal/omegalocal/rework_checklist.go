@@ -17,9 +17,19 @@ func buildReworkChecklist(database WorkspaceDatabase, pipeline map[string]any, a
 			"label":   label,
 			"message": truncateForProof(message, 1800),
 		}
-		for _, key := range []string{"url", "createdAt", "state", "runId"} {
-			if value := strings.TrimSpace(stringOr(metadata[key], "")); value != "" {
-				source[key] = value
+		for _, key := range []string{"url", "sourceUrl", "createdAt", "state", "runId", "path", "line", "originalLine", "diffHunk", "logMode"} {
+			if metadata == nil {
+				continue
+			}
+			if value, exists := metadata[key]; exists && value != nil {
+				if textValue := strings.TrimSpace(stringOr(value, "")); textValue != "" {
+					source[key] = textValue
+				}
+			}
+		}
+		if metadata != nil {
+			if value, exists := metadata["resolved"]; exists {
+				source["resolved"] = boolValue(value)
 			}
 		}
 		sources = append(sources, source)
@@ -66,13 +76,15 @@ func buildReworkChecklist(database WorkspaceDatabase, pipeline map[string]any, a
 		addSourceRecord(stringOr(text(feedback, "kind"), "ci-check-log"), text(feedback, "label"), text(feedback, "message"), feedback)
 	}
 
-	checklist := checklistItemsFromSources(sources)
+	checklistGroups := checklistGroupsFromSources(sources)
+	checklist := checklistItemsFromGroups(checklistGroups)
 	reason := reworkChecklistReason(attempt, sources)
 	if len(checklist) == 0 && reason == "" {
 		return map[string]any{
 			"status":    "clear",
 			"sources":   []map[string]any{},
 			"checklist": []string{},
+			"groups":    []map[string]any{},
 			"createdAt": nowISO(),
 		}
 	}
@@ -80,6 +92,7 @@ func buildReworkChecklist(database WorkspaceDatabase, pipeline map[string]any, a
 		"status":      "needs-rework",
 		"retryReason": reason,
 		"checklist":   checklist,
+		"groups":      checklistGroups,
 		"sources":     sources,
 		"prompt":      reworkChecklistPrompt(reason, checklist, sources),
 		"createdAt":   nowISO(),
@@ -129,28 +142,114 @@ func reworkChecklistRecommendedActions(attempt map[string]any) []map[string]any 
 }
 
 func checklistItemsFromSources(sources []map[string]any) []string {
-	items := []string{}
+	return checklistItemsFromGroups(checklistGroupsFromSources(sources))
+}
+
+func checklistGroupsFromSources(sources []map[string]any) []map[string]any {
+	groups := []map[string]any{}
+	indexByKey := map[string]int{}
 	for _, source := range sources {
-		kind := text(source, "kind")
-		message := text(source, "message")
-		switch kind {
-		case "human":
-			items = append(items, "按人工反馈完成修改："+message)
-		case "review":
-			items = append(items, "处理 Review Agent 指出的阻塞问题："+message)
-		case "pr-review", "pr-comment", "pr-feedback":
-			items = append(items, "处理 PR 评审/评论反馈："+message)
-		case "ci-check-log":
-			items = append(items, "根据 CI/check 失败日志修复并重新验证："+message)
-		case "delivery-gate":
-			items = append(items, deliveryGateChecklistItem(source))
-		case "operation", "event":
-			items = append(items, "复核运行记录并补齐对应修复："+message)
-		default:
-			items = append(items, "解决导致本次执行不能继续的问题："+message)
+		item := checklistItemFromSource(source)
+		if item == "" {
+			continue
 		}
+		key := checklistGroupKey(source, item)
+		if index, exists := indexByKey[key]; exists {
+			group := groups[index]
+			group["count"] = intValue(group["count"]) + 1
+			group["sources"] = append(arrayMaps(group["sources"]), source)
+			group["kinds"] = compactStringList(append(stringSlice(group["kinds"]), text(source, "kind")))
+			groups[index] = group
+			continue
+		}
+		indexByKey[key] = len(groups)
+		groups = append(groups, map[string]any{
+			"key":     key,
+			"item":    item,
+			"count":   1,
+			"kinds":   []string{text(source, "kind")},
+			"sources": []map[string]any{source},
+		})
+	}
+	return groups
+}
+
+func checklistItemsFromGroups(groups []map[string]any) []string {
+	items := []string{}
+	for _, group := range groups {
+		item := text(group, "item")
+		if count := intValue(group["count"]); count > 1 {
+			item = fmt.Sprintf("%s（%d 条相关信号）", item, count)
+		}
+		items = append(items, item)
 	}
 	return compactStringList(items)
+}
+
+func checklistItemFromSource(source map[string]any) string {
+	kind := text(source, "kind")
+	message := text(source, "message")
+	switch kind {
+	case "human":
+		return "按人工反馈完成修改：" + message
+	case "review":
+		return "处理 Review Agent 指出的阻塞问题：" + message
+	case "pr-review", "pr-comment", "pr-feedback":
+		return "处理 PR 评审/评论反馈：" + message
+	case "pr-review-thread":
+		if text(source, "state") == "resolved" || boolValue(source["resolved"]) {
+			return ""
+		}
+		return "处理未解决 PR review thread" + sourceLineSuffix(source) + "：" + message
+	case "ci-check-log":
+		return "根据 CI/check 失败日志修复并重新验证：" + message
+	case "delivery-gate":
+		return deliveryGateChecklistItem(source)
+	case "operation", "event":
+		return "复核运行记录并补齐对应修复：" + message
+	default:
+		return "解决导致本次执行不能继续的问题：" + message
+	}
+}
+
+func checklistGroupKey(source map[string]any, item string) string {
+	if path := text(source, "path"); path != "" {
+		return strings.Join([]string{path, text(source, "line"), normalizedChecklistText(item)}, ":")
+	}
+	if runID := text(source, "runId"); runID != "" {
+		return strings.Join([]string{"check", runID}, ":")
+	}
+	return normalizedChecklistText(item)
+}
+
+func normalizedChecklistText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastSpace := false
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char > 127 {
+			builder.WriteRune(char)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			builder.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func sourceLineSuffix(source map[string]any) string {
+	path := text(source, "path")
+	line := text(source, "line")
+	if path == "" {
+		return ""
+	}
+	if line == "" {
+		return "（" + path + "）"
+	}
+	return "（" + path + ":" + line + "）"
 }
 
 func deliveryGateChecklistItem(source map[string]any) string {

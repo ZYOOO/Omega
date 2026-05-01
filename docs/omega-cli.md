@@ -76,9 +76,11 @@ npm run omega -- status
 npm run omega -- logs
 npm run omega -- logs --level ERROR --limit 50
 npm run omega -- logs --event-type job_supervisor.tick.completed
+npm run omega -- logs --requirement req_item_manual_21 --search approve --page
+npm run omega -- logs --cursor <nextCursor> --page
 ```
 
-调用 `GET /runtime-logs`。默认展示表格；全局 `--json` 可输出原始 JSON：
+调用 `GET /runtime-logs`。默认展示表格；`--requirement` 会按 Requirement 维度反查 Work Item / Pipeline / Attempt 关联日志，`--search` 做全文搜索，`--page` 返回 cursor 分页并显示 `nextCursor`。全局 `--json` 可输出原始 JSON：
 
 ```bash
 npm run omega -- --json logs --level ERROR

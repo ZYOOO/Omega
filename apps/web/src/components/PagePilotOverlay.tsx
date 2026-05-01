@@ -5,6 +5,7 @@ type PagePilotOverlayProps = {
   projectId?: string;
   repositoryTargetId?: string;
   repositoryLabel?: string;
+  externalSelection?: PagePilotSelectionContext | null;
   targetDocument?: Document | null;
   targetFrameElement?: HTMLElement | null;
   targetUnavailableMessage?: string;
@@ -98,6 +99,7 @@ export function PagePilotOverlay({
   projectId,
   repositoryTargetId,
   repositoryLabel,
+  externalSelection,
   targetDocument,
   targetFrameElement,
   targetUnavailableMessage,
@@ -116,6 +118,14 @@ export function PagePilotOverlay({
   const [applyResult, setApplyResult] = useState<PagePilotApplyResult | null>(null);
   const [deliverResult, setDeliverResult] = useState<PagePilotDeliverResult | null>(null);
   const [runs, setRuns] = useState<PagePilotRunInfo[]>([]);
+
+  useEffect(() => {
+    if (!externalSelection) return;
+    setSelection(externalSelection);
+    setSelecting(false);
+    setOpen(true);
+    setStatus("Element captured from the Electron preview. Add an instruction and apply it.");
+  }, [externalSelection]);
 
   useEffect(() => {
     if (!selecting) {

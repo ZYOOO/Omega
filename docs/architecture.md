@@ -318,6 +318,8 @@ POST /github/import-issues
 POST /github/create-pr
 POST /github/pr-status
 POST /feishu/notify
+POST /feishu/review-request
+POST /feishu/review-callback
 ```
 
 OpenAPI 文档位于：
@@ -356,6 +358,6 @@ OpenAPI 文档位于：
 - Agent runner registry 已接入 Codex / opencode / Claude Code 的统一分发骨架；仍需补 runner-specific 模板、timeout/cancel/retry 和 provider 映射。
 - JobSupervisor：继续补 GitHub polling、Git/GitHub command timeout、远端 worker 分配和远端崩溃恢复。
 - 更完整的 checkpoint timeline。
-- GitHub issue comment / label 回写。
-- Feishu 审核卡片与回调。
+- GitHub issue comment / label 回写已落地 DevFlow 关键节点，后续继续扩展到更多 connector 和双向同步控制面。
+- Feishu 审核卡片与回调已完成 Human Review 主链路，后续继续扩展飞书文档正式发布和 pipeline delivery summary 卡片。
 - Shared sync control plane。

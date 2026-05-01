@@ -248,8 +248,10 @@ paths:
       description: >
         Returns structured runtime log records from the local SQLite log stream. Supports
         filters for level, eventType, entityType/entityId, projectId, repositoryTargetId,
-        workItemId, pipelineId, attemptId, stageId, agentId, requestId, createdAfter,
-        createdBefore, and limit.
+        requirementId, workItemId, pipelineId, attemptId, stageId, agentId, requestId,
+        createdAfter, createdBefore, full-text q/search, and limit. By default this
+        remains backward compatible and returns an array. Use page=1 or cursor to return
+        a cursor page object.
       parameters:
         - in: query
           name: level
@@ -274,6 +276,10 @@ paths:
             type: string
         - in: query
           name: repositoryTargetId
+          schema:
+            type: string
+        - in: query
+          name: requirementId
           schema:
             type: string
         - in: query
@@ -311,6 +317,20 @@ paths:
             type: string
             format: date-time
         - in: query
+          name: q
+          schema:
+            type: string
+          description: Full-text search across event type, message, level and details JSON.
+        - in: query
+          name: cursor
+          schema:
+            type: string
+        - in: query
+          name: page
+          schema:
+            type: string
+            enum: ["1"]
+        - in: query
           name: limit
           schema:
             type: integer
@@ -319,6 +339,33 @@ paths:
       responses:
         '200':
           description: Runtime log records returned
+  /runtime-logs/export:
+    get:
+      summary: Export runtime logs
+      description: Exports the same filtered runtime log query as JSONL or CSV.
+      parameters:
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [jsonl, csv]
+            default: jsonl
+        - in: query
+          name: requirementId
+          schema:
+            type: string
+        - in: query
+          name: q
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 5000
+      responses:
+        '200':
+          description: Runtime logs exported
   /migrations:
     get:
       summary: List applied local database migrations
@@ -625,7 +672,9 @@ paths:
       description: >
         Preserves the original counts/status/attention summary and adds dashboard data
         for attempt success rate, failure reasons, slow stages, active runs, pending
-        human review queue, and recommended operator actions.
+        human review queue, stage average duration, runner usage, checkpoint wait time,
+        pull request created/merged/open counts, daily trends, and recommended operator
+        actions.
       responses:
         '200':
           description: Observability summary and dashboard data returned
@@ -1201,3 +1250,65 @@ paths:
           description: Notification sent
         '503':
           description: lark-cli missing or failed
+  /feishu/review-request:
+    post:
+      summary: Send a Feishu Human Review card for a checkpoint
+      description: Builds a review card from checkpoint, work item, requirement, attempt, Run Workpad, and Review Packet. Sends through Feishu robot webhook when configured, otherwise uses lark-cli interactive card when chatId is provided.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - checkpointId
+              properties:
+                checkpointId:
+                  type: string
+                chatId:
+                  type: string
+      responses:
+        '200':
+          description: Review notification sent and recorded on the checkpoint
+        '202':
+          description: Feishu configuration is missing; card/doc preview was recorded for manual setup
+        '404':
+          description: Checkpoint not found
+        '503':
+          description: Feishu send failed
+  /feishu/review-callback:
+    post:
+      summary: Apply a Feishu Human Review decision to a checkpoint
+      description: Applies approve or request-changes through the same checkpoint decision path used by Omega Web.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - checkpointId
+                - action
+              properties:
+                checkpointId:
+                  type: string
+                action:
+                  type: string
+                  enum: [approve, request_changes]
+                reviewer:
+                  type: string
+                reason:
+                  type: string
+                token:
+                  type: string
+                asyncDelivery:
+                  type: boolean
+      responses:
+        '200':
+          description: Checkpoint decision applied
+        '400':
+          description: Unsupported action or missing checkpoint id
+        '401':
+          description: Invalid callback token
+        '404':
+          description: Checkpoint not found

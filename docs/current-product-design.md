@@ -255,6 +255,7 @@ The orchestrator only treats a GitHub issue as executable when it carries an exp
 - `GET /operations`
 - `GET /proof-records`
 - `GET /runtime-logs`
+- `GET /runtime-logs/export`
 - `GET /observability`
 - `POST /job-supervisor/tick`
 - `POST /orchestrator/tick`
@@ -294,11 +295,11 @@ These are the main gaps after the v0Beta audit:
 2. LLM Provider 已有 registry 和运行时选择，但 provider selection 尚未完整映射到每一种 runner 的真实模型调用；这是赛题 Must-have 的验收风险。
 3. Agent 协作已有基础：`master` dispatch、stage contracts、`agentIds`、artifact handoff、handoff bundle 已落地；但并行协商、自动修复重试的完整 rework policy 仍未完成。
 4. Pipeline 编排已有生命周期、dataFlow、execution lock、异步 Attempt job、Run Timeline、JobSupervisor v1、runner heartbeat stream、retry、contract-driven timeout、workspace cleanup、worker host lease 和 continuation policy metadata 基础版；远端 worker 分配、远端崩溃恢复和 GitHub polling 仍需增强。
-5. GitHub 工程闭环已有 OAuth、repo info、issue import、branch/commit/PR/checks/branch sync/conflict/merge proof；但 issue 状态回写、CI proof 深度解析和 PR lifecycle UI 仍不完整。
+5. GitHub 工程闭环已有 OAuth、repo info、issue import、branch/commit/PR/checks/branch sync/conflict/merge proof；issue 状态回写已覆盖 DevFlow 关键节点，CI proof 深度解析和 PR lifecycle UI 仍需继续增强。
 6. Workboard 数据已持久化，但 projects/missions/operations/checkpoints/proof 还没有全部从 snapshot-first 演进到 repository-first relational model。
 7. Product Layer 仍让前端承担部分业务 reducer 逻辑，服务端还没有成为 Mission Control 的唯一写入者。
 8. 当前 Workboard 仍是轻量 issue list，还不是完整的项目、视图、队列、operator workflow 系统。
-9. Feishu 目前有 lark-cli 文本通知基础，但还没有真实 approval card callback 和工具调用链。
+9. Feishu 已有文本通知、Human Review 卡片和 callback 到 checkpoint 状态迁移；后续仍需补飞书文档正式发布、飞书群聊 requirement 入口和 delivery summary 卡片。
 10. Proof 虽然有文件和记录，但缺少 artifact 类型、diff/test/check/review 等结构化 proof 解析。
 11. Page Pilot 已有 direct pilot MVP，但 Preview Runtime Profile、source mapping 覆盖率、服务端多轮对话记录、视觉 proof 和目标 repo/worktree 配置仍需产品化。
 12. Shared sync 未实现，本地与远端/GitHub/Feishu 状态还不能双向 reconciled。

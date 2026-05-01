@@ -32,6 +32,8 @@ type Server struct {
 	watcherCancel  context.CancelFunc
 	jobMu          sync.Mutex
 	attemptCancels map[string]context.CancelFunc
+	previewMu      sync.Mutex
+	previewRuntime map[string]*previewRuntimeSession
 }
 
 type GitHubOAuthConfig struct {
@@ -54,6 +56,7 @@ func NewServer(databasePath, workspaceRoot, openAPIPath string) *Server {
 		},
 		HTTPClient:     http.DefaultClient,
 		attemptCancels: map[string]context.CancelFunc{},
+		previewRuntime: map[string]*previewRuntimeSession{},
 	}
 }
 
@@ -107,6 +110,8 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.listTable(response, request, "pipelines")
 	case request.Method == http.MethodGet && path == "/attempts":
 		server.listTable(response, request, "attempts")
+	case request.Method == http.MethodGet && strings.HasPrefix(path, "/attempts/") && strings.HasSuffix(path, "/action-plan"):
+		server.attemptActionPlan(response, request)
 	case request.Method == http.MethodGet && strings.HasPrefix(path, "/attempts/") && strings.HasSuffix(path, "/timeline"):
 		server.attemptTimeline(response, request)
 	case request.Method == http.MethodPost && strings.HasPrefix(path, "/attempts/") && strings.HasSuffix(path, "/retry"):
@@ -157,6 +162,8 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.observability(response, request)
 	case request.Method == http.MethodGet && path == "/runtime-logs":
 		server.runtimeLogs(response, request)
+	case request.Method == http.MethodGet && path == "/runtime-logs/export":
+		server.runtimeLogsExport(response, request)
 	case request.Method == http.MethodGet && path == "/local-capabilities":
 		server.localCapabilities(response, request)
 	case request.Method == http.MethodGet && path == "/local-workspace-root":
@@ -171,6 +178,12 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.listPagePilotRuns(response, request)
 	case request.Method == http.MethodPost && strings.HasPrefix(path, "/page-pilot/runs/") && strings.HasSuffix(path, "/discard"):
 		server.discardPagePilotRun(response, request)
+	case request.Method == http.MethodPost && path == "/page-pilot/preview-runtime/resolve":
+		server.pagePilotPreviewRuntimeResolve(response, request)
+	case request.Method == http.MethodPost && path == "/page-pilot/preview-runtime/start":
+		server.pagePilotPreviewRuntimeStart(response, request)
+	case request.Method == http.MethodPost && path == "/page-pilot/preview-runtime/restart":
+		server.pagePilotPreviewRuntimeRestart(response, request)
 	case request.Method == http.MethodGet && path == "/github/status":
 		server.githubStatus(response, request)
 	case request.Method == http.MethodGet && path == "/github/oauth/config":
@@ -199,6 +212,10 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.githubPRStatus(response, request)
 	case request.Method == http.MethodPost && path == "/feishu/notify":
 		server.feishuNotify(response, request)
+	case request.Method == http.MethodPost && path == "/feishu/review-request":
+		server.feishuReviewRequest(response, request)
+	case request.Method == http.MethodPost && path == "/feishu/review-callback":
+		server.feishuReviewCallback(response, request)
 	case request.Method == http.MethodPost && path == "/requirements/decompose":
 		server.decomposeRequirement(response, request)
 	case request.Method == http.MethodPost && path == "/orchestrator/tick":
@@ -890,22 +907,36 @@ func (server *Server) mutatePipeline(response http.ResponseWriter, request *http
 
 func (server *Server) decideCheckpoint(response http.ResponseWriter, request *http.Request, status string) {
 	checkpointID := pathID(request.URL.Path)
-	server.logInfo(request.Context(), "checkpoint.decision.requested", "Checkpoint decision requested.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
-	database, err := mustLoad(server, request.Context())
-	if err != nil {
-		server.logError(request.Context(), "checkpoint.decision.load_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
-		writeError(response, http.StatusNotFound, err)
-		return
-	}
-	server.reconcileAttemptIntegrityInDatabase(request.Context(), &database)
-	index := findByID(database.Tables.Checkpoints, checkpointID)
-	if index < 0 {
-		server.logError(request.Context(), "checkpoint.decision.not_found", "Checkpoint not found.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
-		writeJSON(response, http.StatusNotFound, map[string]any{"error": "checkpoint not found"})
-		return
-	}
 	var payload map[string]any
 	_ = json.NewDecoder(request.Body).Decode(&payload)
+	checkpoint, httpStatus, err := server.applyCheckpointDecision(request.Context(), checkpointID, status, payload)
+	if err != nil {
+		if httpStatus >= 500 {
+			writeError(response, httpStatus, err)
+		} else {
+			writeJSON(response, httpStatus, map[string]any{"error": err.Error()})
+		}
+		return
+	}
+	writeJSON(response, http.StatusOK, checkpoint)
+}
+
+func (server *Server) applyCheckpointDecision(ctx context.Context, checkpointID string, status string, payload map[string]any) (map[string]any, int, error) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	server.logInfo(ctx, "checkpoint.decision.requested", "Checkpoint decision requested.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+	database, err := mustLoad(server, ctx)
+	if err != nil {
+		server.logError(ctx, "checkpoint.decision.load_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+		return nil, http.StatusNotFound, err
+	}
+	server.reconcileAttemptIntegrityInDatabase(ctx, &database)
+	index := findByID(database.Tables.Checkpoints, checkpointID)
+	if index < 0 {
+		server.logError(ctx, "checkpoint.decision.not_found", "Checkpoint not found.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+		return nil, http.StatusNotFound, fmt.Errorf("checkpoint not found")
+	}
 	checkpoint := cloneMap(database.Tables.Checkpoints[index])
 	checkpoint["status"] = status
 	asyncApprovedDelivery := false
@@ -921,9 +952,8 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 			markApprovedDevFlowDeliveryQueued(&database, checkpoint)
 		} else {
 			if err := server.completeApprovedDevFlowCheckpoint(&database, checkpoint, reviewer); err != nil {
-				server.logError(request.Context(), "checkpoint.approve.failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
-				writeError(response, http.StatusInternalServerError, err)
-				return
+				server.logError(ctx, "checkpoint.approve.failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
+				return nil, http.StatusInternalServerError, err
 			}
 		}
 	} else {
@@ -934,11 +964,11 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 			var pipeline map[string]any
 			var reworkAttempt map[string]any
 			var prepareErr error
-			database, pipeline, reworkAttempt, prepareErr = server.prepareDevFlowHumanRequestedRework(request.Context(), database, checkpoint, reason)
+			database, pipeline, reworkAttempt, prepareErr = server.prepareDevFlowHumanRequestedRework(ctx, database, checkpoint, reason)
 			if prepareErr != nil {
 				checkpoint["reworkStatus"] = "failed"
 				checkpoint["reworkError"] = prepareErr.Error()
-				server.logError(request.Context(), "checkpoint.rework.prepare_failed", prepareErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
+				server.logError(ctx, "checkpoint.rework.prepare_failed", prepareErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
 			} else if text(reworkAttempt, "status") == "waiting-human" {
 				checkpoint["reworkStatus"] = "waiting-human"
 				checkpoint["reworkAttemptId"] = text(reworkAttempt, "id")
@@ -946,7 +976,7 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 			} else {
 				item := findWorkItem(database, text(pipeline, "workItemId"))
 				target := findRepositoryTarget(database, text(item, "repositoryTargetId"))
-				lock, lockErr := claimDevFlowWorkspaceLock(request.Context(), server, item, target, pipeline, reworkAttempt)
+				lock, lockErr := claimDevFlowWorkspaceLock(ctx, server, item, target, pipeline, reworkAttempt)
 				if lockErr != nil {
 					database, _ = failAttemptRecord(database, text(reworkAttempt, "id"), pipeline, lockErr.Error(), map[string]any{
 						"failureStageId":        "todo",
@@ -957,7 +987,7 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 					checkpoint["reworkStatus"] = "failed"
 					checkpoint["reworkAttemptId"] = text(reworkAttempt, "id")
 					checkpoint["reworkError"] = lockErr.Error()
-					server.logError(request.Context(), "checkpoint.rework.lock_failed", lockErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(pipeline, "id"), "attemptId": text(reworkAttempt, "id")})
+					server.logError(ctx, "checkpoint.rework.lock_failed", lockErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(pipeline, "id"), "attemptId": text(reworkAttempt, "id")})
 				} else {
 					reworkLock = lock
 					reworkPipelineID = text(pipeline, "id")
@@ -971,7 +1001,7 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 	checkpoint["updatedAt"] = nowISO()
 	database.Tables.Checkpoints[index] = checkpoint
 	touch(&database)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.Save(ctx, database); err != nil {
 		if reworkLock != nil {
 			nextLock := cloneMap(reworkLock)
 			nextLock["status"] = "released"
@@ -980,11 +1010,10 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 			nextLock["updatedAt"] = nowISO()
 			_ = saveExecutionLock(context.Background(), server, nextLock)
 		}
-		server.logError(request.Context(), "checkpoint.decision.save_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
-		writeError(response, http.StatusInternalServerError, err)
-		return
+		server.logError(ctx, "checkpoint.decision.save_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
+		return nil, http.StatusInternalServerError, err
 	}
-	server.logInfo(request.Context(), "checkpoint.decision.saved", "Checkpoint decision saved.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId"), "status": status})
+	server.logInfo(ctx, "checkpoint.decision.saved", "Checkpoint decision saved.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId"), "status": status})
 	if asyncApprovedDelivery {
 		reviewer := stringOr(payload["reviewer"], "human")
 		server.completeApprovedDevFlowCheckpointInBackground(text(checkpoint, "id"), reviewer)
@@ -992,7 +1021,7 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 	if reworkAttemptID != "" {
 		server.startDevFlowCycleJob(reworkPipelineID, reworkAttemptID, false, false, reworkLock)
 	}
-	writeJSON(response, http.StatusOK, checkpoint)
+	return checkpoint, http.StatusOK, nil
 }
 
 func (server *Server) createMission(response http.ResponseWriter, request *http.Request) {
@@ -2515,6 +2544,7 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 	if err := os.MkdirAll(proofDir, 0o755); err != nil {
 		return err
 	}
+	item := findWorkItem(*database, text(pipeline, "workItemId"))
 
 	humanReviewPath := filepath.Join(proofDir, "human-review.md")
 	if err := os.WriteFile(humanReviewPath, []byte(fmt.Sprintf("# Human Review\n\n- Reviewer: %s\n- Decision: approved\n- Pull request: %s\n- Approved at: %s\n", reviewer, prURL, nowISO())), 0o644); err != nil {
@@ -2522,6 +2552,26 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 	}
 	if err := server.mergeApprovedDevFlowPullRequest(repoWorkspace, prURL, text(attempt, "branchName"), text(pipeline, "id"), text(attempt, "id")); err != nil {
 		server.logError(context.Background(), "github.pr.merge_failed", err.Error(), map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
+		if item != nil {
+			report := server.syncGitHubIssueOutbound(context.Background(), githubOutboundSyncInput{
+				RepositoryPath: repoWorkspace,
+				Repository:     repositoryFromPullRequestURL(prURL),
+				WorkItem:       item,
+				Pipeline:       pipeline,
+				Attempt:        attempt,
+				Event:          "delivery.merge_failed",
+				Status:         "failed",
+				StageID:        "merging",
+				Summary:        "Human review approved, but pull request merge failed.",
+				PullRequestURL: prURL,
+				BranchName:     text(attempt, "branchName"),
+				FailureReason:  "Pull request merge failed after human approval.",
+				FailureDetail:  err.Error(),
+			})
+			if text(report, "state") != "skipped" {
+				_ = writeJSONFile(filepath.Join(proofDir, "github-outbound-sync-merge-failed.json"), report)
+			}
+		}
 		return fmt.Errorf("merge pull request after human approval: %w", err)
 	}
 	server.logInfo(context.Background(), "github.pr.merged", "Pull request merged after human approval.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
@@ -2567,17 +2617,41 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 	pipeline["status"] = "done"
 	pipeline["updatedAt"] = nowISO()
 	database.Tables.Pipelines[pipelineIndex] = pipeline
-	if item := findWorkItem(*database, text(pipeline, "workItemId")); item != nil {
+	if item != nil {
 		*database = updateWorkItem(*database, text(item, "id"), map[string]any{"status": "Done"})
 	}
 
 	proofFiles, _ := collectFiles(proofDir)
+	githubOutboundSync := []map[string]any{}
+	if item != nil {
+		report := server.syncGitHubIssueOutbound(context.Background(), githubOutboundSyncInput{
+			RepositoryPath: repoWorkspace,
+			Repository:     repositoryFromPullRequestURL(prURL),
+			WorkItem:       item,
+			Pipeline:       pipeline,
+			Attempt:        attempt,
+			Event:          "delivery.completed",
+			Status:         "done",
+			StageID:        "done",
+			Summary:        "Pull request merged after human approval.",
+			PullRequestURL: prURL,
+			BranchName:     text(attempt, "branchName"),
+		})
+		if text(report, "state") != "skipped" {
+			githubOutboundSync = append(githubOutboundSync, report)
+			_ = writeJSONFile(filepath.Join(proofDir, "github-outbound-sync-delivery-completed.json"), report)
+			proofFiles, _ = collectFiles(proofDir)
+		}
+	}
 	result := map[string]any{
 		"status":         "done",
 		"workspacePath":  workspace,
 		"branchName":     text(attempt, "branchName"),
 		"pullRequestUrl": prURL,
 		"proofFiles":     proofFiles,
+	}
+	if len(githubOutboundSync) > 0 {
+		result["githubOutboundSync"] = githubOutboundSync
 	}
 	nextDatabase, _ := completeAttemptRecord(*database, text(attempt, "id"), pipeline, result)
 	*database = nextDatabase

@@ -34,6 +34,50 @@ type WorkflowRuntimeProfile struct {
 	RequiredChecks          []string `json:"requiredChecks,omitempty"`
 }
 
+type WorkflowActionProfile struct {
+	ID              string            `json:"id"`
+	Type            string            `json:"type"`
+	Agent           string            `json:"agent,omitempty"`
+	Prompt          string            `json:"prompt,omitempty"`
+	Mode            string            `json:"mode,omitempty"`
+	DiffSource      string            `json:"diffSource,omitempty"`
+	RequiresDiff    bool              `json:"requiresDiff,omitempty"`
+	InputArtifacts  []string          `json:"inputArtifacts,omitempty"`
+	OutputArtifacts []string          `json:"outputArtifacts,omitempty"`
+	Transitions     map[string]string `json:"transitions,omitempty"`
+	Verdicts        map[string]string `json:"verdicts,omitempty"`
+}
+
+type WorkflowStateProfile struct {
+	ID              string                  `json:"id"`
+	Title           string                  `json:"title"`
+	Agent           string                  `json:"agentId,omitempty"`
+	AgentIDs        []string                `json:"agents,omitempty"`
+	HumanGate       bool                    `json:"humanGate,omitempty"`
+	InputArtifacts  []string                `json:"inputArtifacts,omitempty"`
+	OutputArtifacts []string                `json:"outputArtifacts,omitempty"`
+	Actions         []WorkflowActionProfile `json:"actions,omitempty"`
+	Transitions     map[string]string       `json:"transitions,omitempty"`
+}
+
+type WorkflowTaskClassProfile struct {
+	ID              string   `json:"id"`
+	Title           string   `json:"title,omitempty"`
+	WorkpadMode     string   `json:"workpadMode,omitempty"`
+	PlanningMode    string   `json:"planningMode,omitempty"`
+	ValidationMode  string   `json:"validationMode,omitempty"`
+	MaxChangedFiles int      `json:"maxChangedFiles,omitempty"`
+	Signals         []string `json:"signals,omitempty"`
+}
+
+type WorkflowHookProfile struct {
+	AfterCreate    string `json:"afterCreate,omitempty"`
+	BeforeRun      string `json:"beforeRun,omitempty"`
+	AfterRun       string `json:"afterRun,omitempty"`
+	BeforeRemove   string `json:"beforeRemove,omitempty"`
+	TimeoutSeconds int    `json:"timeoutSeconds,omitempty"`
+}
+
 func workflowPipelineTemplates() []PipelineTemplate {
 	templates := []PipelineTemplate{}
 	if template, ok := loadWorkflowPipelineTemplate("devflow-pr"); ok {
@@ -93,6 +137,13 @@ func parseWorkflowTemplateMarkdown(markdown string, sourcePath string) (Pipeline
 	frontMatter, prompt := splitWorkflowFrontMatter(markdown)
 	promptTemplate, promptSections := parseWorkflowPromptSections(prompt)
 	template := PipelineTemplate{Source: sourcePath, PromptTemplate: strings.TrimSpace(promptTemplate), WorkflowMarkdown: markdown, PromptSections: promptSections}
+	template.StateProfiles = parseWorkflowStateProfiles(frontMatter)
+	template.TaskClasses = parseWorkflowTaskClasses(frontMatter)
+	template.Hooks = parseWorkflowHooks(frontMatter)
+	if len(template.StateProfiles) > 0 {
+		template.StageProfiles = stageProfilesFromWorkflowStates(template.StateProfiles)
+		template.Transitions = append(template.Transitions, transitionsFromWorkflowStates(template.StateProfiles)...)
+	}
 	currentSection := ""
 	var currentStage *StageProfile
 	var currentReview *ReviewRoundProfile
@@ -132,6 +183,9 @@ func parseWorkflowTemplateMarkdown(markdown string, sourcePath string) (Pipeline
 		if strings.HasPrefix(trimmed, "- ") {
 			switch currentSection {
 			case "stages":
+				if len(template.StateProfiles) > 0 {
+					continue
+				}
 				flushStage()
 				flushReview()
 				flushTransition()
@@ -152,7 +206,7 @@ func parseWorkflowTemplateMarkdown(markdown string, sourcePath string) (Pipeline
 			}
 			continue
 		}
-		if currentSection == "stages" && currentStage != nil {
+		if currentSection == "stages" && currentStage != nil && len(template.StateProfiles) == 0 {
 			applyWorkflowStageField(currentStage, trimmed)
 			continue
 		}
@@ -186,6 +240,7 @@ func parseWorkflowTemplateMarkdown(markdown string, sourcePath string) (Pipeline
 	flushStage()
 	flushReview()
 	flushTransition()
+	template.Transitions = uniqueWorkflowTransitions(template.Transitions)
 	return template, nil
 }
 
@@ -220,6 +275,54 @@ func validateWorkflowTemplate(template PipelineTemplate) WorkflowValidationResul
 	}
 	if len(stageIDs) == 0 {
 		result.Errors = append(result.Errors, "at least one stage is required")
+	}
+	actionIDs := map[string]bool{}
+	for _, state := range template.StateProfiles {
+		if strings.TrimSpace(state.ID) == "" {
+			result.Errors = append(result.Errors, "workflow state id is required")
+			continue
+		}
+		if !stageIDs[state.ID] {
+			result.Errors = append(result.Errors, "workflow state has no matching stage: "+state.ID)
+		}
+		for event, target := range state.Transitions {
+			if strings.TrimSpace(event) == "" {
+				result.Errors = append(result.Errors, "state "+state.ID+" has a blank transition event")
+			}
+			if !stageIDs[target] {
+				result.Errors = append(result.Errors, "state "+state.ID+" transition points to unknown stage: "+target)
+			}
+		}
+		for _, action := range state.Actions {
+			if strings.TrimSpace(action.ID) == "" {
+				result.Errors = append(result.Errors, "state "+state.ID+" action id is required")
+				continue
+			}
+			actionKey := state.ID + "/" + action.ID
+			if actionIDs[actionKey] {
+				result.Errors = append(result.Errors, "duplicate workflow action id in state "+state.ID+": "+action.ID)
+			}
+			actionIDs[actionKey] = true
+			if strings.TrimSpace(action.Type) == "" {
+				result.Errors = append(result.Errors, "action "+action.ID+" has no type")
+			}
+			for event, target := range action.Transitions {
+				if strings.TrimSpace(event) == "" {
+					result.Errors = append(result.Errors, "action "+action.ID+" has a blank transition event")
+				}
+				if !stageIDs[target] {
+					result.Errors = append(result.Errors, "action "+action.ID+" transition points to unknown stage: "+target)
+				}
+			}
+			for verdict, target := range action.Verdicts {
+				if strings.TrimSpace(verdict) == "" {
+					result.Errors = append(result.Errors, "action "+action.ID+" has a blank verdict")
+				}
+				if !stageIDs[target] {
+					result.Errors = append(result.Errors, "action "+action.ID+" verdict points to unknown stage: "+target)
+				}
+			}
+		}
 	}
 	for _, transition := range template.Transitions {
 		if !stageIDs[transition.From] {
@@ -313,6 +416,270 @@ func parseWorkflowPromptSections(markdown string) (string, map[string]string) {
 	return strings.TrimSpace(strings.Join(clean, "\n")), output
 }
 
+func parseWorkflowStateProfiles(frontMatter string) []WorkflowStateProfile {
+	lines := strings.Split(strings.ReplaceAll(frontMatter, "\r\n", "\n"), "\n")
+	states := []WorkflowStateProfile{}
+	inStates := false
+	var currentState *WorkflowStateProfile
+	var currentAction *WorkflowActionProfile
+	currentMap := ""
+
+	flushAction := func() {
+		if currentState != nil && currentAction != nil && currentAction.ID != "" {
+			currentState.Actions = append(currentState.Actions, *currentAction)
+		}
+		currentAction = nil
+		currentMap = ""
+	}
+	flushState := func() {
+		flushAction()
+		if currentState != nil && currentState.ID != "" {
+			states = append(states, *currentState)
+		}
+		currentState = nil
+	}
+
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := leadingSpaces(raw)
+		if indent == 0 {
+			if trimmed == "states:" {
+				flushState()
+				inStates = true
+				continue
+			}
+			if inStates {
+				flushState()
+			}
+			inStates = false
+			continue
+		}
+		if !inStates {
+			continue
+		}
+		switch {
+		case indent == 2 && strings.HasPrefix(trimmed, "- "):
+			flushState()
+			currentState = &WorkflowStateProfile{}
+			applyWorkflowStateField(currentState, strings.TrimPrefix(trimmed, "- "))
+		case currentState != nil && indent == 4 && trimmed == "actions:":
+			flushAction()
+			currentMap = ""
+		case currentState != nil && indent == 6 && strings.HasPrefix(trimmed, "- "):
+			flushAction()
+			currentAction = &WorkflowActionProfile{}
+			applyWorkflowActionField(currentAction, strings.TrimPrefix(trimmed, "- "))
+		case currentState != nil && currentAction != nil && indent == 8 && (trimmed == "transitions:" || trimmed == "verdicts:"):
+			currentMap = trimmed[:len(trimmed)-1]
+		case currentState != nil && currentAction != nil && indent >= 10 && currentMap != "":
+			applyWorkflowActionMapField(currentAction, currentMap, trimmed)
+		case currentState != nil && currentAction != nil && indent >= 8:
+			currentMap = ""
+			applyWorkflowActionField(currentAction, trimmed)
+		case currentState != nil && indent == 4 && trimmed == "transitions:":
+			currentMap = "state.transitions"
+		case currentState != nil && indent >= 6 && currentMap == "state.transitions":
+			applyWorkflowStateTransitionField(currentState, trimmed)
+		case currentState != nil && indent >= 4:
+			currentMap = ""
+			applyWorkflowStateField(currentState, trimmed)
+		}
+	}
+	flushState()
+	return states
+}
+
+func parseWorkflowTaskClasses(frontMatter string) []WorkflowTaskClassProfile {
+	lines := strings.Split(strings.ReplaceAll(frontMatter, "\r\n", "\n"), "\n")
+	classes := []WorkflowTaskClassProfile{}
+	inClasses := false
+	var current *WorkflowTaskClassProfile
+	flush := func() {
+		if current != nil && current.ID != "" {
+			classes = append(classes, *current)
+		}
+		current = nil
+	}
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := leadingSpaces(raw)
+		if indent == 0 {
+			if trimmed == "taskClasses:" {
+				flush()
+				inClasses = true
+				continue
+			}
+			if inClasses {
+				flush()
+			}
+			inClasses = false
+			continue
+		}
+		if !inClasses {
+			continue
+		}
+		if indent == 2 && strings.HasPrefix(trimmed, "- ") {
+			flush()
+			current = &WorkflowTaskClassProfile{}
+			applyWorkflowTaskClassField(current, strings.TrimPrefix(trimmed, "- "))
+			continue
+		}
+		if current != nil && indent >= 4 {
+			applyWorkflowTaskClassField(current, trimmed)
+		}
+	}
+	flush()
+	return classes
+}
+
+func parseWorkflowHooks(frontMatter string) WorkflowHookProfile {
+	lines := strings.Split(strings.ReplaceAll(frontMatter, "\r\n", "\n"), "\n")
+	hooks := WorkflowHookProfile{}
+	inHooks := false
+	currentBlockKey := ""
+	blockIndent := 0
+	blockLines := []string{}
+	flushBlock := func() {
+		if currentBlockKey == "" {
+			return
+		}
+		value := strings.TrimRight(strings.Join(blockLines, "\n"), "\n")
+		switch currentBlockKey {
+		case "after_create", "afterCreate":
+			hooks.AfterCreate = value
+		case "before_run", "beforeRun":
+			hooks.BeforeRun = value
+		case "after_run", "afterRun":
+			hooks.AfterRun = value
+		case "before_remove", "beforeRemove":
+			hooks.BeforeRemove = value
+		}
+		currentBlockKey = ""
+		blockLines = nil
+	}
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" && currentBlockKey != "" {
+			blockLines = append(blockLines, "")
+			continue
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := leadingSpaces(raw)
+		if currentBlockKey != "" {
+			if indent > blockIndent {
+				blockLines = append(blockLines, trimWorkflowBlockLine(raw, blockIndent+2))
+				continue
+			}
+			flushBlock()
+		}
+		if indent == 0 {
+			if trimmed == "hooks:" {
+				inHooks = true
+				continue
+			}
+			inHooks = false
+			continue
+		}
+		if !inHooks || indent != 2 {
+			continue
+		}
+		key, value, ok := splitWorkflowKeyValue(trimmed)
+		if !ok {
+			continue
+		}
+		if value == "|" {
+			currentBlockKey = key
+			blockIndent = indent
+			blockLines = []string{}
+			continue
+		}
+		applyWorkflowHookField(&hooks, key, value)
+	}
+	flushBlock()
+	return hooks
+}
+
+func stageProfilesFromWorkflowStates(states []WorkflowStateProfile) []StageProfile {
+	stages := make([]StageProfile, 0, len(states))
+	for _, state := range states {
+		stage := StageProfile{
+			ID:              state.ID,
+			Title:           state.Title,
+			Agent:           state.Agent,
+			AgentIDs:        state.AgentIDs,
+			HumanGate:       state.HumanGate,
+			InputArtifacts:  state.InputArtifacts,
+			OutputArtifacts: state.OutputArtifacts,
+		}
+		if stage.Agent == "" && len(stage.AgentIDs) > 0 {
+			stage.Agent = stage.AgentIDs[0]
+		}
+		stages = append(stages, stage)
+	}
+	return stages
+}
+
+func transitionsFromWorkflowStates(states []WorkflowStateProfile) []WorkflowTransitionProfile {
+	transitions := []WorkflowTransitionProfile{}
+	for _, state := range states {
+		for event, to := range state.Transitions {
+			transitions = append(transitions, WorkflowTransitionProfile{From: state.ID, On: event, To: to})
+		}
+		for _, action := range state.Actions {
+			for event, to := range action.Transitions {
+				transitions = append(transitions, WorkflowTransitionProfile{From: state.ID, On: event, To: to})
+			}
+			for event, to := range action.Verdicts {
+				transitions = append(transitions, WorkflowTransitionProfile{From: state.ID, On: event, To: to})
+			}
+		}
+	}
+	return transitions
+}
+
+func workflowActionPlan(template *PipelineTemplate) []map[string]any {
+	if template == nil {
+		return nil
+	}
+	actions := []map[string]any{}
+	for _, state := range template.StateProfiles {
+		for index, action := range state.Actions {
+			actions = append(actions, map[string]any{
+				"id":              action.ID,
+				"type":            action.Type,
+				"stateId":         state.ID,
+				"stateTitle":      state.Title,
+				"order":           index + 1,
+				"agent":           action.Agent,
+				"prompt":          action.Prompt,
+				"mode":            action.Mode,
+				"diffSource":      action.DiffSource,
+				"requiresDiff":    action.RequiresDiff,
+				"inputArtifacts":  action.InputArtifacts,
+				"outputArtifacts": action.OutputArtifacts,
+				"transitions":     action.Transitions,
+				"verdicts":        action.Verdicts,
+			})
+		}
+	}
+	return actions
+}
+
+func workflowExecutionMode(template *PipelineTemplate) string {
+	if template != nil && len(template.StateProfiles) > 0 && len(workflowActionPlan(template)) > 0 {
+		return "contract-action-plan"
+	}
+	return "legacy-stage-plan"
+}
+
 func splitWorkflowFrontMatter(markdown string) (string, string) {
 	normalized := strings.ReplaceAll(markdown, "\r\n", "\n")
 	lines := strings.Split(normalized, "\n")
@@ -347,6 +714,128 @@ func applyWorkflowStageField(stage *StageProfile, line string) {
 		stage.InputArtifacts = parseWorkflowStringList(value)
 	case "outputArtifacts":
 		stage.OutputArtifacts = parseWorkflowStringList(value)
+	}
+}
+
+func applyWorkflowStateField(state *WorkflowStateProfile, line string) {
+	key, value, ok := splitWorkflowKeyValue(line)
+	if !ok {
+		return
+	}
+	switch key {
+	case "id":
+		state.ID = value
+	case "title":
+		state.Title = value
+	case "agentId", "agent":
+		state.Agent = value
+	case "humanGate":
+		state.HumanGate = parseWorkflowBool(value)
+	case "agents":
+		state.AgentIDs = parseWorkflowStringList(value)
+	case "inputArtifacts":
+		state.InputArtifacts = parseWorkflowStringList(value)
+	case "outputArtifacts":
+		state.OutputArtifacts = parseWorkflowStringList(value)
+	}
+}
+
+func applyWorkflowActionField(action *WorkflowActionProfile, line string) {
+	key, value, ok := splitWorkflowKeyValue(line)
+	if !ok {
+		return
+	}
+	switch key {
+	case "id":
+		action.ID = value
+	case "type":
+		action.Type = value
+	case "agent":
+		action.Agent = value
+	case "prompt":
+		action.Prompt = value
+	case "mode":
+		action.Mode = value
+	case "diffSource":
+		action.DiffSource = value
+	case "requiresDiff":
+		action.RequiresDiff = parseWorkflowBool(value)
+	case "inputArtifacts":
+		action.InputArtifacts = parseWorkflowStringList(value)
+	case "outputArtifacts":
+		action.OutputArtifacts = parseWorkflowStringList(value)
+	}
+}
+
+func applyWorkflowActionMapField(action *WorkflowActionProfile, mapName string, line string) {
+	key, value, ok := splitWorkflowKeyValue(line)
+	if !ok || key == "" || value == "" {
+		return
+	}
+	switch mapName {
+	case "transitions":
+		if action.Transitions == nil {
+			action.Transitions = map[string]string{}
+		}
+		action.Transitions[key] = value
+	case "verdicts":
+		if action.Verdicts == nil {
+			action.Verdicts = map[string]string{}
+		}
+		action.Verdicts[key] = value
+	}
+}
+
+func applyWorkflowStateTransitionField(state *WorkflowStateProfile, line string) {
+	key, value, ok := splitWorkflowKeyValue(line)
+	if !ok || key == "" || value == "" {
+		return
+	}
+	if state.Transitions == nil {
+		state.Transitions = map[string]string{}
+	}
+	state.Transitions[key] = value
+}
+
+func applyWorkflowTaskClassField(taskClass *WorkflowTaskClassProfile, line string) {
+	key, value, ok := splitWorkflowKeyValue(line)
+	if !ok {
+		return
+	}
+	switch key {
+	case "id":
+		taskClass.ID = value
+	case "title":
+		taskClass.Title = value
+	case "workpadMode":
+		taskClass.WorkpadMode = value
+	case "planningMode":
+		taskClass.PlanningMode = value
+	case "validationMode":
+		taskClass.ValidationMode = value
+	case "maxChangedFiles":
+		if parsed, err := strconv.Atoi(value); err == nil {
+			taskClass.MaxChangedFiles = parsed
+		}
+	case "signals":
+		taskClass.Signals = parseWorkflowStringList(value)
+	}
+}
+
+func applyWorkflowHookField(hooks *WorkflowHookProfile, key string, value string) {
+	switch key {
+	case "after_create", "afterCreate":
+		hooks.AfterCreate = value
+	case "before_run", "beforeRun":
+		hooks.BeforeRun = value
+	case "after_run", "afterRun":
+		hooks.AfterRun = value
+	case "before_remove", "beforeRemove":
+		hooks.BeforeRemove = value
+	case "timeoutSeconds", "timeout_seconds":
+		if parsed, err := strconv.Atoi(value); err == nil {
+			hooks.TimeoutSeconds = parsed
+		}
 	}
 }
 
@@ -430,7 +919,7 @@ func splitWorkflowKeyValue(line string) (string, string, bool) {
 	if !ok {
 		return "", "", false
 	}
-	return strings.TrimSpace(before), strings.Trim(strings.TrimSpace(after), `"`), true
+	return strings.TrimSpace(before), strings.Trim(strings.Trim(strings.TrimSpace(after), `"`), `'`), true
 }
 
 func parseWorkflowStringList(value string) []string {
@@ -447,6 +936,47 @@ func parseWorkflowStringList(value string) []string {
 		if item != "" {
 			output = append(output, item)
 		}
+	}
+	return output
+}
+
+func parseWorkflowBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "yes", "1":
+		return true
+	default:
+		return false
+	}
+}
+
+func leadingSpaces(value string) int {
+	count := 0
+	for _, char := range value {
+		if char != ' ' {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func trimWorkflowBlockLine(line string, trimIndent int) string {
+	if len(line) <= trimIndent {
+		return strings.TrimLeft(line, " ")
+	}
+	return line[trimIndent:]
+}
+
+func uniqueWorkflowTransitions(transitions []WorkflowTransitionProfile) []WorkflowTransitionProfile {
+	seen := map[string]bool{}
+	output := []WorkflowTransitionProfile{}
+	for _, transition := range transitions {
+		key := transition.From + "\x00" + transition.On + "\x00" + transition.To
+		if transition.From == "" || transition.On == "" || transition.To == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		output = append(output, transition)
 	}
 	return output
 }

@@ -208,9 +208,11 @@ func (server *Server) scanRecoverableAttempts(ctx context.Context, database *Wor
 		"checkedRecoveryAttempts": 0,
 		"retryableAttempts":       0,
 		"acceptedRetryAttempts":   0,
+		"manualRecoveryRequired":  0,
 		"retryBackoff":            0,
 		"retryLimitReached":       0,
 		"retrySkippedActive":      0,
+		"recoveryClassCounts":     map[string]any{},
 		"recoveryFailures":        []map[string]any{},
 		"recoverableAttempts":     []map[string]any{},
 		"acceptedRetryRuns":       []map[string]any{},
@@ -240,6 +242,10 @@ func (server *Server) scanRecoverableAttempts(ctx context.Context, database *Wor
 			summary["retrySkippedActive"] = intValue(summary["retrySkippedActive"]) + 1
 			continue
 		}
+		recoveryPolicy := supervisorRecoveryPolicyForAttempt(attempt)
+		classCounts := mapValue(summary["recoveryClassCounts"])
+		classCounts[recoveryPolicy.Class] = intValue(classCounts[recoveryPolicy.Class]) + 1
+		summary["recoveryClassCounts"] = classCounts
 		retryRootAttemptID := stringOr(text(attempt, "retryRootAttemptId"), text(attempt, "id"))
 		nextIndex := nextRetryIndex(*database, retryRootAttemptID)
 		record := map[string]any{
@@ -252,6 +258,22 @@ func (server *Server) scanRecoverableAttempts(ctx context.Context, database *Wor
 			"reason":              supervisorAttemptFailureReason(attempt),
 			"maxRetryAttempts":    maxRetries,
 			"retryBackoffSeconds": backoffSeconds,
+			"recoveryPolicy":      supervisorRecoveryPolicyMap(recoveryPolicy),
+		}
+		if plan, status := buildAttemptActionPlan(*database, text(attempt, "id")); status == http.StatusOK {
+			record["actionPlan"] = supervisorActionPlanSummary(plan)
+		}
+		if !recoveryPolicy.AutoRetry {
+			summary["manualRecoveryRequired"] = intValue(summary["manualRecoveryRequired"]) + 1
+			summary["recoverableAttempts"] = append(arrayMaps(summary["recoverableAttempts"]), withSupervisorDecision(record, recoveryPolicy.Action))
+			server.logInfo(ctx, "job_supervisor.recovery.manual_action", recoveryPolicy.Label, map[string]any{
+				"attemptId":      text(attempt, "id"),
+				"pipelineId":     pipelineID,
+				"workItemId":     text(attempt, "itemId"),
+				"failureClass":   recoveryPolicy.Class,
+				"recoveryAction": recoveryPolicy.Action,
+			})
+			continue
 		}
 		if nextIndex > maxRetries {
 			summary["retryLimitReached"] = intValue(summary["retryLimitReached"]) + 1
@@ -268,7 +290,7 @@ func (server *Server) scanRecoverableAttempts(ctx context.Context, database *Wor
 		if !options.AutoRetryFailed {
 			continue
 		}
-		reason := fmt.Sprintf("JobSupervisor retry #%d after %s: %s", nextIndex, text(attempt, "status"), stringOr(supervisorAttemptFailureReason(attempt), "recoverable attempt"))
+		reason := fmt.Sprintf("JobSupervisor retry #%d after %s [%s/%s]: %s", nextIndex, text(attempt, "status"), recoveryPolicy.Class, recoveryPolicy.Action, stringOr(supervisorAttemptFailureReason(attempt), "recoverable attempt"))
 		updated, pipeline, retryAttempt, err := server.prepareDevFlowAttemptRetry(ctx, *database, text(attempt, "id"), reason)
 		if err != nil {
 			summary["recoveryFailures"] = append(arrayMaps(summary["recoveryFailures"]), map[string]any{"attemptId": text(attempt, "id"), "error": err.Error()})
@@ -287,9 +309,13 @@ func (server *Server) scanRecoverableAttempts(ctx context.Context, database *Wor
 		summary["changed"] = intValue(summary["changed"]) + 1
 		summary["acceptedRetryAttempts"] = intValue(summary["acceptedRetryAttempts"]) + 1
 		accepted := map[string]any{"workItemId": text(retryAttempt, "itemId"), "pipelineId": text(pipeline, "id"), "attemptId": text(retryAttempt, "id"), "retryOfAttemptId": text(attempt, "id"), "retryIndex": intValue(retryAttempt["retryIndex"]), "lock": lock}
+		accepted["recoveryPolicy"] = supervisorRecoveryPolicyMap(recoveryPolicy)
+		if plan, status := buildAttemptActionPlan(updated, text(retryAttempt, "id")); status == http.StatusOK {
+			accepted["actionPlan"] = supervisorActionPlanSummary(plan)
+		}
 		summary["acceptedRetryRuns"] = append(arrayMaps(summary["acceptedRetryRuns"]), accepted)
 		*jobs = append(*jobs, accepted)
-		server.logInfo(ctx, "job_supervisor.retry.accepted", "Recoverable attempt accepted for retry.", map[string]any{"attemptId": text(retryAttempt, "id"), "retryOfAttemptId": text(attempt, "id"), "pipelineId": text(pipeline, "id"), "workItemId": text(retryAttempt, "itemId"), "retryIndex": intValue(retryAttempt["retryIndex"])})
+		server.logInfo(ctx, "job_supervisor.retry.accepted", "Recoverable attempt accepted for retry.", map[string]any{"attemptId": text(retryAttempt, "id"), "retryOfAttemptId": text(attempt, "id"), "pipelineId": text(pipeline, "id"), "workItemId": text(retryAttempt, "itemId"), "retryIndex": intValue(retryAttempt["retryIndex"]), "failureClass": recoveryPolicy.Class, "recoveryAction": recoveryPolicy.Action})
 	}
 	return summary
 }
@@ -492,6 +518,27 @@ func withSupervisorDecision(record map[string]any, decision string) map[string]a
 	next := cloneMap(record)
 	next["decision"] = decision
 	return next
+}
+
+func supervisorActionPlanSummary(plan map[string]any) map[string]any {
+	currentState := mapValue(plan["currentState"])
+	currentAction := mapValue(plan["currentAction"])
+	retry := mapValue(plan["retry"])
+	return map[string]any{
+		"executionMode":      text(plan, "executionMode"),
+		"currentStateId":     text(currentState, "id"),
+		"currentStateTitle":  text(currentState, "title"),
+		"currentStateStatus": text(currentState, "status"),
+		"currentActionId":    text(currentAction, "id"),
+		"currentActionType":  text(currentAction, "type"),
+		"currentActionAgent": text(currentAction, "agent"),
+		"currentActionState": text(currentAction, "status"),
+		"actionCount":        len(arrayMaps(plan["actions"])),
+		"transitionCount":    len(arrayMaps(plan["transitions"])),
+		"retryAvailable":     boolValue(retry["available"]),
+		"retryAction":        text(retry, "action"),
+		"retryReason":        text(retry, "reason"),
+	}
 }
 
 func retryBackoffElapsed(attempt map[string]any, backoffSeconds int) bool {

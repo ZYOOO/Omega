@@ -2,7 +2,7 @@
 
 日期：2026-04-30
 
-状态：设计评审中，暂不实现。本文只描述方案、边界和迁移顺序，等待确认后再进入开发。
+状态：分阶段落地中。2026-05-01 已完成第一阶段：`states.actions` 契约解析、校验、Pipeline snapshot 持久化，以及 DevFlow 阶段推进优先读取契约 transitions；已完成第二阶段基础版：`GET /attempts/{attemptId}/action-plan` 可从 snapshot 生成当前 state、current action、state actions、可达 transitions 和 retry action。通用 action handler 仍按本文迁移顺序继续推进。
 
 ## 背景
 
@@ -17,12 +17,12 @@ Work Item
   -> review / human gate / merge / proof
 ```
 
-旧做法的优点是闭环清楚、执行可靠，但核心编排仍集中在 DevFlow 专用代码里。`devflow-pr` workflow contract 已经可以定义 stages、review rounds、runtime policy、transitions 和 prompt sections，但这些能力仍是“部分消费”：
+旧做法的优点是闭环清楚、执行可靠，但核心编排仍集中在 DevFlow 专用代码里。`devflow-pr` workflow contract 已经可以定义 stages、states/actions、review rounds、runtime policy、transitions、task classes 和 prompt sections，但这些能力仍在分阶段消费：
 
 - stage / agent / artifact 会进入 Pipeline run。
 - prompt sections 会进入对应 Agent prompt。
 - runtime policy 中的 review cycle、heartbeat、timeout、retry、required checks 已经有消费路径。
-- transitions 目前更多是辅助路由，尚未成为完整状态机。
+- transitions 已经开始参与运行时阶段推进；完整状态机仍在迁移中。
 - coding、commit、push、PR、review、rework、human review、merge 的顺序仍主要由固定 DevFlow 执行函数控制。
 
 目标不是立刻推翻当前闭环，而是把固定 DevFlow 逐步升级为“由 workflow contract 驱动的执行系统”。这样不同 Repository Workspace 可以拥有自己的项目交付规则，Omega runtime 负责解释规则并写入统一的 Attempt / Operation / Proof / Run Workpad。
@@ -50,7 +50,10 @@ Work Item
 - 默认 workflow markdown：`services/local-runtime/workflows/devflow-pr.md`。
 - Repository-owned workflow：目标仓库 `.omega/WORKFLOW.md`。
 - Agent Profile workflow override：Project / Repository scope 的 `workflowMarkdown`。
-- Workflow parser：front matter 中解析 `stages`、`reviewRounds`、`runtime`、`transitions`。
+- Workflow parser：front matter 中解析 `stages`、`states.actions`、`taskClasses`、`hooks`、`reviewRounds`、`runtime`、`transitions`。
+- Pipeline run workflow snapshot：保存 `states`、扁平 `actions`、`taskClasses`、`hooks`、`executionMode`，供 UI、JobSupervisor 和后续通用执行器消费。
+- DevFlow 阶段推进：Agent invocation 后的 next stage 优先读取 snapshot transitions，缺失时才回退旧固定顺序。
+- Attempt Action Plan：`GET /attempts/{attemptId}/action-plan` 根据 Pipeline snapshot 和 Attempt 当前 stage 返回可解释执行计划，包含 current state、current action、state actions、transitions、taskClasses、hooks 和 retry action。
 - Prompt sections：`## Prompt: requirement`、`architect`、`coding`、`testing`、`rework`、`review`、`delivery`。
 - Runner registry：Codex、opencode、Claude Code 基础 runner。
 - Run Workpad：结构化记录 plan、validation、blockers、PR、review feedback、retry reason、rework checklist。
@@ -58,8 +61,8 @@ Work Item
 
 ### 主要缺口
 
-- workflow contract 不能描述可执行 action 序列。
-- transitions 不能完整驱动 stage/state 迁移。
+- workflow contract 已能描述 action 序列，并能生成 Attempt action plan；action handler 还未全部通用化。
+- transitions 已能驱动部分 stage 推进，但 Attempt / Checkpoint / Merge 的完整状态机还在 DevFlow adapter 中。
 - Runtime 对 `devflow-pr` 有较多固定分支，新增流程需要改 Go 代码。
 - `maxContinuationTurns` 没有形成统一的 continuation turn 协议。
 - simple / complex 任务分类只能写进 prompt，不能改变 runtime 的执行重量。
@@ -210,7 +213,7 @@ Repository .omega/WORKFLOW.md
 
 ### 2. Plan
 
-Generic executor 根据当前 state 和 action list 生成 action plan：
+第二阶段基础版先通过只读 API 根据当前 state 和 action list 生成 action plan：
 
 ```text
 Attempt currentState
@@ -220,7 +223,7 @@ Attempt currentState
   -> required checkpoints
 ```
 
-这一步先可以 dry-run，只生成计划和日志，不执行 action。dry-run 是迁移期保护网。
+这一步先 dry-run，只生成计划和日志，不执行 action。dry-run 是迁移期保护网。当前已落地 `GET /attempts/{attemptId}/action-plan`，返回 current state、current action、state actions、可达 transitions、taskClasses、hooks、retry action 和恢复策略。
 
 ### 3. Execute
 
@@ -269,17 +272,21 @@ Continuation 不等于重跑全部流程。建议定义三种继续方式：
 
 ### 阶段 1：Action schema 只解析不执行
 
-- `workflow_template.go` 解析 `states.actions`。
-- `GET /workflow-templates` 返回 actions。
-- Pipeline run workflow snapshot 保存 actions。
-- UI 可以展示 action plan，但不触发新执行器。
+- [x] `workflow_template.go` 解析 `states.actions`、action verdicts / transitions、`taskClasses` 和基础 hooks。
+- [x] `GET /workflow-templates` 返回 states/actions/taskClasses/hooks。
+- [x] Pipeline run workflow snapshot 保存 states、扁平 actions、taskClasses、hooks、executionMode。
+- [x] Workflow validator 校验 action id、action type、state/action transition 目标。
+- [x] DevFlow Agent invocation 阶段推进优先读取 snapshot transitions。
+- [ ] UI 展示 action plan，但不触发新执行器。
 - 现有 DevFlow 仍照旧运行。
 
 ### 阶段 2：Dry-run executor
 
-- 新增 `GenericWorkflowExecutor.Plan()`。
-- 根据当前 pipeline / attempt / state 生成 action plan。
-- JobSupervisor tick 和详情页可展示计划。
+- [x] 新增 Attempt action plan API：`GET /attempts/{attemptId}/action-plan`。
+- [x] 根据当前 pipeline / attempt / state 生成 action plan。
+- [x] failed / stalled / canceled attempt 会生成 retry action、retry reason 和 recovery policy。
+- [x] JobSupervisor recovery summary / accepted retry job 直接附带 action plan 摘要。
+- [ ] Work Item 详情页直接消费 action plan。
 - 不执行 git、runner、PR 命令。
 
 ### 阶段 3：先迁移 review / rework / merging
@@ -442,7 +449,7 @@ Action detail 使用页内弹窗浏览，不在详情页里行内撑开。
 - 给定 state，能生成正确 action plan。
 - human gate state 不会执行 merge。
 - rework state 能继承 branch / PR / workspace。
-- failed action 能生成 retry reason。
+- failed action 能生成 retry reason 和 recovery policy。
 
 ### Runtime 集成测试
 

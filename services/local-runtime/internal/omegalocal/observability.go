@@ -76,13 +76,18 @@ func countBy(records []map[string]any, key string) map[string]int {
 
 func emptyObservabilityDashboard() map[string]any {
 	return map[string]any{
-		"generatedAt":        nowISO(),
-		"attempts":           map[string]any{"total": 0, "terminal": 0, "active": 0, "successRate": 0},
-		"failureReasons":     []map[string]any{},
-		"slowStages":         []map[string]any{},
-		"waitingHumanQueue":  []map[string]any{},
-		"activeRuns":         []map[string]any{},
-		"recommendedActions": []map[string]any{},
+		"generatedAt":           nowISO(),
+		"attempts":              map[string]any{"total": 0, "terminal": 0, "active": 0, "successRate": 0},
+		"failureReasons":        []map[string]any{},
+		"slowStages":            []map[string]any{},
+		"stageAverageDurations": []map[string]any{},
+		"runnerUsage":           []map[string]any{},
+		"checkpointWaitTimes":   map[string]any{"total": 0, "resolved": 0, "pending": 0, "averageWaitSeconds": 0, "maxWaitSeconds": 0, "byStage": []map[string]any{}},
+		"pullRequests":          map[string]any{"created": 0, "merged": 0, "open": 0},
+		"trends":                []map[string]any{},
+		"waitingHumanQueue":     []map[string]any{},
+		"activeRuns":            []map[string]any{},
+		"recommendedActions":    []map[string]any{},
 	}
 }
 
@@ -104,11 +109,16 @@ func observabilityDashboard(database WorkspaceDatabase, pipelineStatus map[strin
 			"successRate": successRate,
 			"status":      attemptStatus,
 		},
-		"failureReasons":     observabilityFailureReasons(database),
-		"slowStages":         observabilitySlowStages(database, 5),
-		"waitingHumanQueue":  observabilityWaitingHumanQueue(database, 10),
-		"activeRuns":         observabilityActiveRuns(database, 10),
-		"recommendedActions": observabilityRecommendedActions(pipelineStatus, checkpointStatus, operationStatus, workItemStatus, attemptStatus),
+		"failureReasons":        observabilityFailureReasons(database),
+		"slowStages":            observabilitySlowStages(database, 5),
+		"stageAverageDurations": observabilityStageAverageDurations(database, 20),
+		"runnerUsage":           observabilityRunnerUsage(database),
+		"checkpointWaitTimes":   observabilityCheckpointWaitTimes(database),
+		"pullRequests":          observabilityPullRequests(database),
+		"trends":                observabilityTrends(database, 14),
+		"waitingHumanQueue":     observabilityWaitingHumanQueue(database, 10),
+		"activeRuns":            observabilityActiveRuns(database, 10),
+		"recommendedActions":    observabilityRecommendedActions(pipelineStatus, checkpointStatus, operationStatus, workItemStatus, attemptStatus),
 	}
 }
 
@@ -211,6 +221,74 @@ func observabilitySlowStages(database WorkspaceDatabase, limit int) []map[string
 	return output
 }
 
+func observabilityStageAverageDurations(database WorkspaceDatabase, limit int) []map[string]any {
+	type bucket struct {
+		stageID       string
+		title         string
+		count         int
+		totalDuration int
+		maxDuration   int
+		latestAt      string
+	}
+	buckets := map[string]*bucket{}
+	for _, attempt := range database.Tables.Attempts {
+		for _, stage := range arrayMaps(attempt["stages"]) {
+			durationMs := stageDurationMillis(stage)
+			if durationMs <= 0 {
+				continue
+			}
+			stageID := text(stage, "id")
+			if stageID == "" {
+				stageID = text(stage, "stageId")
+			}
+			if stageID == "" {
+				stageID = "unknown"
+			}
+			current := buckets[stageID]
+			if current == nil {
+				current = &bucket{stageID: stageID, title: stringOr(text(stage, "title"), stageID)}
+				buckets[stageID] = current
+			}
+			current.count++
+			current.totalDuration += durationMs
+			if durationMs > current.maxDuration {
+				current.maxDuration = durationMs
+			}
+			latestAt := stringOr(text(stage, "completedAt"), stringOr(text(stage, "finishedAt"), text(attempt, "updatedAt")))
+			if latestAt > current.latestAt {
+				current.latestAt = latestAt
+			}
+		}
+	}
+	output := make([]map[string]any, 0, len(buckets))
+	for _, current := range buckets {
+		average := 0
+		if current.count > 0 {
+			average = current.totalDuration / current.count
+		}
+		output = append(output, map[string]any{
+			"stageId":           current.stageID,
+			"title":             current.title,
+			"count":             current.count,
+			"averageDurationMs": average,
+			"maxDurationMs":     current.maxDuration,
+			"latestAt":          current.latestAt,
+		})
+	}
+	sort.SliceStable(output, func(i, j int) bool {
+		left := intValue(output[i]["averageDurationMs"])
+		right := intValue(output[j]["averageDurationMs"])
+		if left == right {
+			return text(output[i], "latestAt") > text(output[j], "latestAt")
+		}
+		return left > right
+	})
+	if len(output) > limit {
+		return output[:limit]
+	}
+	return output
+}
+
 func stageDurationMillis(stage map[string]any) int {
 	if duration := intValue(stage["durationMs"]); duration > 0 {
 		return duration
@@ -289,6 +367,332 @@ func observabilityActiveRuns(database WorkspaceDatabase, limit int) []map[string
 		return output[:limit]
 	}
 	return output
+}
+
+func observabilityRunnerUsage(database WorkspaceDatabase) []map[string]any {
+	type bucket struct {
+		runner        string
+		count         int
+		successCount  int
+		failureCount  int
+		activeCount   int
+		totalDuration int
+		durationCount int
+		latestAt      string
+	}
+	buckets := map[string]*bucket{}
+	for _, attempt := range database.Tables.Attempts {
+		runner := stringOr(text(attempt, "runner"), "unknown")
+		current := buckets[runner]
+		if current == nil {
+			current = &bucket{runner: runner}
+			buckets[runner] = current
+		}
+		current.count++
+		switch text(attempt, "status") {
+		case "done":
+			current.successCount++
+		case "failed", "stalled", "canceled":
+			current.failureCount++
+		case "running", "waiting-human":
+			current.activeCount++
+		}
+		if duration := attemptDurationMillis(attempt); duration > 0 {
+			current.totalDuration += duration
+			current.durationCount++
+		}
+		latestAt := stringOr(text(attempt, "updatedAt"), stringOr(text(attempt, "finishedAt"), text(attempt, "startedAt")))
+		if latestAt > current.latestAt {
+			current.latestAt = latestAt
+		}
+	}
+	output := make([]map[string]any, 0, len(buckets))
+	for _, current := range buckets {
+		average := 0
+		if current.durationCount > 0 {
+			average = current.totalDuration / current.durationCount
+		}
+		output = append(output, map[string]any{
+			"runner":            current.runner,
+			"count":             current.count,
+			"successCount":      current.successCount,
+			"failureCount":      current.failureCount,
+			"activeCount":       current.activeCount,
+			"averageDurationMs": average,
+			"latestAt":          current.latestAt,
+		})
+	}
+	sort.SliceStable(output, func(i, j int) bool {
+		left := intValue(output[i]["count"])
+		right := intValue(output[j]["count"])
+		if left == right {
+			return text(output[i], "latestAt") > text(output[j], "latestAt")
+		}
+		return left > right
+	})
+	return output
+}
+
+func observabilityCheckpointWaitTimes(database WorkspaceDatabase) map[string]any {
+	total := checkpointWaitBucket{stageID: "all"}
+	byStage := map[string]*checkpointWaitBucket{}
+	for _, checkpoint := range database.Tables.Checkpoints {
+		createdAt := stringOr(text(checkpoint, "createdAt"), text(checkpoint, "updatedAt"))
+		resolvedAt := ""
+		if status := text(checkpoint, "status"); status == "approved" || status == "rejected" || status == "canceled" {
+			resolvedAt = text(checkpoint, "updatedAt")
+		}
+		waitSeconds := durationSeconds(createdAt, resolvedAt)
+		stageID := stringOr(text(checkpoint, "stageId"), "unknown")
+		current := byStage[stageID]
+		if current == nil {
+			current = &checkpointWaitBucket{stageID: stageID}
+			byStage[stageID] = current
+		}
+		for _, target := range []*checkpointWaitBucket{&total, current} {
+			target.count++
+			if resolvedAt == "" {
+				target.pending++
+			} else {
+				target.resolved++
+			}
+			target.totalSeconds += waitSeconds
+			if waitSeconds > target.maxSeconds {
+				target.maxSeconds = waitSeconds
+			}
+		}
+	}
+	stageRows := make([]map[string]any, 0, len(byStage))
+	for _, current := range byStage {
+		stageRows = append(stageRows, checkpointWaitBucketMap(*current))
+	}
+	sort.SliceStable(stageRows, func(i, j int) bool {
+		left := intValue(stageRows[i]["averageWaitSeconds"])
+		right := intValue(stageRows[j]["averageWaitSeconds"])
+		if left == right {
+			return intValue(stageRows[i]["count"]) > intValue(stageRows[j]["count"])
+		}
+		return left > right
+	})
+	result := checkpointWaitBucketMap(total)
+	result["byStage"] = stageRows
+	return result
+}
+
+type checkpointWaitBucket struct {
+	stageID      string
+	count        int
+	resolved     int
+	pending      int
+	totalSeconds int
+	maxSeconds   int
+}
+
+func checkpointWaitBucketMap(current checkpointWaitBucket) map[string]any {
+	average := 0
+	if current.count > 0 {
+		average = current.totalSeconds / current.count
+	}
+	return map[string]any{
+		"stageId":            current.stageID,
+		"total":              current.count,
+		"count":              current.count,
+		"resolved":           current.resolved,
+		"pending":            current.pending,
+		"averageWaitSeconds": average,
+		"maxWaitSeconds":     current.maxSeconds,
+	}
+}
+
+func observabilityPullRequests(database WorkspaceDatabase) map[string]any {
+	created := map[string]string{}
+	merged := map[string]string{}
+	for _, attempt := range database.Tables.Attempts {
+		prURL := text(attempt, "pullRequestUrl")
+		if prURL == "" {
+			continue
+		}
+		created[prURL] = stringOr(text(attempt, "createdAt"), text(attempt, "startedAt"))
+		if status := text(attempt, "status"); status == "done" || status == "merged" || status == "delivered" {
+			merged[prURL] = stringOr(text(attempt, "finishedAt"), text(attempt, "updatedAt"))
+		}
+	}
+	for _, proof := range database.Tables.ProofRecords {
+		value := text(proof, "value")
+		if !strings.Contains(value, "/pull/") {
+			continue
+		}
+		created[value] = stringOr(text(proof, "createdAt"), created[value])
+		label := strings.ToLower(text(proof, "label"))
+		if strings.Contains(label, "merge") || strings.Contains(label, "merged") {
+			merged[value] = text(proof, "createdAt")
+		}
+	}
+	return map[string]any{
+		"created": len(created),
+		"merged":  len(merged),
+		"open":    len(created) - len(merged),
+	}
+}
+
+func observabilityTrends(database WorkspaceDatabase, limit int) []map[string]any {
+	buckets := map[string]map[string]any{}
+	prCreatedByDay := map[string]struct{}{}
+	prMergedByDay := map[string]struct{}{}
+	for _, attempt := range database.Tables.Attempts {
+		startBucket := trendBucket(buckets, dayBucket(stringOr(text(attempt, "startedAt"), text(attempt, "createdAt"))))
+		startBucket["attemptsStarted"] = intValue(startBucket["attemptsStarted"]) + 1
+		if prURL := text(attempt, "pullRequestUrl"); prURL != "" {
+			prCreatedByDay[dayBucket(stringOr(text(attempt, "createdAt"), text(attempt, "startedAt")))+"|"+prURL] = struct{}{}
+		}
+		if finished := dayBucket(stringOr(text(attempt, "finishedAt"), text(attempt, "updatedAt"))); finished != "" && terminalAttemptStatus(text(attempt, "status")) {
+			finishBucket := trendBucket(buckets, finished)
+			finishBucket["attemptsCompleted"] = intValue(finishBucket["attemptsCompleted"]) + 1
+			if text(attempt, "status") == "done" {
+				finishBucket["attemptsDone"] = intValue(finishBucket["attemptsDone"]) + 1
+			}
+			if text(attempt, "status") == "failed" {
+				finishBucket["attemptsFailed"] = intValue(finishBucket["attemptsFailed"]) + 1
+			}
+			if text(attempt, "pullRequestUrl") != "" && text(attempt, "status") == "done" {
+				prMergedByDay[finished+"|"+text(attempt, "pullRequestUrl")] = struct{}{}
+			}
+		}
+	}
+	for _, proof := range database.Tables.ProofRecords {
+		prURL := text(proof, "value")
+		if !strings.Contains(prURL, "/pull/") {
+			continue
+		}
+		day := dayBucket(text(proof, "createdAt"))
+		label := strings.ToLower(text(proof, "label"))
+		if strings.Contains(label, "merge") || strings.Contains(label, "merged") {
+			prMergedByDay[day+"|"+prURL] = struct{}{}
+		} else {
+			prCreatedByDay[day+"|"+prURL] = struct{}{}
+		}
+	}
+	for key := range prCreatedByDay {
+		day := strings.SplitN(key, "|", 2)[0]
+		if day == "" {
+			continue
+		}
+		row := trendBucket(buckets, day)
+		row["pullRequestsCreated"] = intValue(row["pullRequestsCreated"]) + 1
+	}
+	for key := range prMergedByDay {
+		day := strings.SplitN(key, "|", 2)[0]
+		if day == "" {
+			continue
+		}
+		row := trendBucket(buckets, day)
+		row["pullRequestsMerged"] = intValue(row["pullRequestsMerged"]) + 1
+	}
+	for _, checkpoint := range database.Tables.Checkpoints {
+		createdBucket := trendBucket(buckets, dayBucket(stringOr(text(checkpoint, "createdAt"), text(checkpoint, "updatedAt"))))
+		createdBucket["checkpointsCreated"] = intValue(createdBucket["checkpointsCreated"]) + 1
+		status := text(checkpoint, "status")
+		if status == "approved" || status == "rejected" || status == "canceled" {
+			resolvedBucket := trendBucket(buckets, dayBucket(text(checkpoint, "updatedAt")))
+			resolvedBucket["checkpointsResolved"] = intValue(resolvedBucket["checkpointsResolved"]) + 1
+		}
+	}
+	rows := make([]map[string]any, 0, len(buckets))
+	for _, row := range buckets {
+		if text(row, "date") != "" {
+			rows = append(rows, row)
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return text(rows[i], "date") > text(rows[j], "date")
+	})
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return text(rows[i], "date") < text(rows[j], "date")
+	})
+	return rows
+}
+
+func terminalAttemptStatus(status string) bool {
+	return status == "done" || status == "failed" || status == "stalled" || status == "canceled"
+}
+
+func attemptDurationMillis(attempt map[string]any) int {
+	if duration := intValue(attempt["durationMs"]); duration > 0 {
+		return duration
+	}
+	startedAt := text(attempt, "startedAt")
+	finishedAt := stringOr(text(attempt, "finishedAt"), text(attempt, "updatedAt"))
+	if startedAt == "" || finishedAt == "" {
+		return 0
+	}
+	started, err := time.Parse(time.RFC3339Nano, startedAt)
+	if err != nil {
+		return 0
+	}
+	finished, err := time.Parse(time.RFC3339Nano, finishedAt)
+	if err != nil || finished.Before(started) {
+		return 0
+	}
+	return int(finished.Sub(started).Milliseconds())
+}
+
+func durationSeconds(startedAt string, finishedAt string) int {
+	if startedAt == "" {
+		return 0
+	}
+	started, err := time.Parse(time.RFC3339Nano, startedAt)
+	if err != nil {
+		return 0
+	}
+	var finished time.Time
+	if finishedAt == "" {
+		finished = time.Now()
+	} else {
+		finished, err = time.Parse(time.RFC3339Nano, finishedAt)
+		if err != nil {
+			return 0
+		}
+	}
+	if finished.Before(started) {
+		return 0
+	}
+	return int(finished.Sub(started).Seconds())
+}
+
+func dayBucket(timestamp string) string {
+	if timestamp == "" {
+		return ""
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return ""
+	}
+	return parsed.UTC().Format("2006-01-02")
+}
+
+func trendBucket(buckets map[string]map[string]any, date string) map[string]any {
+	if date == "" {
+		return map[string]any{}
+	}
+	current := buckets[date]
+	if current == nil {
+		current = map[string]any{
+			"date":                date,
+			"attemptsStarted":     0,
+			"attemptsCompleted":   0,
+			"attemptsDone":        0,
+			"attemptsFailed":      0,
+			"pullRequestsCreated": 0,
+			"pullRequestsMerged":  0,
+			"checkpointsCreated":  0,
+			"checkpointsResolved": 0,
+		}
+		buckets[date] = current
+	}
+	return current
 }
 
 func observabilityRecommendedActions(pipelineStatus map[string]int, checkpointStatus map[string]int, operationStatus map[string]int, workItemStatus map[string]int, attemptStatus map[string]int) []map[string]any {

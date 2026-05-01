@@ -47,6 +47,7 @@ func upsertRunWorkpad(database *WorkspaceDatabase, attemptID string) map[string]
 		"blockers":           workpadBlockers(*database, pipeline, attempt),
 		"pr":                 workpadPullRequest(attempt),
 		"reviewFeedback":     workpadReviewFeedback(*database, pipeline, attempt),
+		"reviewPacket":       workpadReviewPacket(attempt),
 		"retryReason":        workpadRetryReason(attempt, reworkChecklist),
 		"reworkChecklist":    reworkChecklist,
 		"reworkAssessment":   mapValue(attempt["reworkAssessment"]),
@@ -160,6 +161,7 @@ func sanitizeRunWorkpadPatch(input map[string]any, updatedBy string) (map[string
 		"blockers":           true,
 		"pr":                 true,
 		"reviewFeedback":     true,
+		"reviewPacket":       true,
 		"retryReason":        true,
 		"reworkChecklist":    true,
 		"reworkAssessment":   true,
@@ -207,6 +209,7 @@ func runWorkpadActorCanPatchField(actor string, field string) bool {
 	agentFields := map[string]bool{
 		"plan": true, "acceptanceCriteria": true, "validation": true, "notes": true, "blockers": true,
 		"pr": true, "reviewFeedback": true, "retryReason": true, "reworkChecklist": true, "reworkAssessment": true,
+		"reviewPacket": true,
 	}
 	operatorFields := map[string]bool{
 		"validation": true, "notes": true, "blockers": true, "reviewFeedback": true,
@@ -214,7 +217,7 @@ func runWorkpadActorCanPatchField(actor string, field string) bool {
 	}
 	supervisorFields := map[string]bool{
 		"validation": true, "notes": true, "blockers": true, "pr": true, "reviewFeedback": true,
-		"retryReason": true, "reworkChecklist": true, "reworkAssessment": true,
+		"reviewPacket": true, "retryReason": true, "reworkChecklist": true, "reworkAssessment": true,
 	}
 	switch actor {
 	case "agent", "review-agent", "delivery-agent", "test":
@@ -443,6 +446,14 @@ func workpadReviewFeedback(database WorkspaceDatabase, pipeline map[string]any, 
 		}
 	}
 	return compactStringList(feedback)
+}
+
+func workpadReviewPacket(attempt map[string]any) map[string]any {
+	packet := mapValue(attempt["reviewPacket"])
+	if len(packet) == 0 {
+		return map[string]any{}
+	}
+	return packet
 }
 
 func workpadRetryReason(attempt map[string]any, reworkChecklist map[string]any) string {

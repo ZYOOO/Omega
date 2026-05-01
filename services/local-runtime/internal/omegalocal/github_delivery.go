@@ -189,7 +189,9 @@ func githubPullRequestFeedback(ctx context.Context, repositoryPath string, selec
 	if err := json.Unmarshal(output, &pr); err != nil {
 		return nil
 	}
-	return githubPullRequestFeedbackFromView(pr)
+	feedback := githubPullRequestFeedbackFromView(pr)
+	feedback = append(feedback, githubPullRequestReviewThreadFeedback(ctx, repositoryPath, selector, repo)...)
+	return feedback
 }
 
 func githubPullRequestFeedbackFromView(pr map[string]any) []map[string]any {
@@ -230,6 +232,147 @@ func githubPullRequestFeedbackFromView(pr map[string]any) []map[string]any {
 		add("pr-review", label, message, text(review, "submittedAt"), text(review, "url"))
 	}
 	return feedback
+}
+
+func githubPullRequestReviewThreadFeedback(ctx context.Context, repositoryPath string, selector string, repo string) []map[string]any {
+	owner, name, number := githubPullRequestIdentity(selector, repo)
+	if owner == "" || name == "" || number <= 0 {
+		return nil
+	}
+	query := `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 50) {
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          startLine
+          originalStartLine
+          comments(first: 20) {
+            nodes {
+              author { login }
+              body
+              createdAt
+              url
+              path
+              line
+              originalLine
+              diffHunk
+            }
+          }
+        }
+      }
+    }
+  }
+}`
+	args := []string{"api", "graphql", "-f", "owner=" + owner, "-f", "name=" + name, "-F", fmt.Sprintf("number=%d", number), "-f", "query=" + query}
+	command := exec.CommandContext(ctx, "gh", args...)
+	if strings.TrimSpace(repositoryPath) != "" {
+		command.Dir = strings.TrimSpace(repositoryPath)
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(output, &payload); err != nil {
+		return nil
+	}
+	return githubPullRequestReviewThreadFeedbackFromGraphQL(payload)
+}
+
+func githubPullRequestReviewThreadFeedbackFromGraphQL(payload map[string]any) []map[string]any {
+	data := mapValue(payload["data"])
+	repository := mapValue(data["repository"])
+	pullRequest := mapValue(repository["pullRequest"])
+	nodes := arrayMaps(mapValue(pullRequest["reviewThreads"])["nodes"])
+	feedback := []map[string]any{}
+	for _, thread := range nodes {
+		comments := arrayMaps(mapValue(thread["comments"])["nodes"])
+		comment := map[string]any{}
+		if len(comments) > 0 {
+			comment = comments[len(comments)-1]
+		}
+		resolved := boolValue(thread["isResolved"])
+		state := "unresolved"
+		if resolved {
+			state = "resolved"
+		}
+		path := firstNonEmpty(text(comment, "path"), text(thread, "path"))
+		line := firstNonEmpty(nonZeroIntString(comment["line"]), nonZeroIntString(thread["line"]), nonZeroIntString(comment["originalLine"]), nonZeroIntString(thread["originalLine"]))
+		author := text(mapValue(comment["author"]), "login")
+		label := strings.TrimSpace(state + " thread")
+		if path != "" {
+			label += " " + path
+			if line != "" {
+				label += ":" + line
+			}
+		}
+		if author != "" {
+			label += " by " + author
+		}
+		message := strings.TrimSpace(text(comment, "body"))
+		if message == "" {
+			message = "Review thread is " + state + "."
+		}
+		entry := map[string]any{
+			"kind":     "pr-review-thread",
+			"label":    label,
+			"message":  truncateForProof(message, 1800),
+			"state":    state,
+			"resolved": resolved,
+		}
+		for key, value := range map[string]string{
+			"createdAt":    text(comment, "createdAt"),
+			"url":          text(comment, "url"),
+			"sourceUrl":    text(comment, "url"),
+			"path":         path,
+			"line":         line,
+			"originalLine": firstNonEmpty(nonZeroIntString(comment["originalLine"]), nonZeroIntString(thread["originalLine"])),
+			"diffHunk":     text(comment, "diffHunk"),
+		} {
+			value = strings.TrimSpace(value)
+			if value == "" || value == "0" {
+				continue
+			}
+			entry[key] = value
+		}
+		feedback = append(feedback, entry)
+	}
+	return feedback
+}
+
+func nonZeroIntString(value any) string {
+	if number := intValue(value); number > 0 {
+		return fmt.Sprint(number)
+	}
+	return ""
+}
+
+func githubPullRequestIdentity(selector string, repo string) (string, string, int) {
+	repo = strings.TrimSpace(repo)
+	selector = strings.TrimSpace(selector)
+	owner := ""
+	name := ""
+	if repo != "" {
+		parts := strings.Split(repo, "/")
+		if len(parts) == 2 {
+			owner = strings.TrimSpace(parts[0])
+			name = strings.TrimSpace(parts[1])
+		}
+	}
+	if match := regexp.MustCompile(`github\.com/([^/]+)/([^/]+)/pull/([0-9]+)`).FindStringSubmatch(selector); len(match) == 4 {
+		owner = match[1]
+		name = strings.TrimSuffix(match[2], ".git")
+		return owner, name, intValueFromString(match[3])
+	}
+	if match := regexp.MustCompile(`^#?([0-9]+)$`).FindStringSubmatch(selector); len(match) == 2 {
+		return owner, name, intValueFromString(match[1])
+	}
+	return owner, name, 0
 }
 
 func githubPullRequestFeedbackPrompt(feedback []map[string]any) string {
@@ -279,15 +422,28 @@ func githubPullRequestCheckLogFeedback(ctx context.Context, repositoryPath strin
 			continue
 		}
 		feedback = append(feedback, map[string]any{
-			"kind":    "ci-check-log",
-			"label":   stringOr(text(check, "name"), "check "+runID),
-			"message": truncateForProof(logOutput, 2200),
-			"state":   text(check, "state"),
-			"runId":   runID,
-			"url":     text(check, "link"),
+			"kind":      "ci-check-log",
+			"label":     stringOr(text(check, "name"), "check "+runID),
+			"message":   truncateForProof(logOutput, 2200),
+			"state":     text(check, "state"),
+			"runId":     runID,
+			"url":       text(check, "link"),
+			"sourceUrl": githubCheckLogSourceURL(text(check, "link")),
+			"logMode":   "failed-first",
 		})
 	}
 	return feedback
+}
+
+func githubCheckLogSourceURL(link string) string {
+	link = strings.TrimSpace(link)
+	if link == "" {
+		return ""
+	}
+	if strings.Contains(link, "?") {
+		return link + "&check_suite_focus=true"
+	}
+	return link + "?check_suite_focus=true"
 }
 
 func githubActionsRunID(link string) string {

@@ -19,6 +19,20 @@ export interface ObservabilitySummary {
     blocked: number;
   };
   recentErrors?: RuntimeLogRecordInfo[];
+  dashboard?: {
+    generatedAt?: string;
+    attempts?: Record<string, unknown>;
+    failureReasons?: Array<Record<string, unknown>>;
+    slowStages?: Array<Record<string, unknown>>;
+    stageAverageDurations?: Array<Record<string, unknown>>;
+    runnerUsage?: Array<Record<string, unknown>>;
+    checkpointWaitTimes?: Record<string, unknown>;
+    pullRequests?: Record<string, unknown>;
+    trends?: Array<Record<string, unknown>>;
+    waitingHumanQueue?: Array<Record<string, unknown>>;
+    activeRuns?: Array<Record<string, unknown>>;
+    recommendedActions?: Array<Record<string, unknown>>;
+  };
 }
 
 export interface RuntimeLogRecordInfo {
@@ -30,6 +44,7 @@ export interface RuntimeLogRecordInfo {
   entityId?: string;
   projectId?: string;
   repositoryTargetId?: string;
+  requirementId?: string;
   workItemId?: string;
   pipelineId?: string;
   attemptId?: string;
@@ -38,6 +53,13 @@ export interface RuntimeLogRecordInfo {
   requestId?: string;
   details?: Record<string, unknown>;
   createdAt: string;
+}
+
+export interface RuntimeLogPageInfo {
+  items: RuntimeLogRecordInfo[];
+  limit: number;
+  nextCursor?: string;
+  hasMore: boolean;
 }
 
 export interface LlmProviderInfo {
@@ -355,6 +377,7 @@ export interface AttemptRecordInfo {
   humanChangeRequest?: string;
   pullRequestFeedback?: Array<Record<string, unknown>>;
   checkLogFeedback?: Array<Record<string, unknown>>;
+  reviewPacket?: Record<string, unknown>;
   reworkChecklist?: Record<string, unknown>;
   reworkAssessment?: Record<string, unknown>;
   stdoutSummary?: string;
@@ -395,6 +418,7 @@ export interface RunWorkpadRecordInfo {
     blockers?: string[];
     pr?: Record<string, unknown>;
     reviewFeedback?: string[];
+    reviewPacket?: Record<string, unknown>;
     retryReason?: string;
     reworkChecklist?: Record<string, unknown>;
     reworkAssessment?: Record<string, unknown>;
@@ -405,6 +429,13 @@ export interface RunWorkpadRecordInfo {
   fieldPatchHistory?: Array<Record<string, unknown>>;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface PatchRunWorkpadInput {
+  workpad: Partial<RunWorkpadRecordInfo["workpad"]>;
+  updatedBy?: string;
+  reason?: string;
+  source?: Record<string, unknown>;
 }
 
 export interface ProofRecordInfo {
@@ -568,11 +599,13 @@ export interface PagePilotSelectionContext {
 }
 
 export interface PagePilotApplyInput {
+  runId?: string;
   projectId?: string;
   repositoryTargetId: string;
   instruction: string;
   selection: PagePilotSelectionContext;
   runner?: string;
+  previewRuntimeProfile?: Record<string, unknown>;
 }
 
 export interface PagePilotApplyResult {
@@ -600,6 +633,21 @@ export interface PagePilotApplyResult {
     touchedFiles: string[];
   };
   runnerProcess?: RunnerProcessInfo;
+  previewRuntimeProfile?: Record<string, unknown>;
+  sourceLocator?: Record<string, unknown>;
+  primaryTarget?: Record<string, unknown>;
+  submittedAnnotations?: Array<Record<string, unknown>>;
+  processEvents?: Array<Record<string, unknown>>;
+  conversationBatch?: Record<string, unknown>;
+  roundNumber?: number;
+  prPreview?: {
+    title?: string;
+    body?: string;
+    changedFiles?: string[];
+    lineDiffSummary?: string;
+  };
+  visualProof?: Record<string, unknown>;
+  sourceMappingReport?: Record<string, unknown>;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -612,6 +660,7 @@ export interface PagePilotDeliverInput {
   selection: PagePilotSelectionContext;
   branchName?: string;
   draft?: boolean;
+  previewRuntimeProfile?: Record<string, unknown>;
 }
 
 export interface PagePilotDeliverResult {
@@ -626,7 +675,41 @@ export interface PagePilotDeliverResult {
   changedFiles: string[];
   diffSummary?: string;
   lineDiffSummary?: string;
+  prPreview?: {
+    title?: string;
+    body?: string;
+    changedFiles?: string[];
+    lineDiffSummary?: string;
+  };
+  visualProof?: Record<string, unknown>;
+  previewRuntimeProfile?: Record<string, unknown>;
+  sourceMappingReport?: Record<string, unknown>;
   updatedAt?: string;
+}
+
+export interface PagePilotPreviewRuntimeInput {
+  projectId?: string;
+  repositoryTargetId: string;
+  previewUrl?: string;
+  intent?: string;
+  devCommand?: string;
+}
+
+export interface PagePilotPreviewRuntimeResult {
+  ok: boolean;
+  status: string;
+  agentId?: string;
+  stageId?: string;
+  repositoryTargetId?: string;
+  repositoryPath?: string;
+  previewUrl?: string;
+  profile?: Record<string, unknown>;
+  plan?: Record<string, unknown>;
+  health?: Record<string, unknown>;
+  pid?: number;
+  stdoutTail?: string[];
+  stderrTail?: string[];
+  error?: string;
 }
 
 export type PagePilotRunInfo = PagePilotApplyResult & Partial<PagePilotDeliverResult> & {
@@ -702,7 +785,7 @@ export async function fetchObservability(
 
 export async function fetchRuntimeLogs(
   apiUrl: string,
-  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; createdAfter?: string; createdBefore?: string } = {},
+  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; createdAfter?: string; createdBefore?: string; q?: string; search?: string } = {},
   fetchImpl: typeof fetch = fetch
 ): Promise<RuntimeLogRecordInfo[]> {
   const params = new URLSearchParams();
@@ -712,6 +795,38 @@ export async function fetchRuntimeLogs(
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return fetchJson<RuntimeLogRecordInfo[]>(apiUrl, `/runtime-logs${suffix}`, fetchImpl);
+}
+
+export async function fetchRuntimeLogPage(
+  apiUrl: string,
+  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; pageSize?: number; cursor?: string; createdAfter?: string; createdBefore?: string; q?: string; search?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<RuntimeLogPageInfo> {
+  const params = new URLSearchParams();
+  params.set("page", "1");
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  return fetchJson<RuntimeLogPageInfo>(apiUrl, `/runtime-logs?${params.toString()}`, fetchImpl);
+}
+
+export async function exportRuntimeLogs(
+  apiUrl: string,
+  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; format?: "jsonl" | "csv"; createdAfter?: string; createdBefore?: string; q?: string; search?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<string> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/runtime-logs/export${suffix}`);
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, "Omega control API failed: /runtime-logs/export"));
+  }
+  return response.text();
 }
 
 export async function fetchLlmProviders(
@@ -940,12 +1055,7 @@ export async function fetchRunWorkpads(
 export async function patchRunWorkpad(
   apiUrl: string,
   runWorkpadId: string,
-  input: {
-    workpad: Partial<RunWorkpadRecordInfo["workpad"]>;
-    updatedBy?: string;
-    reason?: string;
-    source?: Record<string, unknown>;
-  },
+  input: PatchRunWorkpadInput,
   fetchImpl: typeof fetch = fetch
 ): Promise<RunWorkpadRecordInfo> {
   const path = `/run-workpads/${encodeURIComponent(runWorkpadId)}`;
@@ -1089,6 +1199,30 @@ export async function discardPagePilotRun(
   fetchImpl: typeof fetch = fetch
 ): Promise<PagePilotRunInfo> {
   return postJson<PagePilotRunInfo>(apiUrl, `/page-pilot/runs/${encodeURIComponent(runId)}/discard`, {}, fetchImpl);
+}
+
+export async function resolvePagePilotPreviewRuntime(
+  apiUrl: string,
+  input: PagePilotPreviewRuntimeInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotPreviewRuntimeResult> {
+  return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/resolve", input, fetchImpl);
+}
+
+export async function startPagePilotPreviewRuntime(
+  apiUrl: string,
+  input: PagePilotPreviewRuntimeInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotPreviewRuntimeResult> {
+  return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/start", input, fetchImpl);
+}
+
+export async function restartPagePilotPreviewRuntime(
+  apiUrl: string,
+  input: PagePilotPreviewRuntimeInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotPreviewRuntimeResult> {
+  return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/restart", input, fetchImpl);
 }
 
 export interface OrchestratorTickInput {

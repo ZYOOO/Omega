@@ -263,6 +263,9 @@ func (server *Server) completeDevFlowCycleJob(ctx context.Context, pipelineID st
 	if err := server.Repo.Save(context.Background(), database); err != nil {
 		return nil, nil, err
 	}
+	if text(result, "status") == "waiting-human" {
+		server.sendFeishuReviewForPipelineIfConfigured(ctx, text(pipeline, "id"))
+	}
 	return pipeline, item, nil
 }
 
@@ -409,7 +412,20 @@ func devFlowNextStageAfter(stageID string) string {
 	}
 }
 
+func devFlowNextStageAfterFromWorkflow(workflow map[string]any, stageID string) string {
+	for _, transition := range arrayMaps(workflow["transitions"]) {
+		if text(transition, "from") == stageID && text(transition, "on") == "passed" && text(transition, "to") != "" {
+			return text(transition, "to")
+		}
+	}
+	return devFlowNextStageAfter(stageID)
+}
+
 func devFlowStageStatusAfterInvocation(stageID string, agentID string, status string) (string, string) {
+	return devFlowStageStatusAfterInvocationWithWorkflow(nil, stageID, agentID, status)
+}
+
+func devFlowStageStatusAfterInvocationWithWorkflow(workflow map[string]any, stageID string, agentID string, status string) (string, string) {
 	if status == "running" {
 		return "running", ""
 	}
@@ -417,7 +433,7 @@ func devFlowStageStatusAfterInvocation(stageID string, agentID string, status st
 		return "failed", ""
 	}
 	if status == "changes-requested" {
-		return "passed", "rework"
+		return "passed", devFlowTransitionFromWorkflow(workflow, stageID, "changes_requested", "rework")
 	}
 	if status == "needs-human" || status == "waiting-human" {
 		return "needs-human", ""
@@ -428,7 +444,16 @@ func devFlowStageStatusAfterInvocation(stageID string, agentID string, status st
 	if stageID == "in_progress" && agentID != "testing" {
 		return "running", ""
 	}
-	return "passed", devFlowNextStageAfter(stageID)
+	return "passed", devFlowNextStageAfterFromWorkflow(workflow, stageID)
+}
+
+func devFlowTransitionFromWorkflow(workflow map[string]any, from string, event string, fallback string) string {
+	for _, transition := range arrayMaps(workflow["transitions"]) {
+		if text(transition, "from") == from && text(transition, "on") == event && text(transition, "to") != "" {
+			return text(transition, "to")
+		}
+	}
+	return fallback
 }
 
 func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelineID string, itemID string, attemptID string, invocation map[string]any) error {
@@ -447,7 +472,8 @@ func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelin
 		return nil
 	}
 	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
-	stageStatus, nextStageID := devFlowStageStatusAfterInvocation(text(invocation, "stageId"), text(invocation, "agentId"), text(invocation, "status"))
+	workflow := mapValue(mapValue(pipeline["run"])["workflow"])
+	stageStatus, nextStageID := devFlowStageStatusAfterInvocationWithWorkflow(workflow, text(invocation, "stageId"), text(invocation, "agentId"), text(invocation, "status"))
 	pipeline = markDevFlowStageProgress(pipeline, text(invocation, "stageId"), stageStatus, text(invocation, "summary"))
 	run := mapValue(pipeline["run"])
 	if nextStageID != "" {
@@ -735,6 +761,12 @@ func completeAttemptRecord(database WorkspaceDatabase, attemptID string, pipelin
 	if feedback := arrayMaps(result["checkLogFeedback"]); len(feedback) > 0 {
 		attempt["checkLogFeedback"] = feedback
 	}
+	if reports := arrayMaps(result["githubOutboundSync"]); len(reports) > 0 {
+		attempt["githubOutboundSync"] = append(arrayMaps(attempt["githubOutboundSync"]), reports...)
+	}
+	if reviewPacket := mapValue(result["reviewPacket"]); len(reviewPacket) > 0 {
+		attempt["reviewPacket"] = reviewPacket
+	}
 	attempt["stdoutSummary"] = truncateForProof(stringOr(result["stdout"], ""), 800)
 	attempt["stderrSummary"] = truncateForProof(stringOr(result["stderr"], ""), 800)
 	attempt["stages"] = attemptStageSnapshot(pipeline)
@@ -790,6 +822,12 @@ func failAttemptRecord(database WorkspaceDatabase, attemptID string, pipeline ma
 		}
 		if feedback := arrayMaps(result["checkLogFeedback"]); len(feedback) > 0 {
 			attempt["checkLogFeedback"] = feedback
+		}
+		if reports := arrayMaps(result["githubOutboundSync"]); len(reports) > 0 {
+			attempt["githubOutboundSync"] = append(arrayMaps(attempt["githubOutboundSync"]), reports...)
+		}
+		if reviewPacket := mapValue(result["reviewPacket"]); len(reviewPacket) > 0 {
+			attempt["reviewPacket"] = reviewPacket
 		}
 		attempt["stdoutSummary"] = truncateForProof(stringOr(result["stdout"], ""), 800)
 	}
@@ -1096,6 +1134,7 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 	stageArtifacts := []map[string]any{}
 	pullRequestFeedback := []map[string]any{}
 	checkLogFeedback := []map[string]any{}
+	githubOutboundSync := []map[string]any{}
 	combinedFeedback := func(primary string) string {
 		parts := []string{}
 		if strings.TrimSpace(primary) != "" {
@@ -1133,7 +1172,40 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		}
 		_ = server.persistDevFlowAgentInvocation(context.Background(), text(pipeline, "id"), text(item, "id"), attemptID, invocation)
 	}
+	recordGitHubOutboundSync := func(event string, status string, stageID string, summary string, prURL string, checksOutput string, changedFiles []string, failureReason string, failureDetail string, reviewPacket map[string]any) {
+		report := server.syncGitHubIssueOutbound(ctx, githubOutboundSyncInput{
+			RepositoryPath:      repoWorkspace,
+			Repository:          repoSlug,
+			WorkItem:            item,
+			Pipeline:            pipeline,
+			Attempt:             currentAttempt,
+			AttemptID:           attemptID,
+			Event:               event,
+			Status:              status,
+			StageID:             stageID,
+			Summary:             summary,
+			PullRequestURL:      prURL,
+			BranchName:          branchName,
+			ChangedFiles:        changedFiles,
+			ChecksOutput:        checksOutput,
+			PullRequestFeedback: pullRequestFeedback,
+			CheckLogFeedback:    checkLogFeedback,
+			ReviewPacket:        reviewPacket,
+			FailureReason:       failureReason,
+			FailureDetail:       failureDetail,
+		})
+		if text(report, "state") == "skipped" {
+			return
+		}
+		githubOutboundSync = append(githubOutboundSync, report)
+		artifact := fmt.Sprintf("github-outbound-sync-%03d.json", len(githubOutboundSync))
+		artifactPath := filepath.Join(proofDir, artifact)
+		if err := writeJSONFile(artifactPath, report); err == nil {
+			stageArtifacts = append(stageArtifacts, map[string]any{"stageId": stringOr(stageID, "delivery"), "agentId": "github", "artifact": artifact})
+		}
+	}
 	failureResult := func(stageID string, agentID string, reason string, detail string, reviewFeedback string) map[string]any {
+		recordGitHubOutboundSync("attempt.failed", "failed", stageID, reason, "", "", nil, reason, detail, nil)
 		result := map[string]any{
 			"status":                "failed",
 			"workspacePath":         workspace,
@@ -1152,8 +1224,12 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		if len(checkLogFeedback) > 0 {
 			result["checkLogFeedback"] = checkLogFeedback
 		}
+		if len(githubOutboundSync) > 0 {
+			result["githubOutboundSync"] = githubOutboundSync
+		}
 		return result
 	}
+	recordGitHubOutboundSync("attempt.started", "running", "todo", "Pipeline attempt started and repository workspace is ready.", "", "", nil, "", "", nil)
 
 	humanChangeRequest := latestHumanChangeRequestFromPipeline(pipeline)
 	reworkFeedbackInput := reworkChecklistPromptFromAttempt(currentAttempt, humanChangeRequest)
@@ -1391,19 +1467,27 @@ Rules:
 		}
 		recordAgent("human_review", "human", "waiting-human", "Review the human-requested rework, PR diff, proof, and agent verdicts. Approve to continue delivery or request changes to send the run back.", "human-review-request.md", "Waiting for explicit human approval after fast rework.", []string{humanReviewRequestPath}, map[string]any{"runner": "human", "status": "waiting-human"})
 
-		if reportPath, err := writeDevFlowRunReport(proofDir, devFlowRunReportInput{
+		reportInput := devFlowRunReportInput{
 			Item:                item,
 			Repository:          repoSlug,
 			BranchName:          branchName,
 			PullRequestURL:      prURL,
 			ChangedFiles:        changedFiles,
+			DiffText:            stringOr(prDiff, diffText),
 			TestOutput:          testOutput,
 			ChecksOutput:        checksOutput,
 			PullRequestFeedback: pullRequestFeedback,
 			CheckLogFeedback:    checkLogFeedback,
 			StageArtifacts:      stageArtifacts,
 			AgentInvocations:    agentInvocations,
-		}); err != nil {
+		}
+		reviewPacket, reviewPacketPath, err := writeDevFlowReviewPacket(proofDir, reportInput)
+		if err != nil {
+			return nil, err
+		}
+		stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reviewPacketPath)})
+		reportInput.ReviewPacket = reviewPacket
+		if reportPath, err := writeDevFlowRunReport(proofDir, reportInput); err != nil {
 			return nil, err
 		} else {
 			stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reportPath)})
@@ -1433,6 +1517,7 @@ Rules:
 			"merged":             false,
 			"humanGate":          "pending",
 			"reworkAssessment":   reworkAssessment,
+			"reviewPacket":       reviewPacket,
 			"changedFiles":       changedFiles,
 			"artifacts":          stageArtifacts,
 			"agentInvocations":   agentInvocations,
@@ -1441,6 +1526,7 @@ Rules:
 			return nil, err
 		}
 		recordAgent("done", "delivery", "waiting-human", deliveryPrompt, "handoff-bundle.json", "Delivery is blocked by the human review checkpoint after fast rework.", []string{filepath.Join(proofDir, "handoff-bundle.json")}, map[string]any{"runner": "local-orchestrator", "status": "waiting-human"})
+		recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review after fast rework.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 		proofFiles, _ := collectFiles(proofDir)
 		return map[string]any{
 			"status":              "waiting-human",
@@ -1454,10 +1540,12 @@ Rules:
 			"stageArtifacts":      stageArtifacts,
 			"agentInvocations":    agentInvocations,
 			"proofFiles":          proofFiles,
+			"reviewPacket":        reviewPacket,
 			"reworkAssessment":    reworkAssessment,
 			"humanChangeRequest":  humanChangeRequest,
 			"pullRequestFeedback": pullRequestFeedback,
 			"checkLogFeedback":    checkLogFeedback,
+			"githubOutboundSync":  githubOutboundSync,
 		}, nil
 	}
 
@@ -1848,19 +1936,27 @@ Rules:
 	}
 	recordAgent("human_review", "human", "waiting-human", "Review the PR, proof, and agent verdicts. Approve to continue delivery or request changes to send the run back.", "human-review-request.md", "Waiting for explicit human approval before delivery.", []string{humanReviewRequestPath}, map[string]any{"runner": "human", "status": "waiting-human"})
 
-	if reportPath, err := writeDevFlowRunReport(proofDir, devFlowRunReportInput{
+	reportInput := devFlowRunReportInput{
 		Item:                item,
 		Repository:          repoSlug,
 		BranchName:          branchName,
 		PullRequestURL:      prURL,
 		ChangedFiles:        changedFiles,
+		DiffText:            stringOr(prDiff, diffText),
 		TestOutput:          testOutput,
 		ChecksOutput:        checksOutput,
 		PullRequestFeedback: pullRequestFeedback,
 		CheckLogFeedback:    checkLogFeedback,
 		StageArtifacts:      stageArtifacts,
 		AgentInvocations:    agentInvocations,
-	}); err != nil {
+	}
+	reviewPacket, reviewPacketPath, err := writeDevFlowReviewPacket(proofDir, reportInput)
+	if err != nil {
+		return nil, err
+	}
+	stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reviewPacketPath)})
+	reportInput.ReviewPacket = reviewPacket
+	if reportPath, err := writeDevFlowRunReport(proofDir, reportInput); err != nil {
 		return nil, err
 	} else {
 		stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reportPath)})
@@ -1887,6 +1983,7 @@ Rules:
 		"pullRequestUrl":     prURL,
 		"merged":             merged,
 		"humanGate":          "pending",
+		"reviewPacket":       reviewPacket,
 		"changedFiles":       changedFiles,
 		"artifacts":          stageArtifacts,
 		"agentInvocations":   agentInvocations,
@@ -1895,6 +1992,7 @@ Rules:
 		return nil, err
 	}
 	recordAgent("done", "delivery", "waiting-human", deliveryPrompt, "handoff-bundle.json", "Delivery is blocked by the human review checkpoint.", []string{filepath.Join(proofDir, "handoff-bundle.json")}, map[string]any{"runner": "local-orchestrator", "status": "waiting-human"})
+	recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 	proofFiles, _ := collectFiles(proofDir)
 	return map[string]any{
 		"status":              "waiting-human",
@@ -1908,8 +2006,10 @@ Rules:
 		"stageArtifacts":      stageArtifacts,
 		"agentInvocations":    agentInvocations,
 		"proofFiles":          proofFiles,
+		"reviewPacket":        reviewPacket,
 		"pullRequestFeedback": pullRequestFeedback,
 		"checkLogFeedback":    checkLogFeedback,
+		"githubOutboundSync":  githubOutboundSync,
 	}, nil
 }
 

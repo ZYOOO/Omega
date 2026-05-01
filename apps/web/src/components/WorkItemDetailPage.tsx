@@ -1,5 +1,5 @@
-import type { ReactNode } from "react";
-import { useMemo, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { retryReasonForAttempt } from "../attemptRetryReason";
 import type { RepositoryTarget, WorkItem, WorkItemStatus } from "../core";
 import type {
@@ -8,6 +8,7 @@ import type {
   CheckpointRecordInfo,
   GitHubPullRequestStatusResult,
   OperationRecordInfo,
+  PatchRunWorkpadInput,
   PipelineRecordInfo,
   ProofRecordInfo,
   RequirementRecordInfo,
@@ -41,6 +42,9 @@ type WorkpadSourceRecord = {
   kind: string;
   label: string;
   message: string;
+  path?: string;
+  line?: string;
+  state?: string;
   url?: string;
 };
 
@@ -52,6 +56,60 @@ type WorkpadPatchHistoryEntry = {
   reason: string;
   sourceLabel: string;
 };
+
+type WorkpadEditableField = "validation" | "notes" | "blockers" | "reviewFeedback" | "retryReason" | "reworkChecklist" | "reworkAssessment";
+
+type WorkpadEditableFieldOption = {
+  id: WorkpadEditableField;
+  label: string;
+  description: string;
+  placeholder: string;
+};
+
+const WORKPAD_EDITABLE_FIELDS: WorkpadEditableFieldOption[] = [
+  {
+    id: "notes",
+    label: "Notes",
+    description: "Capture operator observations, review context, or follow-up notes.",
+    placeholder: "One note per line"
+  },
+  {
+    id: "blockers",
+    label: "Blockers",
+    description: "Record the real reasons still blocking delivery.",
+    placeholder: "One blocker per line"
+  },
+  {
+    id: "reviewFeedback",
+    label: "Review Feedback",
+    description: "Archive feedback that should be reused by rework.",
+    placeholder: "One feedback item per line"
+  },
+  {
+    id: "retryReason",
+    label: "Retry Reason",
+    description: "State why retry is needed in product terms.",
+    placeholder: "Why this attempt needs retry"
+  },
+  {
+    id: "validation",
+    label: "Validation",
+    description: "Add validation status, commands, or manual inspection results.",
+    placeholder: "Validation status, command, or conclusion"
+  },
+  {
+    id: "reworkChecklist",
+    label: "Rework Checklist",
+    description: "Capture the checklist that the next rework should execute.",
+    placeholder: "One rework item per line"
+  },
+  {
+    id: "reworkAssessment",
+    label: "Rework Assessment",
+    description: "Record whether rework should be quick-fix or replanned.",
+    placeholder: "Assessment and reason"
+  }
+];
 
 type DetailHelpers = {
   agentShortLabel: (agentId: string) => string;
@@ -78,7 +136,9 @@ export interface WorkItemDetailPageProps extends DetailHelpers {
   runWorkpads: RunWorkpadRecordInfo[];
   workItem: WorkItem;
   workItems: WorkItem[];
+  onOpenPagePilot: () => void;
   onApproveCheckpoint: (checkpointId: string) => void;
+  onPatchRunWorkpad?: (runWorkpadId: string, input: PatchRunWorkpadInput) => Promise<void>;
   onRequestCheckpointChanges: (checkpointId: string, note?: string) => void;
   onRetryAttempt: (attemptId: string) => void;
 }
@@ -105,7 +165,9 @@ export function WorkItemDetailPage({
   workItem,
   workItemStatusLabel,
   workItems,
+  onOpenPagePilot,
   onApproveCheckpoint,
+  onPatchRunWorkpad,
   onRequestCheckpointChanges,
   onRetryAttempt
 }: WorkItemDetailPageProps) {
@@ -206,6 +268,11 @@ export function WorkItemDetailPage({
             {repositoryLabel ? <span>{repositoryLabel}</span> : null}
             <span>{agentShortLabel(workItem.assignee)}</span>
           </div>
+          <div className="issue-detail-actions">
+            <button type="button" onClick={onOpenPagePilot} disabled={!workItem.repositoryTargetId}>
+              Open in Page Pilot
+            </button>
+          </div>
         </header>
 
         <section className="issue-detail-section detail-flow-priority">
@@ -216,9 +283,10 @@ export function WorkItemDetailPage({
             pipelineStageClassName={pipelineStageClassName}
             pipelineStageLabel={pipelineStageLabel}
           />
+          <ReworkReturnSignal attempt={attempt} pipeline={pipeline} runWorkpad={runWorkpad} />
         </section>
 
-        <RunWorkpad sections={workpadSections} />
+        <RunWorkpad onPatch={onPatchRunWorkpad} record={runWorkpad} sections={workpadSections} />
 
         <section className="issue-detail-section">
           <h3>Requirement source</h3>
@@ -301,9 +369,59 @@ export function WorkItemDetailPage({
   );
 }
 
-function RunWorkpad({ sections }: { sections: WorkpadSection[] }) {
+function RunWorkpad({
+  onPatch,
+  record,
+  sections
+}: {
+  onPatch?: (runWorkpadId: string, input: PatchRunWorkpadInput) => Promise<void>;
+  record?: RunWorkpadRecordInfo;
+  sections: WorkpadSection[];
+}) {
   const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [selectedField, setSelectedField] = useState<WorkpadEditableField>("notes");
+  const [draftValue, setDraftValue] = useState("");
+  const [draftReason, setDraftReason] = useState("");
+  const [patchError, setPatchError] = useState("");
+  const [patchSaving, setPatchSaving] = useState(false);
   const activeSection = sections.find((section) => section.id === activeSectionId);
+  const selectedOption = WORKPAD_EDITABLE_FIELDS.find((field) => field.id === selectedField) ?? WORKPAD_EDITABLE_FIELDS[0];
+  const canEdit = Boolean(record && onPatch);
+
+  useEffect(() => {
+    if (!editorOpen) return;
+    setDraftValue(workpadFieldToDraft(record?.workpad, selectedField));
+    setPatchError("");
+  }, [editorOpen, record?.id, record?.updatedAt, selectedField]);
+
+  async function submitPatch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!record || !onPatch) return;
+    setPatchSaving(true);
+    setPatchError("");
+    try {
+      await onPatch(record.id, {
+        workpad: buildWorkpadFieldPatch(selectedField, draftValue, record.workpad),
+        updatedBy: "operator",
+        reason: draftReason.trim() || `Operator edited ${selectedOption.label}.`,
+        source: {
+          kind: "ui",
+          label: "Run Workpad editor",
+          field: selectedField,
+          attemptId: record.attemptId,
+          workItemId: record.workItemId
+        }
+      });
+      setEditorOpen(false);
+      setDraftReason("");
+    } catch (error) {
+      setPatchError(error instanceof Error ? error.message : "Failed to patch Run Workpad.");
+    } finally {
+      setPatchSaving(false);
+    }
+  }
+
   return (
     <section className="run-workpad" aria-label="Run workpad">
       <header>
@@ -311,7 +429,20 @@ function RunWorkpad({ sections }: { sections: WorkpadSection[] }) {
           <span className="section-label">Run workpad</span>
           <h3>Execution brief</h3>
         </div>
-        <small>{workpadSignalSummary(sections)}</small>
+        <div className="run-workpad-actions">
+          <small>{workpadSignalSummary(sections)}</small>
+          {canEdit ? (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveSectionId(null);
+                setEditorOpen(true);
+              }}
+            >
+              Edit fields
+            </button>
+          ) : null}
+        </div>
       </header>
       <div className="run-workpad-grid">
         {sections.map((section) => (
@@ -347,8 +478,125 @@ function RunWorkpad({ sections }: { sections: WorkpadSection[] }) {
           </article>
         </section>
       ) : null}
+      {editorOpen ? (
+        <section className="detail-popover-backdrop" role="presentation" onClick={() => setEditorOpen(false)}>
+          <article
+            className="detail-popover workpad-edit-popover"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Edit Run Workpad field"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header>
+              <div>
+                <span>Run Workpad patch</span>
+                <strong>Field editor</strong>
+              </div>
+              <button type="button" onClick={() => setEditorOpen(false)}>Close</button>
+            </header>
+            <form className="workpad-edit-form" onSubmit={submitPatch}>
+              <label>
+                <span>Field</span>
+                <select
+                  value={selectedField}
+                  onChange={(event) => setSelectedField(event.target.value as WorkpadEditableField)}
+                >
+                  {WORKPAD_EDITABLE_FIELDS.map((field) => (
+                    <option key={field.id} value={field.id}>{field.label}</option>
+                  ))}
+                </select>
+              </label>
+              <p>{selectedOption.description}</p>
+              <label>
+                <span>Patch value</span>
+                <textarea
+                  value={draftValue}
+                  placeholder={selectedOption.placeholder}
+                  onChange={(event) => setDraftValue(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Reason</span>
+                <input
+                  value={draftReason}
+                  placeholder="Why this field is being patched"
+                  onChange={(event) => setDraftReason(event.target.value)}
+                />
+              </label>
+              {patchError ? <p className="workpad-edit-error">{patchError}</p> : null}
+              <div className="workpad-edit-actions">
+                <button type="button" onClick={() => setEditorOpen(false)} disabled={patchSaving}>Cancel</button>
+                <button type="submit" disabled={patchSaving || !record}>
+                  {patchSaving ? "Saving..." : "Save patch"}
+                </button>
+              </div>
+            </form>
+          </article>
+        </section>
+      ) : null}
     </section>
   );
+}
+
+function workpadFieldToDraft(workpad: RunWorkpadRecordInfo["workpad"] | undefined, field: WorkpadEditableField): string {
+  if (!workpad) return "";
+  if (field === "notes" || field === "blockers" || field === "reviewFeedback") {
+    const value = workpad[field];
+    return Array.isArray(value) ? value.join("\n") : "";
+  }
+  if (field === "retryReason") return workpad.retryReason ?? "";
+  if (field === "validation") {
+    const validation = recordValue(workpad.validation) ?? {};
+    return [recordString(validation, "summary"), recordString(validation, "message")].filter(Boolean).join("\n");
+  }
+  if (field === "reworkChecklist") {
+    const checklist = recordValue(workpad.reworkChecklist) ?? {};
+    const items = asStringArray(checklist.checklist);
+    return items.length ? items.join("\n") : recordString(checklist, "retryReason");
+  }
+  const assessment = recordValue(workpad.reworkAssessment) ?? {};
+  return [recordString(assessment, "strategy"), recordString(assessment, "reason")].filter(Boolean).join("\n");
+}
+
+function buildWorkpadFieldPatch(
+  field: WorkpadEditableField,
+  draftValue: string,
+  workpad: RunWorkpadRecordInfo["workpad"]
+): Partial<RunWorkpadRecordInfo["workpad"]> {
+  const trimmed = draftValue.trim();
+  if (field === "notes" || field === "blockers" || field === "reviewFeedback") {
+    return { [field]: linesFromDraft(draftValue) };
+  }
+  if (field === "retryReason") return { retryReason: trimmed };
+  if (field === "validation") {
+    return {
+      validation: {
+        ...(recordValue(workpad.validation) ?? {}),
+        status: "operator-note",
+        summary: trimmed || "Operator cleared the validation note."
+      }
+    };
+  }
+  if (field === "reworkChecklist") {
+    return {
+      reworkChecklist: {
+        ...(recordValue(workpad.reworkChecklist) ?? {}),
+        status: "operator-patched",
+        checklist: linesFromDraft(draftValue)
+      }
+    };
+  }
+  return {
+    reworkAssessment: {
+      ...(recordValue(workpad.reworkAssessment) ?? {}),
+      strategy: "operator-assessment",
+      reason: trimmed
+    }
+  };
+}
+
+function linesFromDraft(value: string): string[] {
+  return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
 function DeliveryFlowGrid({
@@ -379,6 +627,41 @@ function DeliveryFlowGrid({
         );
       })}
     </div>
+  );
+}
+
+function ReworkReturnSignal({
+  attempt,
+  pipeline,
+  runWorkpad
+}: {
+  attempt?: AttemptRecordInfo;
+  pipeline?: PipelineRecordInfo;
+  runWorkpad?: RunWorkpadRecordInfo;
+}) {
+  const stages = pipeline?.run?.stages ?? attempt?.stages ?? [];
+  const hasReworkStage = stages.some((stage) => /rework/i.test(`${stage.id} ${stage.title ?? ""}`));
+  const rejectedEvent = pipeline?.run?.events?.find((event) => /rejected|changes requested|request changes/i.test(`${event.type ?? ""} ${event.message ?? ""}`));
+  const assessment = recordValue(runWorkpad?.workpad?.reworkAssessment) || recordValue(attempt?.reworkAssessment);
+  const checklist = recordValue(runWorkpad?.workpad?.reworkChecklist) || recordValue(attempt?.reworkChecklist);
+  const checklistItems = asStringArray(checklist?.checklist);
+  if (!hasReworkStage && !rejectedEvent && !assessment && !checklistItems.length && !attempt?.humanChangeRequest) {
+    return null;
+  }
+  const route = recordString(assessment, "strategy") || (hasReworkStage ? "rework" : "waiting");
+  const reason =
+    recordString(assessment, "rationale") ||
+    recordString(checklist, "retryReason") ||
+    attempt?.humanChangeRequest ||
+    rejectedEvent?.message ||
+    "Human or review feedback will be routed into rework before returning to review.";
+  return (
+    <aside className="rework-return-signal" aria-label="Rework return signal">
+      <span>Feedback route</span>
+      <strong>{reworkStrategyLabel(route)}</strong>
+      <p>{shortText(reason, 180)}</p>
+      {checklistItems.length ? <small>{checklistItems.length} checklist action{checklistItems.length === 1 ? "" : "s"} captured for the next run.</small> : null}
+    </aside>
   );
 }
 
@@ -443,6 +726,7 @@ function buildRunWorkpadSections({
   const runtimeReworkChecklist = recordValue(workpad?.reworkChecklist) || recordValue(attempt?.reworkChecklist);
   const runtimeReworkChecklistItems = asStringArray(runtimeReworkChecklist?.checklist);
   const runtimeReworkSources = sourceRecordsFromValue(runtimeReworkChecklist?.sources);
+  const reviewPacket = recordValue(workpad?.reviewPacket) || recordValue(attempt?.reviewPacket);
   const reworkAssessment = recordValue(workpad?.reworkAssessment) || recordValue(attempt?.reworkAssessment);
   const reworkStrategy = recordString(reworkAssessment, "strategy");
   const reworkChecklist = asStringArray(recordValue(reworkAssessment)?.checklist);
@@ -493,6 +777,16 @@ function buildRunWorkpadSections({
           title: `${patchHistory.length} update${patchHistory.length === 1 ? "" : "s"}`,
           preview: patchHistory[0] ? `${patchHistory[0].updatedBy} updated ${patchHistory[0].fields.join(", ")}` : "No field patch recorded.",
           body: <WorkpadPatchHistory entries={patchHistory.slice(0, 5)} />
+        }]
+      : []),
+    ...(reviewPacket
+      ? [{
+          id: "review-packet",
+          label: "Review packet",
+          title: reviewPacketTitle(reviewPacket),
+          preview: shortText(recordString(reviewPacket, "summary") || reviewPacketFirstAction(reviewPacket) || "Diff, validation, checks and risk preview.", 120),
+          tone: reviewPacketTone(reviewPacket),
+          body: <ReviewPacketPreview packet={reviewPacket} />
         }]
       : []),
     {
@@ -596,6 +890,79 @@ function ArtifactList({ artifacts }: { artifacts: DetailProofCard[] }) {
   );
 }
 
+function ReviewPacketPreview({ packet }: { packet: Record<string, unknown> }) {
+  const diff = recordValue(packet.diffPreview);
+  const test = recordValue(packet.testPreview);
+  const checks = recordValue(packet.checkPreview);
+  const risk = recordValue(packet.risk);
+  const actions = arrayRecords(packet.recommendedActions);
+  const changedFiles = asStringArray(diff?.changedFiles);
+  return (
+    <div className="review-packet-preview" aria-label="Review packet preview">
+      <p>{recordString(packet, "summary") || "Review packet is ready for human review."}</p>
+      <div className="review-packet-grid">
+        <article>
+          <span>Diff</span>
+          <strong>{recordString(diff, "summary") || `${changedFiles.length} changed file${changedFiles.length === 1 ? "" : "s"}`}</strong>
+          {changedFiles.length ? (
+            <ul>{changedFiles.slice(0, 6).map((file) => <li key={file}>{file}</li>)}</ul>
+          ) : (
+            <small>No changed files captured.</small>
+          )}
+        </article>
+        <article>
+          <span>Tests</span>
+          <strong>{recordString(test, "status") || "unknown"}</strong>
+          <small>{recordString(test, "summary") || "No validation preview captured."}</small>
+        </article>
+        <article>
+          <span>Checks</span>
+          <strong>{recordString(checks, "status") || "unknown"}</strong>
+          <small>{recordString(checks, "summary") || "No check preview captured."}</small>
+        </article>
+        <article className={`review-packet-risk review-packet-risk-${recordString(risk, "level") || "low"}`}>
+          <span>Risk</span>
+          <strong>{recordString(risk, "level") || "low"}</strong>
+          <ul>{asStringArray(risk?.reasons).slice(0, 4).map((reason) => <li key={reason}>{reason}</li>)}</ul>
+        </article>
+      </div>
+      {actions.length ? (
+        <div className="review-packet-actions">
+          <span>Next actions</span>
+          <ul>
+            {actions.slice(0, 5).map((action, index) => {
+              const label = recordString(action, "label") || recordString(action, "type") || `Action ${index + 1}`;
+              const url = recordString(action, "url");
+              return <li key={`${label}-${index}`}>{url ? <a href={url} target="_blank" rel="noreferrer">{label}</a> : label}</li>;
+            })}
+          </ul>
+        </div>
+      ) : null}
+      {recordString(diff, "patchExcerpt") ? (
+        <pre className="review-packet-diff">{shortText(recordString(diff, "patchExcerpt"), 1800)}</pre>
+      ) : null}
+    </div>
+  );
+}
+
+function reviewPacketTitle(packet: Record<string, unknown>): string {
+  const risk = recordString(recordValue(packet.risk), "level") || "low";
+  const diff = recordValue(packet.diffPreview);
+  const count = numberValue(diff?.fileCount) || asStringArray(diff?.changedFiles).length;
+  return `${risk} risk · ${count} file${count === 1 ? "" : "s"}`;
+}
+
+function reviewPacketTone(packet: Record<string, unknown>): WorkpadSection["tone"] {
+  const risk = recordString(recordValue(packet.risk), "level");
+  if (risk === "high" || risk === "medium") return "warning";
+  return "success";
+}
+
+function reviewPacketFirstAction(packet: Record<string, unknown>): string {
+  const action = arrayRecords(packet.recommendedActions)[0];
+  return action ? recordString(action, "label") : "";
+}
+
 function OperationSummaryList({ operations }: { operations: OperationRecordInfo[] }) {
   return (
     <ul>
@@ -614,7 +981,7 @@ function ChecklistSourceList({ sources }: { sources: WorkpadSourceRecord[] }) {
         <article key={`${source.kind}:${source.label}:${index}`}>
           <div>
             <strong>{sourceLabel(source.kind)}</strong>
-            <small>{source.label}</small>
+            <small>{[source.label, source.state, source.path ? `${source.path}${source.line ? `:${source.line}` : ""}` : ""].filter(Boolean).join(" · ")}</small>
           </div>
           <p>{shortText(source.message, 220)}</p>
           {source.url ? <a href={source.url} target="_blank" rel="noreferrer">Open source</a> : null}
@@ -664,6 +1031,13 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
 }
 
+function arrayRecords(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.flatMap((item) => {
+    const record = recordValue(item);
+    return record ? [record] : [];
+  }) : [];
+}
+
 function feedbackRecordsToStrings(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry) => {
@@ -687,7 +1061,10 @@ function sourceRecordsFromValue(value: unknown): WorkpadSourceRecord[] {
       kind: typeof record.kind === "string" && record.kind.trim() ? record.kind.trim() : "source",
       label: typeof record.label === "string" && record.label.trim() ? record.label.trim() : "Captured source",
       message,
-      url: typeof record.url === "string" && record.url.trim() ? record.url.trim() : undefined
+      path: recordString(record, "path") || undefined,
+      line: recordString(record, "line") || undefined,
+      state: recordString(record, "state") || undefined,
+      url: recordString(record, "sourceUrl") || recordString(record, "url") || undefined
     }];
   });
 }
@@ -732,6 +1109,10 @@ function formatTimestamp(value: string): string {
 function recordValue(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
+}
+
+function numberValue(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function reworkStrategyLabel(strategy: string): string {

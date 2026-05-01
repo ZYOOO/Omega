@@ -78,7 +78,9 @@ updatedAt
 
 `fieldPatches` 是可选的字段级覆盖记录。旧做法：Workpad 每次刷新完全由 runtime 派生，Agent / supervisor 不能稳定写入单个字段。新做法：`PATCH /run-workpads/{id}` 写入 `fieldPatches`，runtime 后续刷新时先生成真实派生 Workpad，再叠加 field patches，避免人工 / supervisor 的 Blockers、Validation、Review Feedback 等被 heartbeat 或 attempt 更新冲掉。
 
-2026-04-30 更新：字段级 patch 新增 `fieldPatchSources` 和 `fieldPatchHistory`。旧做法只保留最终 patch 值，无法说明某个 Blocker / Validation / Retry Reason 来自 CI、人工审核、Agent 还是 supervisor。新做法要求 PATCH 写入者使用明确 `updatedBy`，并可附带 `reason` 与 `source`；runtime 会按字段记录来源，并追加最多 100 条变更历史。当前基础权限边界按写入者限制字段范围：operator / human-review 只能写 review、blocker、validation、retry 等人工判断字段；job-supervisor 可写运行门禁字段；agent 类写入者可写完整交接字段。详情页新增默认折叠的 Patch history 卡片，UI 编辑入口仍是后续项。
+2026-04-30 更新：字段级 patch 新增 `fieldPatchSources` 和 `fieldPatchHistory`。旧做法只保留最终 patch 值，无法说明某个 Blocker / Validation / Retry Reason 来自 CI、人工审核、Agent 还是 supervisor。新做法要求 PATCH 写入者使用明确 `updatedBy`，并可附带 `reason` 与 `source`；runtime 会按字段记录来源，并追加最多 100 条变更历史。当前基础权限边界按写入者限制字段范围：operator / human-review 只能写 review、blocker、validation、retry 等人工判断字段；job-supervisor 可写运行门禁字段；agent 类写入者可写完整交接字段。详情页新增默认折叠的 Patch history 卡片。旧说法：UI 编辑入口仍是后续项。
+
+2026-05-01 更新：Work Item 详情页新增 Run Workpad 字段级编辑入口。旧做法：字段 patch 只能由 API、Agent 或 supervisor 写入，operator 只能看 Patch history，无法在 UI 中补充“真实 blocker / retry reason / review feedback”。新做法：Run Workpad header 提供 `Edit fields`，页内弹窗选择 operator 允许字段并提交到真实 `PATCH /run-workpads/{id}`；payload 固定写入 `updatedBy=operator`、`reason` 和 `source.kind=ui`，后端继续沿用字段权限、来源归因和历史审计。第一版 UI 开放 `Notes`、`Blockers`、`Review Feedback`、`Retry Reason`、`Validation`、`Rework Checklist`、`Rework Assessment`，不开放 PR / Plan / Review Packet 等应由运行时或 Agent 生成的字段，避免人工覆盖交付证据。
 
 `workpad` 内部结构：
 

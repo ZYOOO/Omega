@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -192,6 +193,16 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	if len(template.StageProfiles) != 8 {
 		t.Fatalf("stage profiles = %+v", template.StageProfiles)
 	}
+	if len(template.StateProfiles) != 8 {
+		t.Fatalf("state profiles should come from workflow action graph: %+v", template.StateProfiles)
+	}
+	actionPlan := workflowActionPlan(template)
+	if len(actionPlan) < 12 || workflowExecutionMode(template) != "contract-action-plan" {
+		t.Fatalf("workflow action plan missing: mode=%s actions=%+v", workflowExecutionMode(template), actionPlan)
+	}
+	if len(template.TaskClasses) != 2 || template.TaskClasses[0].ID != "simple" || template.TaskClasses[1].WorkpadMode != "full" {
+		t.Fatalf("workflow task classes missing: %+v", template.TaskClasses)
+	}
 	implementation := template.StageProfiles[1]
 	if implementation.ID != "in_progress" || strings.Join(implementation.AgentIDs, ",") != "architect,coding,testing" {
 		t.Fatalf("implementation agents should come from workflow markdown: %+v", implementation)
@@ -215,15 +226,73 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	}, template)
 	run := mapValue(pipeline["run"])
 	workflow := mapValue(run["workflow"])
-	if workflow["source"] == "" || len(arrayMaps(workflow["reviewRounds"])) != 2 {
+	if workflow["source"] == "" || len(arrayMaps(workflow["reviewRounds"])) != 2 || len(arrayMaps(workflow["actions"])) == 0 || text(workflow, "executionMode") != "contract-action-plan" {
 		t.Fatalf("pipeline run should preserve workflow metadata: %+v", workflow)
+	}
+	if len(arrayMaps(workflow["taskClasses"])) != 2 || len(arrayMaps(workflow["states"])) != 8 {
+		t.Fatalf("pipeline run should preserve workflow state/action policy: %+v", workflow)
 	}
 	stages := arrayMaps(run["stages"])
 	if got := anySlice(stages[1]["agentIds"]); len(got) != 3 || got[0] != "architect" || got[2] != "testing" {
 		t.Fatalf("pipeline stages did not preserve workflow agents: %+v", stages[1])
 	}
-	if got := anySlice(stages[1]["outputArtifacts"]); len(got) == 0 || got[len(got)-1] != "test-report" {
+	if got := anySlice(stages[1]["outputArtifacts"]); len(got) == 0 || got[len(got)-1] != "pull-request" {
 		t.Fatalf("pipeline stages did not preserve workflow artifacts: %+v", stages[1])
+	}
+}
+
+func TestWorkflowContractParsesStateActionsAndRejectsBrokenActionRoute(t *testing.T) {
+	markdown := `---
+id: custom-flow
+name: Custom Flow
+states:
+  - id: todo
+    title: Todo
+    agentId: requirement
+    agents: [requirement]
+    actions:
+      - id: capture
+        type: write_requirement_artifact
+        agent: requirement
+        prompt: requirement
+    transitions:
+      passed: coding
+  - id: coding
+    title: Coding
+    agentId: coding
+    agents: [coding]
+    actions:
+      - id: implement
+        type: run_agent
+        agent: coding
+        prompt: coding
+        requiresDiff: true
+        transitions:
+          passed: missing
+taskClasses:
+  - id: simple
+    workpadMode: compact
+---
+
+## Prompt: coding
+Ship {{title}}.
+`
+	template, err := parseWorkflowTemplateMarkdown(markdown, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(template.StateProfiles) != 2 || len(template.StageProfiles) != 2 || len(workflowActionPlan(&template)) != 2 {
+		t.Fatalf("workflow state/action parse failed: %+v", template)
+	}
+	if !template.StateProfiles[1].Actions[0].RequiresDiff {
+		t.Fatalf("requiresDiff should be parsed: %+v", template.StateProfiles[1].Actions[0])
+	}
+	if got := template.TaskClasses[0].WorkpadMode; got != "compact" {
+		t.Fatalf("task class not parsed: %+v", template.TaskClasses)
+	}
+	validation := validateWorkflowTemplate(template)
+	if validation.ok() || !strings.Contains(strings.Join(validation.Errors, "; "), "unknown stage") {
+		t.Fatalf("expected action transition validation failure, got %+v", validation)
 	}
 }
 
@@ -357,6 +426,18 @@ func TestDevFlowStageStatusAfterChangesRequestedQueuesRework(t *testing.T) {
 	status, next = devFlowStageStatusAfterInvocation("rework", "testing", "passed")
 	if status != "passed" || next != "code_review_round_1" {
 		t.Fatalf("stage status after rework = %s next=%s", status, next)
+	}
+	workflow := map[string]any{"transitions": []any{
+		map[string]any{"from": "code_review_round_1", "on": "changes_requested", "to": "human_review"},
+		map[string]any{"from": "rework", "on": "passed", "to": "code_review_round_2"},
+	}}
+	status, next = devFlowStageStatusAfterInvocationWithWorkflow(workflow, "code_review_round_1", "review", "changes-requested")
+	if status != "passed" || next != "human_review" {
+		t.Fatalf("contract changes-requested route = %s next=%s", status, next)
+	}
+	status, next = devFlowStageStatusAfterInvocationWithWorkflow(workflow, "rework", "testing", "passed")
+	if status != "passed" || next != "code_review_round_2" {
+		t.Fatalf("contract rework pass route = %s next=%s", status, next)
 	}
 }
 
@@ -768,16 +849,7 @@ func TestJobSupervisorTickMarksStalledRunningAttempt(t *testing.T) {
 		"projectId": "project_omega", "key": "OMG-stalled", "title": "Detect stalled run", "description": "Runner stopped heartbeating.",
 		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "ZYOOO/TestRepo", "createdAt": timestamp, "updatedAt": timestamp,
 	}
-	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
-		ID:          "devflow-pr",
-		Name:        "DevFlow PR cycle",
-		Description: "DevFlow",
-		StageProfiles: []StageProfile{
-			{ID: "todo", Title: "Requirement", Agent: "requirement"},
-			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
-			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
-		},
-	})
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
 	run := mapValue(pipeline["run"])
 	stages := arrayMaps(run["stages"])
 	stages[0]["status"] = "passed"
@@ -965,16 +1037,7 @@ func TestPrepareDevFlowAttemptRetryLinksAttempts(t *testing.T) {
 		"id": "item_retry", "projectId": "project_omega", "key": "OMG-retry", "title": "Retry failed attempt", "description": "Retry this failed work.",
 		"status": "Blocked", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": repoPath, "repositoryTargetId": "repo_retry", "createdAt": nowISO(), "updatedAt": nowISO(),
 	}
-	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
-		ID:          "devflow-pr",
-		Name:        "DevFlow PR cycle",
-		Description: "DevFlow",
-		StageProfiles: []StageProfile{
-			{ID: "todo", Title: "Requirement", Agent: "requirement"},
-			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
-			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
-		},
-	})
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
 	pipeline["id"] = "pipeline_retry"
 	pipeline["status"] = "failed"
 	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
@@ -1398,16 +1461,7 @@ func TestJobSupervisorScanRecoverableAttemptsRetriesWithPolicy(t *testing.T) {
 		"id": "item_supervisor_retry", "projectId": "project_omega", "key": "OMG-retry-supervisor", "title": "Supervisor retry", "description": "Retry this failed work.",
 		"status": "Blocked", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": repoPath, "repositoryTargetId": "repo_supervisor_retry", "createdAt": nowISO(), "updatedAt": nowISO(),
 	}
-	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
-		ID:          "devflow-pr",
-		Name:        "DevFlow PR cycle",
-		Description: "DevFlow",
-		StageProfiles: []StageProfile{
-			{ID: "todo", Title: "Requirement", Agent: "requirement"},
-			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
-			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
-		},
-	})
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
 	pipeline["id"] = "pipeline_supervisor_retry"
 	pipeline["status"] = "failed"
 	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
@@ -1437,6 +1491,38 @@ func TestJobSupervisorScanRecoverableAttemptsRetriesWithPolicy(t *testing.T) {
 	}
 	if text(mapValue(jobs[0]["lock"]), "attemptId") != text(retryAttempt, "id") {
 		t.Fatalf("retry job should carry workspace lock: %+v", jobs[0])
+	}
+	policy := mapValue(jobs[0]["recoveryPolicy"])
+	if text(policy, "class") != "transient_network" || text(policy, "action") != "wait-and-retry" {
+		t.Fatalf("retry job missing recovery policy: %+v", jobs[0])
+	}
+	actionPlan := mapValue(jobs[0]["actionPlan"])
+	if text(actionPlan, "executionMode") != "contract-action-plan" || text(actionPlan, "currentStateId") != "todo" || text(actionPlan, "currentActionId") != "capture_requirement" {
+		t.Fatalf("retry job missing action plan summary: %+v", jobs[0])
+	}
+	recoverable := arrayMaps(summary["recoverableAttempts"])
+	if len(recoverable) == 0 || text(mapValue(recoverable[0]["actionPlan"]), "retryAction") != "retry_attempt" {
+		t.Fatalf("recoverable attempt missing action plan summary: %+v", summary)
+	}
+}
+
+func TestJobSupervisorRecoveryPolicyBlocksPermissionAutoRetry(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{Attempts: []map[string]any{
+		{
+			"id": "attempt_permission_failed", "pipelineId": "pipeline_permission", "itemId": "item_permission", "status": "failed",
+			"updatedAt":    time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano),
+			"errorMessage": "gh repo view returned viewerPermission=READ and cannot create pull requests",
+		},
+	}}}
+	jobs := []map[string]any{}
+	summary := server.scanRecoverableAttempts(context.Background(), database, jobSupervisorTickOptions{AutoRetryFailed: true, MaxRetryAttempts: 2, Limit: 5}, &jobs)
+	if summary["manualRecoveryRequired"] != 1 || summary["acceptedRetryAttempts"] != 0 || len(jobs) != 0 {
+		t.Fatalf("permission failure should require manual action: summary=%+v jobs=%+v", summary, jobs)
+	}
+	record := arrayMaps(summary["recoverableAttempts"])[0]
+	if text(record, "decision") != "manual-fix-permission" || text(mapValue(record["recoveryPolicy"]), "class") != "permission_failure" {
+		t.Fatalf("record should explain permission recovery: %+v", record)
 	}
 }
 
@@ -1566,6 +1652,22 @@ func TestJobSupervisorScanRecoverableAttemptsRespectsBackoffAndLimit(t *testing.
 
 func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
 	api, repo := newTestAPI(t)
+	database := WorkspaceDatabase{Tables: WorkspaceTables{
+		Requirements: []map[string]any{{
+			"id": "req_runtime_1", "projectId": "project_omega", "source": "manual", "title": "Runtime logs", "rawText": "Trace approval",
+			"structured": map[string]any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "status": "converted", "createdAt": "2026-04-29T09:00:00Z", "updatedAt": "2026-04-29T09:00:00Z",
+		}},
+		WorkItems: []map[string]any{{
+			"id": "item_runtime_1", "projectId": "project_omega", "key": "OMG-runtime", "title": "Runtime", "description": "Runtime", "status": "Running",
+			"priority": "High", "assignee": "requirement", "labels": []any{}, "team": "Omega", "stageId": "human_review", "target": "target", "requirementId": "req_runtime_1",
+			"createdAt": "2026-04-29T09:00:00Z", "updatedAt": "2026-04-29T09:00:00Z",
+		}},
+		Pipelines: []map[string]any{{"id": "pipeline_item_manual_1", "workItemId": "item_runtime_1", "runId": "run_runtime_1", "status": "running", "run": map[string]any{}, "createdAt": "2026-04-29T09:00:00Z", "updatedAt": "2026-04-29T09:00:00Z"}},
+		Attempts:  []map[string]any{{"id": "attempt_missing", "itemId": "item_runtime_1", "pipelineId": "pipeline_item_manual_1", "status": "failed", "trigger": "manual", "runner": "codex", "startedAt": "2026-04-29T09:00:00Z", "stages": []any{}, "events": []any{}, "createdAt": "2026-04-29T09:00:00Z", "updatedAt": "2026-04-29T09:00:00Z"}},
+	}}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
 	if err := repo.AppendRuntimeLog(context.Background(), RuntimeLogRecord{
 		ID:         "log_error_1",
 		Level:      "ERROR",
@@ -1573,7 +1675,7 @@ func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
 		Message:    "Missing attempt was detected.",
 		PipelineID: "pipeline_item_manual_1",
 		AttemptID:  "attempt_missing",
-		Details:    map[string]any{"pipelineId": "pipeline_item_manual_1"},
+		Details:    map[string]any{"pipelineId": "pipeline_item_manual_1", "note": "approval failed in review gate"},
 		CreatedAt:  "2026-04-29T10:00:00Z",
 	}); err != nil {
 		t.Fatal(err)
@@ -1585,6 +1687,17 @@ func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
 		Message:   "GET /health -> 200",
 		Details:   map[string]any{"path": "/health"},
 		CreatedAt: "2026-04-28T10:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AppendRuntimeLog(context.Background(), RuntimeLogRecord{
+		ID:            "log_req_1",
+		Level:         "INFO",
+		EventType:     "requirement.trace",
+		Message:       "Requirement trace collected.",
+		RequirementID: "req_runtime_1",
+		Details:       map[string]any{"requirementId": "req_runtime_1"},
+		CreatedAt:     "2026-04-29T09:30:00Z",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1600,6 +1713,32 @@ func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
 	decode(t, mustGet(t, api.URL+"/runtime-logs?eventType=checkpoint.approve.missing_attempt&createdAfter=2026-04-29T00%3A00%3A00Z"), &logs)
 	if len(logs) != 1 || logs[0].ID != "log_error_1" {
 		t.Fatalf("time filtered logs = %+v", logs)
+	}
+	decode(t, mustGet(t, api.URL+"/runtime-logs?requirementId=req_runtime_1&q=approval"), &logs)
+	if len(logs) != 1 || logs[0].ID != "log_error_1" {
+		t.Fatalf("requirement/search filtered logs = %+v", logs)
+	}
+	var page RuntimeLogPage
+	decode(t, mustGet(t, api.URL+"/runtime-logs?page=1&limit=1&requirementId=req_runtime_1"), &page)
+	if len(page.Items) != 1 || !page.HasMore || page.NextCursor == "" || page.Items[0].ID != "log_error_1" {
+		t.Fatalf("runtime log page = %+v", page)
+	}
+	var nextPage RuntimeLogPage
+	decode(t, mustGet(t, api.URL+"/runtime-logs?page=1&limit=1&requirementId=req_runtime_1&cursor="+url.QueryEscape(page.NextCursor)), &nextPage)
+	if len(nextPage.Items) != 1 || nextPage.Items[0].ID != "log_req_1" {
+		t.Fatalf("runtime log next page = %+v", nextPage)
+	}
+	exportResponse := mustGet(t, api.URL+"/runtime-logs/export?format=csv&requirementId=req_runtime_1")
+	defer exportResponse.Body.Close()
+	if exportResponse.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d", exportResponse.StatusCode)
+	}
+	rawExport, err := io.ReadAll(exportResponse.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawExport), "requirementId") || !strings.Contains(string(rawExport), "Requirement trace collected.") {
+		t.Fatalf("csv export = %s", string(rawExport))
 	}
 
 	var summary map[string]any
@@ -1829,7 +1968,13 @@ func TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof(t *testing.T) {
 	gh := filepath.Join(bin, "gh")
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %s
-if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf 'ok\n'
+elif [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf '{"nameWithOwner":"acme/demo","viewerPermission":"WRITE","defaultBranchRef":{"name":"main"}}'
+elif [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '[]'
+elif [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   printf 'https://github.com/acme/demo/pull/123\n'
 elif [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   printf 'no checks found\n'
@@ -1942,6 +2087,7 @@ echo "fake coding agent completed"
 		"code-review-round-1.md",
 		"code-review-round-2.md",
 		"human-review-request.md",
+		"attempt-review-packet.json",
 		"attempt-run-report.md",
 		"handoff-bundle.json",
 	} {
@@ -1964,11 +2110,26 @@ echo "fake coding agent completed"
 	if artifacts := arrayMaps(handoff["artifacts"]); len(artifacts) < 7 {
 		t.Fatalf("handoff artifacts = %+v", artifacts)
 	}
+	reviewPacket := mapValue(handoff["reviewPacket"])
+	if text(mapValue(reviewPacket["diffPreview"]), "summary") == "" || text(mapValue(reviewPacket["testPreview"]), "status") == "" || text(mapValue(reviewPacket["risk"]), "level") == "" || len(arrayMaps(reviewPacket["recommendedActions"])) == 0 {
+		t.Fatalf("handoff review packet = %+v", reviewPacket)
+	}
+	packetRaw, err := os.ReadFile(filepath.Join(proofDir, "attempt-review-packet.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var packetFile map[string]any
+	if err := json.Unmarshal(packetRaw, &packetFile); err != nil {
+		t.Fatal(err)
+	}
+	if text(mapValue(packetFile["diffPreview"]), "summary") != text(mapValue(reviewPacket["diffPreview"]), "summary") {
+		t.Fatalf("packet file should match handoff packet: file=%+v handoff=%+v", packetFile, reviewPacket)
+	}
 	reportRaw, err := os.ReadFile(filepath.Join(proofDir, "attempt-run-report.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(reportRaw), "Attempt Run Report") || !strings.Contains(string(reportRaw), "https://github.com/acme/demo/pull/123") {
+	if !strings.Contains(string(reportRaw), "Attempt Run Report") || !strings.Contains(string(reportRaw), "Diff Preview") || !strings.Contains(string(reportRaw), "Recommended Actions") || !strings.Contains(string(reportRaw), "https://github.com/acme/demo/pull/123") {
 		t.Fatalf("attempt report = %s", string(reportRaw))
 	}
 	planRaw, err := os.ReadFile(filepath.Join(proofDir, "solution-plan.md"))
@@ -2680,11 +2841,12 @@ func TestObservabilityDashboardMetrics(t *testing.T) {
 	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
 	database.Tables.Attempts = append(database.Tables.Attempts,
-		map[string]any{"id": "attempt_done", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "done", "currentStageId": "done", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "in_progress", "title": "Implementation", "status": "passed", "startedAt": startedAt, "completedAt": completedAt}}},
-		map[string]any{"id": "attempt_failed", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "failed", "currentStageId": "in_progress", "errorMessage": "tests failed", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "code_review", "title": "Review", "status": "failed", "durationMs": 240000}}},
-		map[string]any{"id": "attempt_running", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "running", "currentStageId": "in_progress", "lastSeenAt": startedAt, "startedAt": startedAt, "updatedAt": startedAt, "stages": []map[string]any{}},
-		map[string]any{"id": "attempt_waiting", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "waiting-human", "currentStageId": "human_review", "lastSeenAt": completedAt, "startedAt": startedAt, "updatedAt": completedAt, "stages": []map[string]any{}},
+		map[string]any{"id": "attempt_done", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "done", "runner": "codex", "currentStageId": "done", "pullRequestUrl": "https://github.com/acme/demo/pull/10", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "in_progress", "title": "Implementation", "status": "passed", "startedAt": startedAt, "completedAt": completedAt}}},
+		map[string]any{"id": "attempt_failed", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "failed", "runner": "codex", "currentStageId": "in_progress", "pullRequestUrl": "https://github.com/acme/demo/pull/11", "errorMessage": "tests failed", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "code_review", "title": "Review", "status": "failed", "durationMs": 240000}}},
+		map[string]any{"id": "attempt_running", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "running", "runner": "opencode", "currentStageId": "in_progress", "lastSeenAt": startedAt, "startedAt": startedAt, "updatedAt": startedAt, "stages": []map[string]any{}},
+		map[string]any{"id": "attempt_waiting", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "waiting-human", "runner": "claude-code", "currentStageId": "human_review", "lastSeenAt": completedAt, "startedAt": startedAt, "updatedAt": completedAt, "stages": []map[string]any{}},
 	)
+	database.Tables.ProofRecords = append(database.Tables.ProofRecords, map[string]any{"id": "proof_merge", "operationId": "operation_merge", "label": "merge proof", "value": "https://github.com/acme/demo/pull/10", "createdAt": completedAt})
 	if err := repo.Save(context.Background(), *database); err != nil {
 		t.Fatal(err)
 	}
@@ -2710,6 +2872,26 @@ func TestObservabilityDashboardMetrics(t *testing.T) {
 	slowStages := arrayMaps(dashboard["slowStages"])
 	if len(slowStages) == 0 || slowStages[0]["stageId"] != "code_review" {
 		t.Fatalf("slow stages = %+v", slowStages)
+	}
+	stageAverages := arrayMaps(dashboard["stageAverageDurations"])
+	if len(stageAverages) < 2 || stageAverages[0]["stageId"] != "code_review" || intNumber(stageAverages[0]["averageDurationMs"]) != 240000 {
+		t.Fatalf("stage averages = %+v", stageAverages)
+	}
+	runnerUsage := arrayMaps(dashboard["runnerUsage"])
+	if len(runnerUsage) == 0 || runnerUsage[0]["runner"] != "codex" || intNumber(runnerUsage[0]["count"]) != 2 || intNumber(runnerUsage[0]["successCount"]) != 1 || intNumber(runnerUsage[0]["failureCount"]) != 1 {
+		t.Fatalf("runner usage = %+v", runnerUsage)
+	}
+	checkpointWaits := mapValue(dashboard["checkpointWaitTimes"])
+	if intNumber(checkpointWaits["total"]) != 1 || intNumber(checkpointWaits["pending"]) != 1 || intNumber(checkpointWaits["maxWaitSeconds"]) <= 0 {
+		t.Fatalf("checkpoint waits = %+v", checkpointWaits)
+	}
+	pullRequests := mapValue(dashboard["pullRequests"])
+	if intNumber(pullRequests["created"]) != 2 || intNumber(pullRequests["merged"]) != 1 || intNumber(pullRequests["open"]) != 1 {
+		t.Fatalf("pull request metrics = %+v", pullRequests)
+	}
+	trends := arrayMaps(dashboard["trends"])
+	if len(trends) == 0 || intNumber(trends[0]["attemptsStarted"]) != 4 || intNumber(trends[0]["pullRequestsCreated"]) != 2 || intNumber(trends[0]["pullRequestsMerged"]) != 1 {
+		t.Fatalf("trends = %+v", trends)
 	}
 	waiting := arrayMaps(dashboard["waitingHumanQueue"])
 	if len(waiting) != 1 || waiting[0]["checkpointId"] != "checkpoint_dashboard" {
@@ -3398,6 +3580,52 @@ func TestGitHubPullRequestFeedbackFromView(t *testing.T) {
 	}
 }
 
+func TestGitHubPullRequestReviewThreadFeedbackFromGraphQL(t *testing.T) {
+	feedback := githubPullRequestReviewThreadFeedbackFromGraphQL(map[string]any{
+		"data": map[string]any{
+			"repository": map[string]any{
+				"pullRequest": map[string]any{
+					"reviewThreads": map[string]any{
+						"nodes": []any{
+							map[string]any{
+								"isResolved": false,
+								"path":       "src/Button.tsx",
+								"line":       float64(42),
+								"comments": map[string]any{"nodes": []any{
+									map[string]any{
+										"author":    map[string]any{"login": "reviewer"},
+										"body":      "Please keep the button copy short.",
+										"createdAt": "2026-05-01T01:00:00Z",
+										"url":       "https://github.com/acme/demo/pull/1#discussion_r1",
+										"diffHunk":  "@@ -1,2 +1,2 @@",
+									},
+								}},
+							},
+							map[string]any{
+								"isResolved": true,
+								"path":       "src/Card.tsx",
+								"line":       float64(9),
+								"comments": map[string]any{"nodes": []any{
+									map[string]any{"body": "Resolved copy note."},
+								}},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if len(feedback) != 2 {
+		t.Fatalf("feedback = %+v", feedback)
+	}
+	if text(feedback[0], "kind") != "pr-review-thread" || text(feedback[0], "state") != "unresolved" || text(feedback[0], "path") != "src/Button.tsx" || text(feedback[0], "line") != "42" {
+		t.Fatalf("unresolved thread feedback missing line context: %+v", feedback[0])
+	}
+	if !boolValue(feedback[1]["resolved"]) || text(feedback[1], "state") != "resolved" {
+		t.Fatalf("resolved thread state missing: %+v", feedback[1])
+	}
+}
+
 func TestGitHubPRStatusClassifiesFailedChecks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake shell gh script uses POSIX sh")
@@ -4035,7 +4263,7 @@ func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 	if err := os.Symlink(sqlite, filepath.Join(bin, "sqlite3")); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", bin)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	mission := map[string]any{
 		"id":               "mission_OMG-90_coding",
@@ -4062,6 +4290,47 @@ func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 	}
 	if !strings.Contains(text(body, "error"), "opencode") || !strings.Contains(text(body, "error"), "cannot start") {
 		t.Fatalf("error body = %+v", body)
+	}
+}
+
+func TestGitHubDeliveryContractPreflightChecksPermissions(t *testing.T) {
+	bin := t.TempDir()
+	gh := filepath.Join(bin, "gh")
+	script := `#!/bin/sh
+case "$1 $2" in
+  "auth status")
+    exit 0
+    ;;
+  "repo view")
+    printf '%s' '{"nameWithOwner":"ZYOOO/TestRepo","viewerPermission":"WRITE","defaultBranchRef":{"name":"main"}}'
+    exit 0
+    ;;
+  "pr list")
+    printf '%s' '[]'
+    exit 0
+    ;;
+esac
+echo "unexpected gh args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	checks := githubDeliveryContractPreflight(context.Background(), map[string]any{
+		"kind":  "github",
+		"owner": "ZYOOO",
+		"repo":  "TestRepo",
+	})
+	statusByID := map[string]string{}
+	for _, check := range checks {
+		statusByID[check.ID] = check.Status
+	}
+	for _, id := range []string{"github-auth", "github-repository", "github-branch-permission", "github-pr-create-permission", "github-checks-read-permission"} {
+		if statusByID[id] != "passed" {
+			t.Fatalf("%s should pass, checks=%+v", id, checks)
+		}
 	}
 }
 
@@ -4132,13 +4401,79 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 		"domContext":     map[string]any{"tagName": "h1"},
 		"sourceMapping":  map[string]any{"source": "src/Page.tsx:headline", "file": "src/Page.tsx", "symbol": "headline"},
 	}
-	var applied map[string]any
-	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+	conflictScope := "devflow:repo_local_page:item_other"
+	conflictLock := map[string]any{
+		"id":                 executionLockID(conflictScope),
+		"scope":              conflictScope,
+		"status":             "claimed",
+		"attemptId":          "attempt_other",
+		"repositoryTargetId": "repo_local_page",
+		"repositoryPath":     targetRepo,
+		"expiresAt":          time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+		"createdAt":          nowISO(),
+		"updatedAt":          nowISO(),
+	}
+	if err := repo.SetSetting(context.Background(), text(conflictLock, "id"), conflictLock); err != nil {
+		t.Fatal(err)
+	}
+	conversationBatch := map[string]any{
+		"id":                  "page_pilot_batch_test",
+		"createdAt":           "17:05:38",
+		"primaryAnnotationId": 1,
+		"instruction":         `replace text with "New headline"`,
+		"annotations": []any{map[string]any{
+			"id":        1,
+			"comment":   "Rename the headline",
+			"selection": selection,
+		}},
+		"status": "running",
+	}
+	submittedAnnotations := []any{map[string]any{
+		"id":        1,
+		"comment":   "Rename the headline",
+		"selection": selection,
+	}}
+	processEvents := []any{
+		map[string]any{"at": "17:05:38", "text": "Captured 1 page annotation(s)."},
+		map[string]any{"at": "17:05:38", "text": "Submitting selection context to the single Page Pilot Agent."},
+	}
+	previewRuntimeProfile := map[string]any{
+		"agentId":            "preview-runtime-agent",
+		"stageId":            "preview_runtime",
+		"repositoryTargetId": "repo_local_page",
+		"workingDirectory":   targetRepo,
+		"previewUrl":         "http://127.0.0.1:3009/",
+		"source":             "npm:dev",
+		"reloadStrategy":     "hmr-wait",
+		"devCommand":         "npm run dev -- --host 127.0.0.1 --port 3009",
+		"evidence":           []any{"package.json"},
+	}
+	blockedByOperation := postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
 		"projectId":          "project_omega",
 		"repositoryTargetId": "repo_local_page",
 		"instruction":        `replace text with "New headline"`,
 		"selection":          selection,
 		"runner":             "profile",
+	})
+	if blockedByOperation.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Page Pilot apply should be blocked by an active repository lock, status = %d", blockedByOperation.StatusCode)
+	}
+	_ = blockedByOperation.Body.Close()
+	conflictLock["status"] = "released"
+	if err := repo.SetSetting(context.Background(), text(conflictLock, "id"), conflictLock); err != nil {
+		t.Fatal(err)
+	}
+	var applied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":             "project_omega",
+		"repositoryTargetId":    "repo_local_page",
+		"instruction":           `replace text with "New headline"`,
+		"selection":             selection,
+		"runner":                "profile",
+		"conversationBatch":     conversationBatch,
+		"submittedAnnotations":  submittedAnnotations,
+		"processEvents":         processEvents,
+		"previewRuntimeProfile": previewRuntimeProfile,
 	}), &applied)
 	if applied["status"] != "applied" || applied["repositoryPath"] != targetRepo {
 		t.Fatalf("applied = %+v", applied)
@@ -4157,6 +4492,61 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if got := arrayValues(applied["changedFiles"]); len(got) != 1 || got[0] != "src/Page.tsx" {
 		t.Fatalf("changed files = %+v", applied["changedFiles"])
 	}
+	if batch := mapValue(applied["conversationBatch"]); text(batch, "status") != "applied" || text(batch, "runId") != runID || len(arrayMaps(batch["annotations"])) != 1 {
+		t.Fatalf("conversation batch should be persisted on apply: %+v", batch)
+	}
+	if len(arrayMaps(applied["submittedAnnotations"])) != 1 || len(arrayMaps(applied["processEvents"])) != 2 {
+		t.Fatalf("conversation details missing from apply result: %+v", applied)
+	}
+	if primary := mapValue(applied["primaryTarget"]); fmt.Sprint(primary["annotationId"]) != "1" {
+		t.Fatalf("primary target missing: %+v", primary)
+	}
+	if profile := mapValue(applied["previewRuntimeProfile"]); text(profile, "source") != "npm:dev" || text(profile, "workingDirectory") != targetRepo {
+		t.Fatalf("preview runtime profile should be persisted on apply: %+v", profile)
+	}
+	if report := mapValue(applied["sourceMappingReport"]); report["strongSourceMappings"].(float64) != 1 || text(report, "status") != "strong" {
+		t.Fatalf("source mapping report should count strong mappings: %+v", report)
+	}
+	lock := mapValue(applied["executionLock"])
+	if text(lock, "status") != "claimed" || text(lock, "ownerType") != "page-pilot" || text(lock, "pagePilotRunId") != runID {
+		t.Fatalf("Page Pilot apply should hold a live-preview lock: %+v", lock)
+	}
+	selectionRoundTwo := cloneMap(selection)
+	selectionRoundTwo["textSnapshot"] = "New headline"
+	var reapplied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"runId":                 runID,
+		"projectId":             "project_omega",
+		"repositoryTargetId":    "repo_local_page",
+		"instruction":           `replace text with "Round two headline"`,
+		"selection":             selectionRoundTwo,
+		"runner":                "profile",
+		"conversationBatch":     conversationBatch,
+		"submittedAnnotations":  submittedAnnotations,
+		"processEvents":         processEvents,
+		"previewRuntimeProfile": previewRuntimeProfile,
+	}), &reapplied)
+	if text(reapplied, "id") != runID || intNumber(reapplied["roundNumber"]) != 2 {
+		t.Fatalf("multi-round apply should keep the same run and increment round: %+v", reapplied)
+	}
+	raw, err = os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Round two headline") {
+		t.Fatalf("multi-round source not patched: %s", raw)
+	}
+	blockedApply := postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_page",
+		"instruction":        `replace text with "Another headline"`,
+		"selection":          selection,
+		"runner":             "profile",
+	})
+	if blockedApply.StatusCode != http.StatusBadRequest {
+		t.Fatalf("second Page Pilot apply should be blocked by live-preview lock, status = %d", blockedApply.StatusCode)
+	}
+	_ = blockedApply.Body.Close()
 	storedRun, err := repo.GetPagePilotRun(context.Background(), runID)
 	if err != nil {
 		t.Fatal(err)
@@ -4166,6 +4556,21 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	}
 	if text(storedRun, "requirementId") == "" || text(storedRun, "workItemId") == "" || text(storedRun, "pipelineId") == "" {
 		t.Fatalf("stored run should link Page Pilot back to feature-one records: %+v", storedRun)
+	}
+	if batch := mapValue(storedRun["conversationBatch"]); text(batch, "status") != "applied" || len(arrayMaps(batch["annotations"])) != 1 {
+		t.Fatalf("stored run should keep server-side Page Pilot conversation: %+v", storedRun)
+	}
+	if profile := mapValue(storedRun["previewRuntimeProfile"]); text(profile, "agentId") != "preview-runtime-agent" {
+		t.Fatalf("stored run should keep preview runtime profile: %+v", storedRun)
+	}
+	if prPreview := mapValue(storedRun["prPreview"]); text(prPreview, "body") == "" {
+		t.Fatalf("stored run should keep PR preview: %+v", storedRun)
+	}
+	if visualProof := mapValue(storedRun["visualProof"]); text(visualProof, "kind") != "dom-snapshot" {
+		t.Fatalf("stored run should keep visual proof: %+v", storedRun)
+	}
+	if report := mapValue(storedRun["sourceMappingReport"]); text(report, "status") != "strong" {
+		t.Fatalf("stored run should keep source mapping report: %+v", storedRun)
 	}
 	linkedDatabase, err := repo.Load(context.Background())
 	if err != nil {
@@ -4211,12 +4616,22 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if discarded["status"] != "discarded" {
 		t.Fatalf("discarded = %+v", discarded)
 	}
+	if batch := mapValue(discarded["conversationBatch"]); text(batch, "status") != "discarded" {
+		t.Fatalf("discard should mark conversation discarded: %+v", batch)
+	}
 	raw, err = os.ReadFile(sourceFile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(raw), "Old headline") {
 		t.Fatalf("source not discarded: %s", raw)
+	}
+	releasedLock, err := repo.GetSetting(context.Background(), text(lock, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(releasedLock, "status") != "released" {
+		t.Fatalf("discard should release Page Pilot lock: %+v", releasedLock)
 	}
 	discardedDatabase, err := repo.Load(context.Background())
 	if err != nil {
@@ -4232,25 +4647,50 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	}
 
 	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
-		"projectId":          "project_omega",
-		"repositoryTargetId": "repo_local_page",
-		"instruction":        `replace text with "New headline"`,
-		"selection":          selection,
-		"runner":             "profile",
+		"projectId":             "project_omega",
+		"repositoryTargetId":    "repo_local_page",
+		"instruction":           `replace text with "New headline"`,
+		"selection":             selection,
+		"runner":                "profile",
+		"conversationBatch":     conversationBatch,
+		"submittedAnnotations":  submittedAnnotations,
+		"processEvents":         processEvents,
+		"previewRuntimeProfile": previewRuntimeProfile,
 	}), &applied)
 	runID = text(applied, "id")
+	lock = mapValue(applied["executionLock"])
 
 	var delivered map[string]any
 	decode(t, postJSON(t, api.URL+"/page-pilot/deliver", map[string]any{
-		"runId":              runID,
-		"projectId":          "project_omega",
-		"repositoryTargetId": "repo_local_page",
-		"instruction":        `replace text with "New headline"`,
-		"selection":          selection,
-		"branchName":         "omega/page-pilot-test",
+		"runId":                 runID,
+		"projectId":             "project_omega",
+		"repositoryTargetId":    "repo_local_page",
+		"instruction":           `replace text with "New headline"`,
+		"selection":             selection,
+		"branchName":            "omega/page-pilot-test",
+		"conversationBatch":     mapValue(applied["conversationBatch"]),
+		"submittedAnnotations":  arrayMaps(applied["submittedAnnotations"]),
+		"processEvents":         append(arrayMaps(applied["processEvents"]), map[string]any{"at": "17:06:00", "text": "User confirmed the Page Pilot changes for delivery."}),
+		"previewRuntimeProfile": mapValue(applied["previewRuntimeProfile"]),
 	}), &delivered)
 	if delivered["status"] != "delivered" || delivered["branchName"] != "omega/page-pilot-test" || delivered["commitSha"] == "" {
 		t.Fatalf("delivered = %+v", delivered)
+	}
+	if batch := mapValue(delivered["conversationBatch"]); text(batch, "status") != "delivered" || len(arrayMaps(delivered["processEvents"])) != 3 {
+		t.Fatalf("delivery should keep conversation context: %+v", delivered)
+	}
+	if profile := mapValue(delivered["previewRuntimeProfile"]); text(profile, "reloadStrategy") != "hmr-wait" {
+		t.Fatalf("delivery should keep preview runtime profile: %+v", delivered)
+	}
+	if report := mapValue(delivered["sourceMappingReport"]); text(report, "status") != "strong" {
+		t.Fatalf("delivery should keep source mapping report: %+v", delivered)
+	}
+	releasedLock, err = repo.GetSetting(context.Background(), text(lock, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(releasedLock, "status") != "released" {
+		t.Fatalf("delivery should release Page Pilot lock: %+v", releasedLock)
 	}
 	deliveredRun, err := repo.Load(context.Background())
 	if err != nil {
@@ -4262,6 +4702,146 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	}
 	if branch := strings.TrimSpace(runGit(t, targetRepo, "branch", "--show-current")); branch != "omega/page-pilot-test" {
 		t.Fatalf("branch = %s", branch)
+	}
+}
+
+func TestPagePilotDomOnlySelectionUsesSourceLocator(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	targetRepo := createDemoGitRepo(t)
+	sourceFile := filepath.Join(targetRepo, "src", "Page.tsx")
+	if err := os.WriteFile(sourceFile, []byte("export function Page() {\n  return <button className=\"card-action\">Start trial</button>;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, targetRepo, "add", ".")
+	runGit(t, targetRepo, "commit", "-m", "add page")
+
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{
+		"id":            "repo_local_dom_only",
+		"kind":          "local",
+		"path":          targetRepo,
+		"defaultBranch": "main",
+	}}
+	project["defaultRepositoryTargetId"] = "repo_local_dom_only"
+	database.Tables.Projects[0] = project
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_dom_only",
+		"workflowTemplate":   "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "local-proof",
+			"model":  "local",
+		}},
+	}), &ProjectAgentProfile{})
+
+	selection := map[string]any{
+		"elementKind":    "button",
+		"stableSelector": `.card-action`,
+		"textSnapshot":   "Start trial",
+		"styleSnapshot":  map[string]any{"fontWeight": "700"},
+		"domContext":     map[string]any{"tagName": "button"},
+		"sourceMapping":  map[string]any{"source": "DOM-only", "file": "", "symbol": ""},
+	}
+	var applied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_dom_only",
+		"instruction":        `replace text with "Launch now"`,
+		"selection":          selection,
+		"runner":             "profile",
+	}), &applied)
+	if applied["status"] != "applied" {
+		t.Fatalf("applied = %+v", applied)
+	}
+	raw, err := os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Launch now") {
+		t.Fatalf("DOM-only source locator did not patch candidate source: %s", raw)
+	}
+	report := mapValue(applied["sourceMappingReport"])
+	if text(report, "status") != "dom-only" || report["domOnlySelections"].(float64) != 1 {
+		t.Fatalf("source mapping report = %+v", report)
+	}
+	locator := mapValue(applied["sourceLocator"])
+	if text(locator, "status") != "candidates-ready" {
+		t.Fatalf("source locator = %+v", locator)
+	}
+	candidates := arrayMaps(arrayMaps(locator["results"])[0]["candidates"])
+	if len(candidates) == 0 || text(candidates[0], "file") != "src/Page.tsx" {
+		t.Fatalf("source candidates = %+v", candidates)
+	}
+	promptBytes, err := os.ReadFile(stringSlice(applied["proofFiles"])[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := string(promptBytes)
+	if !strings.Contains(prompt, "Source locator candidates") || !strings.Contains(prompt, "src/Page.tsx") {
+		t.Fatalf("prompt should include source locator candidates:\n%s", prompt)
+	}
+}
+
+func TestPagePilotPreviewRuntimeStartPersistsGoProfile(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	targetRepo := createDemoGitRepo(t)
+	if err := os.WriteFile(filepath.Join(targetRepo, "package.json"), []byte(`{"scripts":{"dev":"vite --host 127.0.0.1"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, targetRepo, "add", ".")
+	runGit(t, targetRepo, "commit", "-m", "add preview script")
+
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{
+		"id":            "repo_local_preview",
+		"kind":          "local",
+		"path":          targetRepo,
+		"defaultBranch": "main",
+	}}
+	project["defaultRepositoryTargetId"] = "repo_local_preview"
+	database.Tables.Projects[0] = project
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	preview := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		_, _ = response.Write([]byte("ok"))
+	}))
+	defer preview.Close()
+
+	var result map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/preview-runtime/start", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_preview",
+		"previewUrl":         preview.URL,
+	}), &result)
+	if result["ok"] != true || text(result, "status") != "external" {
+		t.Fatalf("preview runtime result = %+v", result)
+	}
+	profile := mapValue(result["profile"])
+	if text(profile, "agentId") != "preview-runtime-agent" || text(profile, "source") != "npm:dev" {
+		t.Fatalf("preview runtime profile = %+v", profile)
+	}
+	stored, err := repo.GetSetting(context.Background(), pagePilotPreviewRuntimeKey("repo_local_preview"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(mapValue(stored["profile"]), "workingDirectory") != targetRepo {
+		t.Fatalf("stored preview runtime = %+v", stored)
 	}
 }
 
@@ -4278,7 +4858,7 @@ func TestFeishuNotifyUsesLocalLarkCLI(t *testing.T) {
 	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", bin)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	response := postJSON(t, api.URL+"/feishu/notify", map[string]any{"chatId": "oc_demo", "text": "Pipeline waiting for review"})
 	var result map[string]any
@@ -4292,6 +4872,168 @@ func TestFeishuNotifyUsesLocalLarkCLI(t *testing.T) {
 	}
 	if !strings.Contains(string(args), "im +messages-send --chat-id oc_demo --text Pipeline waiting for review") {
 		t.Fatalf("lark-cli args = %s", string(args))
+	}
+}
+
+func TestFeishuReviewRequestSendsInteractiveWebhookCard(t *testing.T) {
+	api, repo := newTestAPI(t)
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       nowISO(),
+		Tables: WorkspaceTables{
+			Projects: []map[string]any{{"id": "project_omega", "name": "Omega", "status": "Active", "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Requirements: []map[string]any{{
+				"id": "req_1", "title": "Add review card", "description": strings.Repeat("Requirement detail. ", 20), "status": "converted", "structured": map[string]any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			WorkItems: []map[string]any{{
+				"id": "item_1", "projectId": "project_omega", "requirementId": "req_1", "key": "OMG-1", "title": "Add review card", "description": "Send review card.", "status": "In Review", "labels": []any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "status": "waiting-human", "templateId": "devflow-pr", "run": map[string]any{"stages": []any{}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Attempts: []map[string]any{{
+				"id": "attempt_1", "itemId": "item_1", "pipelineId": "pipeline_1", "status": "waiting-human", "branchName": "omega/OMG-1-devflow", "pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/1", "reviewPacket": map[string]any{"summary": "Review packet ready.", "risk": map[string]any{"level": "medium"}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Checkpoints: []map[string]any{{
+				"id": "pipeline_1:human_review", "pipelineId": "pipeline_1", "attemptId": "attempt_1", "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Waiting for approval.", "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	var received map[string]any
+	webhook := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		writeJSON(response, http.StatusOK, map[string]any{"StatusCode": 0, "message_id": "om_card"})
+	}))
+	defer webhook.Close()
+	t.Setenv("OMEGA_FEISHU_WEBHOOK_URL", webhook.URL)
+	t.Setenv("OMEGA_PUBLIC_APP_URL", "http://127.0.0.1:5173")
+	t.Setenv("OMEGA_PUBLIC_API_URL", "https://omega.example.test")
+	t.Setenv("OMEGA_FEISHU_REVIEW_TOKEN", "secret-token")
+
+	response := postJSON(t, api.URL+"/feishu/review-request", map[string]any{"checkpointId": "pipeline_1:human_review"})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "status") != "sent" || text(result, "format") != "interactive-card" {
+		t.Fatalf("review request result = %+v", result)
+	}
+	if text(received, "msg_type") != "interactive" {
+		t.Fatalf("webhook payload = %+v", received)
+	}
+	card := mapValue(received["card"])
+	if text(mapValue(card["header"]), "template") != "orange" {
+		t.Fatalf("card header = %+v", card["header"])
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := loaded.Tables.Checkpoints[0]
+	if text(mapValue(checkpoint["feishuReview"]), "status") != "sent" {
+		t.Fatalf("checkpoint feishu review = %+v", checkpoint["feishuReview"])
+	}
+}
+
+func TestFeishuReviewRequestUsesLarkCLIInteractiveCard(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       nowISO(),
+		Tables: WorkspaceTables{
+			Projects: []map[string]any{{"id": "project_omega", "name": "Omega", "status": "Active", "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Requirements: []map[string]any{{
+				"id": "req_1", "title": "Add review card", "description": "Requirement detail.", "status": "converted", "structured": map[string]any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			WorkItems: []map[string]any{{
+				"id": "item_1", "projectId": "project_omega", "requirementId": "req_1", "key": "OMG-1", "title": "Add review card", "description": "Send review card.", "status": "In Review", "labels": []any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "status": "waiting-human", "templateId": "devflow-pr", "run": map[string]any{"stages": []any{}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Attempts: []map[string]any{{
+				"id": "attempt_1", "itemId": "item_1", "pipelineId": "pipeline_1", "status": "waiting-human", "branchName": "omega/OMG-1-devflow", "pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/1", "reviewPacket": map[string]any{"summary": "Review packet ready.", "risk": map[string]any{"level": "medium"}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Checkpoints: []map[string]any{{
+				"id": "pipeline_1:human_review", "pipelineId": "pipeline_1", "attemptId": "attempt_1", "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Waiting for approval.", "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args.txt")
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsFile + "\nprintf '%s' '{\"message_id\":\"om_card\"}'\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OMEGA_PUBLIC_APP_URL", "http://127.0.0.1:5173")
+
+	response := postJSON(t, api.URL+"/feishu/review-request", map[string]any{"checkpointId": "pipeline_1:human_review", "chatId": "oc_demo"})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "status") != "sent" || text(result, "format") != "interactive-card" || text(result, "tool") != "lark-cli" {
+		t.Fatalf("review request result = %+v", result)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argsText := string(args)
+	for _, expected := range []string{"im +messages-send --chat-id oc_demo", "--msg-type interactive", "--content"} {
+		if !strings.Contains(argsText, expected) {
+			t.Fatalf("lark-cli args missing %q: %s", expected, argsText)
+		}
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(mapValue(loaded.Tables.Checkpoints[0]["feishuReview"]), "format") != "interactive-card" {
+		t.Fatalf("checkpoint feishu review = %+v", loaded.Tables.Checkpoints[0]["feishuReview"])
+	}
+}
+
+func TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath(t *testing.T) {
+	api, repo := newTestAPI(t)
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       nowISO(),
+		Tables: WorkspaceTables{
+			Projects:  []map[string]any{{"id": "project_omega", "name": "Omega", "status": "Active", "createdAt": nowISO(), "updatedAt": nowISO()}},
+			WorkItems: []map[string]any{{"id": "item_1", "projectId": "project_omega", "key": "OMG-1", "title": "Review item", "status": "In Review", "labels": []any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "status": "waiting-human", "templateId": "manual-review", "run": map[string]any{"stages": []any{map[string]any{"id": "human_review", "status": "needs-human"}, map[string]any{"id": "done", "status": "waiting"}}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Checkpoints: []map[string]any{{"id": "pipeline_1:human_review", "pipelineId": "pipeline_1", "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Waiting.", "createdAt": nowISO(), "updatedAt": nowISO()}},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMEGA_FEISHU_REVIEW_TOKEN", "secret-token")
+
+	response := postJSON(t, api.URL+"/feishu/review-callback", map[string]any{"checkpointId": "pipeline_1:human_review", "action": "approve", "reviewer": "feishu-user", "token": "secret-token"})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "status") != "approved" {
+		t.Fatalf("callback result = %+v", result)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(loaded.Tables.Checkpoints[0], "status") != "approved" || !strings.Contains(text(loaded.Tables.Checkpoints[0], "decisionNote"), "feishu-user") {
+		t.Fatalf("checkpoint after callback = %+v", loaded.Tables.Checkpoints[0])
 	}
 }
 
@@ -4332,6 +5074,86 @@ func TestSQLiteSaveToleratesLegacyDuplicateRecordIDs(t *testing.T) {
 	}
 	if len(loaded.Tables.WorkItems) != 2 {
 		t.Fatalf("snapshot work items should be preserved, got %+v", loaded.Tables.WorkItems)
+	}
+}
+
+func TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	previewRoot := t.TempDir()
+	t.Setenv("OMEGA_PAGE_PILOT_WORKSPACE_ROOT", previewRoot)
+	targetRepo := filepath.Join(previewRoot, safeSegment("ZYOOO_TestRepo"))
+	if err := os.MkdirAll(filepath.Join(targetRepo, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sourceFile := filepath.Join(targetRepo, "src", "Page.tsx")
+	if err := os.WriteFile(sourceFile, []byte("export function Page() {\n  return <h1>Old headline</h1>;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, targetRepo, "init")
+	runGit(t, targetRepo, "checkout", "-b", "main")
+	runGit(t, targetRepo, "config", "user.email", "omega-test@example.local")
+	runGit(t, targetRepo, "config", "user.name", "Omega Test")
+	runGit(t, targetRepo, "add", ".")
+	runGit(t, targetRepo, "commit", "-m", "add page")
+
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{
+		"id":            "repo_ZYOOO_TestRepo",
+		"kind":          "github",
+		"owner":         "ZYOOO",
+		"repo":          "TestRepo",
+		"url":           "https://github.com/ZYOOO/TestRepo",
+		"defaultBranch": "main",
+	}}
+	project["defaultRepositoryTargetId"] = "repo_ZYOOO_TestRepo"
+	database.Tables.Projects[0] = project
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_ZYOOO_TestRepo",
+		"workflowTemplate":   "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "local-proof",
+			"model":  "local",
+		}},
+	}), &saved)
+
+	selection := map[string]any{
+		"elementKind":    "title",
+		"stableSelector": `[data-omega-source="src/Page.tsx:headline"]`,
+		"textSnapshot":   "Old headline",
+		"styleSnapshot":  map[string]any{"fontSize": "32px"},
+		"domContext":     map[string]any{"tagName": "h1"},
+		"sourceMapping":  map[string]any{"source": "src/Page.tsx:headline", "file": "src/Page.tsx", "symbol": "headline"},
+	}
+	var applied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_ZYOOO_TestRepo",
+		"instruction":        `replace text with "New headline"`,
+		"selection":          selection,
+		"runner":             "profile",
+	}), &applied)
+	if applied["status"] != "applied" || applied["repositoryPath"] != targetRepo {
+		t.Fatalf("applied = %+v", applied)
+	}
+	raw, err := os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "New headline") {
+		t.Fatalf("isolated workspace source not patched: %s", raw)
 	}
 }
 

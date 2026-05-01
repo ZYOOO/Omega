@@ -48,10 +48,15 @@ func makePipelineWithTemplate(item map[string]any, template *PipelineTemplate) m
 				"id":             template.ID,
 				"name":           template.Name,
 				"source":         template.Source,
+				"states":         template.StateProfiles,
+				"actions":        workflowActionPlan(template),
+				"taskClasses":    template.TaskClasses,
+				"hooks":          template.Hooks,
 				"reviewRounds":   template.ReviewRounds,
 				"runtime":        template.Runtime,
 				"transitions":    template.Transitions,
 				"promptSections": template.PromptSections,
+				"executionMode":  workflowExecutionMode(template),
 			},
 			"dataFlow":             dataFlowForStages(stages),
 			"selectedCapabilities": map[string]any{"llmProvider": defaultProviderSelection().ProviderID, "model": defaultProviderSelection().Model},
@@ -100,6 +105,18 @@ func normalizePipelineExecutionMetadata(database WorkspaceDatabase) WorkspaceDat
 			if len(arrayMaps(workflow["reviewRounds"])) == 0 {
 				workflow["reviewRounds"] = normalizedWorkflow["reviewRounds"]
 			}
+			if len(arrayMaps(workflow["states"])) == 0 {
+				workflow["states"] = normalizedWorkflow["states"]
+			}
+			if len(arrayMaps(workflow["actions"])) == 0 {
+				workflow["actions"] = normalizedWorkflow["actions"]
+			}
+			if len(arrayMaps(workflow["taskClasses"])) == 0 {
+				workflow["taskClasses"] = normalizedWorkflow["taskClasses"]
+			}
+			if len(mapValue(workflow["hooks"])) == 0 {
+				workflow["hooks"] = normalizedWorkflow["hooks"]
+			}
 			if len(arrayMaps(workflow["transitions"])) == 0 {
 				workflow["transitions"] = normalizedWorkflow["transitions"]
 			}
@@ -108,6 +125,9 @@ func normalizePipelineExecutionMetadata(database WorkspaceDatabase) WorkspaceDat
 			}
 			if len(mapValue(workflow["promptSections"])) == 0 {
 				workflow["promptSections"] = normalizedWorkflow["promptSections"]
+			}
+			if text(workflow, "executionMode") == "" {
+				workflow["executionMode"] = normalizedWorkflow["executionMode"]
 			}
 			run["workflow"] = workflow
 		}
@@ -134,10 +154,15 @@ func applyWorkflowTemplateToPipeline(pipeline map[string]any, template PipelineT
 	workflow["id"] = template.ID
 	workflow["name"] = template.Name
 	workflow["source"] = template.Source
+	workflow["states"] = template.StateProfiles
+	workflow["actions"] = workflowActionPlan(&template)
+	workflow["taskClasses"] = template.TaskClasses
+	workflow["hooks"] = template.Hooks
 	workflow["reviewRounds"] = template.ReviewRounds
 	workflow["runtime"] = template.Runtime
 	workflow["transitions"] = template.Transitions
 	workflow["promptSections"] = template.PromptSections
+	workflow["executionMode"] = workflowExecutionMode(&template)
 	run["workflow"] = workflow
 	next["run"] = run
 	next["updatedAt"] = nowISO()
@@ -190,6 +215,9 @@ type PipelineTemplate struct {
 	PromptTemplate   string                      `json:"promptTemplate,omitempty"`
 	WorkflowMarkdown string                      `json:"workflowMarkdown,omitempty"`
 	StageProfiles    []StageProfile              `json:"stages"`
+	StateProfiles    []WorkflowStateProfile      `json:"states,omitempty"`
+	TaskClasses      []WorkflowTaskClassProfile  `json:"taskClasses,omitempty"`
+	Hooks            WorkflowHookProfile         `json:"hooks,omitempty"`
 	ReviewRounds     []ReviewRoundProfile        `json:"reviewRounds,omitempty"`
 	Runtime          WorkflowRuntimeProfile      `json:"runtime,omitempty"`
 	Transitions      []WorkflowTransitionProfile `json:"transitions,omitempty"`

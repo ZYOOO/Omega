@@ -178,6 +178,7 @@ GET  /operations
 GET  /proof-records
 GET  /execution-locks
 GET  /runtime-logs
+GET  /runtime-logs/export
 POST /job-supervisor/tick
 POST /orchestrator/tick
 GET  /agent-definitions

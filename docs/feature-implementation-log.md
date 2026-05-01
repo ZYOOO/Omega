@@ -2,6 +2,134 @@
 
 这个文档用于记录每个功能的落地方式。后续每完成一个功能，都按相同结构补一节：目标、入口、数据/API、运行时行为、验证、后续工作。
 
+## 2026-05-01: GitHub / CI 出站同步增强与飞书审核卡片本地 CLI 路径
+
+### 目标
+
+把功能一的外部协作从“能在本地看见状态”推进到“外部系统也能看见可操作上下文”。旧做法已经能回写 GitHub Issue、读取 PR/checks，并通过飞书 webhook 发送审核卡片；但 PR 本身缺少结构化 review packet 评论，CI 不能按策略触发，`lark-cli` 路径也只保留文本降级。
+
+### 数据/API
+
+- GitHub outbound sync 继续使用现有 DevFlow report 写入路径，无新增 HTTP API。
+- PR 出站同步新增 `gh pr comment --edit-last --create-if-none`，在同一 PR 上维护结构化 review packet 评论。
+- CI 触发通过显式环境变量启用：
+  - `OMEGA_GITHUB_CI_TRIGGER=rerun-failed`
+  - `OMEGA_GITHUB_CI_TRIGGER=workflow-dispatch`
+  - `OMEGA_GITHUB_CI_WORKFLOW`
+  - `OMEGA_GITHUB_CI_REF`
+  - `OMEGA_GITHUB_CI_INPUTS`
+- 飞书 `POST /feishu/review-request` 在无 webhook 且有 `chatId` 时优先走 `lark-cli im +messages-send --msg-type interactive --content ...`。
+
+### 运行时行为
+
+- Work Item 没有 GitHub Issue 也不影响 PR comment 同步；只要 Attempt 有 `pullRequestUrl`，PR review packet 就会尝试写回。
+- CI 自动触发默认关闭，避免本地演示误触远端 Actions；只有显式配置时才执行真实 `gh` 写操作。
+- 发送飞书回复 / 通知本身不需要公网；公网只用于飞书云端按钮直接回调本机 runtime。没有公网时，卡片仍可发送，审核人可以通过 `Open review` 回到 Omega Web 操作。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestSyncGitHubIssueOutboundPostsCommentAndLabels|TestSyncGitHubIssueOutboundPostsPRCommentWithoutIssue|TestGitHubCITriggerRerunsFailedRuns|TestGitHubCITriggerWorkflowDispatch|TestFeishuReviewRequestUsesLarkCLIInteractiveCard'
+```
+
+### 后续工作
+
+- 本地事件桥：用 `lark-cli event consume` 消费飞书交互事件，再调用本机 runtime，避免必须暴露公网 callback。
+- 飞书长文档：把当前 review doc preview 通过飞书文档 API 发布为正式文档，并在卡片中附链接。
+- CI 触发策略：把 rerun / dispatch 配置接入 Project / Repository settings，而不是只靠 env。
+
+## 2026-04-30: Page Pilot 产品入口与 Repository Workspace 选择
+
+### 目标
+
+解决功能二入口不明显、进入后依赖默认 Repository Workspace 的问题。旧做法把 Page Pilot 藏在 Workboard 左侧导航里，用户从 Electron 首页启动后不容易发现；进入 Page Pilot 后也没有显式选择目标 repo 的步骤，容易误以为仍是固定项目演示。
+
+### 入口
+
+- 首页增加 `打开 Page Pilot` / `启动 Page Pilot` 按钮。
+- 支持 `#page-pilot` 深链，Electron 或浏览器可直接打开功能二页面。
+- Work Item 详情页增加 `Open in Page Pilot`，使用当前 Work Item 的 `repositoryTargetId` 作为 Page Pilot 目标。
+- Page Pilot 页面保留普通 App chrome，不再默认进入会隐藏导航的沉浸式空白预览状态。
+- Electron preload 暴露 `window.omegaDesktop.reloadApp()`；Page Pilot 顶部提供 `Reload app`，用于替代浏览器地址栏刷新按钮。
+- 旧尝试：`Open preview` 曾在 Omega 页面里打开 BrowserView，并用 `preview-preload.cjs` 注入最小工具条，再把圈选结果回传到 Omega 页面的 overlay。这个做法改变了已验证的 direct pilot 体验，现不作为主路径继续推进。
+- 新做法：Page Pilot 页面只作为启动器，负责选择 Repository Workspace、预览来源和打开目标页面；打开后 Electron BrowserView 使用已验证的 `pilot-preload.cjs`，在目标页面内完成圈选、多批注、Apply、Confirm 和 Discard。
+- Preview source 保留三种显式模式：Repository source、Dev server URL、HTML file。Repository source 会通过 Electron bridge 准备明确 repo 的预览来源；HTML file 会转为 `file://` 交给 Electron 打开；Dev server URL 适合 Vite / Next / Astro 等需要端口的项目。
+
+### 运行时行为
+
+- `PagePilotPreview` 顶部新增 Repository Workspace 选择区，但不再承载目标页面内的圈选和编辑交互。
+- 用户选择 repo 后，前端更新当前 `activeRepositoryWorkspaceTargetId`，后续 apply / deliver 都使用该 repo target。
+- 未选择 repo 时，页面明确显示 `Choose a target repository`，不再静默使用模糊默认值。
+- Work Item 详情页按钮会先绑定该 item 的 repo，再切换到 Page Pilot。
+- Electron `omega-preview:open` 支持把 `projectId`、`repositoryTargetId`、`repositoryLabel` 随目标 URL 传给 `pilot-preload.cjs`，旧 direct pilot 不再依赖固定 env/default repo。
+- direct pilot 目标页内新增 `返回` 按钮，用于关闭 BrowserView 回到 Omega 页面。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+```
+
+### 后续工作
+
+- Electron service state 和 preview URL 还需要接到 Page Pilot 页面，让用户能从 UI 启动/重启目标项目 preview。
+- Repository Workspace 选择后应展示该 repo 的 Preview Runtime Profile、启动状态和最近 Page Pilot runs。
+
+## 2026-04-30: Electron Desktop Shell 自动启动本地服务基础版
+
+### 目标
+
+让功能二尽早进入接近打包产品的启动方式。旧做法需要手动分别启动 Go local runtime、Omega Web Vite dev server 和目标项目 preview server；新做法由 Electron main process 统一启动或复用这些本地服务，减少 Page Pilot 集成验证时的手动前置步骤。
+
+### 入口
+
+```bash
+npm run desktop
+```
+
+可选目标项目预览：
+
+```bash
+OMEGA_PREVIEW_REPO_PATH=/Users/zyong/Projects/TestRepo npm run desktop
+OMEGA_PREVIEW_REPO_PATH=/Users/zyong/Projects/TestRepo OMEGA_PREVIEW_COMMAND="npm run dev -- --host 127.0.0.1 --port 5173" npm run desktop
+```
+
+### 数据/API
+
+新增 Electron 侧 supervisor 模块：
+
+```text
+apps/desktop/src/process-supervisor.cjs
+```
+
+新增 preload 查询能力：
+
+```text
+window.omegaDesktop.getServices()
+```
+
+当前没有新增 Go API。Preview Runtime Profile API 仍作为后续正式运行档案能力推进。
+
+### 运行时行为
+
+- Electron 启动后先探测 `http://127.0.0.1:3888/health`，存在则复用，不存在则启动 `go run ./services/local-runtime/cmd/omega-local-runtime --host 127.0.0.1 --port 3888`。
+- Electron 探测 `http://127.0.0.1:5174/`，存在则复用，不存在则启动 `npm run web:dev -- --host 127.0.0.1 --port 5174`。
+- 如果设置 `OMEGA_PREVIEW_REPO_PATH` 或 `OMEGA_PAGE_PILOT_REPO_PATH`，Electron 会在该明确 repo 内启动目标 preview server；没有显式路径时不会猜测目标项目，避免误跑 Omega 自身目录。
+- Preview 命令优先使用 `OMEGA_PREVIEW_COMMAND`；否则读取目标 repo `package.json`，按 `dev/start/preview` 脚本和 lockfile 推断包管理器；静态 `index.html` 用 `python3 -m http.server` 兜底。
+- Electron 退出时会尽力停止由本次启动创建的子进程；已存在的外部服务不会被关闭。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=15000
+```
+
+### 后续工作
+
+- 将 preview process supervisor 下沉到 Go runtime API，并把 pid、stdout/stderr、健康检查和失败诊断写入 Page Pilot run。
+- 从 Repository Workspace UI 选择目标 repo 和 preview profile，替代 env 配置。
+- 打包模式下将 Go runtime 二进制和 Web 静态资源纳入正式 app bundle。
+
 ## 2026-04-30: PR 评审反馈进入 Rework Checklist
 
 ### 目标
@@ -153,6 +281,15 @@ GET /runtime-logs
 ```
 
 支持按 `level`、`eventType`、`entityType`、`entityId`、`projectId`、`repositoryTargetId`、`workItemId`、`pipelineId`、`attemptId`、`stageId`、`agentId`、`requestId`、`createdAfter`、`createdBefore` 和 `limit` 查询。
+
+2026-05-01 更新：
+
+- 旧做法保留：基础查询仍默认返回数组，兼容 Operator 面板和旧 CLI。
+- 新增 `requirementId` 维度：新日志可以直接写入 `requirementId`；旧日志会通过当前 workspace snapshot 反查同 Requirement 下的 Work Item / Pipeline / Attempt。
+- 新增 cursor pagination：`GET /runtime-logs?page=1&limit=N&cursor=...` 返回 `items / nextCursor / hasMore`。
+- 新增全文搜索：`q` / `search` 会匹配 level、event type、message 和 details JSON。
+- 新增导出：`GET /runtime-logs/export?format=jsonl|csv` 复用同一批过滤条件，默认导出 JSONL。
+- CLI `omega logs` 增加 `--requirement`、`--search`、`--page`、`--cursor`。
 
 ### 运行时行为
 
@@ -357,12 +494,13 @@ apps/web/src/App.tsx
 ```text
 apps/desktop/src/main.cjs
 apps/desktop/src/omega-preload.cjs
-apps/desktop/src/preview-preload.cjs
 apps/desktop/src/pilot-main.cjs
 apps/desktop/src/pilot-preload.cjs
 ```
 
 开发模式下 Electron 加载现有 React/Vite URL，不需要打包。它预留目标项目 `BrowserView`，通过 preload 注入 Page Pilot selection bridge。React SPA 和 Go runtime 不被替代：React 继续做 Omega UI，Go 继续做 SQLite / runner / git / PR。
+
+后续修正：`preview-preload.cjs` 的最小 selection bridge 属于中间尝试；产品主路径改为 BrowserView 直接加载 `pilot-preload.cjs`，保留已验证的目标页内 direct pilot 体验。
 
 新增 `desktop:pilot` 直接体验模式：Electron 主窗口直接打开用户产品 URL（默认 `http://127.0.0.1:5173/`），`pilot-preload.cjs` 在目标页面内注入悬浮手指、hover 高亮、tooltip 和修改输入框。这个模式用于还原赛题中的页面内 Agent 体验：用户看到的就是自己的产品页面，Page Pilot 浮层直接跑在页面上，而不是 Chrome 或 Workboard iframe。
 
@@ -789,10 +927,162 @@ go test ./services/local-runtime/internal/omegalocal -run TestPagePilot
 node --check apps/desktop/src/pilot-preload.cjs
 ```
 
+## 2026-04-30: Preview Runtime Profile 关联 Page Pilot Run 基础版
+
+### 背景
+
+- Electron 已能理解目标项目并启动 dev server，但 Go runtime 的 Page Pilot run 只保存修改结果，缺少“当时预览是怎么启动和刷新的”。
+- 这会影响后续审计、失败诊断和 Work Item 详情页回看。
+
+### 新做法
+
+- Page Pilot 启动器在打开 direct pilot 时携带 Preview Runtime Profile。
+- `pilot-preload.cjs` 在 `/page-pilot/apply` 和 `/page-pilot/deliver` 中提交 `previewRuntimeProfile`。
+- Go runtime 把 profile 写入 Page Pilot run，并同步到 mission / pipeline artifacts。
+- profile 记录 preview URL、工作目录、dev command、health check、reload strategy 和 evidence。
+
+### 当前边界
+
+- 这是持久化基础版，真实 dev server 启动和刷新仍由 Electron supervisor 执行。
+- 后续需要把 Preview Runtime resolve/start/restart API 和 pid/stdout/stderr/health check 下沉到 Go runtime。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget'
+```
+
+## 2026-04-30: Page Pilot Source Mapping 覆盖率报告基础版
+
+### 背景
+
+- Page Pilot 的圈选定位质量会直接影响 Agent 修改的可靠性。
+- 旧记录只保存 selection context，缺少对“本轮有多少强源码映射、多少 DOM-only”的结构化判断。
+
+### 新做法
+
+- `/page-pilot/apply` 基于本轮批注生成 `sourceMappingReport`。
+- 报告包含批注总数、强源码映射数量、DOM-only 数量、缺失文件映射数量、覆盖率和状态。
+- `/page-pilot/deliver` 保留同一报告。
+- mission 和 pipeline artifacts 同步记录该报告，后续 UI 可以直接展示定位可信度。
+
+### 当前边界
+
+- 这是单 run 基础版统计。
+- 按页面 / 组件聚合、定位失败原因分类和 DOM-only 源码候选能力仍需后续扩展。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget'
+```
+
+## 2026-04-30: Source Mapping Report 驱动 Agent 输入
+
+### 背景
+
+- 单纯记录覆盖率只能帮助人排查，不能直接提升 Agent 修改质量。
+- Page Pilot 需要把定位质量变成执行链路的一部分：强映射走明确文件，DOM-only 先定位候选源码。
+
+### 新做法
+
+- `apply` 在 Agent 执行前生成 `sourceMappingReport`。
+- 如果报告不是 `strong`，runtime 会生成 `sourceLocator`：
+  - 使用文本快照、selector token、DOM tag 和批注 token 搜索仓库源码；
+  - 跳过 `.git`、`.omega`、`node_modules`、`dist`、`build` 等目录；
+  - 每条候选记录文件、分数、命中依据和预览行。
+- Agent prompt 新增覆盖率报告和源码候选区块。
+- prompt 规则要求低覆盖率时先检查候选文件；没有候选时说明缺少映射，不做无关大范围修改。
+- `local-proof` 验证路径也会复用候选文件，DOM-only 批注可以在测试中真实修改源码。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotDomOnlySelectionUsesSourceLocator|TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget'
+```
+
+## 2026-04-30: Page Pilot live-preview 写锁基础版
+
+### 背景
+
+- Page Pilot `apply` 会直接修改目标预览工作区，用户确认前这些改动既不能被其他 Page Pilot run 覆盖，也不能被误当成另一个运行的上下文。
+- 旧做法只有文档要求 live-preview 需要 repository write lock，但 Go runtime 的 apply / deliver / discard 没有真正声明和释放锁。
+
+### 新做法
+
+- `apply` 解析出明确 repository workspace 后，先声明 `page-pilot-live:{repositoryTargetId}:{repositoryPath}` execution lock。
+- 锁会写入 `ownerType = page-pilot`、`pagePilotRunId`、`repositoryTargetId`、`repositoryPath`、`workItemId`、`pipelineId` 和保留策略。
+- 同一个 run 的 `deliver` 可以继续使用这把锁完成 branch / commit / PR 交付。
+- `discard` 和 `deliver` 成功后释放锁；`apply` 失败会自动释放锁，避免卡住后续操作。
+- 第二个 Page Pilot run 在锁未释放时会被拒绝，前端可以直接展示“预览工作区正在被某个 Page Pilot run 持有”。
+
+### 当前边界
+
+- 这是 Go runtime 内的 Page Pilot live-preview 锁基础版，覆盖 Page Pilot run 之间的并发写入。
+- Preview Runtime Profile 和 process supervisor 进入 Go 一等化后，还需要把 dev server 进程、刷新动作和锁状态统一关联到 Page Pilot run。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget'
+```
+
+## 2026-04-30: Page Pilot Recent Runs 与 Work Item 回跳基础版
+
+### 目标
+
+让功能二不再只是“打开目标页面做一次操作”。用户回到 Page Pilot 启动器后，应该能看到最近 run 的真实状态，并能跳回对应 Work Item 查看 pipeline、operation、proof 和后续交付记录。
+
+### 新做法
+
+- `PagePilotPreview` 消费已有 `GET /page-pilot/runs`，按当前 Repository Workspace 过滤后展示最近 8 条 run。
+- 每条 run 展示状态、变更文件数量、Work Item ID、更新时间和 Pipeline ID。
+- 存在 `pullRequestUrl` 时展示 PR 跳转。
+- 存在 `workItemId` 时展示 Work Item 回跳，链接到独立 Work Item 详情路由。
+- 该区块只消费真实 runtime 记录，不在前端伪造 run。
+
+### 当前边界
+
+- 这是 Page Pilot run 可追踪 UI 基础版。
+- 同一 run 多轮追加批注 / 重新 apply 仍未完成，后续需要在服务端 conversation 基础上继续迭代。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+npm run lint
+```
+
 ### 后续工作
 
 - 在 direct pilot 中增加可视化 debug 模式，显示候选元素排名，便于排查复杂页面的遮挡和命中问题。
 - 为跨 iframe / shadow DOM 场景补充更完整的 composed path / elementFromPoint 适配。
+
+## 2026-04-30: Page Pilot 服务端 Run Conversation 基础版
+
+### 背景
+
+- 旧做法：Electron direct pilot 的批注轮次、primary target 和过程事件主要存在目标页 localStorage。
+- 这会导致刷新、换页面或从 Work Item 回看时，服务端 run 只知道最终 diff，缺少“用户选了什么、如何提交、Agent 如何处理”的上下文。
+
+### 实现
+
+- `/page-pilot/apply` 接收可选 `conversationBatch`、`submittedAnnotations`、`processEvents`。
+- Go runtime 在 Page Pilot run 中持久化：
+  - `conversationBatch`：本轮批注、整体说明、主目标、runId、状态；
+  - `submittedAnnotations`：提交给 Agent 的批注列表；
+  - `primaryTarget`：服务端可查询的主目标摘要；
+  - `processEvents`：目标页内的关键过程事件。
+- `/page-pilot/deliver` 会把 conversation 状态同步为 `delivered`。
+- `/page-pilot/runs/{id}/discard` 会把 conversation 状态同步为 `discarded`。
+- `syncPagePilotRunRecords` 把 conversation 写入 mission 和 pipeline run artifacts，后续 Work Item 详情可以直接读取服务端记录。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget'
+```
 
 ### 2026-04-28 补充
 
@@ -1374,4 +1664,454 @@ npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx ap
 ```bash
 go test ./services/local-runtime/internal/omegalocal -run 'TestBuildReworkChecklistMergesReviewHumanAndDeliveryGateSignals|TestRunWorkpadRecordTracksAttemptRetryContext|TestPrepareDevFlowAttemptRetryLinksAttempts|TestPrepareDevFlowHumanRequestedReworkStartsAttemptWithFeedback'
 go test ./services/local-runtime/internal/omegalocal
+```
+
+## 2026-04-30: Page Pilot 隔离 Preview Workspace
+
+### 旧做法
+
+- Page Pilot 打开目标项目预览时，Electron 侧曾尝试从用户本机常见目录推断 GitHub target 对应的本地 worktree。
+- Go runtime 对 GitHub target 只在当前启动目录刚好是目标仓库时才能 apply。
+- 这两者都会让“看到的预览”和“实际写入的仓库”存在不一致风险。
+
+### 新做法
+
+- local target：只使用用户显式绑定的本地 `path`。
+- GitHub target：Electron shell 准备 Omega 管理的隔离 preview workspace，默认路径为 `~/Omega/workspaces/page-pilot/<owner_repo>`。
+- `omega-preview:resolve-target` 返回真实 `repoPath`、可用 `index.html` 或 preview URL；不会扫描 `~/Projects` 等用户目录。
+- Go runtime Page Pilot apply 同步改为只认显式 local target 或同一个隔离 preview workspace。
+- Open preview 失败会回传 Electron `loadURL` 错误并记录主进程日志，方便判断是端口未启动、URL 错误还是页面自身为空。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget'
+```
+
+## 2026-04-30: Page Pilot 全页预览模式
+
+### 旧做法
+
+- Electron BrowserView 只覆盖 Omega 页面右侧区域，看起来像一块浮层。
+- 用户进入目标页面后仍能看到 Omega 的左侧栏和配置区，容易误解为“预览嵌在控制台里”，也不利于检查真实页面布局。
+
+### 中间尝试
+
+- `omega-preview:open` 打开后 BrowserView 覆盖整个 Electron content area，用户看到的是目标 App 完整页面。
+- 目标页面通过 `preview-preload.cjs` 注入最小 Page Pilot 控制条：圈选元素、刷新、返回。
+- 圈选元素后 BrowserView 自动关闭，并把 selection context 发送回 Omega Page Pilot 面板，继续展示指令输入和 apply/deliver 链路。
+
+### 新做法
+
+- 保留 BrowserView 全页打开目标 App。
+- BrowserView 使用 `pilot-preload.cjs`，目标页面内直接完成圈选、多批注、整体说明、Apply、Confirm、Discard 和返回。
+- Page Pilot React 页面只做 repo / preview source 启动器，不再承载目标页内圈选结果。
+
+### 验证
+
+```bash
+npm run lint
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+```
+
+## 2026-04-30: Page Pilot Dev Server Preview Runtime Agent
+
+### 旧做法
+
+- Page Pilot 的 Dev server 模式把输入框内容当作 URL 直接交给 Electron 打开。
+- 如果目标项目服务没有启动，用户只能看到连接失败或空白页。
+- Electron 虽然有启动时的保守 preview supervisor，但它依赖环境变量，不会在用户选择 Repository Workspace 后动态理解并启动目标项目。
+
+### 新做法
+
+- Dev server 模式改为 `Dev server by Agent`。
+- 用户选择 Repository Workspace 后，前端调用 `omegaDesktop.startPreviewDevServer`。
+- Electron 本地 Preview Runtime Agent 锁定所选 repository target：
+  - local target 只使用显式绑定路径；
+  - GitHub target 使用 Omega 管理的隔离 preview workspace。
+- Agent 读取项目线索，生成 Preview Runtime Profile，包含 `agentId`、`stageId`、工作目录、dev command、preview URL、health check、reload strategy 和 evidence。
+- supervisor 在对应 repository workspace 内启动 dev server，并等待 health check 成功。
+- 只有启动成功后才打开 direct pilot；失败原因直接展示在 Page Pilot 启动器里。
+
+### 当前边界
+
+- 这是 Electron 侧基础版 Preview Runtime Agent，已能真实启动服务。
+- profile / pid / stdout / stderr 还没有进入 Go runtime 一等记录，后续继续做 Go Preview Runtime Profile API 和 process supervisor。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+```
+
+## 2026-04-30: Page Pilot Preview Runtime Reload Supervisor
+
+### 旧做法
+
+- 目标页内 `Reload` 和 Page Editing Agent apply 后的刷新直接调用浏览器 reload。
+- Electron 不知道当前项目是否需要 HMR 等待、浏览器刷新还是 dev server restart。
+- 如果 Agent 修改了 `package.json`、lockfile、框架配置或服务已挂掉，单纯 reload 不能保证用户看到最新页面。
+
+### 新做法
+
+- `pilot-preload.cjs` 的 Reload / apply / discard 刷新统一调用 Electron `omega-preview:reload`。
+- Electron 主进程把刷新交给 Preview Runtime Supervisor。
+- Supervisor 根据 Preview Runtime Profile 和 changed files 选择策略：
+  - 普通源码变更：按 profile 执行 `hmr-wait` 或 `browser-reload`；
+  - 运行时配置变更：提升为 `server-restart`；
+  - 服务 health check 失败：自动 restart 后再刷新。
+- Electron 只负责触发和刷新 BrowserView，不再决定具体技术策略。
+
+### 当前边界
+
+- 这是 Electron 侧基础版 reload supervisor。
+- 后续 Go runtime 一等化后，需要把 refresh action、restart pid、stdout/stderr、health check 结果写入 Page Pilot run 记录。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+npm run lint
+node --check apps/desktop/src/process-supervisor.cjs
+node --check apps/desktop/src/main.cjs
+node --check apps/desktop/src/omega-preload.cjs
+node --check apps/desktop/src/pilot-preload.cjs
+```
+
+## 2026-04-30: 功能一 / 功能二 P0 测试闭环
+
+### 目标
+
+把最近拆出的 8 个高优先级验收项收敛成可重复验证的产品能力，而不是只停留在 UI 或局部 API：
+
+1. 功能一 GitHub delivery contract preflight。
+2. 功能一 Reject -> Rework 可视化。
+3. 固定标准测试脚本和测试报告。
+4. Go runtime 全量测试可靠性。
+5. 功能二 Go Preview Runtime supervisor/API。
+6. Page Pilot 结果面板：diff summary、PR preview、Work Item 回跳。
+7. 同一 Page Pilot run 多轮追加 apply。
+8. Page Pilot visual proof。
+
+### 实现
+
+- DevFlow preflight 新增 GitHub delivery contract 检查：`gh auth status`、`gh repo view`、viewer permission 和 PR/checks 元数据读取都在运行前完成。
+- Work Item 详情页新增 rework return signal，把人工拒绝、rework assessment、rework checklist 和回流状态放在 Delivery flow 附近展示。
+- 新增 `npm run test:feature-p0`，把前端关键测试、desktop preload 语法检查和 Go runtime 全量测试串成固定回归命令。
+- Go runtime 新增 `/page-pilot/preview-runtime/resolve|start|restart`，由明确 Repository Workspace 生成 Preview Runtime Profile，启动目标 dev server，并记录 pid/stdout/stderr/health check 基础信息。
+- Page Pilot apply 支持传入既有 `runId`，同一 run 可继续追加批注和说明，`roundNumber` 递增，同时沿用同一个 Work Item / Pipeline。
+- Page Pilot run 新增 `prPreview` 和 `visualProof`，并同步到 mission / pipeline artifacts；Recent runs 的详情弹窗可查看 PR preview、diff summary、source mapping、visual proof、preview runtime 和 conversation。
+- 新增 `docs/test-report.md` 记录测试口径；需要 Electron / 真实目标页验证的项目继续放在 `docs/manual-testing-needed.md`。
+
+### 验证
+
+```bash
+npm run lint
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+node --check apps/desktop/src/process-supervisor.cjs
+node --check apps/desktop/src/pilot-preload.cjs
+go test ./services/local-runtime/internal/omegalocal
+```
+
+### 后续
+
+- Go Preview Runtime 当前是进程托管基础版，后续继续补跨进程恢复、持久 process table 和更完整的失败诊断。
+- Visual proof 当前以 DOM snapshot 为基础证据，后续可增加前后截图和更细的行级 diff 证据。
+
+## 2026-05-01: JobSupervisor 自动恢复分类策略
+
+### 旧做法
+
+- JobSupervisor 已能扫描 failed / stalled Attempt，并按 `autoRetryFailed`、`maxRetryAttempts`、`retryBackoffSeconds` 决定是否创建 retry Attempt。
+- 但失败原因没有分层：runner crash、临时网络失败、GitHub API 临时失败、CI flaky failure、权限失败都会进入近似相同的 retry 判断。
+- 权限类失败容易被自动重试浪费时间；非 flaky CI 失败也可能被当成普通 retry，而不是进入 rework checklist。
+
+### 新做法
+
+- 新增 `recovery_policy.go`，集中生成 `supervisorRecoveryPolicy`：
+  - `runner_crash` -> `retry-with-clean-worker`，允许自动 retry；
+  - `transient_network` -> `wait-and-retry`，允许自动 retry；
+  - `github_api_transient` -> `wait-and-retry`，允许自动 retry；
+  - `ci_flaky_failure` -> `retry-validation`，允许自动 retry；
+  - `permission_failure` -> `manual-fix-permission`，不自动 retry；
+  - `ci_failure` -> `rework-required`，不自动 retry；
+  - `unknown_failure` -> `retry-with-context`，低置信度自动 retry，并保留失败上下文。
+- `scanRecoverableAttempts` 会把 `recoveryPolicy` 写入 recoverable record 和 accepted retry run。
+- JobSupervisor summary 新增：
+  - `manualRecoveryRequired`
+  - `recoveryClassCounts`
+- 自动 retry reason 会带上 `[failureClass/recoveryAction]`，下一轮 Attempt 能看到为什么被重试。
+- 权限失败和非 flaky CI 失败会进入 manual/rework 决策，不再被 `autoRetryFailed=true` 盲目重跑。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestSupervisorRecoveryPolicyClassifiesFailureModes|TestJobSupervisorScanRecoverableAttemptsCreatesRetryJob|TestJobSupervisorRecoveryPolicyBlocksPermissionAutoRetry|TestJobSupervisorScanRecoverableAttemptsUsesWorkflowRetryPolicy|TestJobSupervisorScanRecoverableAttemptsRespectsBackoffAndLimit'
+```
+
+## 2026-05-01: 数据分析指标扩展版
+
+### 旧做法
+
+`/observability.dashboard` 已有基础指标：Attempt 成功率、失败原因分布、慢阶段、待人工队列、活跃运行和推荐动作。这一版适合看当前运行是否异常，但还不能直接回答“哪个 stage 平均最慢、哪个 runner 用得最多、checkpoint 等待多久、PR 创建/合并趋势如何”。
+
+### 新做法
+
+- `stageAverageDurations`：按 stage 聚合运行次数、平均耗时、最大耗时和最近更新时间。
+- `runnerUsage`：按 runner 聚合使用次数、成功数、失败数、活跃数和平均耗时。
+- `checkpointWaitTimes`：聚合 checkpoint 总数、已处理数、待处理数、平均等待秒数、最大等待秒数，并按 stage 拆分。
+- `pullRequests`：统计本地交付记录中可见的 PR created / merged / open 数量。
+- `trends`：按天聚合 Attempt started / completed / done / failed、PR created / merged、checkpoint created / resolved。
+- 前端 control API 类型同步补齐这些 dashboard 字段，后续 Operator UI 或 CLI 可以直接消费。
+
+### 实现说明
+
+当前 PR 指标以本地 SQLite 中的 Attempt `pullRequestUrl` 和 ProofRecord PR 证据为来源，不额外访问远端平台；这样可以在离线或权限不足时仍给出本地交付视角。后续如果引入一等 PR 表，可以把 created/merged/open 从事件推断升级为记录级统计。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestObservabilityDashboardMetrics'
+```
+
+## 2026-05-01: Run Report / Review Packet 扩展版
+
+### 旧做法
+
+DevFlow 进入 Human Review 前会生成 `attempt-run-report.md`，聚合需求、PR、changed files、测试、checks、review 和 artifacts。这个基础版适合人工阅读，但结构化程度不足：前端只能从 Workpad、proof 和 PR 状态里拼信息，无法稳定展示“diff/test/check preview、风险等级、下一步动作”。
+
+### 新做法
+
+- Runtime 在 Human Review 前生成 `attempt-review-packet.json`，并把同一份 `reviewPacket` 写入：
+  - `handoff-bundle.json`
+  - Attempt record
+  - Run Workpad record
+- `attempt-run-report.md` 继续保留，同时新增 Diff Preview、Test Preview、Check Preview、Risk、Recommended Actions 小节，来源和 JSON packet 保持一致。
+- `reviewPacket` 结构包含：
+  - `diffPreview`：changed files、文件数、增删行统计和 diff excerpt；
+  - `testPreview`：validation status、summary、output excerpt；
+  - `checkPreview`：remote check status、summary、output excerpt、PR/comment/check feedback；
+  - `risk`：`low` / `medium` / `high` 和原因列表；
+  - `recommendedActions`：下一步动作，例如打开 PR、补验证、查看 checks、按高风险处理。
+- Work Item 详情页 Run Workpad 新增 `Review packet` 卡片，默认只展示风险和文件数；点击后打开页内弹窗的一页预览，不把长 diff 直接塞进主页面。
+
+### 实现说明
+
+风险分级先基于本地可验证信号：changed files、validation output、remote check output、PR feedback 和 failed check log。它不是替代 Human Review，而是把“审核时应该先看什么”结构化，让人工和后续自动 rework 都消费同一份 packet。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof|TestRunWorkpadRecordTracksAttemptRetryContext'
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+npm run lint
+```
+
+## 2026-05-01: Run Workpad 字段级编辑入口
+
+### 旧做法
+
+Run Workpad 已是一等记录，并且后端支持 `PATCH /run-workpads/{id}`、字段权限、来源归因和 patch history。但详情页只能展示字段和历史，operator 发现 Retry Reason、Blockers、Review Feedback 或 Validation 需要补充时，仍要绕到 API 或等待 Agent / supervisor 写入。
+
+### 新做法
+
+- Work Item 详情页 Run Workpad header 新增 `Edit fields`。
+- 编辑入口使用页内弹窗，不把长字段直接展开到主页面。
+- 提交时调用真实 `PATCH /run-workpads/{id}`，不会只改本地 UI 状态。
+- UI 只开放 operator 允许字段：
+  - Notes
+  - Blockers
+  - Review Feedback
+  - Retry Reason
+  - Validation
+  - Rework Checklist
+  - Rework Assessment
+- 每次提交固定带上 `updatedBy=operator`、`reason` 和 `source.kind=ui`，后端继续记录 `fieldPatchSources` / `fieldPatchHistory`。
+
+### 实现说明
+
+`App.tsx` 只新增 `updateRunWorkpadPatch` 回调和 `patchRunWorkpad` API 接线；字段选择、表单状态、payload 生成和错误展示放在 `WorkItemDetailPage`，避免继续扩大主入口耦合。数组类字段按“一行一条”写入；结构化字段保留原对象并覆盖 summary / checklist / reason。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+```
+
+## 2026-05-01: Review/Rework Feedback Sweep 扩展版
+
+### 旧做法
+
+PR comments / reviews 和 failed check log 已经能进入 Attempt / Run Workpad / Rework Checklist，但来源粒度还偏粗：PR review thread 是否已 resolved 不清楚，inline comment 缺少文件和行号，check log 只有 run 链接，重复的 review / comment / thread 容易在 checklist 里生成多条相似待办。
+
+### 新做法
+
+- GitHub PR feedback 采集在 `gh pr view --json comments,reviews` 基础上，增加 GraphQL review thread best-effort 采集。
+- PR review thread source 会记录：
+  - `state=resolved/unresolved`
+  - `resolved`
+  - `path`
+  - `line`
+  - `originalLine`
+  - `diffHunk`
+  - `sourceUrl`
+- Rework Checklist 生成时：
+  - unresolved thread 会转成带 `path:line` 的行动项；
+  - resolved thread 只保留在 sources 中，不再制造新的 rework action；
+  - 同一文件行、同一内容或同一 check run 的重复信号会进入 `groups`，checklist 只展示合并后的行动项，并标注相关信号数量。
+- failed check log source 增加 `sourceUrl` 深链和 `logMode=failed-first`，Workpad source drilldown 优先打开具体 check 来源。
+- Work Item 详情页的 Rework Checklist source 列表会展示 source state、文件和行号，让用户不用打开全部日志也能先定位来源。
+
+### 实现说明
+
+GraphQL review thread 采集是 best-effort：如果当前 `gh` 权限或 GraphQL schema 不支持对应字段，会静默退回 comments / reviews 基础采集，不阻断 PR status 或 DevFlow。Rework Checklist 的去重分组发生在 runtime 侧，因此 Rework Agent、Retry API 和 UI 读取到的是同一份结构化结果。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestGitHubPullRequestFeedbackFromView|TestGitHubPullRequestReviewThreadFeedbackFromGraphQL|TestBuildReworkChecklistMergesReviewHumanAndDeliveryGateSignals|TestGitHubPRStatusClassifiesFailedChecks'
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+```
+
+## 2026-05-01: GitHub / CI 真实出站同步
+
+### 旧做法
+
+GitHub Issue 已经能导入 Workboard，DevFlow 也能创建 PR、读取 checks 和 failed check log，但 Pipeline 状态只保存在 Omega 本地。GitHub Issue 侧没有自动 comment / label 回写，外部协作者无法从 Issue 页面判断当前是否在执行、等待审核、已完成或需要处理。
+
+### 新做法
+
+- Go local runtime 新增 GitHub Issue outbound sync。
+- 对能解析 GitHub Issue 的 Work Item，DevFlow 会在关键节点写回：
+  - `attempt.started`
+  - `human_review.waiting`
+  - `delivery.merge_failed`
+  - `attempt.failed`
+  - `delivery.completed`
+- 每次同步会：
+  - 通过 `gh issue comment` 写入结构化状态评论；
+  - 通过 `gh label create --force` 确保 `omega:*` 标签存在；
+  - 通过 `gh issue edit` 切换 `omega:running/review/blocked/merging/done` 状态标签；
+  - 把 sync report 写入 Attempt record 和 proof JSON。
+- GitHub Issue comment 会包含 PR URL、changed files、CI/checks 输出、failed check log / PR feedback 摘要、失败原因，以及 review packet 的风险等级和推荐动作。
+
+### 实现说明
+
+出站同步是主链路的 best-effort 旁路：GitHub comment / label 失败不会让 PR 创建、review 或 merge 主链路失败，但失败详情会进入 runtime log 和 sync report。非 GitHub Issue 来源会返回 `skipped`，避免误写其他仓库或平台。
+
+详细设计见 `docs/github-outbound-sync.md`。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestGitHubIssueRefFromWorkItemParsesImportRefAndURL|TestSyncGitHubIssueOutboundPostsCommentAndLabels|TestSyncGitHubIssueOutboundSkipsUnlinkedWorkItem'
+go test ./services/local-runtime/internal/omegalocal
+```
+
+真实 GitHub smoke：
+
+- 使用 `ZYOOO/TestRepo`。
+- 先 clone 最新远端代码并 `git pull --ff-only`。
+- 创建临时 issue，执行 comment / label 出站同步后关闭。
+- 已验证临时 issue：`ZYOOO/TestRepo#36`。
+
+## 2026-05-01: 飞书 Human Review 审核链路
+
+### 旧做法
+
+Go local runtime 只有基础文本通知能力，且依赖本机 `lark-cli`。DevFlow 到 Human Review 后只能在 Omega Web 内操作，飞书侧没有结构化卡片、没有长内容承载、也没有回调到 checkpoint 状态迁移。
+
+### 新做法
+
+- 新增 `POST /feishu/review-request`。
+  - 读取 checkpoint、Work Item、Requirement、Attempt、Run Workpad 和 Review Packet。
+  - 生成 Human Review interactive card。
+  - 优先通过飞书机器人 webhook 发送。
+  - 未配置 webhook 时，如果有 `lark-cli + chatId`，发送文本 fallback。
+  - 两者都没有时返回 `needs-configuration`，并把 card/doc preview 写入 checkpoint.`feishuReview`。
+- 新增 `POST /feishu/review-callback`。
+  - 飞书侧 approve / request changes 与 Omega Web 本地按钮使用同一个 checkpoint decision helper。
+  - approve 会继续原有 merging / delivery。
+  - request changes 会继续原有 rework assessment / rework attempt。
+- DevFlow 进入 Human Review 后会按配置自动发送飞书审核通知，不阻塞主链路。
+
+### 实现说明
+
+飞书卡片只放审核所需摘要：Work Item、需求摘要、PR、风险等级、Review Packet 摘要和操作按钮。长需求和长 diff 会生成 Markdown review doc preview，后续可以接入飞书文档 API 发布为正式文档。发送结果持久化到 checkpoint.`feishuReview`，用于本地回溯和后续一等 Connector Sync Report 演进。
+
+详细说明见 `docs/feishu-review-chain.md`。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestFeishuNotifyUsesLocalLarkCLI'
+```
+
+当前本机没有 `lark-cli`，真实飞书群体验需要配置机器人 webhook 或安装并登录 `lark-cli`。人工验证项已记录到 `docs/manual-testing-needed.md`。
+
+## 2026-05-01: Workflow Action Graph 基础版
+
+### 旧做法
+
+`devflow-pr` 已经能从 Markdown workflow 读取 stages、review rounds、runtime、transitions 和 prompt sections，但执行图仍主要由 Go 中固定 DevFlow 顺序表达。新增或调整流程时，需要改 Go 代码，workflow contract 只能影响局部参数。
+
+### 新做法
+
+- `devflow-pr` workflow front matter 新增 `states.actions`，把每个 state 下要执行的动作声明出来。
+- action 支持：
+  - `id` / `type` / `agent` / `prompt`；
+  - `requiresDiff`；
+  - `inputArtifacts` / `outputArtifacts`；
+  - `transitions`；
+  - review action 的 `verdicts`。
+- workflow contract 新增 `taskClasses`，记录 simple / complex 任务的 workpad、planning、validation 策略。
+- Pipeline run workflow snapshot 会保存：
+  - `states`
+  - 扁平化 `actions`
+  - `taskClasses`
+  - `hooks`
+  - `executionMode`
+- Workflow validator 会检查 action id、action type、state/action transition 指向的 stage。
+- Agent invocation 后的 next stage 推进优先读取 Pipeline snapshot transitions；没有配置时才回退旧 DevFlow 固定顺序。
+
+### 实现说明
+
+本阶段没有推翻现有 DevFlow 主链路，而是先把“执行图”变成可解析、可校验、可持久化、可路由消费的契约。后续通用 action executor 可以从同一个 snapshot 生成 action plan，并逐步接管 review / rework / merging。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestWorkflowContractParsesStateActionsAndRejectsBrokenActionRoute|TestRepositoryWorkflowTemplateValidationRejectsBrokenContract|TestDevFlowReviewOutcomeRoutesChangesRequestedToRework|TestDevFlowStageStatusAfterChangesRequestedQueuesRework'
+```
+
+## 2026-05-01: Attempt Action Plan 基础版
+
+### 旧做法
+
+Workflow contract 已能声明 action graph，但 Attempt 层还没有一个统一、可查询的“当前该执行什么”的视图。UI、JobSupervisor、retry 提示仍容易各自从 stage status、attempt status 和日志里推断状态。
+
+### 新做法
+
+- 新增 `GET /attempts/{attemptId}/action-plan`。
+- API 直接读取 Pipeline run workflow snapshot，不重新解析运行中的 workflow，避免 Attempt 过程中规则漂移。
+- 返回内容包含：
+  - current state；
+  - current action；
+  - 当前 state 下的 action 列表；
+  - 当前 state 的可达 transitions；
+  - taskClasses / hooks snapshot；
+  - retry action、retry reason 和 recovery policy。
+- failed / stalled / canceled attempt 会把 retry action 标出来，并复用 JobSupervisor 的恢复策略分类。
+- JobSupervisor recovery summary / accepted retry job 会附带 action plan 摘要，让自动恢复不再只依赖 attempt status 和错误文本。
+
+### 实现说明
+
+本阶段仍是 dry-run executor：只生成可解释执行计划，不执行 git、runner、PR 或 merge 命令。后续 UI 和 JobSupervisor 可以先消费这个计划，再逐步把 review / rework / merging 迁到通用 action handler。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestBuildAttemptActionPlanUsesWorkflowSnapshot|TestAttemptActionPlanAPIIncludesRetryPolicy'
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorScanRecoverableAttemptsRetriesWithPolicy|TestBuildAttemptActionPlanUsesWorkflowSnapshot|TestAttemptActionPlanAPIIncludesRetryPolicy'
 ```

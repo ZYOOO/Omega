@@ -24,11 +24,12 @@ const templateCards = [
 
 type PortalHomeProps = {
   onOpenWorkboard: () => void;
+  onOpenPagePilot: () => void;
   onToggleTheme: () => void;
   uiTheme: "light" | "dark";
 };
 
-export function PortalHome({ onOpenWorkboard, onToggleTheme, uiTheme }: PortalHomeProps) {
+export function PortalHome({ onOpenWorkboard, onOpenPagePilot, onToggleTheme, uiTheme }: PortalHomeProps) {
   return (
     <main className={`site-shell portal-shell theme-${uiTheme}`}>
       <header className="portal-topbar">
@@ -83,8 +84,8 @@ export function PortalHome({ onOpenWorkboard, onToggleTheme, uiTheme }: PortalHo
                 <button type="button" className="portal-outline" onClick={onOpenWorkboard} data-omega-source="apps/web/src/components/PortalHome.tsx:open-workboard-button">
                   打开 Workboard
                 </button>
-                <button type="button" className="portal-outline" onClick={onOpenWorkboard}>
-                  连接 GitHub
+                <button type="button" className="portal-primary" onClick={onOpenPagePilot} data-omega-source="apps/web/src/components/PortalHome.tsx:open-page-pilot-button">
+                  打开 Page Pilot
                 </button>
               </div>
             </article>
@@ -144,6 +145,9 @@ export function PortalHome({ onOpenWorkboard, onToggleTheme, uiTheme }: PortalHo
               <span>热更新预览</span>
               <span>MR 摘要</span>
             </div>
+            <button type="button" className="portal-card-action" onClick={onOpenPagePilot}>
+              启动 Page Pilot
+            </button>
           </article>
         </aside>
       </div>

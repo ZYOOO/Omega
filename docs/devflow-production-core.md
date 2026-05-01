@@ -26,7 +26,7 @@ Requirement / Work Item
 - manual run / retry 主要依赖 active Attempt 判断；Workboard 路径的 execution lock 覆盖弱于 issue auto-run 路径。
 - workspace root、repo path、cleanup 意图和锁信息分散在 runtime spec、proof、日志和执行流程里。
 - prompt 主要由 Go 字符串拼接，workflow markdown 只定义 stage/review/runtime 的一部分。
-- JobSupervisor 能做基础 tick，但 worker host lease、orphan running Attempt 恢复和 workspace cleanup 没有形成闭环。
+- JobSupervisor 能做基础 tick，但 worker host lease、orphan running Attempt 恢复、workspace cleanup 和按失败类型区分的恢复动作没有形成闭环。
 
 ## 新做法
 
@@ -55,6 +55,14 @@ Requirement / Work Item
   - 旧做法：review feedback、人工 request changes、失败原因、PR/check 推荐动作分散在不同字段和 UI 区块。
   - 新做法：Attempt 失败、取消、人工 request changes、retry 和 Workpad 刷新都会生成统一 checklist；Retry API 默认使用 checklist 的主因，Rework Agent prompt 优先消费 checklist prompt。
   - 详细数据结构见 `docs/devflow-rework-checklist.md`。
+- JobSupervisor 自动恢复会先生成 `recoveryPolicy`，再决定动作：
+  - runner crash / worker host orphan：`retry-with-clean-worker`，重新起干净 worker 后按 backoff 自动 retry。
+  - 临时网络失败：`wait-and-retry`，等待网络恢复和 backoff 后自动 retry。
+  - GitHub API 临时失败：`wait-and-retry`，等待 API 恢复和 backoff 后自动 retry。
+  - CI flaky failure：`retry-validation`，优先重试验证。
+  - 权限失败：`manual-fix-permission`，停止自动 retry，要求修复凭据、仓库权限或 branch policy。
+  - 非 flaky CI failure：`rework-required`，把 check log / recommended action 交给 rework checklist，而不是盲目重跑。
+  - 未知失败：`retry-with-context`，低置信度自动 retry，并在 retry reason 中保留失败上下文。
 
 ## 架构
 
@@ -100,6 +108,8 @@ tick
   -> worker lease orphan recovery
   -> Ready Work Item scan
   -> failed / stalled retry scan
+  -> recovery policy classification
+  -> auto retry / manual action / rework routing
   -> workspace cleanup scan
 ```
 
@@ -111,3 +121,4 @@ tick
 - workspace cleanup 当前清理 repo checkout 并保留 proof；归档、压缩、删除整个 workspace 仍需后续策略。
 - workflow contract 仍需更完整的 DAG、artifact、runner policy、stage-specific timeout 校验。
 - worker host 当前是本机 lease；远端 worker 分配和远端崩溃恢复仍需后续增强。
+- 自动恢复分类当前基于 Attempt 字段、recommended actions 和 check log feedback；后续可以继续接入 runner 结构化 exit code、GitHub check step 分类和权限 preflight 的机器可读错误码。

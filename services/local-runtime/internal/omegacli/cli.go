@@ -84,7 +84,7 @@ Usage:
 Commands:
   health                         Check local runtime health
   status                         Show observability summary
-  logs [--level L] [--limit N]   Show runtime logs
+  logs [--level L] [--limit N]   Show runtime logs; supports --requirement, --search, --cursor
   work-items list                List work items
   work-items run <id-or-key>     Run a Work Item through devflow-pr
   attempts list                  List attempts
@@ -153,6 +153,10 @@ func (cli *CLI) logs(ctx context.Context, args []string, jsonOutput bool) error 
 	flags.SetOutput(io.Discard)
 	level := flags.String("level", "", "log level")
 	eventType := flags.String("event-type", "", "event type")
+	requirementID := flags.String("requirement", "", "requirement id")
+	search := flags.String("search", "", "full-text search")
+	cursor := flags.String("cursor", "", "runtime log cursor")
+	page := flags.Bool("page", false, "return a cursor page")
 	limit := flags.Int("limit", 20, "maximum records")
 	if _, err := parseCommandFlags(flags, args); err != nil {
 		return err
@@ -164,7 +168,35 @@ func (cli *CLI) logs(ctx context.Context, args []string, jsonOutput bool) error 
 	if *eventType != "" {
 		query.Set("eventType", *eventType)
 	}
+	if *requirementID != "" {
+		query.Set("requirementId", *requirementID)
+	}
+	if *search != "" {
+		query.Set("q", *search)
+	}
+	if *cursor != "" {
+		query.Set("cursor", *cursor)
+	}
 	query.Set("limit", strconv.Itoa(*limit))
+	if *page || *cursor != "" {
+		query.Set("page", "1")
+		var pageBody map[string]any
+		if err := cli.get(ctx, "/runtime-logs?"+query.Encode(), &pageBody); err != nil {
+			return err
+		}
+		if jsonOutput {
+			return printJSON(cli.Stdout, pageBody)
+		}
+		writer := tabwriter.NewWriter(cli.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(writer, "TIME\tLEVEL\tEVENT\tMESSAGE")
+		for _, entry := range arrayMaps(pageBody["items"]) {
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", text(entry, "createdAt"), text(entry, "level"), text(entry, "eventType"), oneLine(text(entry, "message"), 96))
+		}
+		if text(pageBody, "nextCursor") != "" {
+			fmt.Fprintf(writer, "\nnextCursor\t%s\t\t\n", text(pageBody, "nextCursor"))
+		}
+		return writer.Flush()
+	}
 	var logs []map[string]any
 	if err := cli.get(ctx, "/runtime-logs?"+query.Encode(), &logs); err != nil {
 		return err

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ var sqliteMigrations = []struct {
 	{Version: "20260427_001", Name: "agent_profiles_first_class_table"},
 	{Version: "20260428_001", Name: "page_pilot_runs_first_class_table"},
 	{Version: "20260429_001", Name: "runtime_logs_append_only_table"},
+	{Version: "20260501_001", Name: "runtime_logs_query_extensions"},
 }
 
 func NewSQLiteRepository(path string) *SQLiteRepository {
@@ -116,6 +118,7 @@ CREATE TABLE IF NOT EXISTS runtime_logs (
   entity_id TEXT,
   project_id TEXT,
   repository_target_id TEXT,
+  requirement_id TEXT,
   work_item_id TEXT,
   pipeline_id TEXT,
   attempt_id TEXT,
@@ -132,6 +135,9 @@ CREATE INDEX IF NOT EXISTS idx_runtime_logs_attempt ON runtime_logs(attempt_id, 
 `); err != nil {
 		return err
 	}
+	if err := repo.ensureRuntimeLogQueryExtensions(ctx); err != nil {
+		return err
+	}
 
 	for _, migration := range sqliteMigrations {
 		if err := repo.exec(ctx, fmt.Sprintf(
@@ -144,6 +150,37 @@ CREATE INDEX IF NOT EXISTS idx_runtime_logs_attempt ON runtime_logs(attempt_id, 
 		}
 	}
 	return nil
+}
+
+func (repo *SQLiteRepository) ensureRuntimeLogQueryExtensions(ctx context.Context) error {
+	output, err := repo.query(ctx, `.mode json
+PRAGMA table_info(runtime_logs);
+`)
+	if err != nil {
+		return err
+	}
+	var columns []map[string]any
+	if strings.TrimSpace(output) != "" {
+		if err := json.Unmarshal([]byte(output), &columns); err != nil {
+			return err
+		}
+	}
+	hasRequirementID := false
+	for _, column := range columns {
+		if text(column, "name") == "requirement_id" {
+			hasRequirementID = true
+			break
+		}
+	}
+	if !hasRequirementID {
+		if err := repo.exec(ctx, "ALTER TABLE runtime_logs ADD COLUMN requirement_id TEXT;"); err != nil {
+			return err
+		}
+	}
+	return repo.exec(ctx, `
+CREATE INDEX IF NOT EXISTS idx_runtime_logs_requirement ON runtime_logs(requirement_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_logs_work_item ON runtime_logs(work_item_id, created_at);
+`)
 }
 
 func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDatabase) error {
@@ -558,8 +595,8 @@ func (repo *SQLiteRepository) AppendRuntimeLog(ctx context.Context, record Runti
 	return repo.exec(ctx, fmt.Sprintf(`
 INSERT OR REPLACE INTO runtime_logs (
   id, level, event_type, message, entity_type, entity_id, project_id, repository_target_id,
-  work_item_id, pipeline_id, attempt_id, stage_id, agent_id, request_id, details_json, created_at
-) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+  requirement_id, work_item_id, pipeline_id, attempt_id, stage_id, agent_id, request_id, details_json, created_at
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
 `,
 		sqlQuote(record.ID),
 		sqlQuote(strings.ToUpper(record.Level)),
@@ -569,6 +606,7 @@ INSERT OR REPLACE INTO runtime_logs (
 		nullableQ(record.EntityID),
 		nullableQ(record.ProjectID),
 		nullableQ(record.RepositoryTargetID),
+		nullableQ(record.RequirementID),
 		nullableQ(record.WorkItemID),
 		nullableQ(record.PipelineID),
 		nullableQ(record.AttemptID),
@@ -581,11 +619,26 @@ INSERT OR REPLACE INTO runtime_logs (
 }
 
 func (repo *SQLiteRepository) ListRuntimeLogs(ctx context.Context, filters map[string]string, limit int) ([]RuntimeLogRecord, error) {
-	if err := repo.Initialize(ctx); err != nil {
+	page, err := repo.ListRuntimeLogsPage(ctx, filters, limit)
+	if err != nil {
 		return nil, err
 	}
-	if limit <= 0 || limit > 500 {
+	return page.Items, nil
+}
+
+func (repo *SQLiteRepository) ListRuntimeLogsPage(ctx context.Context, filters map[string]string, limit int) (RuntimeLogPage, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return RuntimeLogPage{}, err
+	}
+	maxLimit := 500
+	if filters["export"] == "1" {
+		maxLimit = 5000
+	}
+	if limit <= 0 || limit > maxLimit {
 		limit = 100
+		if filters["export"] == "1" {
+			limit = maxLimit
+		}
 	}
 	where := []string{"1=1"}
 	for key, column := range map[string]string{
@@ -607,12 +660,25 @@ func (repo *SQLiteRepository) ListRuntimeLogs(ctx context.Context, filters map[s
 			where = append(where, fmt.Sprintf("%s = %s", column, sqlQuote(value)))
 		}
 	}
+	if requirementID := strings.TrimSpace(filters["requirementId"]); requirementID != "" {
+		if scope := repo.runtimeLogRequirementScope(ctx, requirementID); scope != "" {
+			where = append(where, scope)
+		}
+	}
 	if value := strings.TrimSpace(filters["createdAfter"]); value != "" {
 		where = append(where, fmt.Sprintf("created_at >= %s", sqlQuote(value)))
 	}
 	if value := strings.TrimSpace(filters["createdBefore"]); value != "" {
 		where = append(where, fmt.Sprintf("created_at <= %s", sqlQuote(value)))
 	}
+	if value := strings.TrimSpace(filters["query"]); value != "" {
+		like := sqlQuote("%" + strings.ToLower(value) + "%")
+		where = append(where, fmt.Sprintf("(LOWER(event_type) LIKE %s OR LOWER(message) LIKE %s OR LOWER(details_json) LIKE %s OR LOWER(level) LIKE %s)", like, like, like, like))
+	}
+	if cursor := decodeRuntimeLogCursor(filters["cursor"]); cursor.CreatedAt != "" && cursor.ID != "" {
+		where = append(where, fmt.Sprintf("(created_at < %s OR (created_at = %s AND id < %s))", sqlQuote(cursor.CreatedAt), sqlQuote(cursor.CreatedAt), sqlQuote(cursor.ID)))
+	}
+	queryLimit := limit + 1
 	output, err := repo.query(ctx, fmt.Sprintf(`.mode json
 SELECT
   id,
@@ -623,6 +689,7 @@ SELECT
   entity_id AS entityId,
   project_id AS projectId,
   repository_target_id AS repositoryTargetId,
+  requirement_id AS requirementId,
   work_item_id AS workItemId,
   pipeline_id AS pipelineId,
   attempt_id AS attemptId,
@@ -633,18 +700,22 @@ SELECT
   created_at AS createdAt
 FROM runtime_logs
 WHERE %s
-ORDER BY created_at DESC
+ORDER BY created_at DESC, id DESC
 LIMIT %d;
-`, strings.Join(where, " AND "), limit))
+`, strings.Join(where, " AND "), queryLimit))
 	if err != nil {
-		return nil, err
+		return RuntimeLogPage{}, err
 	}
 	if strings.TrimSpace(output) == "" {
-		return []RuntimeLogRecord{}, nil
+		return RuntimeLogPage{Items: []RuntimeLogRecord{}, Limit: limit, HasMore: false}, nil
 	}
 	var rows []map[string]any
 	if err := json.Unmarshal([]byte(output), &rows); err != nil {
-		return nil, err
+		return RuntimeLogPage{}, err
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
 	}
 	logs := make([]RuntimeLogRecord, 0, len(rows))
 	for _, row := range rows {
@@ -657,6 +728,7 @@ LIMIT %d;
 			EntityID:           text(row, "entityId"),
 			ProjectID:          text(row, "projectId"),
 			RepositoryTargetID: text(row, "repositoryTargetId"),
+			RequirementID:      text(row, "requirementId"),
 			WorkItemID:         text(row, "workItemId"),
 			PipelineID:         text(row, "pipelineId"),
 			AttemptID:          text(row, "attemptId"),
@@ -671,7 +743,87 @@ LIMIT %d;
 		}
 		logs = append(logs, record)
 	}
-	return logs, nil
+	nextCursor := ""
+	if hasMore && len(logs) > 0 {
+		last := logs[len(logs)-1]
+		nextCursor = encodeRuntimeLogCursor(runtimeLogCursor{CreatedAt: last.CreatedAt, ID: last.ID})
+	}
+	return RuntimeLogPage{Items: logs, Limit: limit, NextCursor: nextCursor, HasMore: hasMore}, nil
+}
+
+type runtimeLogCursor struct {
+	CreatedAt string `json:"createdAt"`
+	ID        string `json:"id"`
+}
+
+func encodeRuntimeLogCursor(cursor runtimeLogCursor) string {
+	raw, err := json.Marshal(cursor)
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeRuntimeLogCursor(value string) runtimeLogCursor {
+	if strings.TrimSpace(value) == "" {
+		return runtimeLogCursor{}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return runtimeLogCursor{}
+	}
+	var cursor runtimeLogCursor
+	_ = json.Unmarshal(raw, &cursor)
+	return cursor
+}
+
+func (repo *SQLiteRepository) runtimeLogRequirementScope(ctx context.Context, requirementID string) string {
+	terms := []string{fmt.Sprintf("requirement_id = %s", sqlQuote(requirementID))}
+	database, err := repo.Load(ctx)
+	if err == nil && database != nil {
+		workItemIDs := map[string]bool{}
+		pipelineIDs := map[string]bool{}
+		attemptIDs := map[string]bool{}
+		for _, item := range database.Tables.WorkItems {
+			if text(item, "requirementId") == requirementID {
+				workItemIDs[text(item, "id")] = true
+			}
+		}
+		for _, pipeline := range database.Tables.Pipelines {
+			if workItemIDs[text(pipeline, "workItemId")] {
+				pipelineIDs[text(pipeline, "id")] = true
+			}
+		}
+		for _, attempt := range database.Tables.Attempts {
+			if workItemIDs[text(attempt, "itemId")] || pipelineIDs[text(attempt, "pipelineId")] {
+				attemptIDs[text(attempt, "id")] = true
+			}
+		}
+		if clause := sqlInClause("work_item_id", workItemIDs); clause != "" {
+			terms = append(terms, clause)
+		}
+		if clause := sqlInClause("pipeline_id", pipelineIDs); clause != "" {
+			terms = append(terms, clause)
+		}
+		if clause := sqlInClause("attempt_id", attemptIDs); clause != "" {
+			terms = append(terms, clause)
+		}
+	}
+	terms = append(terms, fmt.Sprintf("details_json LIKE %s", sqlQuote("%"+requirementID+"%")))
+	return "(" + strings.Join(terms, " OR ") + ")"
+}
+
+func sqlInClause(column string, values map[string]bool) string {
+	quoted := []string{}
+	for value := range values {
+		if strings.TrimSpace(value) != "" {
+			quoted = append(quoted, sqlQuote(value))
+		}
+	}
+	if len(quoted) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s IN (%s)", column, strings.Join(quoted, ","))
 }
 
 func (repo *SQLiteRepository) exec(ctx context.Context, input string) error {

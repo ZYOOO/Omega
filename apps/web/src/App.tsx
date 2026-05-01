@@ -59,6 +59,7 @@ import {
   fetchRequirements,
   fetchRunWorkpads,
   fetchRuntimeLogs,
+  patchRunWorkpad,
   releaseExecutionLock,
   requestCheckpointChanges,
   retryAttempt,
@@ -88,6 +89,7 @@ import {
   type ObservabilitySummary,
   type OperationRecordInfo,
   type PagePilotSelectionContext,
+  type PatchRunWorkpadInput,
   type OrchestratorWatcherInfo,
   type PipelineRecordInfo,
   type PipelineTemplateInfo,
@@ -168,12 +170,14 @@ function initialAppSurface(): AppSurface {
   if (typeof window === "undefined") return "home";
   if (window.location.hash === "#home") return "home";
   if (window.location.hash === "#workboard") return "workboard";
+  if (window.location.hash === "#page-pilot") return "workboard";
   if (isWorkItemDetailHash(window.location.hash)) return "workboard";
   return import.meta.env.MODE === "test" ? "workboard" : "home";
 }
 
 function initialActiveNav(savedNav: PrimaryNav): PrimaryNav {
   if (typeof window !== "undefined" && isWorkItemDetailHash(window.location.hash)) return "Issues";
+  if (typeof window !== "undefined" && window.location.hash === "#page-pilot") return "Page Pilot";
   return savedNav;
 }
 
@@ -792,6 +796,13 @@ function App() {
         setInspectorOpen(false);
         return;
       }
+      if (window.location.hash === "#page-pilot") {
+        setAppSurface("workboard");
+        setActiveNav("Page Pilot");
+        setActiveWorkItemDetailId("");
+        setInspectorOpen(false);
+        return;
+      }
       if (window.location.hash === "#workboard" || window.location.hash === "#home") {
         setActiveWorkItemDetailId("");
       }
@@ -805,7 +816,7 @@ function App() {
   const repositoryTargetCount = repositoryTargets.length;
   const effectiveRepositoryWorkspaceTargetId =
     activeRepositoryWorkspaceTargetId ||
-    (activeNav === "Issues" ? primaryProject?.defaultRepositoryTargetId ?? (repositoryTargets.length === 1 ? repositoryTargets[0].id : "") : "");
+    (activeNav === "Issues" || activeNav === "Page Pilot" ? primaryProject?.defaultRepositoryTargetId ?? (repositoryTargets.length === 1 ? repositoryTargets[0].id : "") : "");
   const activeRepositoryWorkspace =
     repositoryTargets.find((target) => target.id === effectiveRepositoryWorkspaceTargetId) ?? undefined;
   const activeRepositoryWorkspaceLabel =
@@ -1188,6 +1199,15 @@ function App() {
       setOperations(nextOperations);
       setProofRecords(nextProofRecords);
     }
+  }
+
+  async function updateRunWorkpadPatch(runWorkpadId: string, input: PatchRunWorkpadInput) {
+    if (!missionControlApiUrl) {
+      throw new Error("Omega control API is not connected.");
+    }
+    const patched = await patchRunWorkpad(missionControlApiUrl, runWorkpadId, input);
+    setRunWorkpads((current) => current.map((record) => (record.id === patched.id ? patched : record)));
+    await refreshExecutionState({ includeArtifacts: false });
   }
 
   const hasLiveExecution =
@@ -2136,6 +2156,36 @@ function App() {
     window.history.replaceState(null, "", "#workboard");
   }
 
+  function openPagePilot() {
+    setAppSurface("workboard");
+    setActiveNav("Page Pilot");
+    setActiveWorkItemDetailId("");
+    if (!activeRepositoryWorkspaceTargetId) {
+      const fallbackTargetId = primaryProject?.defaultRepositoryTargetId ?? (repositoryTargets.length === 1 ? repositoryTargets[0].id : "");
+      if (fallbackTargetId) setActiveRepositoryWorkspaceTargetId(fallbackTargetId);
+    }
+    window.history.replaceState(null, "", "#page-pilot");
+  }
+
+  function openPagePilotForRepository(repositoryTargetId?: string) {
+    if (repositoryTargetId) {
+      setActiveRepositoryWorkspaceTargetId(repositoryTargetId);
+    }
+    openPagePilot();
+  }
+
+  async function reloadDesktopApp() {
+    const desktopBridge = (window as Window & {
+      omegaDesktop?: { reloadApp?: () => Promise<{ ok: boolean; error?: string }> };
+    }).omegaDesktop;
+    if (desktopBridge?.reloadApp) {
+      const result = await desktopBridge.reloadApp();
+      if (!result.ok) setRunnerMessage(result.error ?? "Electron reload failed.");
+      return;
+    }
+    window.location.reload();
+  }
+
   function openWorkItemDetail(itemId: string) {
     setAppSurface("workboard");
     setActiveNav("Issues");
@@ -2284,7 +2334,7 @@ function App() {
   }
 
   if (appSurface === "home") {
-    return <PortalHome onOpenWorkboard={openWorkboard} onToggleTheme={toggleUiTheme} uiTheme={uiTheme} />;
+    return <PortalHome onOpenWorkboard={openWorkboard} onOpenPagePilot={openPagePilot} onToggleTheme={toggleUiTheme} uiTheme={uiTheme} />;
   }
 
   return (
@@ -2340,8 +2390,12 @@ function App() {
             window.history.replaceState(null, "", "#workboard");
           }
           if (item === "Views" || item === "Page Pilot") {
+            if (item === "Page Pilot" && !activeRepositoryWorkspaceTargetId) {
+              const fallbackTargetId = primaryProject?.defaultRepositoryTargetId ?? (repositoryTargets.length === 1 ? repositoryTargets[0].id : "");
+              if (fallbackTargetId) setActiveRepositoryWorkspaceTargetId(fallbackTargetId);
+            }
             setActiveWorkItemDetailId("");
-            window.history.replaceState(null, "", "#workboard");
+            window.history.replaceState(null, "", item === "Page Pilot" ? "#page-pilot" : "#workboard");
           }
         }}
         onRunDetail={() => {
@@ -3231,9 +3285,15 @@ function App() {
         {activeNav === "Page Pilot" ? (
           <PagePilotPreview
             projectId={primaryProject?.id ?? "project_omega"}
+            repositoryTargets={repositoryTargets}
             repositoryTargetId={pagePilotRepositoryTarget?.id}
             repositoryLabel={pagePilotRepositoryLabel}
             apiAvailable={Boolean(missionControlApiUrl)}
+            onReloadApp={() => void reloadDesktopApp()}
+            onSelectRepositoryTarget={(targetId) => {
+              setActiveRepositoryWorkspaceTargetId(targetId);
+              clearWorkspaceMessages();
+            }}
             onApply={applyPagePilotChange}
             onDeliver={deliverPagePilotConfirmedChange}
             onDiscard={discardPagePilotPendingChange}
@@ -3267,7 +3327,9 @@ function App() {
                 workItem={activeWorkItemDetail}
                 workItems={displayWorkItems}
                 workItemStatusLabel={workItemStatusLabel}
+                onOpenPagePilot={() => openPagePilotForRepository(activeWorkItemDetail.repositoryTargetId)}
                 onApproveCheckpoint={(checkpointId) => void approvePendingCheckpoint(checkpointId)}
+                onPatchRunWorkpad={updateRunWorkpadPatch}
                 onRequestCheckpointChanges={(checkpointId, note) => void rejectPendingCheckpoint(checkpointId, note)}
                 onRetryAttempt={(attemptId) => void retryWorkItemAttempt(attemptId)}
               />

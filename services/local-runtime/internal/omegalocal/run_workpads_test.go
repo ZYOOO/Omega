@@ -23,6 +23,20 @@ func TestRunWorkpadRecordTracksAttemptRetryContext(t *testing.T) {
 	attempt["failureReason"] = "Review agent blocked delivery."
 	attempt["failureReviewFeedback"] = "Fix missing loading state before merge."
 	attempt["checkLogFeedback"] = []any{map[string]any{"kind": "ci-check-log", "label": "lint", "message": "Lint failed on the loading state copy."}}
+	attempt["reviewPacket"] = map[string]any{
+		"summary": "OMG-1 has reviewable diff and one validation concern.",
+		"diffPreview": map[string]any{
+			"summary":      "2 changed file(s), +10/-2 lines.",
+			"changedFiles": []any{"src/App.tsx", "src/App.test.tsx"},
+		},
+		"testPreview":  map[string]any{"status": "attention", "summary": "Lint failed."},
+		"checkPreview": map[string]any{"status": "missing", "summary": "No remote checks captured."},
+		"risk": map[string]any{
+			"level":   "high",
+			"reasons": []any{"Validation output needs attention."},
+		},
+		"recommendedActions": []any{map[string]any{"type": "validation", "label": "Run focused validation before approval."}},
+	}
 	attempt["status"] = "failed"
 
 	database, err := repo.Load(context.Background())
@@ -58,6 +72,10 @@ func TestRunWorkpadRecordTracksAttemptRetryContext(t *testing.T) {
 	reworkChecklist := mapValue(workpad["reworkChecklist"])
 	if text(reworkChecklist, "status") != "needs-rework" {
 		t.Fatalf("rework checklist status = %+v", reworkChecklist)
+	}
+	reviewPacket := mapValue(workpad["reviewPacket"])
+	if text(mapValue(reviewPacket["risk"]), "level") != "high" || len(arrayMaps(reviewPacket["recommendedActions"])) != 1 {
+		t.Fatalf("review packet = %+v", reviewPacket)
 	}
 	if checklist := stringSlice(reworkChecklist["checklist"]); len(checklist) == 0 || !strings.Contains(strings.Join(checklist, "\n"), "Fix missing loading state") {
 		t.Fatalf("rework checklist = %+v", reworkChecklist)

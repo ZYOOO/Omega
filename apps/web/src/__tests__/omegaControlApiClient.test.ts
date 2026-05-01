@@ -18,10 +18,12 @@ import {
   fetchLlmProviderSelection,
   fetchLlmProviders,
   fetchObservability,
+  fetchRuntimeLogPage,
   fetchPagePilotRuns,
   fetchPipelines,
   fetchPipelineTemplates,
   fetchRunWorkpads,
+  exportRuntimeLogs,
   patchRunWorkpad,
   requestCheckpointChanges,
   runCurrentPipelineStage,
@@ -73,6 +75,34 @@ describe("omegaControlApiClient", () => {
         workpad: { blockers: ["Required check pending"] }
       }, fetchImpl)
     ).resolves.toMatchObject({ workpad: { updatedBy: "job-supervisor" }, fieldPatchHistory: [{ updatedBy: "job-supervisor" }] });
+  });
+
+  it("queries runtime logs with cursor search and export filters", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/runtime-logs/export")) {
+        expect(url).toContain("format=csv");
+        expect(url).toContain("requirementId=req_1");
+        return Promise.resolve(new Response("createdAt,level,eventType\n2026-05-01T00:00:00Z,ERROR,devflow.failed\n", { status: 200 }));
+      }
+      expect(url).toContain("/runtime-logs?");
+      expect(url).toContain("page=1");
+      expect(url).toContain("requirementId=req_1");
+      expect(url).toContain("q=merge");
+      return Promise.resolve(jsonResponse({
+        items: [{ id: "log_1", level: "ERROR", eventType: "devflow.failed", message: "merge failed", requirementId: "req_1", createdAt: "2026-05-01T00:00:00Z" }],
+        limit: 1,
+        nextCursor: "cursor_2",
+        hasMore: true
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchRuntimeLogPage("http://omega.local", { requirementId: "req_1", q: "merge", limit: 1 }, fetchImpl)).resolves.toMatchObject({
+      items: [{ id: "log_1", requirementId: "req_1" }],
+      nextCursor: "cursor_2",
+      hasMore: true
+    });
+    await expect(exportRuntimeLogs("http://omega.local", { requirementId: "req_1", format: "csv" }, fetchImpl)).resolves.toContain("devflow.failed");
   });
 
   it("loads control-plane summaries and configuration", async () => {
