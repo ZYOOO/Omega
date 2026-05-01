@@ -271,7 +271,8 @@ Item
 - [ ] Go runtime 模块化：继续拆 `server.go`，优先拆 HTTP handler 注册、delivery/PR API、workspace cleanup API 和 runtime settings API
 - [x] 把 Requirement Decomposition 建成一等服务端能力：raw requirement / GitHub issue -> structured requirement / acceptance criteria / risks / sub-items / target repo context
 - [x] 把 Agent handoff bundle 建成基础 artifact：每个 stage 有输入/输出 artifact contract，`devflow-pr` 生成 handoff bundle
-- [ ] 把 Agent handoff bundle 从文件 proof 继续升级为可查询的一等表记录
+- [x] 把 Agent handoff bundle 从文件 proof 继续升级为可查询的一等表记录
+  - 2026-05-02：新增 SQLite `handoff_bundles` 表和 `GET /handoff-bundles`，从真实 proof / Attempt / Operation 中抽取 bundle、summary、PR 和 changed files；旧文件 proof 仍保留为兼容来源。
 - [x] 增加 Agent runtime spec 基础版：每个 operation / DevFlow cycle 写入 `.omega/agent-runtime.json`
 - [x] 增加 runner-specific runtime 模板基础版：Codex / Claude Code 继续生成本机 CLI policy 文件；opencode / Trae Agent 已补账号配置入口、runner/model/prompt/Skills/MCP 配置和 Project Agent Profile 消费链路，后续继续增强更细的 tool policy 文件。
 - [x] 扩展 runner process supervisor：opencode / Trae Agent / demo-code 已接入 runner registry、capability preflight、exit status、stdout/stderr 持久化；timeout / cancel 继续沿用 context-aware supervisor。
@@ -296,12 +297,15 @@ Item
 - [x] 清理遗留外部参考命名：内部文件、类型、测试、历史文档统一使用 Omega Workboard / DevFlow 语言，外部产品名只出现在“参考来源”说明中
   - 2026-05-02 核对：当前 `services` / `apps` / `docs` 中未发现需避开的历史参考命名；后续新增文档继续按 Omega Workboard / DevFlow 语言维护。
 - [x] 把 Product Layer 持久化从 workspace 快照推进到 missions / operations / checkpoints / proof_records 等一等表基础版
-- [ ] 按新的 Work Model 继续把 Project / Repository target / Work item / Pipeline run 的 SQLite 结构从 JSON snapshot 推进为可查询表
+- [x] 按新的 Work Model 继续把 Project / Repository target / Work item / Pipeline run 的 SQLite 结构从 JSON snapshot 推进为可查询表基础版
+  - 2026-05-02：新增 `repository_targets` 可查询表和 `GET /repository-targets`。旧 Project JSON 中的 `repositoryTargets` 仍作为兼容镜像保留；Project / Pipeline run 全量拆表和旧镜像移除继续单独跟踪。
 - [x] 先把 Requirement 从 snapshot 中抽成服务端一等表，并在本地 SQLite / 前端本地 fallback SQLite 中持久化
-- [ ] 把 Go Local Service 的 SQLite 写入从 snapshot-first 继续推进为 repository-first
+- [x] 把 Go Local Service 的 SQLite 写入从 snapshot-first 继续推进为 repository-first 基础版
+  - 2026-05-02：保存 workspace 时同步物化 Repository target / handoff bundle / operation queue 审计表，读路径可按 repository target 查询；旧 snapshot-first 保存仍保留为兼容层，后续逐步迁移 Project / Pipeline run 写入。
 - [ ] 把 Go 侧 migration metadata 演进成可执行增量迁移
 - [x] 把旧 Node / 前端本地服务路径降级为兼容回退；Go Local Runtime 已是默认主路径
 - [ ] 清理旧 Node / 前端本地服务端兼容代码，减少双实现维护成本
+  - 2026-05-02 注释：本轮只新增 repository-first 审计表，不移除旧兼容代码，避免影响当前功能一/功能二测试。
 - [ ] 继续减少前端直接持有的业务逻辑，让服务端成为 Mission Control 的唯一写入者
 - [x] 把 GitHub repo / issue import API 接到前端 UI
 - [x] 把 App 内部需求入口接到 repository workspace：不依赖 GitHub issue 也能创建 Work item 并运行
@@ -359,6 +363,7 @@ Item
 - [x] 把 LLM Provider / runner account selection 真正映射到 opencode / Trae Agent / compatible provider runner；Codex / Claude Code 继续走本机 CLI 登录态。
 - [x] 把 `run-current-stage` 的 runner 扩展为 Codex / opencode / Claude Code / Trae Agent，并保留 `local-proof` / `demo-code` 兜底。
 - [ ] 设计 shared sync API：本地/远端/GitHub/飞书创建 requirement 后双向同步状态
+  - 2026-05-02 计划：先保留为设计项，不在本轮落地。需要定义本地事件版本、远端权限、repository lock 所有权和离线冲突解决。
 - [ ] 在 Go Local Runtime 中扩展 `lark-cli` adapter，支持发送 checkpoint 卡片通知和 pipeline 结果通知
   - 2026-05-01：Human Review 已新增飞书 review-request / callback 链路；机器人 webhook 和 `lark-cli` chatId 都支持 interactive card。Pipeline 结果通知仍可继续扩展为 delivery summary 卡片。
 
@@ -399,8 +404,10 @@ Item
 - [x] 增加 Agent 协作协议基础版：stage input contract、output contract、handoff bundle、reject reason、retry instruction
 - [x] 增加 repository target 安全约束：执行前必须解析 Work item 的 `repositoryTargetId`，避免 Agent 在错误仓库运行
 - [x] 增加 DevFlow 长运行的后台 Attempt job 基础版，避免 HTTP 请求阻塞整条执行流程
-- [ ] 增加长运行 operation 的正式 queue / retry 模型
+- [x] 增加长运行 operation 的正式 queue / retry 模型基础版
+  - 2026-05-02：新增 SQLite `operation_queue` 和 `GET /operation-queue`，从真实 Operation 物化 queued/running/done/failed/canceled、priority、lock、attemptCount 和 queue payload；真正的 worker dequeue / retry mutation 继续后续实现。
 - [ ] 增加本地 App sync loop：push local changes / pull remote changes / acquire execution lock / report events
+  - 2026-05-02 计划：该项属于 shared sync / 多端协作授权，不阻塞当前单机测试；需要先确定远端控制面、授权模型和冲突策略。
 - [x] 增加显式的 run attempts 表
 - [x] AutoRun 会形成一条正式 Attempt，并把 workspace、branch、PR、proof、错误和耗时写入持久化记录
 - [x] Done Item 在列表禁用 Run；详情页提供显式 Rerun；失败状态显示 Retry 入口
@@ -409,7 +416,8 @@ Item
   - 2026-05-02 核对：workflow runtime 已持久化 Attempt timeout、retry 上限、backoff、heartbeat、cleanup retention，并被 DevFlow / JobSupervisor 消费。
 - [x] 增加与数据库状态联动的 workspace cleanup 策略
 - [x] Work item 详情页增加 Proof 一等展示，按 Requirement / Solution / Diff / Test / Review / PR / Merge 等类型展示证据
-- [ ] 增加 proof 内容解析和预览，不只停留在文件路径层
+- [x] 增加 proof 内容解析和预览，不只停留在文件路径层基础版
+  - 2026-05-02：新增 `GET /proof-records/{id}/preview`，按 proof sourcePath 读取本地文本、JSON、Markdown、diff 内容并限制预览大小；二进制截图和大文件分页继续后续增强。
 - [x] 增加本地 CLI capability detection：codex / opencode / git / gh / lark-cli
 - [x] Human Review Request changes 创建真实 rework Attempt，并把人工反馈写入 Workpad / retry reason / 下一轮 Agent prompt
 - [x] Human Review Request changes 复用同一 workspace、branch 和 PR，并在本地 workspace 丢失时优先恢复远端 delivery branch
@@ -432,11 +440,14 @@ Item
 - [x] 在 UI 中更清晰地展示 Mission / Operation / Checkpoint 基础版：Operator 列表、Work item 详情页、Human Review gate
 - [ ] 优化空状态，引导用户导入 GitHub / Feishu / CI 或手动创建
 - [ ] 明确未来多人协作模型
+  - 2026-05-02 计划：与 shared sync / 多端授权合并设计，优先保证本地 repository-first 执行链路稳定。
 - [x] 接入本地 GitHub 网页 OAuth 主路径
 - [x] GitHub OAuth App 配置改为 App 内填写并持久化到 SQLite，`.env` 只作为开发 fallback
 - [ ] 继续明确未来 GitHub App / 多人协作授权策略
+  - 2026-05-02 计划：继续保留为远期产品化，不与本机 `gh` / OAuth 主链路混在一起。
 - [x] 增加本地 App 执行器能力 / Runner process / 当前 execution lock 展示基础版
 - [ ] 增加本地 App sync loop 在线状态和远端同步状态展示
+  - 2026-05-02 计划：依赖 shared sync API 和远端授权模型，暂不进入本轮实现。
 - [x] 增加飞书通知状态展示（runner message 基础版）
 
 ## 赛题追踪
@@ -463,6 +474,7 @@ Item
 - [x] 可观测性面板基础版（summary API + Operator UI）
 - [x] 可观测性面板增强：`/observability` 支持时间窗口、分组统计、最近失败、慢阶段 drilldown 和趋势数据；Views 页面可切换窗口与分组，定位失败和慢阶段更直接。
 - [ ] 代码库语义索引
+  - 2026-05-02 计划：先记录为下一轮能力建设。建议拆成 repository scan、symbol/document index、selection/source mapping 消费、Agent prompt retrieval 四步，等功能一/功能二主链路测试稳定后实施。
 - [x] Pipeline 模板
 - [x] Git 集成基础版：隔离 clone、创建本地 branch、commit、生成 diff/summary proof
 - [x] GitHub PR 集成基础版：推送 branch、创建 PR、读取 checks、合并 PR

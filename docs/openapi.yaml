@@ -171,6 +171,94 @@ paths:
       responses:
         '200':
           description: Proof records returned
+  /proof-records/{id}/preview:
+    get:
+      summary: Preview proof record content
+      description: >
+        读取 proof record 指向的本地文本型证据内容，返回文件名、类型、大小、
+        是否截断和预览文本。当前基础版支持 JSON、Markdown、diff 和普通文本，
+        二进制截图与大文件分页继续作为后续增强。
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Proof preview returned
+        '404':
+          description: Proof record not found
+  /repository-targets:
+    get:
+      summary: List repository target audit records
+      description: >
+        返回从 Project repository target 镜像物化出来的可查询记录。旧 Project
+        snapshot 仍保留为兼容来源；该接口用于 repository-first 查询和审计。
+      parameters:
+        - in: query
+          name: projectId
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Repository target records returned
+  /handoff-bundles:
+    get:
+      summary: List handoff bundle audit records
+      description: >
+        返回从真实 proof / Attempt / Operation 抽取的一等 handoff bundle 记录，
+        包含 bundle JSON、summary、changed files 和 PR 摘要。
+      parameters:
+        - in: query
+          name: attemptId
+          schema:
+            type: string
+        - in: query
+          name: pipelineId
+          schema:
+            type: string
+        - in: query
+          name: workItemId
+          schema:
+            type: string
+        - in: query
+          name: repositoryTargetId
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Handoff bundle records returned
+  /operation-queue:
+    get:
+      summary: List operation queue audit records
+      description: >
+        返回从 Operation 物化的长运行队列视图，包含 status、priority、stage、
+        agent、lock、attemptCount 和 queue payload。当前基础版是只读审计视图。
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+        - in: query
+          name: attemptId
+          schema:
+            type: string
+        - in: query
+          name: pipelineId
+          schema:
+            type: string
+        - in: query
+          name: workItemId
+          schema:
+            type: string
+        - in: query
+          name: repositoryTargetId
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Operation queue records returned
   /run-workpads:
     get:
       summary: List Run Workpad records

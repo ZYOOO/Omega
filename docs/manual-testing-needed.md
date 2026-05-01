@@ -2,6 +2,12 @@
 
 这个文档只记录自动化测试覆盖不到、需要在 Electron / 真实目标页面里确认的内容。完成后可以在对应条目后补充结果和问题。
 
+## 2026-05-02 Repository-first 审计 API
+
+本轮新增的 `repository_targets`、`handoff_bundles`、`operation_queue` 和 proof preview 基础 API 已用 Go / 前端 API client 自动化测试覆盖，当前不需要额外人工手测。
+
+后续 shared sync、多端协作授权、App sync loop 和代码库语义索引需要先完成产品方案与远端环境，再补单独手测清单。
+
 ## 2026-04-30 Page Pilot 桌面端链路
 
 ### 需要验证

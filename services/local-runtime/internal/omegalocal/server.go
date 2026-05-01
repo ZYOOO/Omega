@@ -137,6 +137,8 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.createProject(response, request)
 	case request.Method == http.MethodGet && path == "/requirements":
 		server.listTable(response, request, "requirements")
+	case request.Method == http.MethodGet && path == "/repository-targets":
+		server.listRepositoryTargets(response, request)
 	case request.Method == http.MethodGet && path == "/events":
 		server.listTable(response, request, "missionEvents")
 	case request.Method == http.MethodGet && path == "/pipelines":
@@ -159,6 +161,12 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.listTable(response, request, "operations")
 	case request.Method == http.MethodGet && path == "/proof-records":
 		server.listTable(response, request, "proofRecords")
+	case request.Method == http.MethodGet && strings.HasPrefix(path, "/proof-records/") && strings.HasSuffix(path, "/preview"):
+		server.proofRecordPreview(response, request)
+	case request.Method == http.MethodGet && path == "/handoff-bundles":
+		server.listHandoffBundles(response, request)
+	case request.Method == http.MethodGet && path == "/operation-queue":
+		server.listOperationQueue(response, request)
 	case request.Method == http.MethodGet && path == "/run-workpads":
 		server.listTable(response, request, "runWorkpads")
 	case request.Method == http.MethodPatch && strings.HasPrefix(path, "/run-workpads/"):

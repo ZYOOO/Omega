@@ -14,14 +14,18 @@ import {
   fetchGitHubOAuthConfig,
   fetchGitHubRepositories,
   fetchGitHubStatus,
+  fetchHandoffBundles,
   fetchLocalCapabilities,
   fetchLlmProviderSelection,
   fetchLlmProviders,
   fetchObservability,
+  fetchOperationQueue,
   fetchRuntimeLogPage,
   fetchPagePilotRuns,
   fetchPipelines,
   fetchPipelineTemplates,
+  fetchProofPreview,
+  fetchRepositoryTargets,
   fetchWorkflowTemplates,
   fetchRunWorkpads,
   exportRuntimeLogs,
@@ -107,6 +111,40 @@ describe("omegaControlApiClient", () => {
       hasMore: true
     });
     await expect(exportRuntimeLogs("http://omega.local", { requirementId: "req_1", format: "csv" }, fetchImpl)).resolves.toContain("devflow.failed");
+  });
+
+  it("reads repository audit records and proof previews", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "http://omega.local/repository-targets?projectId=project_omega") {
+        return Promise.resolve(jsonResponse([{ id: "repo_1", projectId: "project_omega", kind: "github", owner: "acme", repo: "demo" }]));
+      }
+      if (url === "http://omega.local/handoff-bundles?attemptId=attempt_1") {
+        return Promise.resolve(jsonResponse([{ id: "handoff_1", attemptId: "attempt_1", summary: { pullRequest: "https://github.com/acme/demo/pull/1" } }]));
+      }
+      if (url === "http://omega.local/operation-queue?status=running") {
+        return Promise.resolve(jsonResponse([{ id: "queue:operation_1", operationId: "operation_1", status: "running", queue: { prompt: "Run delivery" } }]));
+      }
+      if (url === "http://omega.local/proof-records/proof_1/preview") {
+        return Promise.resolve(jsonResponse({ available: true, proof: { id: "proof_1", label: "handoff" }, fileName: "handoff-bundle.json", previewType: "json", content: "{\"changedFiles\":[]}" }));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchRepositoryTargets("http://omega.local", { projectId: "project_omega" }, fetchImpl)).resolves.toMatchObject([
+      { id: "repo_1", kind: "github", repo: "demo" }
+    ]);
+    await expect(fetchHandoffBundles("http://omega.local", { attemptId: "attempt_1" }, fetchImpl)).resolves.toMatchObject([
+      { id: "handoff_1", summary: { pullRequest: "https://github.com/acme/demo/pull/1" } }
+    ]);
+    await expect(fetchOperationQueue("http://omega.local", { status: "running" }, fetchImpl)).resolves.toMatchObject([
+      { id: "queue:operation_1", operationId: "operation_1", status: "running" }
+    ]);
+    await expect(fetchProofPreview("http://omega.local", "proof_1", fetchImpl)).resolves.toMatchObject({
+      available: true,
+      fileName: "handoff-bundle.json",
+      previewType: "json"
+    });
   });
 
   it("loads control-plane summaries and configuration", async () => {

@@ -361,5 +361,8 @@ func (server *Server) putAgentProfile(response http.ResponseWriter, request *htt
 }
 
 func errorsIsNoRows(err error) bool {
+	if err == nil {
+		return false
+	}
 	return err == sql.ErrNoRows || strings.Contains(err.Error(), "no rows")
 }

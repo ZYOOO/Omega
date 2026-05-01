@@ -29,6 +29,7 @@ var sqliteMigrations = []struct {
 	{Version: "20260429_001", Name: "runtime_logs_append_only_table"},
 	{Version: "20260501_001", Name: "runtime_logs_query_extensions"},
 	{Version: "20260502_001", Name: "workflow_templates_first_class_table"},
+	{Version: "20260502_002", Name: "repository_audit_tables"},
 }
 
 func NewSQLiteRepository(path string) *SQLiteRepository {
@@ -57,6 +58,21 @@ CREATE TABLE IF NOT EXISTS workspace_snapshots (
   saved_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, team TEXT NOT NULL, status TEXT NOT NULL, labels_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS repository_targets (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  label TEXT NOT NULL,
+  owner TEXT,
+  repo TEXT,
+  path TEXT,
+  url TEXT,
+  default_branch TEXT,
+  target_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repository_targets_project ON repository_targets(project_id, kind, updated_at);
 CREATE TABLE IF NOT EXISTS requirements (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, repository_target_id TEXT, source TEXT NOT NULL, source_external_ref TEXT, title TEXT NOT NULL, raw_text TEXT NOT NULL, structured_json TEXT NOT NULL, acceptance_criteria_json TEXT NOT NULL, risks_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, key TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL, priority TEXT NOT NULL, assignee TEXT NOT NULL, labels_json TEXT NOT NULL, team TEXT NOT NULL, stage_id TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mission_control_states (run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, work_items_json TEXT NOT NULL, events_json TEXT NOT NULL, sync_intents_json TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -70,6 +86,40 @@ CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, pipeline_id TEXT NO
 CREATE TABLE IF NOT EXISTS missions (id TEXT PRIMARY KEY, pipeline_id TEXT NOT NULL, work_item_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, mission_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, stage_id TEXT NOT NULL, agent_id TEXT NOT NULL, status TEXT NOT NULL, prompt TEXT NOT NULL, required_proof_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS proof_records (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, label TEXT NOT NULL, value TEXT NOT NULL, source_path TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS handoff_bundles (
+  id TEXT PRIMARY KEY,
+  attempt_id TEXT,
+  pipeline_id TEXT,
+  work_item_id TEXT,
+  repository_target_id TEXT,
+  source_path TEXT,
+  bundle_json TEXT NOT NULL,
+  summary_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_handoff_bundles_attempt ON handoff_bundles(attempt_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_handoff_bundles_work_item ON handoff_bundles(work_item_id, updated_at);
+CREATE TABLE IF NOT EXISTS operation_queue (
+  id TEXT PRIMARY KEY,
+  operation_id TEXT NOT NULL,
+  pipeline_id TEXT,
+  attempt_id TEXT,
+  work_item_id TEXT,
+  repository_target_id TEXT,
+  stage_id TEXT,
+  agent_id TEXT,
+  status TEXT NOT NULL,
+  priority INTEGER NOT NULL,
+  not_before TEXT,
+  locked_by TEXT,
+  lock_expires_at TEXT,
+  attempt_count INTEGER NOT NULL,
+  queue_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operation_queue_status ON operation_queue(status, priority, updated_at);
 CREATE TABLE IF NOT EXISTS run_workpads (
   id TEXT PRIMARY KEY,
   attempt_id TEXT NOT NULL,
@@ -219,6 +269,7 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 		"DELETE FROM mission_control_states;",
 		"DELETE FROM work_items;",
 		"DELETE FROM requirements;",
+		"DELETE FROM repository_targets;",
 		"DELETE FROM projects;",
 		"DELETE FROM connections;",
 		"DELETE FROM ui_preferences;",
@@ -227,6 +278,8 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 		"DELETE FROM pipelines;",
 		"DELETE FROM proof_records;",
 		"DELETE FROM operations;",
+		"DELETE FROM handoff_bundles;",
+		"DELETE FROM operation_queue;",
 		"DELETE FROM missions;",
 		"DELETE FROM run_workpads;",
 		"DELETE FROM workflow_templates;",
@@ -238,6 +291,14 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 			"INSERT OR REPLACE INTO projects VALUES (%s,%s,%s,%s,%s,%s,%s,%s);",
 			q(project, "id"), q(project, "name"), q(project, "description"), q(project, "team"), q(project, "status"),
 			jsonQ(project["labels"]), q(project, "createdAt"), q(project, "updatedAt"),
+		))
+	}
+	for _, target := range repositoryTargetRecordsFromProjects(database.Tables.Projects) {
+		sqlText = append(sqlText, fmt.Sprintf(
+			"INSERT OR REPLACE INTO repository_targets VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+			q(target, "id"), q(target, "projectId"), q(target, "kind"), q(target, "label"),
+			nullableQ(target["owner"]), nullableQ(target["repo"]), nullableQ(target["path"]), nullableQ(target["url"]),
+			nullableQ(target["defaultBranch"]), jsonQ(target["target"]), q(target, "createdAt"), q(target, "updatedAt"),
 		))
 	}
 	for _, requirement := range database.Tables.Requirements {
@@ -310,6 +371,24 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 	for _, proof := range database.Tables.ProofRecords {
 		sqlText = append(sqlText, fmt.Sprintf("INSERT OR REPLACE INTO proof_records VALUES (%s,%s,%s,%s,%s,%s);",
 			q(proof, "id"), q(proof, "operationId"), q(proof, "label"), q(proof, "value"), nullableQ(proof["sourcePath"]), q(proof, "createdAt")))
+	}
+	for _, bundle := range handoffBundleRecordsFromDatabase(database) {
+		sqlText = append(sqlText, fmt.Sprintf(
+			"INSERT OR REPLACE INTO handoff_bundles VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+			q(bundle, "id"), nullableQ(bundle["attemptId"]), nullableQ(bundle["pipelineId"]), nullableQ(bundle["workItemId"]),
+			nullableQ(bundle["repositoryTargetId"]), nullableQ(bundle["sourcePath"]), jsonQ(bundle["bundle"]), jsonQ(bundle["summary"]),
+			q(bundle, "createdAt"), q(bundle, "updatedAt"),
+		))
+	}
+	for _, queueItem := range operationQueueRecordsFromDatabase(database) {
+		sqlText = append(sqlText, fmt.Sprintf(
+			"INSERT OR REPLACE INTO operation_queue VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%d,%s,%s,%s);",
+			q(queueItem, "id"), q(queueItem, "operationId"), nullableQ(queueItem["pipelineId"]), nullableQ(queueItem["attemptId"]),
+			nullableQ(queueItem["workItemId"]), nullableQ(queueItem["repositoryTargetId"]), nullableQ(queueItem["stageId"]),
+			nullableQ(queueItem["agentId"]), q(queueItem, "status"), intValue(queueItem["priority"]),
+			nullableQ(queueItem["notBefore"]), nullableQ(queueItem["lockedBy"]), nullableQ(queueItem["lockExpiresAt"]),
+			intValue(queueItem["attemptCount"]), jsonQ(queueItem["queue"]), q(queueItem, "createdAt"), q(queueItem, "updatedAt"),
+		))
 	}
 	for _, workpad := range database.Tables.RunWorkpads {
 		sqlText = append(sqlText, fmt.Sprintf("INSERT OR REPLACE INTO run_workpads VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);",

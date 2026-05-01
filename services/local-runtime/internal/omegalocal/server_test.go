@@ -4017,6 +4017,71 @@ func TestCreateProjectAndBindRepositoryTarget(t *testing.T) {
 	t.Fatalf("created project missing after bind: %+v", loaded.Tables.Projects)
 }
 
+func TestRepositoryAuditTablesAndProofPreview(t *testing.T) {
+	api, repo := newTestAPI(t)
+	proofDir := t.TempDir()
+	handoffPath := filepath.Join(proofDir, "handoff-bundle.json")
+	if err := os.WriteFile(handoffPath, []byte(`{"changedFiles":["index.html"],"pullRequestUrl":"https://github.com/acme/demo/pull/7"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	timestamp := nowISO()
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       timestamp,
+		Tables: WorkspaceTables{
+			Projects: []map[string]any{{
+				"id": "project_omega", "name": "Omega", "description": "", "team": "Omega", "status": "Active", "labels": []any{}, "createdAt": timestamp, "updatedAt": timestamp,
+				"repositoryTargets": []any{map[string]any{"id": "repo_acme_demo", "kind": "github", "owner": "acme", "repo": "demo", "url": "https://github.com/acme/demo", "defaultBranch": "main", "createdAt": timestamp, "updatedAt": timestamp}},
+			}},
+			WorkItems: []map[string]any{{
+				"id": "item_1", "projectId": "project_omega", "key": "OMG-1", "title": "Audit", "description": "Audit proof.", "status": "Running", "priority": "High", "assignee": "delivery", "labels": []any{}, "team": "Omega", "stageId": "delivery", "target": "repo", "repositoryTargetId": "repo_acme_demo", "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "runId": "run_1", "status": "running", "run": map[string]any{}, "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			Attempts: []map[string]any{{
+				"id": "attempt_1", "itemId": "item_1", "pipelineId": "pipeline_1", "repositoryTargetId": "repo_acme_demo", "status": "running", "trigger": "manual", "runner": "codex", "stages": []any{}, "events": []any{}, "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			Missions: []map[string]any{{
+				"id": "mission_1", "pipelineId": "pipeline_1", "workItemId": "item_1", "title": "Delivery", "status": "running", "mission": map[string]any{}, "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			Operations: []map[string]any{{
+				"id": "operation_1", "missionId": "mission_1", "stageId": "delivery", "agentId": "delivery", "status": "running", "prompt": "Publish proof.", "requiredProof": []any{"handoff"}, "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			ProofRecords: []map[string]any{{
+				"id": "proof_1", "operationId": "operation_1", "label": "handoff-bundle", "value": "handoff-bundle.json", "sourcePath": handoffPath, "createdAt": timestamp,
+			}},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+
+	var targets []map[string]any
+	decode(t, mustGet(t, api.URL+"/repository-targets?projectId=project_omega"), &targets)
+	if len(targets) != 1 || text(targets[0], "id") != "repo_acme_demo" {
+		t.Fatalf("repository targets = %+v", targets)
+	}
+
+	var bundles []map[string]any
+	decode(t, mustGet(t, api.URL+"/handoff-bundles?attemptId=attempt_1"), &bundles)
+	if len(bundles) != 1 || text(mapValue(bundles[0]["summary"]), "pullRequest") == "" {
+		t.Fatalf("handoff bundles = %+v", bundles)
+	}
+
+	var queue []map[string]any
+	decode(t, mustGet(t, api.URL+"/operation-queue?status=running"), &queue)
+	if len(queue) != 1 || text(queue[0], "operationId") != "operation_1" {
+		t.Fatalf("operation queue = %+v", queue)
+	}
+
+	var preview map[string]any
+	decode(t, mustGet(t, api.URL+"/proof-records/proof_1/preview"), &preview)
+	if preview["available"] != true || !strings.Contains(text(preview, "content"), "index.html") {
+		t.Fatalf("proof preview = %+v", preview)
+	}
+}
+
 func TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)

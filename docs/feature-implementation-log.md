@@ -38,6 +38,45 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestObservabilityDash
 - 飞书 Task bridge 目前仍依赖本机 `lark-cli` 和 JobSupervisor tick，后续可增加常驻状态页和失败重试队列。
 - Page Pilot isolated-devflow 已有安全边界和 PR 交付基础，后续继续补跨进程恢复、持久 preview process table 和截图级 proof。
 
+## 2026-05-02: Repository-first 审计表与 Proof 预览
+
+### 目标
+
+把仍藏在 workspace snapshot 或 proof 文件路径里的核心执行对象先物化成可查询记录，让功能一的审计、排障和后续 UI 预览不再依赖前端拼装。这个版本先做基础表和只读 API，旧兼容数据保留，避免影响当前功能一/功能二测试。
+
+### 数据/API
+
+- 新增 SQLite 表：
+  - `repository_targets`：从 Project 的 repository target 镜像物化 project、repo、path、default branch 和原始 target JSON。
+  - `handoff_bundles`：从 proof / Attempt / Operation 抽取 handoff bundle、summary、PR、changed files。
+  - `operation_queue`：从 Operation 物化 queue view，包含 status、priority、stage、agent、lock 和 retry 次数。
+- 新增 API：
+  - `GET /repository-targets?projectId=...`
+  - `GET /handoff-bundles?attemptId=...&pipelineId=...&workItemId=...&repositoryTargetId=...`
+  - `GET /operation-queue?status=...&attemptId=...&pipelineId=...&workItemId=...&repositoryTargetId=...`
+  - `GET /proof-records/{proofId}/preview`
+
+### 运行时行为
+
+- 保存 workspace 时同步刷新三张审计表，保持旧 snapshot 与新查询表一致。
+- Handoff bundle 仍以真实 proof 文件为来源；如果能读取 `handoff-bundle.json`，API 会返回结构化 bundle，否则返回 proof label / value 兜底。
+- Proof preview 只读取本地可安全展示的文本型 proof，包含 JSON、Markdown、diff 和普通文本；默认限制到 128KB 并标记 `truncated`。
+- Operation queue 当前是只读队列视图，用于观测长运行 operation；真实 worker dequeue、重试 mutation 和跨进程恢复继续由后续 JobSupervisor 阶段补齐。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+```
+
+### 后续工作
+
+- Project / Pipeline run 全量拆表，逐步移除 snapshot-first 写入路径。
+- Handoff / proof UI 消费新 preview API，减少详情页只显示 path 的情况。
+- 长运行 operation queue 增加 claim、lease、retry 和失败分类。
+- shared sync、多端授权和代码库语义索引继续按 `docs/todo.md` 拆分推进。
+
 ## 2026-05-02: Todo 状态复核与产品化剩余项收敛
 
 ### 目标

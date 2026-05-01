@@ -4,6 +4,28 @@
 
 ## 2026-05-02
 
+### Repository-first 审计表、Proof 预览与 Operation Queue 基础版
+
+完成：
+
+- 新增 SQLite `repository_targets` 审计表，把 Project JSON 中的 repository target 物化成可查询记录；旧 Project snapshot 仍保留为兼容来源。
+- 新增 SQLite `handoff_bundles` 审计表，从真实 proof、Attempt、Pipeline、Operation 中抽取 handoff bundle、summary、PR 和 changed files。
+- 新增 SQLite `operation_queue` 基础表，从 Operation 物化 queued / running / done / failed / canceled、priority、lock、attemptCount 和 queue payload。
+- 新增 `GET /repository-targets`、`GET /handoff-bundles`、`GET /operation-queue` 和 `GET /proof-records/{id}/preview`。
+- Proof preview 会读取本地文本、JSON、Markdown、diff 文件，限制预览大小并返回 previewType / truncated / sizeBytes，避免 UI 只能显示文件路径。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+```
+
+后续：
+
+- Project / Pipeline run 全量拆表、旧 snapshot-first 写入清理、worker dequeue / retry mutation、二进制 proof 预览和大文件分页继续作为后续增强。
+- shared sync、多端协作授权、App sync loop 和代码库语义索引不在本轮假装完成，已拆到 `docs/todo.md` 的后续计划。
+
 ### P0 产品化补齐：Action Plan / Observability / Onboarding / 飞书桥 / Page Pilot 隔离
 
 完成：

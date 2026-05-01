@@ -508,6 +508,65 @@ export interface ProofRecordInfo {
   createdAt?: string;
 }
 
+export interface ProofPreviewInfo {
+  proof: ProofRecordInfo;
+  available: boolean;
+  sourcePath?: string;
+  fileName?: string;
+  extension?: string;
+  sizeBytes?: number;
+  content?: string;
+  truncated?: boolean;
+  previewType?: "json" | "markdown" | "diff" | "text" | string;
+  error?: string;
+}
+
+export interface RepositoryTargetRecordInfo {
+  id: string;
+  projectId?: string;
+  kind: string;
+  label?: string;
+  owner?: string;
+  repo?: string;
+  path?: string;
+  url?: string;
+  defaultBranch?: string;
+  [key: string]: unknown;
+}
+
+export interface HandoffBundleInfo {
+  id: string;
+  attemptId?: string;
+  pipelineId?: string;
+  workItemId?: string;
+  repositoryTargetId?: string;
+  sourcePath?: string;
+  bundle?: Record<string, unknown>;
+  summary?: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface OperationQueueItemInfo {
+  id: string;
+  operationId: string;
+  pipelineId?: string;
+  attemptId?: string;
+  workItemId?: string;
+  repositoryTargetId?: string;
+  stageId?: string;
+  agentId?: string;
+  status: string;
+  priority?: number;
+  notBefore?: string;
+  lockedBy?: string;
+  lockExpiresAt?: string;
+  attemptCount?: number;
+  queue?: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface RequirementRecordInfo {
   id: string;
   projectId: string;
@@ -1254,6 +1313,51 @@ export async function fetchProofRecords(
   fetchImpl: typeof fetch = fetch
 ): Promise<ProofRecordInfo[]> {
   return fetchJson<ProofRecordInfo[]>(apiUrl, "/proof-records", fetchImpl);
+}
+
+export async function fetchProofPreview(
+  apiUrl: string,
+  proofId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<ProofPreviewInfo> {
+  return fetchJson<ProofPreviewInfo>(apiUrl, `/proof-records/${encodeURIComponent(proofId)}/preview`, fetchImpl);
+}
+
+export async function fetchRepositoryTargets(
+  apiUrl: string,
+  filters: { projectId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<RepositoryTargetRecordInfo[]> {
+  const params = new URLSearchParams();
+  if (filters.projectId) params.set("projectId", filters.projectId);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<RepositoryTargetRecordInfo[]>(apiUrl, `/repository-targets${suffix}`, fetchImpl);
+}
+
+export async function fetchHandoffBundles(
+  apiUrl: string,
+  filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<HandoffBundleInfo[]> {
+  const params = new URLSearchParams();
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) params.set(key, value);
+  });
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<HandoffBundleInfo[]>(apiUrl, `/handoff-bundles${suffix}`, fetchImpl);
+}
+
+export async function fetchOperationQueue(
+  apiUrl: string,
+  filters: { status?: string; attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<OperationQueueItemInfo[]> {
+  const params = new URLSearchParams();
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) params.set(key, value);
+  });
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<OperationQueueItemInfo[]>(apiUrl, `/operation-queue${suffix}`, fetchImpl);
 }
 
 export async function fetchRequirements(
