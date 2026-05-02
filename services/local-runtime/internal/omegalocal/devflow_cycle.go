@@ -1530,48 +1530,89 @@ Rules:
 		}, nil
 	}
 
-	requirementArtifact := map[string]any{
-		"workItemId":          text(item, "id"),
-		"workItemKey":         text(item, "key"),
-		"title":               text(item, "title"),
-		"description":         effectiveDescription,
-		"source":              text(item, "source"),
-		"repositoryTargetId":  text(target, "id"),
-		"repositoryTarget":    repoSlug,
-		"repositoryClonePath": cloneTarget,
-		"defaultBranch":       baseBranch,
-		"acceptanceCriteria":  item["acceptanceCriteria"],
-		"createdAt":           nowISO(),
-	}
-	if err := writeJSONFile(filepath.Join(proofDir, "requirement-artifact.json"), requirementArtifact); err != nil {
-		return nil, err
-	}
-	requirementFallback := fmt.Sprintf("Structure requirement %s for repository %s.\n\nTitle: %s\n\nDescription:\n%s", text(item, "key"), repoSlug, text(item, "title"), effectiveDescription)
-	requirementPrompt := renderWorkflowPromptSection(template, "requirement", promptVariables, requirementFallback)
-	recordAgent("todo", "requirement", "passed", requirementPrompt, "requirement-artifact.json", "Requirement artifact captured with repository boundary and acceptance criteria.", []string{filepath.Join(proofDir, "requirement-artifact.json")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+	var (
+		commitSha          string
+		commitSummary      string
+		diffText           string
+		changedNames       string
+		changedFiles       []string
+		testOutput         string
+		testErr            error
+		prTitle            string
+		prBody             string
+		prURL              string
+		prDiff             string
+		checksOutput       string
+		remoteChecks       []map[string]any
+		remoteChecksRaw    string
+		remoteCheckSummary map[string]any
+	)
 
-	solutionPlan := fmt.Sprintf("# Solution Plan\n\n"+
-		"- Work item: `%s`\n"+
-		"- Repository: `%s`\n"+
-		"- Base branch: `%s`\n"+
-		"- Delivery branch: `%s`\n"+
-		"- Planned change: implement the requested product change in the repository, not a proof-only placeholder.\n\n"+
-		"## Stage Handoff\n\n"+
-		"1. Requirement intake reads the Omega work item and repository workspace boundary.\n"+
-		"2. Solution design passes the full requirement, acceptance criteria, and repository path to the coding agent.\n"+
-		"3. Coding agent edits the target repository and must produce a real git diff.\n"+
-		"4. Testing runs repository validation against the new commit.\n"+
-		"5. Review reads the PR diff and CI/check state before delivery.\n"+
-		"6. Human review records the gate decision.\n"+
-		"7. Delivery merges or leaves the PR waiting for manual review.\n",
-		text(item, "key"), repoSlug, baseBranch, branchName)
-	if err := os.WriteFile(filepath.Join(proofDir, "solution-plan.md"), []byte(solutionPlan), 0o644); err != nil {
-		return nil, err
+	writeRequirementArtifact := func() error {
+		requirementArtifact := map[string]any{
+			"workItemId":          text(item, "id"),
+			"workItemKey":         text(item, "key"),
+			"title":               text(item, "title"),
+			"description":         effectiveDescription,
+			"source":              text(item, "source"),
+			"repositoryTargetId":  text(target, "id"),
+			"repositoryTarget":    repoSlug,
+			"repositoryClonePath": cloneTarget,
+			"defaultBranch":       baseBranch,
+			"acceptanceCriteria":  item["acceptanceCriteria"],
+			"createdAt":           nowISO(),
+		}
+		if err := writeJSONFile(filepath.Join(proofDir, "requirement-artifact.json"), requirementArtifact); err != nil {
+			return err
+		}
+		requirementFallback := fmt.Sprintf("Structure requirement %s for repository %s.\n\nTitle: %s\n\nDescription:\n%s", text(item, "key"), repoSlug, text(item, "title"), effectiveDescription)
+		requirementPrompt := renderWorkflowPromptSection(template, "requirement", promptVariables, requirementFallback)
+		recordAgent("todo", "requirement", "passed", requirementPrompt, "requirement-artifact.json", "Requirement artifact captured with repository boundary and acceptance criteria.", []string{filepath.Join(proofDir, "requirement-artifact.json")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		return nil
 	}
-	solutionFallback := fmt.Sprintf("Design implementation for %s in %s.\n\nRequirement:\n%s", text(item, "key"), repoSlug, effectiveDescription)
-	solutionPrompt := renderWorkflowPromptSection(template, "architect", promptVariables, solutionFallback)
-	recordAgent("in_progress", "architect", "passed", solutionPrompt, "solution-plan.md", "Solution plan created and handed to the coding agent.", []string{filepath.Join(proofDir, "solution-plan.md")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
-	codingFallback := fmt.Sprintf(`You are the coding agent for Omega.
+	classifyTask := func() error {
+		classification := map[string]any{
+			"workItemId":         text(item, "id"),
+			"workItemKey":        text(item, "key"),
+			"repositoryTarget":   repoSlug,
+			"taskClass":          "default",
+			"planningMode":       "contract",
+			"validationMode":     "repository",
+			"selectedWorkflowId": text(pipeline, "templateId"),
+			"createdAt":          nowISO(),
+		}
+		if err := writeJSONFile(filepath.Join(proofDir, "task-classification.json"), classification); err != nil {
+			return err
+		}
+		recordAgent("in_progress", "master", "passed", "Classify task from workflow contract and repository target.", "task-classification.json", "Task classification captured from the active workflow contract.", []string{filepath.Join(proofDir, "task-classification.json")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		return nil
+	}
+	runArchitecture := func() error {
+		solutionPlan := fmt.Sprintf("# Solution Plan\n\n"+
+			"- Work item: `%s`\n"+
+			"- Repository: `%s`\n"+
+			"- Base branch: `%s`\n"+
+			"- Delivery branch: `%s`\n"+
+			"- Planned change: implement the requested product change in the repository, not a proof-only placeholder.\n\n"+
+			"## Stage Handoff\n\n"+
+			"1. Requirement intake reads the Omega work item and repository workspace boundary.\n"+
+			"2. Solution design passes the full requirement, acceptance criteria, and repository path to the coding agent.\n"+
+			"3. Coding agent edits the target repository and must produce a real git diff.\n"+
+			"4. Testing runs repository validation against the new commit.\n"+
+			"5. Review reads the PR diff and CI/check state before delivery.\n"+
+			"6. Human review records the gate decision.\n"+
+			"7. Delivery merges or leaves the PR waiting for manual review.\n",
+			text(item, "key"), repoSlug, baseBranch, branchName)
+		if err := os.WriteFile(filepath.Join(proofDir, "solution-plan.md"), []byte(solutionPlan), 0o644); err != nil {
+			return err
+		}
+		solutionFallback := fmt.Sprintf("Design implementation for %s in %s.\n\nRequirement:\n%s", text(item, "key"), repoSlug, effectiveDescription)
+		solutionPrompt := renderWorkflowPromptSection(template, "architect", promptVariables, solutionFallback)
+		recordAgent("in_progress", "architect", "passed", solutionPrompt, "solution-plan.md", "Solution plan created and handed to the coding agent.", []string{filepath.Join(proofDir, "solution-plan.md")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		return nil
+	}
+	runCoding := func() error {
+		codingFallback := fmt.Sprintf(`You are the coding agent for Omega.
 
 Repository: %s
 Repository path: %s
@@ -1593,110 +1634,127 @@ Rules:
   - Validation run
   - Known follow-up or risk
 `, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), effectiveDescription, filepath.Join(proofDir, "coding-agent-note.md"))
-	codingPrompt := renderWorkflowPromptSection(template, "coding", promptVariables, codingFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
-	if err := os.WriteFile(filepath.Join(proofDir, "coding-prompt.md"), []byte(codingPrompt), 0o644); err != nil {
-		return nil, err
-	}
-	recordAgent("in_progress", "coding", "running", codingPrompt, "", "Coding agent is editing the repository workspace.", []string{filepath.Join(proofDir, "coding-prompt.md")}, map[string]any{"runner": codingRunnerID, "status": "running"})
-	codingModel, codingEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
-	codingTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
-		Role:              "coding",
-		StageID:           "in_progress",
-		Runner:            codingRunnerID,
-		Workspace:         repoWorkspace,
-		Prompt:            codingPrompt,
-		OutputPath:        filepath.Join(proofDir, "coding-agent-note.md"),
-		Sandbox:           "workspace-write",
-		Model:             codingModel,
-		Env:               codingEnv,
-		HeartbeatInterval: runnerHeartbeatInterval,
-		OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "in_progress", "coding", codingRunnerID),
-	})
-	codingProcess, codingErr := codingTurn.Process, codingTurn.Error
-	if codingErr != nil {
-		reason := "Coding agent failed before producing an acceptable repository diff."
-		recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
-		return failureResult("in_progress", "coding", reason, codingErr.Error(), ""), fmt.Errorf("coding agent failed: %w", codingErr)
-	}
-	statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short")
-	if err != nil {
-		return nil, fmt.Errorf("read coding agent changes: %w", err)
-	}
-	if strings.TrimSpace(statusOutput) == "" {
-		reason := "Coding agent completed but produced no repository changes, so there is no diff for review or delivery."
-		recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
-		return failureResult("in_progress", "coding", reason, "git status --short returned no changed files after the coding runner finished.", ""), errors.New("coding agent produced no repository changes")
-	}
-	if _, err := runCommand(repoWorkspace, "git", "add", "-A"); err != nil {
-		return nil, fmt.Errorf("stage coding agent changes: %w", err)
-	}
-	if _, err := runCommand(repoWorkspace, "git", "commit", "-m", "Omega implementation for "+text(item, "key")); err != nil {
-		return nil, fmt.Errorf("commit coding agent changes: %w", err)
-	}
-	commitSha, _ := runCommand(repoWorkspace, "git", "rev-parse", "HEAD")
-	commitSummary, _ := runCommand(repoWorkspace, "git", "show", "--stat", "--oneline", "--no-renames", "HEAD")
-	diffText, _ := runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
-	changedNames, err := runCommand(repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
-	if err != nil {
-		return nil, fmt.Errorf("list changed files: %w", err)
-	}
-	changedFiles := compactLines(changedNames)
-	if err := os.WriteFile(filepath.Join(proofDir, "git-diff.patch"), []byte(diffText), 0o644); err != nil {
-		return nil, err
-	}
-	implementationSummary := fmt.Sprintf("# Implementation\n\n- Branch: `%s`\n- Commit: `%s`\n- Changed files:\n%s\n```text\n%s\n```\n", branchName, strings.TrimSpace(commitSha), markdownFileList(changedFiles), truncateForProof(commitSummary, 4000))
-	if err := os.WriteFile(filepath.Join(proofDir, "implementation-summary.md"), []byte(implementationSummary), 0o644); err != nil {
-		return nil, err
-	}
-	recordAgent("in_progress", "coding", "passed", codingPrompt, "implementation-summary.md", fmt.Sprintf("Coding agent produced %d changed file(s).", len(changedFiles)), []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md"), filepath.Join(proofDir, "implementation-summary.md"), filepath.Join(proofDir, "git-diff.patch")}, codingProcess)
-
-	testOutput, testErr := runRepositoryValidation(repoWorkspace)
-	testStatus := "passed"
-	if testErr != nil {
-		testStatus = "failed"
-	}
-	testVariables := cloneStringMap(promptVariables)
-	testVariables["changedFiles"] = strings.Join(changedFiles, ", ")
-	testVariables["testOutput"] = testOutput
-	testFallback := fmt.Sprintf("Validate %s after coding changes. Changed files: %s", text(item, "key"), strings.Join(changedFiles, ", "))
-	testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, testFallback)
-	testReport := fmt.Sprintf("# Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after coding changes.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None"))
-	if err := os.WriteFile(filepath.Join(proofDir, "test-report.md"), []byte(testReport), 0o644); err != nil {
-		return nil, err
-	}
-	recordAgent("in_progress", "testing", testStatus, testPrompt, "test-report.md", "Repository validation completed.", []string{filepath.Join(proofDir, "test-report.md")}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput})
-	if testErr != nil {
-		reason := "Repository validation failed after the coding agent produced changes."
-		return failureResult("in_progress", "testing", reason, stringOr(testOutput, testErr.Error()), ""), fmt.Errorf("repository validation failed: %w", testErr)
-	}
-
-	if text(target, "kind") == "github" {
-		_, _ = runCommand(repoWorkspace, "gh", "auth", "setup-git")
-	}
-	if err := pushDevFlowBranch(repoWorkspace, branchName); err != nil {
-		return nil, fmt.Errorf("push branch: %w", err)
-	}
-
-	prTitle := text(item, "key") + " " + text(item, "title")
-	prBody := buildDevFlowPullRequestBody(item, changedFiles, testOutput, humanChangeRequest, diffText)
-	prURL, err := ensureDevFlowPullRequest(repoWorkspace, repoSlug, branchName, baseBranch, prTitle, prBody)
-	if err != nil {
-		return nil, fmt.Errorf("create pull request: %w", err)
-	}
-	if humanChangeRequest != "" {
-		if output, err := updateDevFlowPullRequestDescriptionIfChanged(repoWorkspace, prURL, prTitle, prBody); err != nil {
-			server.logDebug(ctx, "github.pr.description_update_skipped", "Pull request description update skipped after human-requested rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output+"\n"+err.Error(), 1200)})
-		} else {
-			server.logInfo(ctx, "github.pr.description_updated", "Pull request description updated after human-requested rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output, 1200)})
+		codingPrompt := renderWorkflowPromptSection(template, "coding", promptVariables, codingFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
+		if err := os.WriteFile(filepath.Join(proofDir, "coding-prompt.md"), []byte(codingPrompt), 0o644); err != nil {
+			return err
 		}
+		recordAgent("in_progress", "coding", "running", codingPrompt, "", "Coding agent is editing the repository workspace.", []string{filepath.Join(proofDir, "coding-prompt.md")}, map[string]any{"runner": codingRunnerID, "status": "running"})
+		codingModel, codingEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
+		codingTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
+			Role:              "coding",
+			StageID:           "in_progress",
+			Runner:            codingRunnerID,
+			Workspace:         repoWorkspace,
+			Prompt:            codingPrompt,
+			OutputPath:        filepath.Join(proofDir, "coding-agent-note.md"),
+			Sandbox:           "workspace-write",
+			Model:             codingModel,
+			Env:               codingEnv,
+			HeartbeatInterval: runnerHeartbeatInterval,
+			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "in_progress", "coding", codingRunnerID),
+		})
+		codingProcess, codingErr := codingTurn.Process, codingTurn.Error
+		if codingErr != nil {
+			reason := "Coding agent failed before producing an acceptable repository diff."
+			recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
+			return fmt.Errorf("coding agent failed: %w", codingErr)
+		}
+		statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short")
+		if err != nil {
+			return fmt.Errorf("read coding agent changes: %w", err)
+		}
+		if strings.TrimSpace(statusOutput) == "" {
+			reason := "Coding agent completed but produced no repository changes, so there is no diff for review or delivery."
+			recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
+			return errors.New("coding agent produced no repository changes")
+		}
+		if _, err := runCommand(repoWorkspace, "git", "add", "-A"); err != nil {
+			return fmt.Errorf("stage coding agent changes: %w", err)
+		}
+		if _, err := runCommand(repoWorkspace, "git", "commit", "-m", "Omega implementation for "+text(item, "key")); err != nil {
+			return fmt.Errorf("commit coding agent changes: %w", err)
+		}
+		commitSha, _ = runCommand(repoWorkspace, "git", "rev-parse", "HEAD")
+		commitSummary, _ = runCommand(repoWorkspace, "git", "show", "--stat", "--oneline", "--no-renames", "HEAD")
+		diffText, _ = runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
+		changedNames, err = runCommand(repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
+		if err != nil {
+			return fmt.Errorf("list changed files: %w", err)
+		}
+		changedFiles = compactLines(changedNames)
+		if err := os.WriteFile(filepath.Join(proofDir, "git-diff.patch"), []byte(diffText), 0o644); err != nil {
+			return err
+		}
+		implementationSummary := fmt.Sprintf("# Implementation\n\n- Branch: `%s`\n- Commit: `%s`\n- Changed files:\n%s\n```text\n%s\n```\n", branchName, strings.TrimSpace(commitSha), markdownFileList(changedFiles), truncateForProof(commitSummary, 4000))
+		if err := os.WriteFile(filepath.Join(proofDir, "implementation-summary.md"), []byte(implementationSummary), 0o644); err != nil {
+			return err
+		}
+		recordAgent("in_progress", "coding", "passed", codingPrompt, "implementation-summary.md", fmt.Sprintf("Coding agent produced %d changed file(s).", len(changedFiles)), []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md"), filepath.Join(proofDir, "implementation-summary.md"), filepath.Join(proofDir, "git-diff.patch")}, codingProcess)
+		return nil
 	}
-	prDiff, _ := runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
-	checksOutput, _ := runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
-	remoteChecks, remoteChecksRaw := githubPullRequestChecks(ctx, repoWorkspace, prURL, repoSlug)
-	if strings.TrimSpace(remoteChecksRaw) != "" {
-		checksOutput = remoteChecksRaw
+	runValidation := func() error {
+		testOutput, testErr = runRepositoryValidation(repoWorkspace)
+		testStatus := "passed"
+		if testErr != nil {
+			testStatus = "failed"
+		}
+		testVariables := cloneStringMap(promptVariables)
+		testVariables["changedFiles"] = strings.Join(changedFiles, ", ")
+		testVariables["testOutput"] = testOutput
+		testFallback := fmt.Sprintf("Validate %s after coding changes. Changed files: %s", text(item, "key"), strings.Join(changedFiles, ", "))
+		testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, testFallback)
+		testReport := fmt.Sprintf("# Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after coding changes.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None"))
+		if err := os.WriteFile(filepath.Join(proofDir, "test-report.md"), []byte(testReport), 0o644); err != nil {
+			return err
+		}
+		recordAgent("in_progress", "testing", testStatus, testPrompt, "test-report.md", "Repository validation completed.", []string{filepath.Join(proofDir, "test-report.md")}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput})
+		if testErr != nil {
+			return fmt.Errorf("repository validation failed: %w", testErr)
+		}
+		return nil
 	}
-	remoteCheckSummary := githubCheckSummaryWithRequired(remoteChecks, template.Runtime.RequiredChecks)
+	ensurePullRequest := func() error {
+		if text(target, "kind") == "github" {
+			_, _ = runCommand(repoWorkspace, "gh", "auth", "setup-git")
+		}
+		if err := pushDevFlowBranch(repoWorkspace, branchName); err != nil {
+			return fmt.Errorf("push branch: %w", err)
+		}
+		prTitle = text(item, "key") + " " + text(item, "title")
+		prBody = buildDevFlowPullRequestBody(item, changedFiles, testOutput, humanChangeRequest, diffText)
+		var err error
+		prURL, err = ensureDevFlowPullRequest(repoWorkspace, repoSlug, branchName, baseBranch, prTitle, prBody)
+		if err != nil {
+			return fmt.Errorf("create pull request: %w", err)
+		}
+		if humanChangeRequest != "" {
+			if output, err := updateDevFlowPullRequestDescriptionIfChanged(repoWorkspace, prURL, prTitle, prBody); err != nil {
+				server.logDebug(ctx, "github.pr.description_update_skipped", "Pull request description update skipped after human-requested rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output+"\n"+err.Error(), 1200)})
+			} else {
+				server.logInfo(ctx, "github.pr.description_updated", "Pull request description updated after human-requested rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output, 1200)})
+			}
+		}
+		prDiff, _ = runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
+		checksOutput, _ = runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+		remoteChecks, remoteChecksRaw = githubPullRequestChecks(ctx, repoWorkspace, prURL, repoSlug)
+		if strings.TrimSpace(remoteChecksRaw) != "" {
+			checksOutput = remoteChecksRaw
+		}
+		remoteCheckSummary = githubCheckSummaryWithRequired(remoteChecks, template.Runtime.RequiredChecks)
+		return nil
+	}
+	if err := runDevFlowContractState(template, "todo", []devFlowContractActionStep{{ID: "capture_requirement", Type: "write_requirement_artifact", Agent: "requirement", Run: writeRequirementArtifact}}); err != nil {
+		return failureResult("todo", "requirement", "Workflow contract requirement action failed.", err.Error(), ""), err
+	}
+	if err := runDevFlowContractState(template, "in_progress", []devFlowContractActionStep{
+		{ID: "classify_task", Type: "classify_task", Agent: "master", Run: classifyTask},
+		{ID: "architecture_handoff", Type: "run_agent", Agent: "architect", Run: runArchitecture},
+		{ID: "implement_change", Type: "run_agent", Agent: "coding", Run: runCoding},
+		{ID: "validate_repository", Type: "run_validation", Agent: "testing", Run: runValidation},
+		{ID: "publish_pull_request", Type: "ensure_pr", Agent: "delivery", Run: ensurePullRequest},
+	}); err != nil {
+		return failureResult("in_progress", "delivery", "Workflow contract implementation action failed.", err.Error(), ""), err
+	}
 	pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
 	checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, remoteChecks)
 

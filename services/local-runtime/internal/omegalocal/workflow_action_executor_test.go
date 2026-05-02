@@ -157,3 +157,45 @@ func TestWorkflowContractRejectsUnsupportedActionType(t *testing.T) {
 		t.Fatalf("validation errors should mention unsupported action type: %+v", validation.Errors)
 	}
 }
+
+func TestRunDevFlowContractStateUsesContractOrder(t *testing.T) {
+	template := &PipelineTemplate{StateProfiles: []WorkflowStateProfile{{
+		ID: "in_progress",
+		Actions: []WorkflowActionProfile{
+			{ID: "validate_repository", Type: "run_validation", Agent: "testing"},
+			{ID: "architecture_handoff", Type: "run_agent", Agent: "architect"},
+		},
+	}}}
+	order := []string{}
+	err := runDevFlowContractState(template, "in_progress", []devFlowContractActionStep{
+		{ID: "architecture_handoff", Type: "run_agent", Agent: "architect", Run: func() error {
+			order = append(order, "architect")
+			return nil
+		}},
+		{ID: "validate_repository", Type: "run_validation", Agent: "testing", Run: func() error {
+			order = append(order, "testing")
+			return nil
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(order, ",") != "testing,architect" {
+		t.Fatalf("contract action order not honored: %v", order)
+	}
+}
+
+func TestRunDevFlowContractStateRequiresHandler(t *testing.T) {
+	template := &PipelineTemplate{StateProfiles: []WorkflowStateProfile{{
+		ID: "in_progress",
+		Actions: []WorkflowActionProfile{{
+			ID: "publish_pull_request", Type: "ensure_pr", Agent: "delivery",
+		}},
+	}}}
+	err := runDevFlowContractState(template, "in_progress", []devFlowContractActionStep{
+		{ID: "validate_repository", Type: "run_validation", Agent: "testing", Run: func() error { return nil }},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no DevFlow runtime handler") {
+		t.Fatalf("missing handler error = %v", err)
+	}
+}

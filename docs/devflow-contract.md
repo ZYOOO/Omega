@@ -56,10 +56,11 @@ DevFlow 的默认模式不再只是 Go runtime 里的固定流程，而是一份
 - 调整 runtime policy：`maxReviewCycles`、heartbeat、timeout、required checks、cleanup retention 等。
 - 调整 prompt section 和 runner profile，用同一 contract 影响 Agent 输入。
 
-仍处于兼容 adapter 的部分：
+当前执行边界：
 
-- 编码、验证、提交、push、PR 创建等写仓库动作已经按 action metadata 记录和校验，但执行体仍复用 DevFlow adapter 内的可靠实现。
-- 后续会继续把这些写仓库动作拆成更独立的 action handler，但默认行为保持不变。
+- 首次主链路的 Requirement、task classification、architecture handoff、coding、validation、ensure PR 已通过 contract state runner 执行。
+- contract 可以调整这些 action 的顺序，或移除非必需 action；如果 contract 引用没有 runtime handler 的 action，会在执行前失败。
+- Rework 和 Merging 的内部副作用已经按 contract 路由进入对应 stage，但 handler 代码仍在 DevFlow adapter 文件内，后续会继续拆成更小的独立 handler 文件，降低 `devflow_cycle.go` 的体积。
 
 ## Review / Rework 路由
 

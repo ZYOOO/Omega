@@ -2,7 +2,7 @@
 
 日期：2026-04-30
 
-状态：分阶段落地中。2026-05-01 已完成第一阶段：`states.actions` 契约解析、校验、Pipeline snapshot 持久化，以及 DevFlow 阶段推进优先读取契约 transitions；已完成第二阶段基础版：`GET /attempts/{attemptId}/action-plan` 可从 snapshot 生成当前 state、current action、state actions、可达 transitions 和 retry action。2026-05-02 已完成第三阶段基础版：review / rework / merging 的 action 识别、verdict/event 归一和下一阶段路由已迁入 `workflow-action-handler`。2026-05-02 晚间继续推进到 contract action executor：默认 `devflow-pr` 以 `states.actions` 作为运行协议，runtime 会校验 action type registry，并从 `run_review` action 派生真实 Review 轮次和 Rework 路由；写仓库动作仍复用 DevFlow adapter 的可靠执行体。
+状态：分阶段落地中。2026-05-01 已完成第一阶段：`states.actions` 契约解析、校验、Pipeline snapshot 持久化，以及 DevFlow 阶段推进优先读取契约 transitions；已完成第二阶段基础版：`GET /attempts/{attemptId}/action-plan` 可从 snapshot 生成当前 state、current action、state actions、可达 transitions 和 retry action。2026-05-02 已完成第三阶段基础版：review / rework / merging 的 action 识别、verdict/event 归一和下一阶段路由已迁入 `workflow-action-handler`。2026-05-02 晚间继续推进到 contract action executor：默认 `devflow-pr` 以 `states.actions` 作为运行协议，runtime 会校验 action type registry，并从 `run_review` action 派生真实 Review 轮次和 Rework 路由；Requirement、task classification、architecture、coding、validation、ensure PR 已按 contract state runner 执行。
 
 ## 背景
 
@@ -23,7 +23,7 @@ Work Item
 - prompt sections 会进入对应 Agent prompt。
 - runtime policy 中的 review cycle、heartbeat、timeout、retry、required checks 已经有消费路径。
 - transitions 已经参与运行时阶段推进；Review / Rework / Human Review / Merging 会优先按 action verdict / transition 路由。
-- coding、commit、push、PR 等写仓库动作已进入 action registry 和执行元数据，但执行体仍由 DevFlow adapter 承接，后续再继续拆出独立 handler。
+- coding、validation、commit、push、PR 创建已由 contract state runner 调用对应 action handler；handler 代码仍位于 DevFlow adapter 文件内，后续治理会继续拆文件。
 
 目标不是立刻推翻当前闭环，而是把固定 DevFlow 逐步升级为“由 workflow contract 驱动的执行系统”。这样不同 Repository Workspace 可以拥有自己的项目交付规则，Omega runtime 负责解释规则并写入统一的 Attempt / Operation / Proof / Run Workpad。
 
@@ -61,7 +61,7 @@ Work Item
 
 ### 主要缺口
 
-- workflow contract 已能描述 action 序列，并能生成 Attempt action plan；Review 轮次会从 `states.actions` 的 `run_review` 派生，`approved` / `changes_requested` / `needs_human_info` 会按 action verdict 推进。
+- workflow contract 已能描述 action 序列，并能生成 Attempt action plan；首次主链路和 Review 轮次会按 `states.actions` 执行，`approved` / `changes_requested` / `needs_human_info` 会按 action verdict 推进。
 - action type 已接入 runtime handler registry 校验；未注册 action type 会在 workflow 校验时失败，避免配置被静默忽略。
 - transitions 已能驱动 review / rework / human review / merging 的阶段路由；Attempt / Checkpoint / Merge 的具体副作用仍由 DevFlow adapter 中的真实实现执行。
 - Runtime 对 `devflow-pr` 有较多固定分支，新增流程需要改 Go 代码。
@@ -319,7 +319,7 @@ merge_pr
 - Rework 会根据触发它的 review stage 读取 `changes_requested` 路由，不再固定从第一轮 Review 推断。
 - 新增 action type registry，未注册的 action type 会让 workflow validation 失败。
 
-Implementation 主链路中的编码、验证、提交、push、ensure_pr 已进入 action registry 和 action metadata，但副作用执行体仍由 DevFlow adapter 承接。下一阶段继续把这些写仓库动作拆成独立 handler。
+Implementation 主链路中的 Requirement、task classification、architecture、coding、validation、ensure_pr 已通过 `runDevFlowContractState` 执行。contract 可调整这些 action 的顺序；缺失 handler 会直接返回 workflow contract action error。
 
 ### 阶段 4：迁移 implementation 主链路
 
@@ -333,6 +333,19 @@ push_branch
 ensure_pr
 ```
 
+2026-05-02 已落地：
+
+- 新增 `devFlowContractActionStep` 和 `runDevFlowContractState`，按 active template 的 state actions 顺序调用真实 handler。
+- `todo` state 使用 `write_requirement_artifact` handler 写 Requirement artifact。
+- `in_progress` state 使用以下 handler 执行：
+  - `classify_task`
+  - `run_agent` / `architect`
+  - `run_agent` / `coding`
+  - `run_validation` / `testing`
+  - `ensure_pr` / `delivery`
+- 如果 contract action 没有对应 handler，会返回 `workflow contract action has no DevFlow runtime handler`，而不是静默跳过。
+- 新增单测覆盖 contract action 执行顺序和缺失 handler 失败。
+
 这一阶段之后，`runDevFlowCycle` 应退化为 adapter：
 
 ```text
@@ -341,6 +354,8 @@ create attempt
 call generic executor
 persist result
 ```
+
+当前 `runDevFlowCycle` 已开始退化为 adapter：它仍承载上下文准备、workspace/proof、runner credential 和失败结果组装，但主链路动作由 state runner 调用。后续治理重点是继续把 Rework / Merging 细节拆成独立文件，进一步压缩 `devflow_cycle.go`。
 
 ### 阶段 5：项目模板化
 

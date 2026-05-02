@@ -23,6 +23,82 @@ func workflowActionHandlerName(actionType string) string {
 	return ""
 }
 
+type devFlowContractActionStep struct {
+	ID     string
+	Type   string
+	Agent  string
+	Run    func() error
+	Ran    bool
+	Repeat bool
+}
+
+func runDevFlowContractState(template *PipelineTemplate, stageID string, steps []devFlowContractActionStep) error {
+	actions := workflowActionMapsFromTemplate(template, stageID)
+	if len(actions) == 0 {
+		for index := range steps {
+			if err := steps[index].Run(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, action := range actions {
+		stepIndex := devFlowContractActionStepIndex(steps, action)
+		if stepIndex < 0 {
+			return workflowContractActionError(stageID, action)
+		}
+		if steps[stepIndex].Ran && !steps[stepIndex].Repeat {
+			continue
+		}
+		if err := steps[stepIndex].Run(); err != nil {
+			return err
+		}
+		steps[stepIndex].Ran = true
+	}
+	return nil
+}
+
+func devFlowContractActionStepIndex(steps []devFlowContractActionStep, action map[string]any) int {
+	for index, step := range steps {
+		if step.ID != "" && step.ID == text(action, "id") {
+			return index
+		}
+		if step.Type != "" && step.Type != text(action, "type") {
+			continue
+		}
+		if step.Agent != "" && step.Agent != text(action, "agent") {
+			continue
+		}
+		return index
+	}
+	return -1
+}
+
+func workflowContractActionError(stageID string, action map[string]any) error {
+	return errWorkflowContractActionUnsupported{stageID: stageID, actionID: text(action, "id"), actionType: text(action, "type"), agentID: text(action, "agent")}
+}
+
+type errWorkflowContractActionUnsupported struct {
+	stageID    string
+	actionID   string
+	actionType string
+	agentID    string
+}
+
+func (err errWorkflowContractActionUnsupported) Error() string {
+	parts := []string{"workflow contract action has no DevFlow runtime handler", "stage=" + err.stageID}
+	if err.actionID != "" {
+		parts = append(parts, "action="+err.actionID)
+	}
+	if err.actionType != "" {
+		parts = append(parts, "type="+err.actionType)
+	}
+	if err.agentID != "" {
+		parts = append(parts, "agent="+err.agentID)
+	}
+	return strings.Join(parts, " ")
+}
+
 type workflowActionRouteResult struct {
 	StageStatus string
 	NextStageID string

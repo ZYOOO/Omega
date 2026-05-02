@@ -2426,3 +2426,36 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRou
 go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewRounds|TestWorkflowContractRejectsUnsupportedActionType|TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestBuildAttemptActionPlanUsesWorkflowSnapshot'
 go test ./services/local-runtime/internal/omegalocal
 ```
+
+## 2026-05-02: 通用 Action Executor 阶段 4 主链路迁移
+
+### 功能作用
+
+把默认 DevFlow 的 implementation 主链路从固定 Go 顺序迁到 workflow contract state runner。这样默认模式仍是当前 DevFlow，但用户修改 `states.actions` 时，Requirement、分类、架构、编码、验证和 PR 创建这些动作会按 contract 执行，而不是只影响展示。
+
+### 实现架构
+
+- 新增 `devFlowContractActionStep` 和 `runDevFlowContractState`。
+- executor 从 active `PipelineTemplate.StateProfiles` 找到 state actions，并按 action 顺序匹配 runtime handler。
+- `todo` state：
+  - `write_requirement_artifact`
+- `in_progress` state：
+  - `classify_task`
+  - `run_agent` / `architect`
+  - `run_agent` / `coding`
+  - `run_validation` / `testing`
+  - `ensure_pr` / `delivery`
+- 如果 action 没有 runtime handler，会返回明确错误，阻止半配置流程继续跑。
+- Agent invocation 的 action route metadata 继续保留，Run Timeline / Workpad 可以追踪 action 来源。
+
+### 实现边界
+
+- Rework / Merging 已按 contract 路由，但内部 apply / validate / update PR / merge 代码仍在 DevFlow adapter 文件内。
+- 后续技术债治理会把这些 handler 继续拆分成独立文件，减少 `devflow_cycle.go` 体积。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunDevFlowContractState|TestWorkflowActionRoute|TestDevFlowReviewRounds|TestWorkflowContractRejectsUnsupportedActionType'
+go test ./services/local-runtime/internal/omegalocal
+```

@@ -1651,3 +1651,38 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRou
 go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewRounds|TestWorkflowContractRejectsUnsupportedActionType|TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestBuildAttemptActionPlanUsesWorkflowSnapshot'
 go test ./services/local-runtime/internal/omegalocal
 ```
+
+## 2026-05-02 23:05 CST
+
+### 通用 Action Executor 阶段 4 主链路迁移
+
+旧做法：
+
+- Requirement、architecture、coding、validation、push、ensure PR 在 `executeDevFlowPRCycle` 中按 Go 代码顺序直接铺开。
+- workflow contract 可以展示 action plan，但 implementation 主链路不能真正改变执行顺序。
+- contract 中引用了 DevFlow runtime 未实现的 action 时，缺少明确的执行期错误。
+
+新做法：
+
+- 新增 `runDevFlowContractState`，按 active workflow template 的 `states.actions` 顺序执行真实 handler。
+- `todo` state 通过 `write_requirement_artifact` 写 Requirement artifact。
+- `in_progress` state 通过 action handler 执行：
+  - `classify_task`
+  - `run_agent` / `architect`
+  - `run_agent` / `coding`
+  - `run_validation` / `testing`
+  - `ensure_pr` / `delivery`
+- Contract 可以调整这些 action 的顺序或移除非必需 action；缺少 handler 会返回 workflow contract action error。
+- 新增 `task-classification.json` proof artifact，补齐 `classify_task` 的真实输出。
+
+实现边界：
+
+- 主链路已经由 contract state runner 驱动。
+- Rework / Merging 内部细节仍在 DevFlow adapter 文件内，后续作为代码体积治理继续拆成独立 handler 文件。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunDevFlowContractState|TestWorkflowActionRoute|TestDevFlowReviewRounds|TestWorkflowContractRejectsUnsupportedActionType'
+go test ./services/local-runtime/internal/omegalocal
+```
