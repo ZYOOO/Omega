@@ -2,6 +2,27 @@ package omegalocal
 
 import "strings"
 
+var workflowActionHandlerRegistry = map[string]string{
+	"write_requirement_artifact": "devflow.requirement.write_artifact",
+	"classify_task":              "devflow.task.classify",
+	"run_agent":                  "devflow.runner.run_agent",
+	"run_validation":             "devflow.validation.run",
+	"ensure_pr":                  "devflow.github.ensure_pr",
+	"run_review":                 "devflow.review.run",
+	"build_rework_checklist":     "devflow.rework.build_checklist",
+	"human_gate":                 "devflow.human_gate.wait",
+	"refresh_pr_status":          "devflow.github.refresh_pr_status",
+	"merge_pr":                   "devflow.github.merge_pr",
+	"write_handoff":              "devflow.delivery.write_handoff",
+}
+
+func workflowActionHandlerName(actionType string) string {
+	if handler := workflowActionHandlerRegistry[strings.TrimSpace(actionType)]; handler != "" {
+		return handler
+	}
+	return ""
+}
+
 type workflowActionRouteResult struct {
 	StageStatus string
 	NextStageID string
@@ -196,6 +217,7 @@ func workflowActionMapFromProfile(action WorkflowActionProfile, stateID string, 
 	return map[string]any{
 		"id":              action.ID,
 		"type":            action.Type,
+		"handler":         workflowActionHandlerName(action.Type),
 		"agent":           action.Agent,
 		"prompt":          action.Prompt,
 		"mode":            action.Mode,
@@ -236,6 +258,102 @@ func workflowActionRouteMap(route workflowActionRouteResult) map[string]any {
 	}
 	if route.ActionType != "" {
 		output["actionType"] = route.ActionType
+	}
+	return output
+}
+
+func devFlowReviewRoundsFromContract(template *PipelineTemplate) []ReviewRoundProfile {
+	if template == nil {
+		return defaultDevFlowReviewRounds()
+	}
+	legacyByStage := map[string]ReviewRoundProfile{}
+	for _, round := range template.ReviewRounds {
+		if round.StageID != "" {
+			legacyByStage[round.StageID] = round
+		}
+	}
+	rounds := []ReviewRoundProfile{}
+	for _, state := range template.StateProfiles {
+		for _, action := range state.Actions {
+			if action.Type != "run_review" {
+				continue
+			}
+			legacy := legacyByStage[state.ID]
+			artifact := legacy.Artifact
+			if artifact == "" {
+				artifact = state.ID + ".md"
+			}
+			focus := legacy.Focus
+			if focus == "" {
+				focus = state.Title
+			}
+			diffSource := action.DiffSource
+			if diffSource == "" {
+				diffSource = legacy.DiffSource
+			}
+			if diffSource == "" {
+				diffSource = "local_diff"
+			}
+			rounds = append(rounds, ReviewRoundProfile{
+				StageID:            state.ID,
+				Artifact:           artifact,
+				Focus:              focus,
+				DiffSource:         diffSource,
+				ChangesRequestedTo: stringOr(action.Verdicts["changes_requested"], legacy.ChangesRequestedTo),
+				NeedsHumanInfoTo:   stringOr(action.Verdicts["needs_human_info"], legacy.NeedsHumanInfoTo),
+			})
+		}
+	}
+	if len(rounds) > 0 {
+		return rounds
+	}
+	if len(template.ReviewRounds) > 0 {
+		return template.ReviewRounds
+	}
+	return defaultDevFlowReviewRounds()
+}
+
+func devFlowReviewRoundStageExists(rounds []ReviewRoundProfile, stageID string) bool {
+	if strings.TrimSpace(stageID) == "" {
+		return false
+	}
+	for _, round := range rounds {
+		if round.StageID == stageID {
+			return true
+		}
+	}
+	return false
+}
+
+func devFlowContractActionFor(template *PipelineTemplate, stageID string, actionType string, agentID string) map[string]any {
+	if template == nil {
+		return nil
+	}
+	for _, action := range workflowActionMapsFromTemplate(template, stageID) {
+		if actionType != "" && text(action, "type") != actionType {
+			continue
+		}
+		if agentID != "" && text(action, "agent") != agentID {
+			continue
+		}
+		return action
+	}
+	return nil
+}
+
+func devFlowContractActionProcess(template *PipelineTemplate, stageID string, actionType string, agentID string, base map[string]any) map[string]any {
+	output := cloneMap(base)
+	action := devFlowContractActionFor(template, stageID, actionType, agentID)
+	if len(action) == 0 {
+		return output
+	}
+	output["workflowAction"] = map[string]any{
+		"id":          text(action, "id"),
+		"type":        text(action, "type"),
+		"stateId":     text(action, "stateId"),
+		"agent":       text(action, "agent"),
+		"transitions": mapValue(action["transitions"]),
+		"verdicts":    mapValue(action["verdicts"]),
 	}
 	return output
 }

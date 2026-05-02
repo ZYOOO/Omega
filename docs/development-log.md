@@ -1623,3 +1623,31 @@ npm run build
 ```bash
 go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewOutcome|TestDevFlowStageStatusAfterChangesRequestedQueuesRework'
 ```
+
+## 2026-05-02 22:10 CST
+
+### DevFlow Contract Action Executor 增强
+
+旧做法：
+
+- 默认 DevFlow 虽然已经有 `states.actions`，但 Review 轮次仍主要从旧 `reviewRounds` 字段读取。
+- Review loop 会按 Go 固定顺序跑完所有 review round，即使 contract 把第一轮 `approved` 指到 Human Review，也可能继续执行后续固定 review。
+- Rework 的回环默认从第一轮 Review 推断，不能可靠表达“从哪一轮 Review 触发，就按哪一轮的 verdict 回到目标 stage”。
+- action type 只校验非空，配置了 runtime 不认识的 action 时不够早暴露。
+
+新做法：
+
+- `executionMode` 升级为 `contract-action-executor`，默认 `devflow-pr.md` 被视为当前 DevFlow 的运行协议。
+- Review 轮次从 `states.actions` 中的 `run_review` action 派生；旧 `reviewRounds` 只作为 artifact、focus、diffSource 的兼容展示补充。
+- Review `approved` / `changes_requested` / `needs_human_info` 按 action verdict / transition 推进；如果 `approved` 指向非 Review stage，会结束 Review 序列。
+- Rework 根据实际触发的 Review stage 读取 `changes_requested` 路由，再进入 contract 指定的 rework stage。
+- 新增 action handler registry，`write_requirement_artifact`、`run_agent`、`run_validation`、`ensure_pr`、`run_review`、`build_rework_checklist`、`human_gate`、`refresh_pr_status`、`merge_pr`、`write_handoff` 等 action type 都有明确 handler 名称；未知 action type 会在 workflow validation 阶段失败。
+- Agent invocation 的 process metadata 增加 action route，便于 Run Timeline / Workpad 追踪当前执行来自哪一个 contract action。
+- 新增 `docs/devflow-contract.md`，说明当前默认 contract、可修改范围、handler registry 和 Review/Rework 路由规则。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewRounds|TestWorkflowContractRejectsUnsupportedActionType|TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestBuildAttemptActionPlanUsesWorkflowSnapshot'
+go test ./services/local-runtime/internal/omegalocal
+```

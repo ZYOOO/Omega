@@ -305,6 +305,8 @@ func validateWorkflowTemplate(template PipelineTemplate) WorkflowValidationResul
 			actionIDs[actionKey] = true
 			if strings.TrimSpace(action.Type) == "" {
 				result.Errors = append(result.Errors, "action "+action.ID+" has no type")
+			} else if workflowActionHandlerName(action.Type) == "" {
+				result.Errors = append(result.Errors, "action "+action.ID+" uses unsupported action type: "+action.Type)
 			}
 			for event, target := range action.Transitions {
 				if strings.TrimSpace(event) == "" {
@@ -655,6 +657,7 @@ func workflowActionPlan(template *PipelineTemplate) []map[string]any {
 			actions = append(actions, map[string]any{
 				"id":              action.ID,
 				"type":            action.Type,
+				"handler":         workflowActionHandlerName(action.Type),
 				"stateId":         state.ID,
 				"stateTitle":      state.Title,
 				"order":           index + 1,
@@ -675,7 +678,7 @@ func workflowActionPlan(template *PipelineTemplate) []map[string]any {
 
 func workflowExecutionMode(template *PipelineTemplate) string {
 	if template != nil && len(template.StateProfiles) > 0 && len(workflowActionPlan(template)) > 0 {
-		return "contract-action-plan"
+		return "contract-action-executor"
 	}
 	return "legacy-stage-plan"
 }

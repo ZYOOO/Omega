@@ -1115,6 +1115,11 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		startedAt := nowISO()
 		finishedAt := nowISO()
 		invocationID := fmt.Sprintf("%s:agent:%03d:%s:%s", text(pipeline, "id"), len(agentInvocations)+1, stageID, agentID)
+		process = cloneMap(process)
+		route := workflowActionRouteFromPipeline(pipeline, stageID, agentID, status)
+		if route.ActionID != "" || route.ActionType != "" {
+			process["actionRoute"] = workflowActionRouteMap(route)
+		}
 		invocation := map[string]any{
 			"id":          invocationID,
 			"stageId":     stageID,
@@ -1362,14 +1367,16 @@ Rules:
 		pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
 		checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, nil)
 
-		reviewRounds := defaultDevFlowReviewRounds()
-		if template != nil && len(template.ReviewRounds) > 0 {
-			reviewRounds = template.ReviewRounds
-		}
+		reviewRounds := devFlowReviewRoundsFromContract(template)
 		reviewApproved := true
 		reviewFeedback := ""
+		nextReviewStageID := ""
 		for _, reviewRound := range reviewRounds {
 			stageID := stringOr(reviewRound.StageID, "code_review")
+			if nextReviewStageID != "" && stageID != nextReviewStageID {
+				continue
+			}
+			nextReviewStageID = ""
 			artifact := stringOr(reviewRound.Artifact, stageID+".md")
 			reviewPath := filepath.Join(proofDir, strings.TrimSuffix(artifact, filepath.Ext(artifact))+"-human-rework"+filepath.Ext(artifact))
 			reviewDiff := diffText
@@ -1411,6 +1418,13 @@ Rules:
 			outcome := devFlowReviewOutcome(reviewPath)
 			if outcome.Verdict == "approved" {
 				recordAgent(stageID, "review", "passed", reviewPrompt, filepath.Base(reviewPath), outcome.Summary, []string{reviewPath}, reviewTurn.Process)
+				nextStageID := devFlowTransitionTo(template, stageID, "approved", "")
+				if nextStageID != "" && !devFlowReviewRoundStageExists(reviewRounds, nextStageID) {
+					break
+				}
+				if nextStageID != "" {
+					nextReviewStageID = nextStageID
+				}
 				continue
 			}
 			status := "changes-requested"
@@ -1686,13 +1700,10 @@ Rules:
 	pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
 	checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, remoteChecks)
 
-	reviewRounds := defaultDevFlowReviewRounds()
-	if template != nil && len(template.ReviewRounds) > 0 {
-		reviewRounds = template.ReviewRounds
-	}
+	reviewRounds := devFlowReviewRoundsFromContract(template)
 	maxReviewCycles := devFlowMaxReviewCycles(template)
-	runReworkTurn := func(cycle int, feedback string) error {
-		stageID := devFlowTransitionTo(template, "code_review_round_1", "changes_requested", "rework")
+	runReworkTurn := func(cycle int, fromStageID string, feedback string) error {
+		stageID := devFlowTransitionTo(template, fromStageID, "changes_requested", "rework")
 		if stageID == "" {
 			stageID = "rework"
 		}
@@ -1836,7 +1847,7 @@ Rules:
 			break
 		}
 		remoteReworkCycle++
-		if err := runReworkTurn(remoteReworkCycle, remoteFeedback); err != nil {
+		if err := runReworkTurn(remoteReworkCycle, "in_progress", remoteFeedback); err != nil {
 			reason := "Rework agent failed while applying remote check feedback."
 			return failureResult("rework", "coding", reason, err.Error(), remoteFeedback), err
 		}
@@ -1844,9 +1855,16 @@ Rules:
 	reviewCycle := remoteReworkCycle + 1
 	for {
 		var reviewFeedback string
+		reworkFromStageID := "code_review_round_1"
 		needsRework := false
+		stopReviewSequence := false
+		nextReviewStageID := ""
 		for _, reviewRound := range reviewRounds {
 			stageID := stringOr(reviewRound.StageID, "code_review")
+			if nextReviewStageID != "" && stageID != nextReviewStageID {
+				continue
+			}
+			nextReviewStageID = ""
 			artifact := stringOr(reviewRound.Artifact, stageID+".md")
 			if reviewCycle > 1 {
 				artifact = strings.TrimSuffix(artifact, filepath.Ext(artifact)) + fmt.Sprintf("-cycle-%d%s", reviewCycle, filepath.Ext(artifact))
@@ -1893,6 +1911,13 @@ Rules:
 			switch outcome.Verdict {
 			case "approved":
 				recordAgent(stageID, "review", "passed", reviewPrompt, artifact, outcome.Summary, []string{reviewPath}, reviewProcess)
+				nextStageID := devFlowTransitionTo(template, stageID, "approved", "")
+				if nextStageID != "" && !devFlowReviewRoundStageExists(reviewRounds, nextStageID) {
+					stopReviewSequence = true
+				}
+				if nextStageID != "" && !stopReviewSequence {
+					nextReviewStageID = nextStageID
+				}
 			case "needs_human_info":
 				recordAgent(stageID, "review", "needs-human", reviewPrompt, artifact, outcome.Summary, []string{reviewPath}, reviewProcess)
 				reviewFeedback = outcome.Summary
@@ -1902,15 +1927,17 @@ Rules:
 			case "changes_requested":
 				recordAgent(stageID, "review", "changes-requested", reviewPrompt, artifact, outcome.Summary, []string{reviewPath}, reviewProcess)
 				reviewFeedback = outcome.Summary
+				reworkFromStageID = stageID
 				needsRework = true
 				break
 			default:
 				recordAgent(stageID, "review", "changes-requested", reviewPrompt, artifact, outcome.Summary, []string{reviewPath}, reviewProcess)
 				reviewFeedback = outcome.Summary
+				reworkFromStageID = stageID
 				needsRework = true
 				break
 			}
-			if needsRework || outcome.Verdict == "needs_human_info" {
+			if needsRework || outcome.Verdict == "needs_human_info" || stopReviewSequence {
 				break
 			}
 		}
@@ -1922,7 +1949,7 @@ Rules:
 			break
 		}
 		reviewCycle++
-		if err := runReworkTurn(reviewCycle, reviewFeedback); err != nil {
+		if err := runReworkTurn(reviewCycle, reworkFromStageID, reviewFeedback); err != nil {
 			reason := "Rework agent failed while applying review feedback."
 			return failureResult("rework", "coding", reason, err.Error(), reviewFeedback), err
 		}

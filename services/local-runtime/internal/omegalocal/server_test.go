@@ -197,7 +197,7 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 		t.Fatalf("state profiles should come from workflow action graph: %+v", template.StateProfiles)
 	}
 	actionPlan := workflowActionPlan(template)
-	if len(actionPlan) < 12 || workflowExecutionMode(template) != "contract-action-plan" {
+	if len(actionPlan) < 12 || workflowExecutionMode(template) != "contract-action-executor" {
 		t.Fatalf("workflow action plan missing: mode=%s actions=%+v", workflowExecutionMode(template), actionPlan)
 	}
 	if len(template.TaskClasses) != 2 || template.TaskClasses[0].ID != "simple" || template.TaskClasses[1].WorkpadMode != "full" {
@@ -226,7 +226,7 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	}, template)
 	run := mapValue(pipeline["run"])
 	workflow := mapValue(run["workflow"])
-	if workflow["source"] == "" || len(arrayMaps(workflow["reviewRounds"])) != 2 || len(arrayMaps(workflow["actions"])) == 0 || text(workflow, "executionMode") != "contract-action-plan" {
+	if workflow["source"] == "" || len(arrayMaps(workflow["reviewRounds"])) != 2 || len(arrayMaps(workflow["actions"])) == 0 || text(workflow, "executionMode") != "contract-action-executor" {
 		t.Fatalf("pipeline run should preserve workflow metadata: %+v", workflow)
 	}
 	if len(arrayMaps(workflow["taskClasses"])) != 2 || len(arrayMaps(workflow["states"])) != 8 {
@@ -1497,7 +1497,7 @@ func TestJobSupervisorScanRecoverableAttemptsRetriesWithPolicy(t *testing.T) {
 		t.Fatalf("retry job missing recovery policy: %+v", jobs[0])
 	}
 	actionPlan := mapValue(jobs[0]["actionPlan"])
-	if text(actionPlan, "executionMode") != "contract-action-plan" || text(actionPlan, "currentStateId") != "todo" || text(actionPlan, "currentActionId") != "capture_requirement" {
+	if text(actionPlan, "executionMode") != "contract-action-executor" || text(actionPlan, "currentStateId") != "todo" || text(actionPlan, "currentActionId") != "capture_requirement" {
 		t.Fatalf("retry job missing action plan summary: %+v", jobs[0])
 	}
 	recoverable := arrayMaps(summary["recoverableAttempts"])

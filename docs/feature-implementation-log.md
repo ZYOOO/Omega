@@ -2395,3 +2395,34 @@ npm run build
 ```bash
 go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewOutcome|TestDevFlowStageStatusAfterChangesRequestedQueuesRework'
 ```
+
+## 2026-05-02: DevFlow Contract Action Executor 增强
+
+### 功能作用
+
+让当前默认 DevFlow 模式真正以 workflow contract 作为运行协议：默认仍是现有 DevFlow 闭环，但用户可以通过 Repository / Profile / Workflow Template 覆盖 contract 来调整 Review / Rework / Human Review / Merging 的路由，而不是只能改 UI 上的展示字段。
+
+### 实现架构
+
+- `services/local-runtime/workflows/devflow-pr.md` 继续作为默认 contract。
+- `workflowActionHandlerRegistry` 维护 runtime 支持的 action type 与 handler 名称。
+- `workflowExecutionMode` 升级为 `contract-action-executor`，Pipeline snapshot 和 action plan 都暴露这个模式。
+- `devFlowReviewRoundsFromContract` 从 `states.actions` 的 `run_review` action 派生 Review 轮次；`reviewRounds` 仅作为 artifact / focus 兼容补充。
+- Review Agent verdict 会按 action verdict 转为下一阶段：
+  - `APPROVED` -> `approved`
+  - `CHANGES_REQUESTED` -> `changes_requested`
+  - `NEEDS_HUMAN_INFO` -> `needs_human_info`
+- Rework 入口根据触发它的 Review stage 读取 contract route，支持从不同 Review stage 进入不同 rework/复审路径。
+- workflow validation 会拒绝未注册 action type，避免半配置状态进入真实运行。
+
+### 实现边界
+
+- 写仓库副作用（coding、validation、commit、push、ensure_pr）已经有 action handler registry 和 action metadata，但执行体仍沿用 DevFlow adapter 的可靠实现。
+- 后续阶段再继续把这些写仓库副作用拆成独立 action handler。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewRounds|TestWorkflowContractRejectsUnsupportedActionType|TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestBuildAttemptActionPlanUsesWorkflowSnapshot'
+go test ./services/local-runtime/internal/omegalocal
+```

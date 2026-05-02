@@ -26,7 +26,7 @@ func TestBuildAttemptActionPlanUsesWorkflowSnapshot(t *testing.T) {
 	if status != 200 {
 		t.Fatalf("status = %d plan=%+v", status, plan)
 	}
-	if plan["executionMode"] != "contract-action-plan" || text(mapValue(plan["currentState"]), "id") != "in_progress" {
+	if plan["executionMode"] != "contract-action-executor" || text(mapValue(plan["currentState"]), "id") != "in_progress" {
 		t.Fatalf("plan identity = %+v", plan)
 	}
 	currentAction := mapValue(plan["currentAction"])

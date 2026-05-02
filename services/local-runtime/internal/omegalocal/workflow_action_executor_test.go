@@ -1,6 +1,9 @@
 package omegalocal
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestWorkflowActionRouteUsesReviewVerdicts(t *testing.T) {
 	workflow := map[string]any{"states": []any{
@@ -88,5 +91,69 @@ func TestWorkflowActionRouteCanReadTemplateActions(t *testing.T) {
 	route := workflowActionRoute(nil, template, "code_review_round_1", "review", "passed")
 	if route.NextStageID != "human_review" || route.Event != "approved" {
 		t.Fatalf("template action route = %+v", route)
+	}
+}
+
+func TestDevFlowReviewRoundsComeFromContractActions(t *testing.T) {
+	template := &PipelineTemplate{
+		ID: "devflow-pr",
+		StateProfiles: []WorkflowStateProfile{
+			{
+				ID:    "code_review_round_1",
+				Title: "Security Review",
+				Actions: []WorkflowActionProfile{{
+					ID:         "security_review",
+					Type:       "run_review",
+					Agent:      "review",
+					DiffSource: "pr_diff",
+					Verdicts: map[string]string{
+						"approved":          "human_review",
+						"changes_requested": "targeted_rework",
+						"needs_human_info":  "human_review",
+					},
+				}},
+			},
+		},
+		ReviewRounds: []ReviewRoundProfile{{
+			StageID:    "code_review_round_1",
+			Artifact:   "security-review.md",
+			Focus:      "security and release risk",
+			DiffSource: "local_diff",
+		}},
+	}
+
+	rounds := devFlowReviewRoundsFromContract(template)
+	if len(rounds) != 1 {
+		t.Fatalf("rounds = %+v", rounds)
+	}
+	round := rounds[0]
+	if round.StageID != "code_review_round_1" || round.Artifact != "security-review.md" || round.Focus != "security and release risk" {
+		t.Fatalf("round metadata should preserve the contract/legacy display fields: %+v", round)
+	}
+	if round.DiffSource != "pr_diff" || round.ChangesRequestedTo != "targeted_rework" || round.NeedsHumanInfoTo != "human_review" {
+		t.Fatalf("round execution fields should come from action verdicts: %+v", round)
+	}
+}
+
+func TestWorkflowContractRejectsUnsupportedActionType(t *testing.T) {
+	template := PipelineTemplate{
+		ID: "custom",
+		StageProfiles: []StageProfile{
+			{ID: "todo", Title: "Todo", Agent: "requirement"},
+		},
+		StateProfiles: []WorkflowStateProfile{{
+			ID: "todo",
+			Actions: []WorkflowActionProfile{{
+				ID:   "invented_action",
+				Type: "unknown_runtime_action",
+			}},
+		}},
+	}
+	validation := validateWorkflowTemplate(template)
+	if validation.ok() {
+		t.Fatalf("unsupported action type should fail validation: %+v", validation)
+	}
+	if !strings.Contains(strings.Join(validation.Errors, "\n"), "unsupported action type") {
+		t.Fatalf("validation errors should mention unsupported action type: %+v", validation.Errors)
 	}
 }
