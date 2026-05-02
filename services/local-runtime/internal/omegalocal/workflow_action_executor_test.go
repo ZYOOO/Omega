@@ -185,6 +185,56 @@ func TestRunDevFlowContractStateUsesContractOrder(t *testing.T) {
 	}
 }
 
+func TestRunDevFlowContractStateUsesReworkAndMergingActions(t *testing.T) {
+	template := &PipelineTemplate{StateProfiles: []WorkflowStateProfile{
+		{
+			ID: "rework",
+			Actions: []WorkflowActionProfile{
+				{ID: "build_rework_checklist", Type: "build_rework_checklist", Agent: "master"},
+				{ID: "apply_rework", Type: "run_agent", Agent: "coding"},
+				{ID: "validate_rework", Type: "run_validation", Agent: "testing"},
+				{ID: "update_pull_request", Type: "ensure_pr", Agent: "delivery"},
+			},
+		},
+		{
+			ID: "merging",
+			Actions: []WorkflowActionProfile{
+				{ID: "refresh_pr_status", Type: "refresh_pr_status", Agent: "delivery"},
+				{ID: "merge_pull_request", Type: "merge_pr", Agent: "delivery"},
+			},
+		},
+		{
+			ID: "done",
+			Actions: []WorkflowActionProfile{
+				{ID: "finalize_handoff", Type: "write_handoff", Agent: "delivery"},
+			},
+		},
+	}}
+	order := []string{}
+	if err := runDevFlowContractState(template, "rework", []devFlowContractActionStep{
+		{ID: "apply_rework", Type: "run_agent", Agent: "coding", Run: func() error { order = append(order, "apply"); return nil }},
+		{ID: "build_rework_checklist", Type: "build_rework_checklist", Agent: "master", Run: func() error { order = append(order, "checklist"); return nil }},
+		{ID: "update_pull_request", Type: "ensure_pr", Agent: "delivery", Run: func() error { order = append(order, "pr"); return nil }},
+		{ID: "validate_rework", Type: "run_validation", Agent: "testing", Run: func() error { order = append(order, "validate"); return nil }},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDevFlowContractState(template, "merging", []devFlowContractActionStep{
+		{ID: "merge_pull_request", Type: "merge_pr", Agent: "delivery", Run: func() error { order = append(order, "merge"); return nil }},
+		{ID: "refresh_pr_status", Type: "refresh_pr_status", Agent: "delivery", Run: func() error { order = append(order, "refresh"); return nil }},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDevFlowContractState(template, "done", []devFlowContractActionStep{
+		{ID: "finalize_handoff", Type: "write_handoff", Agent: "delivery", Run: func() error { order = append(order, "handoff"); return nil }},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(order, ",") != "checklist,apply,validate,pr,refresh,merge,handoff" {
+		t.Fatalf("contract action order = %v", order)
+	}
+}
+
 func TestRunDevFlowContractStateRequiresHandler(t *testing.T) {
 	template := &PipelineTemplate{StateProfiles: []WorkflowStateProfile{{
 		ID: "in_progress",

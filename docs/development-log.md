@@ -1686,3 +1686,33 @@ go test ./services/local-runtime/internal/omegalocal
 go test ./services/local-runtime/internal/omegalocal -run 'TestRunDevFlowContractState|TestWorkflowActionRoute|TestDevFlowReviewRounds|TestWorkflowContractRejectsUnsupportedActionType'
 go test ./services/local-runtime/internal/omegalocal
 ```
+
+## 2026-05-02 23:50 CST
+
+### 通用 Action Executor 阶段 4 增强
+
+旧做法：
+
+- Rework 虽然已按 Review verdict 进入对应 stage，但内部仍由 Go 固定顺序执行 build feedback、coding、validation、push 和 PR 更新。
+- Human Review approve 后会直接在 approval continuation 中执行 merge / handoff，contract 只记录 action route metadata。
+
+新做法：
+
+- Rework 内部拆为 contract action step：
+  - `build_rework_checklist`
+  - `apply_rework`
+  - `validate_rework`
+  - `update_pull_request`
+- Human Review approve 后按 state action 执行：
+  - `human_gate`
+  - `refresh_pr_status`
+  - `merge_pr`
+  - `write_handoff`
+- `runDevFlowContractState` 覆盖 Rework / Merging / Done 的真实副作用顺序；contract 改顺序时 runtime 会跟随，缺少 handler 仍直接失败。
+- 新增 `docs/latest-architecture.md`，记录当前功能一、功能二、runtime、workflow contract、runner、GitHub/CI、飞书和可观测性的最新版架构。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+```

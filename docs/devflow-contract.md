@@ -59,8 +59,10 @@ DevFlow 的默认模式不再只是 Go runtime 里的固定流程，而是一份
 当前执行边界：
 
 - 首次主链路的 Requirement、task classification、architecture handoff、coding、validation、ensure PR 已通过 contract state runner 执行。
+- Rework 的 `build_rework_checklist`、`apply_rework`、`validate_rework`、`update_pull_request` 已通过 contract state runner 执行。
+- Human Review approved 后，`human_gate`、`refresh_pr_status`、`merge_pr`、`write_handoff` 已按 contract state runner 执行。
 - contract 可以调整这些 action 的顺序，或移除非必需 action；如果 contract 引用没有 runtime handler 的 action，会在执行前失败。
-- Rework 和 Merging 的内部副作用已经按 contract 路由进入对应 stage，但 handler 代码仍在 DevFlow adapter 文件内，后续会继续拆成更小的独立 handler 文件，降低 `devflow_cycle.go` 的体积。
+- 代码治理边界：handler 真实副作用已经由 contract state runner 调用，但部分 handler 实现仍在 DevFlow adapter 文件内，后续会继续拆成更小的独立 handler 文件，降低 `devflow_cycle.go` / `server.go` 的体积。
 
 ## Review / Rework 路由
 
@@ -104,5 +106,6 @@ runtime 会把 verdict 映射到 action event：
 
 ```bash
 go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewRounds|TestWorkflowContractRejectsUnsupportedActionType|TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestBuildAttemptActionPlanUsesWorkflowSnapshot'
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunDevFlowContractState'
 go test ./services/local-runtime/internal/omegalocal
 ```

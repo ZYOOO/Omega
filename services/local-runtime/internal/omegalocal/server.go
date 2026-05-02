@@ -2695,52 +2695,89 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 		return err
 	}
 	item := findWorkItem(*database, text(pipeline, "workItemId"))
+	template := findPipelineTemplate(text(pipeline, "templateId"))
 
 	humanReviewPath := filepath.Join(proofDir, "human-review.md")
-	if err := os.WriteFile(humanReviewPath, []byte(fmt.Sprintf("# Human Review\n\n- Reviewer: %s\n- Decision: approved\n- Pull request: %s\n- Approved at: %s\n", reviewer, prURL, nowISO())), 0o644); err != nil {
-		return err
+	mergePath := filepath.Join(proofDir, "merge.md")
+	handoffPath := filepath.Join(proofDir, "handoff-bundle.json")
+	recordHumanDecision := func() error {
+		return os.WriteFile(humanReviewPath, []byte(fmt.Sprintf("# Human Review\n\n- Reviewer: %s\n- Decision: approved\n- Pull request: %s\n- Approved at: %s\n", reviewer, prURL, nowISO())), 0o644)
 	}
-	if err := server.mergeApprovedDevFlowPullRequest(repoWorkspace, prURL, text(attempt, "branchName"), text(pipeline, "id"), text(attempt, "id")); err != nil {
-		server.logError(context.Background(), "github.pr.merge_failed", err.Error(), map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
-		if item != nil {
-			report := server.syncGitHubIssueOutbound(context.Background(), githubOutboundSyncInput{
-				RepositoryPath: repoWorkspace,
-				Repository:     repositoryFromPullRequestURL(prURL),
-				WorkItem:       item,
-				Pipeline:       pipeline,
-				Attempt:        attempt,
-				Event:          "delivery.merge_failed",
-				Status:         "failed",
-				StageID:        "merging",
-				Summary:        "Human review approved, but pull request merge failed.",
-				PullRequestURL: prURL,
-				BranchName:     text(attempt, "branchName"),
-				FailureReason:  "Pull request merge failed after human approval.",
-				FailureDetail:  err.Error(),
-			})
-			if text(report, "state") != "skipped" {
-				_ = writeJSONFile(filepath.Join(proofDir, "github-outbound-sync-merge-failed.json"), report)
+	refreshPullRequestStatus := func() error {
+		checksOutput, _ := runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+		statusPath := filepath.Join(proofDir, "merge-pr-status.md")
+		statusReport := fmt.Sprintf("# PR Status Before Merge\n\n- Pull request: %s\n- Refreshed at: %s\n\n```text\n%s\n```\n", prURL, nowISO(), stringOr(strings.TrimSpace(checksOutput), "No check output was returned."))
+		if err := os.WriteFile(statusPath, []byte(statusReport), 0o644); err != nil {
+			return err
+		}
+		server.logInfo(context.Background(), "github.pr.status_refreshed", "Pull request status refreshed before merge.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
+		return nil
+	}
+	mergePullRequest := func() error {
+		if err := server.mergeApprovedDevFlowPullRequest(repoWorkspace, prURL, text(attempt, "branchName"), text(pipeline, "id"), text(attempt, "id")); err != nil {
+			server.logError(context.Background(), "github.pr.merge_failed", err.Error(), map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
+			if item != nil {
+				report := server.syncGitHubIssueOutbound(context.Background(), githubOutboundSyncInput{
+					RepositoryPath: repoWorkspace,
+					Repository:     repositoryFromPullRequestURL(prURL),
+					WorkItem:       item,
+					Pipeline:       pipeline,
+					Attempt:        attempt,
+					Event:          "delivery.merge_failed",
+					Status:         "failed",
+					StageID:        "merging",
+					Summary:        "Human review approved, but pull request merge failed.",
+					PullRequestURL: prURL,
+					BranchName:     text(attempt, "branchName"),
+					FailureReason:  "Pull request merge failed after human approval.",
+					FailureDetail:  err.Error(),
+				})
+				if text(report, "state") != "skipped" {
+					_ = writeJSONFile(filepath.Join(proofDir, "github-outbound-sync-merge-failed.json"), report)
+				}
+			}
+			return fmt.Errorf("merge pull request after human approval: %w", err)
+		}
+		server.logInfo(context.Background(), "github.pr.merged", "Pull request merged after human approval.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
+		return os.WriteFile(mergePath, []byte(fmt.Sprintf("# Merge\n\nMerged after human approval: %s\n", prURL)), 0o644)
+	}
+	writeHandoff := func() error {
+		if raw, err := os.ReadFile(handoffPath); err == nil {
+			var handoff map[string]any
+			if json.Unmarshal(raw, &handoff) == nil {
+				handoff["merged"] = true
+				handoff["humanGate"] = "approved"
+				handoff["approvedBy"] = reviewer
+				handoff["approvedAt"] = nowISO()
+				return writeJSONFile(handoffPath, handoff)
 			}
 		}
-		return fmt.Errorf("merge pull request after human approval: %w", err)
+		return writeJSONFile(handoffPath, map[string]any{
+			"pipelineId":       text(pipeline, "id"),
+			"attemptId":        text(attempt, "id"),
+			"workspacePath":    workspace,
+			"pullRequestUrl":   prURL,
+			"branchName":       text(attempt, "branchName"),
+			"merged":           true,
+			"humanGate":        "approved",
+			"approvedBy":       reviewer,
+			"approvedAt":       nowISO(),
+			"handoffGenerated": "approval-continuation",
+		})
 	}
-	server.logInfo(context.Background(), "github.pr.merged", "Pull request merged after human approval.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
-	mergePath := filepath.Join(proofDir, "merge.md")
-	if err := os.WriteFile(mergePath, []byte(fmt.Sprintf("# Merge\n\nMerged after human approval: %s\n", prURL)), 0o644); err != nil {
+	if err := runDevFlowContractState(template, "human_review", []devFlowContractActionStep{{ID: "wait_human_decision", Type: "human_gate", Agent: "human", Run: recordHumanDecision}}); err != nil {
+		return err
+	}
+	if err := runDevFlowContractState(template, "merging", []devFlowContractActionStep{
+		{ID: "refresh_pr_status", Type: "refresh_pr_status", Agent: "delivery", Run: refreshPullRequestStatus},
+		{ID: "merge_pull_request", Type: "merge_pr", Agent: "delivery", Run: mergePullRequest},
+	}); err != nil {
 		return err
 	}
 	mergeRoute := workflowActionRouteFromPipeline(pipeline, "merging", "delivery", "passed")
 	doneStageID := stringOr(mergeRoute.NextStageID, "done")
-	handoffPath := filepath.Join(proofDir, "handoff-bundle.json")
-	if raw, err := os.ReadFile(handoffPath); err == nil {
-		var handoff map[string]any
-		if json.Unmarshal(raw, &handoff) == nil {
-			handoff["merged"] = true
-			handoff["humanGate"] = "approved"
-			handoff["approvedBy"] = reviewer
-			handoff["approvedAt"] = nowISO()
-			_ = writeJSONFile(handoffPath, handoff)
-		}
+	if err := runDevFlowContractState(template, doneStageID, []devFlowContractActionStep{{ID: "finalize_handoff", Type: "write_handoff", Agent: "delivery", Run: writeHandoff}}); err != nil {
+		return err
 	}
 
 	run := mapValue(pipeline["run"])

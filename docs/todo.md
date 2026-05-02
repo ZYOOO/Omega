@@ -109,7 +109,8 @@ Item
 - [x] 迁移通用 action executor 阶段 3 基础版：review / rework / merging 的 action 识别、verdict/event 归一、下一阶段路由已进入 `workflow-action-handler`；真实 runner、PR/check、merge/proof 执行仍沿用现有 DevFlow adapter。旧做法是 Go helper 直接根据固定 stage/status 推断下一步。
 - [x] 迁移通用 action executor 阶段 3 增强：默认 DevFlow 的 Review 轮次从 `states.actions` / `run_review` 派生，Review approved / changes_requested 按 action verdict 路由，Rework 根据触发它的 Review stage 回环；`executionMode` 升级为 `contract-action-executor`，并新增 action type handler registry 校验。旧做法是 `reviewRounds` 和固定 review loop 决定执行。
 - [x] 迁移通用 action executor 阶段 4：Requirement、task classification、architecture handoff、coding、validation、ensure_pr 已通过 `runDevFlowContractState` 按 `states.actions` 顺序执行；contract 可调整这些 action 的执行顺序或移除非必需 action，缺少 runtime handler 会直接失败。旧做法是 Go 主函数固定顺序铺开执行。
-- [ ] 迁移通用 action executor 后续治理：继续把 Rework 内部的 apply / validate / update PR 和 Merging 内部 refresh / merge 拆成更小的独立 handler 文件；当前默认链路已由 contract state runner 驱动，但部分 handler 代码仍在 DevFlow adapter 文件内。
+- [x] 迁移通用 action executor 阶段 4 增强：Rework 的 build checklist / apply / validate / update PR，以及 Human Review approved 后的 human gate / refresh PR status / merge PR / write handoff 已由 `runDevFlowContractState` 按 contract action 执行。旧做法是 Rework 和 Merging 内部仍由 Go 固定顺序直接调用。
+- [ ] 迁移通用 action executor 后续治理：继续把已接入 state runner 的 handler 实现拆成更小的独立文件；当前默认链路已由 contract state runner 驱动，但部分 handler 代码仍在 DevFlow adapter / server 文件内。
 - [x] 增强 Review / Rework 交接契约：Review Prompt 必须输出 Summary、Blocking findings、Validation gaps、Rework instructions、Residual risks；旧做法主要依赖 verdict line，容易让 retry/rework 缺少可执行原因。
 - [x] 补齐全 Agent 交接契约：Requirement、Architect、Testing、Delivery 的 prompt section 和 Agent output contract 已统一为结构化 handoff，避免只在 Review 阶段有明确原因和下一步。
 - [x] 增加 workflow contract 校验基础版：加载 repo/profile workflow 时检查 stage id、transition 引用、review round 引用、agent 和 runtime 非负值，失败时阻止运行。
