@@ -413,12 +413,7 @@ func devFlowNextStageAfter(stageID string) string {
 }
 
 func devFlowNextStageAfterFromWorkflow(workflow map[string]any, stageID string) string {
-	for _, transition := range arrayMaps(workflow["transitions"]) {
-		if text(transition, "from") == stageID && text(transition, "on") == "passed" && text(transition, "to") != "" {
-			return text(transition, "to")
-		}
-	}
-	return devFlowNextStageAfter(stageID)
+	return workflowActionTransitionTo(workflow, nil, stageID, "passed", devFlowNextStageAfter(stageID))
 }
 
 func devFlowStageStatusAfterInvocation(stageID string, agentID string, status string) (string, string) {
@@ -426,34 +421,8 @@ func devFlowStageStatusAfterInvocation(stageID string, agentID string, status st
 }
 
 func devFlowStageStatusAfterInvocationWithWorkflow(workflow map[string]any, stageID string, agentID string, status string) (string, string) {
-	if status == "running" {
-		return "running", ""
-	}
-	if status == "failed" {
-		return "failed", ""
-	}
-	if status == "changes-requested" {
-		return "passed", devFlowTransitionFromWorkflow(workflow, stageID, "changes_requested", "rework")
-	}
-	if status == "needs-human" || status == "waiting-human" {
-		return "needs-human", ""
-	}
-	if status != "passed" && status != "done" {
-		return "running", ""
-	}
-	if stageID == "in_progress" && agentID != "testing" {
-		return "running", ""
-	}
-	return "passed", devFlowNextStageAfterFromWorkflow(workflow, stageID)
-}
-
-func devFlowTransitionFromWorkflow(workflow map[string]any, from string, event string, fallback string) string {
-	for _, transition := range arrayMaps(workflow["transitions"]) {
-		if text(transition, "from") == from && text(transition, "on") == event && text(transition, "to") != "" {
-			return text(transition, "to")
-		}
-	}
-	return fallback
+	route := workflowActionRoute(workflow, nil, stageID, agentID, status)
+	return route.StageStatus, route.NextStageID
 }
 
 func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelineID string, itemID string, attemptID string, invocation map[string]any) error {
@@ -472,8 +441,9 @@ func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelin
 		return nil
 	}
 	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
-	workflow := mapValue(mapValue(pipeline["run"])["workflow"])
-	stageStatus, nextStageID := devFlowStageStatusAfterInvocationWithWorkflow(workflow, text(invocation, "stageId"), text(invocation, "agentId"), text(invocation, "status"))
+	route := workflowActionRouteFromPipeline(pipeline, text(invocation, "stageId"), text(invocation, "agentId"), text(invocation, "status"))
+	stageStatus, nextStageID := route.StageStatus, route.NextStageID
+	invocation["actionRoute"] = workflowActionRouteMap(route)
 	pipeline = markDevFlowStageProgress(pipeline, text(invocation, "stageId"), stageStatus, text(invocation, "summary"))
 	run := mapValue(pipeline["run"])
 	if nextStageID != "" {
@@ -966,14 +936,7 @@ func devFlowAttemptTimeout(template *PipelineTemplate) time.Duration {
 }
 
 func devFlowTransitionTo(template *PipelineTemplate, from string, event string, fallback string) string {
-	if template != nil {
-		for _, transition := range template.Transitions {
-			if transition.From == from && transition.On == event && transition.To != "" {
-				return transition.To
-			}
-		}
-	}
-	return fallback
+	return workflowActionTransitionTo(nil, template, from, event, fallback)
 }
 
 func ensureDevFlowRepositoryWorkspace(workspace string, repoWorkspace string, cloneTarget string, branchName string, baseBranch string) (string, error) {

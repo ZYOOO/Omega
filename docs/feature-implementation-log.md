@@ -2360,3 +2360,38 @@ npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeo
 npm run lint
 npm run build
 ```
+
+## 2026-05-02: 通用 Action Executor 阶段 3 基础版
+
+### 旧做法
+
+- Review / Rework / Merging 的阶段推进主要散落在 DevFlow 固定 helper 和 checkpoint approve 逻辑中。
+- workflow contract 虽然能描述 `states.actions`、verdict 和 transition，但 review verdict、rework 回环、merge 完成后的下一步仍容易被固定 stage 顺序限制。
+
+### 新做法
+
+- 新增 `workflow-action-handler`：
+  - 从 Pipeline workflow snapshot 读取当前 state actions；
+  - 缺失 snapshot 时回退到 workflow template；
+  - 将 runner status / review verdict 归一成 contract event；
+  - 优先按 action verdict、action transition、state transition、template transition 计算下一阶段。
+- Review Agent：
+  - `passed` + `run_review` 会归一为 `approved`；
+  - `changes-requested` 会归一为 `changes_requested`；
+  - 支持 contract 自定义 `approved` / `changes_requested` 的目标 stage。
+- Rework：
+  - `passed` 优先读取 contract 中的 rework state transition；
+  - 支持从 rework 回到不同 review stage，而不是只能固定回第一轮 review。
+- Merging：
+  - Human Review approved 和 Merge passed 都记录 action route metadata；
+  - 真实 PR merge、GitHub outbound sync、proof、handoff bundle 仍沿用原有可靠执行路径。
+
+### 实现边界
+
+这次迁移的是控制面：action 识别、event 归一和 stage route。coding / validation / commit / push / ensure_pr 这些写仓库动作仍由 DevFlow adapter 承接，后续再进入通用 action executor 阶段 4。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewOutcome|TestDevFlowStageStatusAfterChangesRequestedQueuesRework'
+```

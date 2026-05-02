@@ -106,7 +106,7 @@ Item
 - [x] 迁移通用 action executor 阶段 2 基础版：新增 `GET /attempts/{attemptId}/action-plan`，从 Pipeline workflow snapshot 生成当前 state、current action、state actions、可达 transitions、retry action 和恢复策略，不执行真实写仓库动作。
 - [x] 迁移通用 action executor 阶段 2 增强：JobSupervisor recovery summary / accepted retry job 会附带 action plan 摘要，自动恢复决策与 workflow snapshot 对齐。
 - [x] 迁移通用 action executor 阶段 2 UI：Work Item 详情页的 Delivery flow、Attempt stage、Retry / Rework signal 已直接消费 `/attempts/{attemptId}/action-plan`，旧的 stage / attempt 状态推断只作为兼容 fallback。
-- [ ] 迁移通用 action executor 阶段 3：先把 review / rework / merging 从 DevFlow 固定函数迁到 action handler，保留现有真实 PR/check/proof 行为。
+- [x] 迁移通用 action executor 阶段 3 基础版：review / rework / merging 的 action 识别、verdict/event 归一、下一阶段路由已进入 `workflow-action-handler`；真实 runner、PR/check、merge/proof 执行仍沿用现有 DevFlow adapter。旧做法是 Go helper 直接根据固定 stage/status 推断下一步。
 - [x] 增强 Review / Rework 交接契约：Review Prompt 必须输出 Summary、Blocking findings、Validation gaps、Rework instructions、Residual risks；旧做法主要依赖 verdict line，容易让 retry/rework 缺少可执行原因。
 - [x] 补齐全 Agent 交接契约：Requirement、Architect、Testing、Delivery 的 prompt section 和 Agent output contract 已统一为结构化 handoff，避免只在 Review 阶段有明确原因和下一步。
 - [x] 增加 workflow contract 校验基础版：加载 repo/profile workflow 时检查 stage id、transition 引用、review round 引用、agent 和 runtime 非负值，失败时阻止运行。

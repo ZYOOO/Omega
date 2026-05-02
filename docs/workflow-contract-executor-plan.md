@@ -2,7 +2,7 @@
 
 日期：2026-04-30
 
-状态：分阶段落地中。2026-05-01 已完成第一阶段：`states.actions` 契约解析、校验、Pipeline snapshot 持久化，以及 DevFlow 阶段推进优先读取契约 transitions；已完成第二阶段基础版：`GET /attempts/{attemptId}/action-plan` 可从 snapshot 生成当前 state、current action、state actions、可达 transitions 和 retry action。通用 action handler 仍按本文迁移顺序继续推进。
+状态：分阶段落地中。2026-05-01 已完成第一阶段：`states.actions` 契约解析、校验、Pipeline snapshot 持久化，以及 DevFlow 阶段推进优先读取契约 transitions；已完成第二阶段基础版：`GET /attempts/{attemptId}/action-plan` 可从 snapshot 生成当前 state、current action、state actions、可达 transitions 和 retry action。2026-05-02 已完成第三阶段基础版：review / rework / merging 的 action 识别、verdict/event 归一和下一阶段路由已迁入 `workflow-action-handler`，真实 runner、PR/check、merge/proof 执行仍由 DevFlow adapter 承接。
 
 ## 背景
 
@@ -52,7 +52,7 @@ Work Item
 - Agent Profile workflow override：Project / Repository scope 的 `workflowMarkdown`。
 - Workflow parser：front matter 中解析 `stages`、`states.actions`、`taskClasses`、`hooks`、`reviewRounds`、`runtime`、`transitions`。
 - Pipeline run workflow snapshot：保存 `states`、扁平 `actions`、`taskClasses`、`hooks`、`executionMode`，供 UI、JobSupervisor 和后续通用执行器消费。
-- DevFlow 阶段推进：Agent invocation 后的 next stage 优先读取 snapshot transitions，缺失时才回退旧固定顺序。
+- DevFlow 阶段推进：Agent invocation 后通过 `workflow-action-handler` 读取 snapshot action verdict / state transition / template transition，缺失时才回退旧固定顺序。
 - Attempt Action Plan：`GET /attempts/{attemptId}/action-plan` 根据 Pipeline snapshot 和 Attempt 当前 stage 返回可解释执行计划，包含 current state、current action、state actions、transitions、taskClasses、hooks 和 retry action。
 - Prompt sections：`## Prompt: requirement`、`architect`、`coding`、`testing`、`rework`、`review`、`delivery`。
 - Runner registry：Codex、opencode、Claude Code 基础 runner。
@@ -61,8 +61,8 @@ Work Item
 
 ### 主要缺口
 
-- workflow contract 已能描述 action 序列，并能生成 Attempt action plan；action handler 还未全部通用化。
-- transitions 已能驱动部分 stage 推进，但 Attempt / Checkpoint / Merge 的完整状态机还在 DevFlow adapter 中。
+- workflow contract 已能描述 action 序列，并能生成 Attempt action plan；review / rework / merging 已完成 action handler 路由基础版，implementation 主链路仍待迁移。
+- transitions 已能驱动 review / rework / merging 的阶段路由，但 Attempt / Checkpoint / Merge 的执行细节还在 DevFlow adapter 中。
 - Runtime 对 `devflow-pr` 有较多固定分支，新增流程需要改 Go 代码。
 - `maxContinuationTurns` 没有形成统一的 continuation turn 协议。
 - simple / complex 任务分类只能写进 prompt，不能改变 runtime 的执行重量。
@@ -301,7 +301,15 @@ refresh_pr_status
 merge_pr
 ```
 
-Implementation 主链路仍由旧 DevFlow 执行函数负责。
+2026-05-02 基础版已落地：
+
+- 新增 `workflow-action-handler`，统一从 Pipeline workflow snapshot 或 template 中解析当前 stage 的 action。
+- Review Agent 的 `approved`、`changes_requested`、`needs_human_info` 先归一成 contract event，再按 action verdict 或 state transition 路由。
+- Rework 的 `passed` 路由先读 state transition，支持从 rework 回到任意 contract 指定 review stage。
+- Human Review approved 到 Merging、Merging passed 到 Done 会记录 action handler 路由元数据，并继续复用真实 PR merge、proof、handoff 逻辑。
+- 旧 Go 固定顺序保留为 fallback，用于缺少 action graph 的历史 pipeline。
+
+Implementation 主链路仍由 DevFlow adapter 执行函数负责，下一阶段再迁移 coding / validation / commit / push / ensure_pr。
 
 ### 阶段 4：迁移 implementation 主链路
 

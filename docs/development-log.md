@@ -1603,3 +1603,23 @@ npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeo
 npm run lint
 npm run build
 ```
+
+## 2026-05-02 18:10 CST
+
+### 通用 Action Executor 阶段 3 基础版
+
+完成：
+
+- 新增 `workflow-action-handler` 路由层，统一解析 Pipeline workflow snapshot / template 中的 state actions、action verdict、state transition 和 template transition。
+- Review / Rework / Merging 的下一阶段不再只靠固定 Go switch 推断：
+  - Review `passed` 会按 `run_review` action verdict 归一为 `approved`。
+  - Review `changes-requested` 会按 `changes_requested` verdict 路由。
+  - Rework / Merging `passed` 会优先消费 state transition。
+- Human Review approved 到 Merging、Merging passed 到 Done 会写入 action route 元数据，同时保留现有真实 PR merge、proof、handoff 行为。
+- 旧固定顺序仍保留为 fallback，兼容历史 pipeline 或未配置 action graph 的 workflow。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestWorkflowActionRoute|TestDevFlowReviewOutcome|TestDevFlowStageStatusAfterChangesRequestedQueuesRework'
+```

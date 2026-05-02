@@ -2599,8 +2599,11 @@ func markApprovedDevFlowDeliveryQueued(database *WorkspaceDatabase, checkpoint m
 			continue
 		}
 		next := cloneMap(pipeline)
+		approvalRoute := workflowActionRouteFromPipeline(next, "human_review", "human", "passed")
+		mergeStageID := stringOr(approvalRoute.NextStageID, "merging")
 		run := mapValue(next["run"])
 		appendRunEvent(run, "gate.approved", "Human review approved. Delivery merge is running in the background.", "human_review", "human")
+		appendRunEvent(run, "action.routed", "Human review approval routed by workflow action handler.", "human_review", "human")
 		stages := arrayMaps(run["stages"])
 		for _, stage := range stages {
 			switch text(stage, "id") {
@@ -2608,7 +2611,7 @@ func markApprovedDevFlowDeliveryQueued(database *WorkspaceDatabase, checkpoint m
 				stage["status"] = "passed"
 				stage["approvedBy"] = "human"
 				stage["completedAt"] = nowISO()
-			case "merging":
+			case mergeStageID:
 				if text(stage, "status") == "ready" || text(stage, "status") == "waiting" {
 					stage["status"] = "running"
 					stage["startedAt"] = nowISO()
@@ -2726,6 +2729,8 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 	if err := os.WriteFile(mergePath, []byte(fmt.Sprintf("# Merge\n\nMerged after human approval: %s\n", prURL)), 0o644); err != nil {
 		return err
 	}
+	mergeRoute := workflowActionRouteFromPipeline(pipeline, "merging", "delivery", "passed")
+	doneStageID := stringOr(mergeRoute.NextStageID, "done")
 	handoffPath := filepath.Join(proofDir, "handoff-bundle.json")
 	if raw, err := os.ReadFile(handoffPath); err == nil {
 		var handoff map[string]any
@@ -2751,7 +2756,7 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 			stage["status"] = "passed"
 			stage["completedAt"] = nowISO()
 			stage["evidence"] = []string{mergePath}
-		case "done":
+		case doneStageID:
 			stage["status"] = "passed"
 			stage["completedAt"] = nowISO()
 			stage["evidence"] = []string{handoffPath}
@@ -2759,6 +2764,7 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 	}
 	run["stages"] = stages
 	appendRunEvent(run, "gate.approved", fmt.Sprintf("Human review approved by %s.", reviewer), "human_review", "human")
+	appendRunEvent(run, "action.executed", "Merge action completed through workflow action handler.", "merging", "delivery")
 	appendRunEvent(run, "devflow.cycle.completed", "DevFlow PR cycle completed after human approval.", "done", "delivery")
 	pipeline["run"] = run
 	pipeline["status"] = "done"
@@ -2804,8 +2810,8 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 	*database = nextDatabase
 	upsertRunWorkpad(database, text(attempt, "id"))
 	for _, operation := range []map[string]any{
-		{"id": fmt.Sprintf("%s:agent:human_review:human", text(pipeline, "id")), "missionId": fmt.Sprintf("mission_%s_agent_workflow", text(pipeline, "id")), "stageId": "human_review", "agentId": "human", "status": "passed", "prompt": "Human approved delivery checkpoint.", "requiredProof": []any{"human-decision"}, "summary": "Human review approved.", "createdAt": nowISO(), "updatedAt": nowISO()},
-		{"id": fmt.Sprintf("%s:agent:merging:delivery", text(pipeline, "id")), "missionId": fmt.Sprintf("mission_%s_agent_workflow", text(pipeline, "id")), "stageId": "merging", "agentId": "delivery", "status": "passed", "prompt": "Merge approved pull request.", "requiredProof": []any{"pull-request"}, "summary": "Pull request merged after human approval.", "createdAt": nowISO(), "updatedAt": nowISO()},
+		{"id": fmt.Sprintf("%s:agent:human_review:human", text(pipeline, "id")), "missionId": fmt.Sprintf("mission_%s_agent_workflow", text(pipeline, "id")), "stageId": "human_review", "agentId": "human", "status": "passed", "prompt": "Human approved delivery checkpoint.", "requiredProof": []any{"human-decision"}, "summary": "Human review approved.", "actionRoute": workflowActionRouteMap(workflowActionRouteFromPipeline(pipeline, "human_review", "human", "passed")), "createdAt": nowISO(), "updatedAt": nowISO()},
+		{"id": fmt.Sprintf("%s:agent:merging:delivery", text(pipeline, "id")), "missionId": fmt.Sprintf("mission_%s_agent_workflow", text(pipeline, "id")), "stageId": "merging", "agentId": "delivery", "status": "passed", "prompt": "Merge approved pull request.", "requiredProof": []any{"pull-request"}, "summary": "Pull request merged after human approval.", "actionRoute": workflowActionRouteMap(mergeRoute), "createdAt": nowISO(), "updatedAt": nowISO()},
 	} {
 		database.Tables.Operations = appendOrReplace(database.Tables.Operations, operation)
 	}
