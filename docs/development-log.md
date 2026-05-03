@@ -2,7 +2,73 @@
 
 本文记录当前 v0Beta 已完成的关键工程节点，方便后续整理仓库和演示材料。
 
+## 2026-05-03
+
+### 飞书审核人搜索与绑定
+
+完成：
+
+- 新增 `POST /feishu/users/search`，Settings 中的 Feishu Reviewer lookup 可按姓名、企业邮箱或手机号查找审核人，不再要求用户手动去开放平台找 `open_id`。
+- Reviewer lookup 支持 `Use current user`，通过 `lark-cli contact +get-user` 直接绑定当前登录用户，解决联系人搜索不返回自己的情况。
+- 姓名搜索优先复用本机 `lark-cli` 用户登录态；邮箱 / 手机号搜索在姓名搜索不可用时用应用机器人凭据解析用户 ID，适配“只有 App ID / App Secret”的常见配置方式。
+- Feishu 配置新增 `assigneeLabel`，页面保存内部审核人 ID 的同时保留展示名，后续 Human Review Task 创建继续使用强绑定 assignee。
+- Provider 面板保留简化主路径：测试本机 `lark-cli`、搜索 Reviewer、保存绑定；Chat / Task / webhook 原始覆盖项继续放在高级配置中。
+- 同步更新飞书审核链路、权限说明和人工测试清单，明确群机器人 / webhook 不需要个人 open_id，个人任务审核需要先解析审核人身份。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuConfigPreflightUsesLocalLarkCLIProfile|TestFeishuUserSearchUsesLocalLarkCLI|TestFeishuUserSearchCanResolveCurrentUser|TestFeishuUserSearchFallsBackToEmailIDLookup'
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+```
+
 ## 2026-05-02
+
+### Human Review 等待态信号与飞书发送原因可观测性
+
+完成：
+
+- Work Item 详情页不再仅因为 workflow 中有 Rework 阶段就展示 `Feedback route`；只有真实 request changes、rework assessment、retry available 或失败/停滞 attempt 才展示返工路由。
+- Run Workpad 对 Human Review pending checkpoint 改为等待信号，不再染成 blocker；历史 rework checklist / retry reason 也不会在普通等待审核态误显示为当前黄色告警。
+- 自动飞书审核发送在缺少 chat/task/webhook 目标时，会写入 checkpoint.`feishuReview.status = needs-configuration` 并记录 `feishu.review.needs_target`，不再静默留下空状态。
+- 补齐 Current attempt 的 Action Plan 摘要样式，避免 action title / status / transition 文案挤在一行。
+
+验证：
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestUsesLarkCLIInteractiveCard|TestFeishuConfigPreflightUsesLocalLarkCLIProfile'
+```
+
+### 飞书 Provider 面板简化与 lark-cli 预检
+
+完成：
+
+- Settings 右侧 Feishu Provider 默认只保留本机 `lark-cli` 状态和 `Test Feishu connection`，Chat / Task / webhook 等固定投递覆盖项收进高级折叠，避免测试前出现一长串非必填字段。
+- `/feishu/config/test` 改为优先检查 `lark-cli config show` 的本机 App profile；只要 App ID / App Secret 已配置即可返回 ready，不再因为未填写 chat id / assignee / webhook 直接失败。
+- Feishu 连接状态会在检测到本机 `lark-cli` 后显示为 connected，符合“先配置本机 CLI，再由运行链路发起审核”的使用方式。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuConfigEncryptsSecretsAndPublicMasking|TestFeishuConfigPreflightUsesLocalLarkCLIProfile'
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+npm run lint
+curl -s -X POST http://127.0.0.1:3888/feishu/config/test | jq .
+```
+
+### Workflow Markdown 与 Agent Prompt 契约样例
+
+完成：
+
+- 参考成熟项目模板的组织方式，把 Omega 测试 fixtures 从“简短说明”升级为“可执行契约”。
+- `docs/test-workflow-fixtures/prompts.md` 按 Requirement / Architect / Coding / Testing / Review / Rework / Delivery 拆成角色、输入、边界、输出契约和失败处理。
+- 新增 `authoring-guide.md`，说明实际项目应准备 `WORKFLOW.md`、`PROMPTS.md`、`AGENTS.md`、`RUNTIME_POLICY.md`、`REVIEW_POLICY.md`、`DELIVERY_POLICY.md`、`REQUIREMENT_TEMPLATE.md` 和 Page Pilot 策略文件。
+- 新增 requirement、runtime、review、delivery、Page Pilot policy 样例，方便后续在 Workspace Agent Studio 中逐项复制测试。
+
+验证：
+
+- 本次为文档与配置样例更新，不涉及运行时代码。
 
 ### Repository-first 审计表、Proof 预览与 Operation Queue 基础版
 
@@ -65,6 +131,29 @@ go test ./services/local-runtime/internal/omegalocal
 - Stage rule 顶部合并为横向摘要，默认规则文案只作为说明展示，不再作为可编辑 textarea 的实际内容。
 - Prompts / Agents tab 也改为窄侧栏 + 右侧主编辑区：Prompts 拆成 Role instruction、Execution rules、Review notes；Agents 增加 runner 对应的 model preset、Skills/MCP chip 选择和 raw bindings 高级编辑。
 - 保留 `stagePolicy` 保存链路，单个 stage 规则编辑继续序列化回 Agent Profile。
+
+### Workspace Agent Studio 模板导入
+
+完成：
+
+- 新增 `POST /agent-profile/import-template`，支持从内置样例、当前 Repository target 的 `.omega` 目录、显式本地路径导入 workflow / prompt / stage policy。
+- 导入会读取 `WORKFLOW.md` / `workflow.md`、`PROMPTS.md` / `prompts.md`、`STAGE_POLICY.md` / `stage-policy.md` / `stage_policy.md`。
+- `PROMPTS.md` 会按 Requirement / Architect / Coding / Testing / Review / Rework / Delivery 章节合并进 workflow markdown 的 prompt sections，并同步生成 Agent Profile 摘要。
+- Workspace Agent Studio 增加 `Import sample template` 和 `Import from repository .omega` 两个入口，导入后直接保存到 SQLite 一等 Agent Profile 表和兼容 settings。
+
+路径规则：
+
+- 新运行优先读取目标仓库 `{repository.path}/.omega/WORKFLOW.md`。
+- 其次读取 Repository scoped Agent Profile，再读取 Project scoped Agent Profile。
+- 再应用页面保存的 workflow template override。
+- 最后回退到内置 `services/local-runtime/workflows/devflow-pr.md`。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+```
 
 验证：
 
@@ -1715,4 +1804,120 @@ go test ./services/local-runtime/internal/omegalocal
 
 ```bash
 go test ./services/local-runtime/internal/omegalocal
+```
+
+## 2026-05-02 23:58 CST
+
+### 通用 Action Executor 后续治理
+
+旧做法：
+
+- Rework 与审批后 Delivery 虽然已经由 `runDevFlowContractState` 调用，但 handler 执行体仍直接写在 `devflow_cycle.go` 和 `server.go`。
+- 主流程文件同时负责上下文组装、执行副作用和状态持久化，后续继续扩展 contract action 时容易再次膨胀。
+
+新做法：
+
+- 新增 `devflow_rework_actions.go`，承载 Rework 的四个 action handler：
+  - `build_rework_checklist`
+  - `apply_rework`
+  - `validate_rework`
+  - `update_pull_request`
+- 新增 `devflow_delivery_actions.go`，承载 Human Review approved 后的四个 action handler：
+  - `human_gate`
+  - `refresh_pr_status`
+  - `merge_pr`
+  - `write_handoff`
+- `devflow_cycle.go` 只组装 Rework action handler 所需上下文，并把 action steps 交给 state runner。
+- `server.go` 只保留 checkpoint continuation 的状态更新、proof 归档、attempt completion 和 workpad 刷新。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+```
+
+## 2026-05-02 继续：Migration Runner 与 Mission Control 写入收口
+
+### 可执行增量迁移
+
+旧做法：
+
+- `sqlite.go` 在 `Initialize` 中创建全量 schema。
+- `omega_migrations` 只记录版本，初始化完成后直接写入所有 migration metadata。
+- 少量字段补齐逻辑以 ad hoc 函数散落在初始化流程里。
+
+新做法：
+
+- 新增 `sqlite_migrations.go`，定义 `sqliteMigration{Version, Name, Up}`。
+- `Initialize` 只先保证 `omega_migrations` 表存在，然后按顺序执行未应用 migration。
+- 每个 migration 的 `Up` 成功后才写入 `omega_migrations`；失败不会落表，下一次启动可重试。
+- `runtime_logs_query_extensions` 迁移继续负责旧表补 `requirement_id` 和查询索引。
+
+验证补充：
+
+- 新增 `sqlite_migrations_test.go` 覆盖首次执行、幂等重复执行、失败不记录、旧 runtime_logs 表升级。
+
+### Mission Control 唯一写入者
+
+旧做法：
+
+- 前端在 local runtime 缺失时会直接修改 Work Item 状态、优先级、创建/删除本地 Work Item，或者把 Agent Profile 保存到浏览器 localStorage。
+- 这些 fallback 方便早期 demo，但会造成 UI 状态和服务端真实状态分叉。
+
+新做法：
+
+- 新增 `apps/web/src/missionControlWrites.ts`，所有 canonical workspace 写入在前端先检查 local runtime。
+- 创建 / 删除 / 运行 Work Item、状态 / 优先级修改、Agent Profile 保存都必须通过 Go local runtime。
+- 前端继续保留 theme、Page Pilot preview URL 等 UI 偏好本地状态；业务状态不再由浏览器自行写入。
+
+### 模块化治理
+
+- `server_routes.go` 承接 `Handler` 和 HTTP 路由表，`server.go` 不再继续承载入口注册逻辑。
+- 本轮前端先拆出 Mission Control 写入守卫；Workboard list、Inspector、GitHub workspace 仍是后续拆分项。
+
+## 2026-05-02 继续：飞书绑定与 Agent 连通性测试
+
+### 本轮目标
+
+设置页里之前只有静态的 Feishu provider 状态，实际配置仍主要靠环境变量；Agent Studio 也只能看到本机 capability，不能在选择前确认当前 runner + model + 账号凭据是否真的可用。
+
+### 变更内容
+
+- 新增 `/feishu/config` 读写接口，把 chat/task/webhook、审核人、文档目录、webhook secret、review token 和 Task bridge 开关落到 SQLite。
+- webhook secret / review token 复用本地 AES-GCM 加密通道，前端只展示 masked 状态，保存时不会把星号占位写回数据库。
+- Workspace Settings 的 Provider Access 面板新增 Feishu 绑定表单和 Test connection。
+- DevFlow Human Review 发送飞书审核请求时会优先消费页面保存的配置，再回退环境变量。
+- JobSupervisor 的 Feishu Task bridge 开关开始消费页面配置，不再只能靠 `OMEGA_FEISHU_TASK_BRIDGE_ENABLED`。
+- 新增 `/agent-runner/preflight`，按 Agent Profile 的 runner/model 做真实 CLI 探测；Trae/opencode 会同时检查加密账号凭据是否存在。
+- Workspace Agent Studio 的 Agents tab 展示 tested / failed / missing，并提供单个 Agent 的 Test connection。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+npm run lint
+npm run build
+```
+
+## 2026-05-03 继续：DevFlow 状态自愈、详情自动刷新与飞书 current-user fallback
+
+### 本轮目标
+
+实测 `OMG-30` 暴露了三个问题：真实失败原因不够容易定位、Human Review 后状态可能被旧 JobSupervisor 快照覆盖、飞书测试消息成功但自动审核/失败通知没有发送。
+
+### 变更内容
+
+- 排查 `OMG-30` 两次尝试：第一次是目标仓库 `customer-health.html` trailing whitespace 被 `git diff --check` 拦截；第二次已进入 Human Review，但 stale JobSupervisor 快照误标 stalled。
+- JobSupervisor 在标记 stalled 前增加 fresh database guard，避免旧快照覆盖后台 job 已写入的 `waiting-human`。
+- Integrity scan 增加 pending Human Review checkpoint 自愈，可把这类误标 stalled 的 attempt 恢复为 `waiting-human`。
+- Work Item 详情页对 active attempt 的 action plan / timeline 增加独立轮询，页面不再依赖手动刷新才能看到阶段变化。
+- 飞书自动审核和失败通知新增 current-user fallback：没有保存 chat/task/webhook 时，使用当前 `lark-cli auth login` 用户作为直投目标。
+- 失败通知在 failed/stalled 保存后自动尝试投递，并把投递结果写入 attempt / runtime log。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
 ```

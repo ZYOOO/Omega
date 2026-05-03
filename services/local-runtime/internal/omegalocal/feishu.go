@@ -62,6 +62,42 @@ func sendFeishuText(ctx context.Context, chatID string, text string) (map[string
 	}, nil
 }
 
+func sendFeishuTextToUser(ctx context.Context, userID string, text string) (map[string]any, error) {
+	userID = strings.TrimSpace(userID)
+	text = strings.TrimSpace(text)
+	if userID == "" {
+		return nil, fmt.Errorf("userId is required")
+	}
+	if text == "" {
+		return nil, fmt.Errorf("text is required")
+	}
+	path, err := exec.LookPath("lark-cli")
+	if err != nil {
+		return nil, fmt.Errorf("lark-cli not found")
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(timeoutCtx, path, "im", "+messages-send", "--as", "bot", "--user-id", userID, "--text", text).CombinedOutput()
+	trimmed := strings.TrimSpace(string(output))
+	if err != nil {
+		if trimmed == "" {
+			trimmed = err.Error()
+		}
+		return nil, fmt.Errorf("lark-cli failed: %s", trimmed)
+	}
+	messageID := extractMessageID(trimmed)
+	return map[string]any{
+		"status":    "sent",
+		"provider":  "feishu",
+		"tool":      "lark-cli",
+		"format":    "text",
+		"route":     "direct-user",
+		"userId":    userID,
+		"messageId": messageID,
+		"raw":       trimmed,
+	}, nil
+}
+
 func sendFeishuInteractiveCard(ctx context.Context, chatID string, card map[string]any) (map[string]any, error) {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
@@ -95,6 +131,45 @@ func sendFeishuInteractiveCard(ctx context.Context, chatID string, card map[stri
 		"tool":      "lark-cli",
 		"format":    "interactive-card",
 		"chatId":    chatID,
+		"messageId": messageID,
+		"raw":       trimmed,
+	}, nil
+}
+
+func sendFeishuInteractiveCardToUser(ctx context.Context, userID string, card map[string]any) (map[string]any, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, fmt.Errorf("userId is required")
+	}
+	if len(card) == 0 {
+		return nil, fmt.Errorf("interactive card is required")
+	}
+	cardJSON, err := json.Marshal(card)
+	if err != nil {
+		return nil, err
+	}
+	path, err := exec.LookPath("lark-cli")
+	if err != nil {
+		return nil, fmt.Errorf("lark-cli not found")
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(timeoutCtx, path, "im", "+messages-send", "--as", "bot", "--user-id", userID, "--msg-type", "interactive", "--content", string(cardJSON)).CombinedOutput()
+	trimmed := strings.TrimSpace(string(output))
+	if err != nil {
+		if trimmed == "" {
+			trimmed = err.Error()
+		}
+		return nil, fmt.Errorf("lark-cli failed: %s", trimmed)
+	}
+	messageID := extractMessageID(trimmed)
+	return map[string]any{
+		"status":    "sent",
+		"provider":  "feishu",
+		"tool":      "lark-cli",
+		"format":    "interactive-card",
+		"route":     "direct-user",
+		"userId":    userID,
 		"messageId": messageID,
 		"raw":       trimmed,
 	}, nil

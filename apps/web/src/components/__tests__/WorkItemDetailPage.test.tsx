@@ -107,7 +107,8 @@ describe("WorkItemDetailPage", () => {
             stages: [
               { id: "implementation", title: "Implementation and PR", status: "running", agentIds: ["coding", "testing"] },
               { id: "human_review", title: "Human Review", status: "waiting-human", agentIds: ["review"] }
-            ]
+            ],
+            events: [{ type: "checkpoint.rejected", message: "Add loading feedback before merge." }]
           }
         }}
         attempts={[{
@@ -170,6 +171,96 @@ describe("WorkItemDetailPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /implementation.*coding/i }));
     expect(screen.getByText("Prompt")).toBeInTheDocument();
     expect(screen.getByText("/tmp/implementation-summary.md")).toBeInTheDocument();
+  });
+
+  it("does not show a rework route just because the workflow contains a rework stage", () => {
+    const workItem: WorkItem = {
+      id: "item_manual_28",
+      key: "OMG-28",
+      title: "新增页面",
+      description: "Need a new page.",
+      status: "In Review" as const,
+      priority: "Medium" as const,
+      assignee: "coding",
+      labels: [],
+      team: "Omega",
+      stageId: "review",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: ["页面可人工验收"],
+      blockedByItemIds: []
+    };
+
+    render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[{
+          id: "attempt_28:workpad",
+          attemptId: "attempt_28",
+          pipelineId: "pipeline_28",
+          workItemId: "item_manual_28",
+          repositoryTargetId: "repo_test",
+          status: "waiting-human",
+          workpad: {
+            blockers: ["Human Review 审批"],
+            reworkChecklist: {
+              checklist: ["历史运行记录里捕获过一条返工建议。"],
+              retryReason: "Agent stage artifact recorded."
+            },
+            retryReason: "Agent stage artifact recorded."
+          }
+        }]}
+        pipeline={{
+          id: "pipeline_28",
+          workItemId: "item_manual_28",
+          runId: "run_28",
+          status: "waiting-human",
+          run: {
+            stages: [
+              { id: "implementation", title: "Implementation and PR", status: "done", agentIds: ["coding", "testing"] },
+              { id: "rework", title: "Rework", status: "done", agentIds: ["coding", "testing"] },
+              { id: "human_review", title: "Human Review", status: "waiting-human", agentIds: ["review"] }
+            ]
+          }
+        }}
+        attempts={[{
+          id: "attempt_28",
+          itemId: "item_manual_28",
+          pipelineId: "pipeline_28",
+          status: "waiting-human",
+          currentStageId: "human_review",
+          pullRequestUrl: "https://github.com/ZYOOO/TestRepo/pull/37"
+        }]}
+        checkpoints={[{
+          id: "pipeline_28:human_review",
+          pipelineId: "pipeline_28",
+          attemptId: "attempt_28",
+          stageId: "human_review",
+          status: "pending",
+          title: "Human Review 审批",
+          summary: "Human Review 需要人工确认后才能继续"
+        }]}
+        operations={[]}
+        proofRecords={[]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    expect(screen.queryByText("Feedback route")).not.toBeInTheDocument();
+    expect(screen.queryByText("Rework checklist")).not.toBeInTheDocument();
+    expect(screen.getByText("No active blockers")).toBeInTheDocument();
+    expect(screen.getByText("No retry needed")).toBeInTheDocument();
   });
 
   it("round-trips work item detail hash routes", () => {

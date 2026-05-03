@@ -206,7 +206,7 @@ describe("App operator view", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved to local runtime"));
-    expect(localStorage.getItem("omega-agent-configuration-draft")).toContain("devflow-pr");
+    expect(localStorage.getItem("omega-agent-configuration-draft")).toBeNull();
   });
 
   it("renders execution locks, runner process telemetry, and pipeline stages", async () => {

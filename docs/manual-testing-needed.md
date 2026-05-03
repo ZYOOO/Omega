@@ -57,7 +57,7 @@ go test ./services/local-runtime/internal/omegalocal
 - [ ] 如需卡片打开 Omega Web，配置 `OMEGA_PUBLIC_APP_URL`。
 - [ ] 建议配置 `OMEGA_FEISHU_REVIEW_TOKEN`，并在飞书回调中带上同一个 token。
 - [ ] 如果不使用 webhook，登录 `lark-cli`，然后配置 `OMEGA_FEISHU_REVIEW_CHAT_ID`。
-- [ ] 如使用无公网 Task 审核，登录 `lark-cli`，配置 `OMEGA_FEISHU_REVIEW_MODE=task` 和 `OMEGA_FEISHU_REVIEW_ASSIGNEE_ID`。
+- [ ] 如使用无公网 Task 审核，登录 `lark-cli`，在 Settings 的 Feishu Reviewer lookup 中按姓名 / 企业邮箱 / 手机号搜索并选择审核人，再保存绑定。
 - [ ] 如需长 review 详情进入飞书文档，配置 `OMEGA_FEISHU_REVIEW_CREATE_DOC=true`；如需写入指定目录，再配置 `OMEGA_FEISHU_REVIEW_DOC_FOLDER_TOKEN`。
 
 当前本机检查：已安装 `lark-cli version 1.0.23`，并确认支持 interactive card、task create/comment/get 和 docs create。真实飞书发送还需要用户登录 / profile、bot 权限和真实 assignee / chat id。
@@ -72,6 +72,8 @@ go test ./services/local-runtime/internal/omegalocal
 - [ ] 如果配置了公网 callback，飞书侧 `Approve` 走 `/feishu/review-callback` 后，Omega checkpoint 变为 approved，并继续 merging。
 - [ ] 如果配置了公网 callback，飞书侧 `Request changes` 走 `/feishu/review-callback` 后，Omega checkpoint 变为 rejected，并生成 rework attempt / checklist。
 - [ ] Task 模式下，Human Review 后飞书里出现一条审核任务，任务描述包含 Work Item、PR、branch、需求摘要和 review token。
+- [ ] Settings 里按姓名搜索审核人时能返回候选人；如果姓名搜索依赖的用户登录态不可用，按企业邮箱或手机号搜索能给出明确权限 / 配置错误。
+- [ ] Settings 里点击 `Use current user` 能把当前 `lark-cli auth login` 的飞书用户选为 Reviewer。
 - [ ] Task 模式下，完成任务后调用 `/feishu/review-task/sync`，Omega checkpoint 变为 approved，并继续 merging。
 - [ ] Task 模式下，调用 `/feishu/review-task/bridge/tick` 的 `dryRun=true` 能看到待同步 taskGuid；启用 `OMEGA_FEISHU_TASK_BRIDGE_ENABLED=true` 后，JobSupervisor tick 能自动同步已完成任务。
 - [ ] Task 模式下，在任务评论里写明确修改意见并转发到 `/feishu/review-task/comment`，Omega checkpoint 变为 rejected，并生成 rework attempt / checklist。
@@ -82,4 +84,21 @@ go test ./services/local-runtime/internal/omegalocal
 
 ```bash
 go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding|TestFeishuReviewTaskSyncApprovesCompletedTask|TestFeishuReviewTaskBridgeDryRunListsPendingTasks|TestFeishuReviewTaskCommentRequestsChanges|TestFeishuReviewTaskCommentNeedInfoRecordsOnly|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestUsesLarkCLIInteractiveCard|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestFeishuNotifyUsesLocalLarkCLI'
+```
+
+## 2026-05-03 DevFlow 状态刷新与飞书 current-user fallback
+
+### 需要验证
+
+- [ ] 确认本机已登录 `lark-cli auth login`，Settings 里的 Feishu 测试消息能发给当前用户。
+- [ ] 不配置 chat id / task assignee / webhook，只触发一个 DevFlow 到 Human Review；当前飞书用户应收到审核通知。
+- [ ] Work Item 详情页停留在运行中的 attempt，Delivery flow / Run timeline 应在约 2.5 秒内自动更新，不需要浏览器刷新。
+- [ ] 人为制造一次 validation failure 或 stalled recovery 场景；当前飞书用户应收到失败通知。
+- [ ] 如果当前 attempt 已经因为 stale supervisor 被误标 stalled，但仍有 pending Human Review checkpoint，JobSupervisor tick 后应恢复为 `waiting-human`。
+
+### 自动化已覆盖
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget|TestFeishuAutoReviewFallsBackToCurrentLarkUser|TestJobSupervisorMarksOrphanedWorkerAttemptStalled|TestJobSupervisorDoesNotOverwriteFreshWaitingHumanAttempt|TestJobSupervisorRecoversOrphanedHumanReviewAttempt'
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
 ```

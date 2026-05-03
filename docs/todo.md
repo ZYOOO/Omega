@@ -85,7 +85,7 @@ Item
 - [x] 增加数据分析指标基础版：`/observability.dashboard` 返回 Attempt 成功率、失败原因分布、慢阶段、待人工队列、活跃运行和推荐动作。
 - [x] 扩展数据分析指标：继续补 stage 平均耗时、runner 使用次数、checkpoint 等待时长、PR 创建/合并数量和趋势统计。
 - [x] 扩展 `/observability` dashboard 基础版：保留旧 summary 字段，并新增 dashboard data，供 UI/CLI 后续消费。
-- [ ] 扩展 `/observability` dashboard：补齐时间窗口、分组统计、趋势、最近失败详情和慢阶段 drilldown。
+- [x] 扩展 `/observability` dashboard：补齐时间窗口、分组统计、趋势、最近失败详情和慢阶段 drilldown。
 - [ ] 暂缓：增加接口测试套件：按 OpenAPI 覆盖 requirement、pipeline、attempt、checkpoint、proof、GitHub delivery、Page Pilot linkage 的 smoke / e2e。
 - [ ] 暂缓：生成统一测试报告：把 API 测试、Go 测试、前端测试、一次端到端演示结果汇总到 `docs/test-report.md`。
 - [x] 强化 workspace lifecycle 基础版：DevFlow run 统一生成 workspace lifecycle spec，写入 `.omega/workspace-lifecycle.json`，并在 manual run / retry / JobSupervisor auto run 中声明 execution lock；旧做法主要依赖分散的 workspace path 计算和 active attempt 判断。
@@ -110,7 +110,7 @@ Item
 - [x] 迁移通用 action executor 阶段 3 增强：默认 DevFlow 的 Review 轮次从 `states.actions` / `run_review` 派生，Review approved / changes_requested 按 action verdict 路由，Rework 根据触发它的 Review stage 回环；`executionMode` 升级为 `contract-action-executor`，并新增 action type handler registry 校验。旧做法是 `reviewRounds` 和固定 review loop 决定执行。
 - [x] 迁移通用 action executor 阶段 4：Requirement、task classification、architecture handoff、coding、validation、ensure_pr 已通过 `runDevFlowContractState` 按 `states.actions` 顺序执行；contract 可调整这些 action 的执行顺序或移除非必需 action，缺少 runtime handler 会直接失败。旧做法是 Go 主函数固定顺序铺开执行。
 - [x] 迁移通用 action executor 阶段 4 增强：Rework 的 build checklist / apply / validate / update PR，以及 Human Review approved 后的 human gate / refresh PR status / merge PR / write handoff 已由 `runDevFlowContractState` 按 contract action 执行。旧做法是 Rework 和 Merging 内部仍由 Go 固定顺序直接调用。
-- [ ] 迁移通用 action executor 后续治理：继续把已接入 state runner 的 handler 实现拆成更小的独立文件；当前默认链路已由 contract state runner 驱动，但部分 handler 代码仍在 DevFlow adapter / server 文件内。
+- [x] 迁移通用 action executor 后续治理：已把接入 state runner 的 Rework handler 拆到 `devflow_rework_actions.go`，Human Review approved 后的 Delivery handler 拆到 `devflow_delivery_actions.go`；`devflow_cycle.go` / `server.go` 只保留上下文组装、state runner 调用和状态持久化。旧做法是 handler 执行体仍直接写在 DevFlow adapter / server 文件内。
 - [x] 增强 Review / Rework 交接契约：Review Prompt 必须输出 Summary、Blocking findings、Validation gaps、Rework instructions、Residual risks；旧做法主要依赖 verdict line，容易让 retry/rework 缺少可执行原因。
 - [x] 补齐全 Agent 交接契约：Requirement、Architect、Testing、Delivery 的 prompt section 和 Agent output contract 已统一为结构化 handoff，避免只在 Review 阶段有明确原因和下一步。
 - [x] 增加 workflow contract 校验基础版：加载 repo/profile workflow 时检查 stage id、transition 引用、review round 引用、agent 和 runtime 非负值，失败时阻止运行。
@@ -234,6 +234,8 @@ Item
   - 旧做法保留说明：该版本把 workflow markdown、Agent runner、prompt/policy 和 runtime preview 放在同一块编辑器内，能用但信息密度和入口层次不够清晰。
 - [x] Workspace Agent Studio 基础版：在 Workspace Config 内提供工作区级共享的 Workflow 图形编排、Prompt 设置、Agent runner/model/Skills/MCP 选择和 Runtime files 预览；继续复用 Agent Profile / workflow markdown / runtime policy 保存链路。
 - [x] Workspace Agent Studio runner / 凭据边界修正：runner 编排保留 Codex 优先、opencode、Claude Code、Trae Agent；页面内账号 / Key 配置只面向 opencode / Trae Agent，Codex / Claude Code 走本机 CLI 登录态。
+- [x] Workspace Agent Studio 增加 Agent runner 连通性测试：每个 Agent 可在选择前调用 runtime preflight 验证 CLI、账号凭据和有效 model；UI 展示 tested / failed / missing，避免运行时才暴露不可用 runner。
+- [x] Workspace Agent Studio 补齐中文 Workflow / Prompt 契约样例：`docs/test-workflow-fixtures/` 新增 authoring guide、requirement/runtime/review/delivery/Page Pilot policy，并把 prompts 从简短说明升级为结构化 handoff 契约。
 - [x] Project Agent Profile 接入 Go API / SQLite：支持 `/agent-profile` 读写、Project / Repository scope 解析、Pipeline run metadata 绑定和 runner runtime bundle 写入
 - [x] Agent Profile runner 配置接入本机 capability 预检：前端阻止保存不可用 runner，Go runtime 在创建 attempt / operation workspace 前拒绝未安装 runner
 - [x] 建立 Agent / Workflow 配置方案文档：`docs/agent-workflow-configuration-plan.md`
@@ -270,9 +272,11 @@ Item
 - [x] DevFlow 编排重构：前端详情页展示真实 Agent turn、输入/输出 artifact、状态流转和 runner telemetry，弱化单纯 proof 数字
 - [x] DevFlow 编排重构：JobSupervisor 已接入 heartbeat、stall retry、cancel、contract-driven timeout/retry 和 workspace lock 基础版
 - [x] DevFlow 编排重构：补 worker host 分配、本地 worker lease、continuation policy metadata 和 orphan running Attempt crash recovery 基础版
-- [ ] DevFlow 编排重构：继续补远端 runner 崩溃恢复和 GitHub polling supervisor
+- [x] DevFlow 编排重构：远端 runner heartbeat / runner crash recovery policy / GitHub PR checks polling supervisor 基础版已完成；`JobSupervisor` 会刷新 remote heartbeat、轮询 PR checks、写入 `remoteSignals`，并把 runner crash / GitHub API 临时失败 / CI failure 纳入 recovery policy。旧待办保留为历史项，后续增强转入更细粒度的 runner host 管理和多端协作清单。
 - [ ] 前端模块化：继续拆分 `App.tsx`，优先拆 Workboard list/detail、Inspector、Operator 面板和 GitHub workspace 组件
+  - 2026-05-02：新增 `missionControlWrites.ts`，先把业务写入守卫从 `App.tsx` 拆出；Workboard list / Inspector / GitHub workspace 组件仍需继续拆。
 - [ ] Go runtime 模块化：继续拆 `server.go`，优先拆 HTTP handler 注册、delivery/PR API、workspace cleanup API 和 runtime settings API
+  - 2026-05-02：HTTP handler 注册已拆到 `server_routes.go`；delivery action handler 已拆到 `devflow_delivery_actions.go`；workspace cleanup API 和 runtime settings API 仍需继续拆。
 - [x] 把 Requirement Decomposition 建成一等服务端能力：raw requirement / GitHub issue -> structured requirement / acceptance criteria / risks / sub-items / target repo context
 - [x] 把 Agent handoff bundle 建成基础 artifact：每个 stage 有输入/输出 artifact contract，`devflow-pr` 生成 handoff bundle
 - [x] 把 Agent handoff bundle 从文件 proof 继续升级为可查询的一等表记录
@@ -285,7 +289,8 @@ Item
 - [x] Human Review checkpoint 产品主路径真实化：默认不 auto approve / auto merge，Review Agent 通过后停在 `waiting-human`
 - [x] 把 Workflow Template 从文件默认值继续升级为 SQLite 一等记录，并支持 Project / Repository Workspace 覆盖
 - [x] 增加 Workflow Template 编辑 API 基础版：读取、保存、校验、恢复默认，并由 Agent Profile 运行时消费覆盖
-- [ ] 后续：Workflow Template Markdown 文件导入/导出、版本对比和恢复历史
+- [x] Workflow Template Markdown 文件导入基础版：Workspace Agent Studio 可从内置样例或当前仓库 `.omega` 导入 workflow / prompts / stage policy，并保存为一等 Agent Profile。
+- [ ] 后续：Workflow Template Markdown 文件导出、版本对比和恢复历史
 - [x] 把 coding / rework / review prompt sections 从 Workflow Markdown body 渲染到 Agent prompt，进一步减少 Go 里的 prompt hardcode
 - [x] 增加正式 JobSupervisor v1：扫描 ready work items / failed attempts / stalled attempts / human gates / workflow contract，并按显式策略调度下一步
 - [x] JobSupervisor 增加 heartbeat、stall detection、retry、cancel、timeout 基础版
@@ -306,11 +311,13 @@ Item
 - [x] 先把 Requirement 从 snapshot 中抽成服务端一等表，并在本地 SQLite / 前端本地 fallback SQLite 中持久化
 - [x] 把 Go Local Service 的 SQLite 写入从 snapshot-first 继续推进为 repository-first 基础版
   - 2026-05-02：保存 workspace 时同步物化 Repository target / handoff bundle / operation queue 审计表，读路径可按 repository target 查询；旧 snapshot-first 保存仍保留为兼容层，后续逐步迁移 Project / Pipeline run 写入。
-- [ ] 把 Go 侧 migration metadata 演进成可执行增量迁移
+- [x] 把 Go 侧 migration metadata 演进成可执行增量迁移
+  - 2026-05-02：旧做法是初始化时创建全量 schema 后直接 `INSERT OR IGNORE` 迁移版本；新做法新增可执行 migration runner，每个版本拥有 `Up` 步骤，启动时只执行未应用版本，成功后才写入 `omega_migrations`，并补了失败不落表、幂等执行和旧 runtime_logs 表升级测试。
 - [x] 把旧 Node / 前端本地服务路径降级为兼容回退；Go Local Runtime 已是默认主路径
 - [ ] 清理旧 Node / 前端本地服务端兼容代码，减少双实现维护成本
   - 2026-05-02 注释：本轮只新增 repository-first 审计表，不移除旧兼容代码，避免影响当前功能一/功能二测试。
-- [ ] 继续减少前端直接持有的业务逻辑，让服务端成为 Mission Control 的唯一写入者
+- [x] 继续减少前端直接持有的业务逻辑，让服务端成为 Mission Control 的唯一写入者
+  - 2026-05-02：旧做法在无 API 时仍由前端本地修改 Work Item / Agent Profile；新做法新增前端写入守卫，创建/删除/运行 Work Item、状态/优先级修改和 Agent Profile 保存必须经过 Go local runtime，前端只保留 UI 偏好类本地状态。
 - [x] 把 GitHub repo / issue import API 接到前端 UI
 - [x] 把 App 内部需求入口接到 repository workspace：不依赖 GitHub issue 也能创建 Work item 并运行
 - [x] Work item 详情页展示 Attempt stages / Agent turns / artifacts / Human Review 基础版，可看到真实状态流转
@@ -360,7 +367,8 @@ Item
 - [ ] 增加 App 内可编辑 Workflow Template：在 UI/API 中编辑阶段、Agent、Gate、review rounds、默认 repo/workspace 配置，替代散落的 md/env 文件
   - 2026-05-02 更新：Workflow Template 已有 SQLite 一等记录和读取/保存/校验/恢复默认 API；Workspace Agent Studio 已完成图形化查看和基础编辑入口。阶段增删、连线编辑、导入/导出和版本恢复仍未完成。
 - [x] Project Agent Profile 从 `omega_settings` 继续升级为一等 SQLite 表
-- [ ] Project Agent Profile 继续补充版本历史展示、恢复默认、导入/导出，以及更完整的 workflow/schema 校验
+- [x] Project Agent Profile 导入基础版：`POST /agent-profile/import-template` 支持 fixtures / repository `.omega` / path 三类来源。
+- [ ] Project Agent Profile 继续补充版本历史展示、恢复默认、导出，以及更完整的 workflow/schema 校验
 - [ ] 持久化 connector sync report，而不只是 sync intent
   - 2026-05-01 更新：GitHub Issue 出站同步已先落地 sync report；其他 connector 仍待补齐。
 - [ ] 增加新项目的 workspace bootstrap API
@@ -395,8 +403,10 @@ Item
   - 2026-05-01：`POST /feishu/review-callback` 与本地 Approve / Request changes 使用同一 checkpoint decision helper；真实公网 callback 需要配置 `OMEGA_PUBLIC_API_URL` 和可选 `OMEGA_FEISHU_REVIEW_TOKEN`。
 - [x] 增加无公网 Feishu Task 审核桥接
   - 2026-05-01：`POST /feishu/review-request` 支持 `mode=task`，通过 `lark-cli task +create` 创建审核任务；任务完成后 `/feishu/review-task/sync` 同步为 approve，任务评论通过 `/feishu/review-task/comment` 同步为 request changes 或 need-info。
-- [ ] 增加 Feishu Task 本地常驻事件桥
-  - 当前已完成本机 API 和同步语义；后续把任务评论 / 完成事件自动轮询或订阅并转发到本机 runtime，减少手动 sync。
+- [x] 增加 Feishu Task 本地常驻事件桥
+  - 2026-05-02：新增 `/feishu/review-task/bridge/tick`，支持 dry-run 列出待同步任务和正式同步已完成任务；JobSupervisor 可按配置自动 tick。
+- [x] 增加 Feishu 绑定配置 UI
+  - 2026-05-02：Workspace Settings 的 Provider Access 面板可保存 chat/task/webhook、任务审核人、文档目录、webhook secret 和 review token；密钥使用本地加密落库并以 masked 状态展示。
 - [ ] 把 Feishu 群聊 requirement 入口建模成 Product Layer 的一等事件源
 - [x] 持久化 Feishu message/card/doc external reference，方便从 Workboard 回跳
   - 2026-05-01：发送结果写入 checkpoint.`feishuReview`，包含 provider、tool、format、message id、task id、task url、nonce 或 card/doc preview；后续可继续提升为一等 Connector Sync Report 表。

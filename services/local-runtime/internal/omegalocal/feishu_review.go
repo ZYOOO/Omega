@@ -104,16 +104,7 @@ func feishuReviewTokenAllowed(request *http.Request, payload map[string]any) boo
 }
 
 func (server *Server) sendFeishuReviewForPipelineIfConfigured(ctx context.Context, pipelineID string) {
-	chatID := strings.TrimSpace(os.Getenv("OMEGA_FEISHU_REVIEW_CHAT_ID"))
-	webhook := strings.TrimSpace(os.Getenv("OMEGA_FEISHU_WEBHOOK_URL"))
-	if webhook == "" {
-		webhook = strings.TrimSpace(os.Getenv("FEISHU_BOT_WEBHOOK"))
-	}
-	taskOptions := feishuReviewSendOptions{ChatID: chatID}
-	if chatID == "" && webhook == "" && !feishuReviewTaskModeEnabled(taskOptions) {
-		server.logDebug(ctx, "feishu.review.skipped", "Feishu review notification skipped because no chat or webhook is configured.", map[string]any{"pipelineId": pipelineID})
-		return
-	}
+	taskOptions := server.mergeFeishuReviewOptions(ctx, feishuReviewSendOptions{})
 	database, err := mustLoad(server, ctx)
 	if err != nil {
 		server.logError(ctx, "feishu.review.load_failed", err.Error(), map[string]any{"pipelineId": pipelineID})
@@ -121,10 +112,55 @@ func (server *Server) sendFeishuReviewForPipelineIfConfigured(ctx context.Contex
 	}
 	for _, checkpoint := range database.Tables.Checkpoints {
 		if text(checkpoint, "pipelineId") == pipelineID && text(checkpoint, "status") == "pending" && text(checkpoint, "stageId") == "human_review" {
+			if taskOptions.ChatID == "" && taskOptions.WebhookURL == "" && taskOptions.DirectUserID == "" && !feishuReviewTaskModeEnabled(taskOptions) {
+				server.logInfo(ctx, "feishu.review.needs_target", "Feishu review notification needs a chat, task assignee, tasklist, webhook target, or current-user lark-cli auth.", map[string]any{"pipelineId": pipelineID, "checkpointId": text(checkpoint, "id")})
+			}
 			_, _, _ = server.sendFeishuReviewForCheckpointWithOptions(ctx, text(checkpoint, "id"), taskOptions, false)
 			return
 		}
 	}
+}
+
+func (server *Server) sendFeishuAttemptFailureIfConfigured(ctx context.Context, pipelineID string, attemptID string) {
+	database, err := mustLoad(server, ctx)
+	if err != nil {
+		server.logError(ctx, "feishu.failure.load_failed", err.Error(), map[string]any{"pipelineId": pipelineID, "attemptId": attemptID})
+		return
+	}
+	attemptIndex := findByID(database.Tables.Attempts, attemptID)
+	if attemptIndex < 0 {
+		return
+	}
+	attempt := database.Tables.Attempts[attemptIndex]
+	if text(attempt, "feishuFailureNotifiedAt") != "" {
+		return
+	}
+	pipeline := pipelineByID(database, pipelineID)
+	item := findWorkItem(database, text(attempt, "itemId"))
+	options := server.mergeFeishuReviewOptions(ctx, feishuReviewSendOptions{})
+	result, err := sendFeishuFailurePacket(ctx, map[string]any{"pipeline": pipeline, "attempt": attempt, "item": item}, options)
+	if err != nil {
+		server.logError(ctx, "feishu.failure.send_failed", err.Error(), map[string]any{"pipelineId": pipelineID, "attemptId": attemptID, "workItemId": text(attempt, "itemId")})
+		return
+	}
+	if text(result, "status") == "sent" {
+		nextAttempt := cloneMap(attempt)
+		nextAttempt["feishuFailureNotifiedAt"] = nowISO()
+		nextAttempt["feishuFailure"] = result
+		delete(nextAttempt, "feishuFailureNotifyPending")
+		database.Tables.Attempts[attemptIndex] = nextAttempt
+		touch(&database)
+		_ = server.Repo.Save(ctx, database)
+	}
+	server.logInfo(ctx, "feishu.failure.synced", "Feishu failure notification state recorded.", map[string]any{
+		"pipelineId": pipelineID,
+		"attemptId":  attemptID,
+		"workItemId": text(attempt, "itemId"),
+		"status":     text(result, "status"),
+		"provider":   text(result, "provider"),
+		"route":      text(result, "route"),
+		"messageId":  text(result, "messageId"),
+	})
 }
 
 func (server *Server) sendFeishuReviewForCheckpoint(ctx context.Context, checkpointID string, chatID string, manual bool) (map[string]any, int, error) {
@@ -132,12 +168,18 @@ func (server *Server) sendFeishuReviewForCheckpoint(ctx context.Context, checkpo
 }
 
 type feishuReviewSendOptions struct {
-	ChatID     string
-	Mode       string
-	AssigneeID string
-	TasklistID string
-	FollowerID string
-	Due        string
+	ChatID         string
+	DirectUserID   string
+	Mode           string
+	AssigneeID     string
+	TasklistID     string
+	FollowerID     string
+	Due            string
+	WebhookURL     string
+	WebhookSecret  string
+	ReviewToken    string
+	CreateDoc      bool
+	DocFolderToken string
 }
 
 func (server *Server) sendFeishuReviewForCheckpointWithOptions(ctx context.Context, checkpointID string, options feishuReviewSendOptions, manual bool) (map[string]any, int, error) {
@@ -164,7 +206,7 @@ func (server *Server) sendFeishuReviewForCheckpointWithOptions(ctx context.Conte
 		attempt = cloneMap(database.Tables.Attempts[attemptIndex])
 	}
 	packet := feishuReviewPacketFromRecords(database, checkpoint, pipeline, item, attempt)
-	result, err := sendFeishuReviewPacket(ctx, packet, options)
+	result, err := sendFeishuReviewPacket(ctx, packet, server.mergeFeishuReviewOptions(ctx, options))
 	if err != nil {
 		server.logError(ctx, "feishu.review.send_failed", err.Error(), map[string]any{"checkpointId": checkpointID, "pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id")})
 		if manual {
@@ -194,6 +236,71 @@ func (server *Server) sendFeishuReviewForCheckpointWithOptions(ctx context.Conte
 	return result, http.StatusOK, err
 }
 
+func (server *Server) mergeFeishuReviewOptions(ctx context.Context, options feishuReviewSendOptions) feishuReviewSendOptions {
+	config, _ := server.feishuConfig(ctx)
+	if strings.TrimSpace(options.ChatID) == "" {
+		options.ChatID = config.ChatID
+	}
+	if strings.TrimSpace(options.Mode) == "" {
+		options.Mode = config.Mode
+	}
+	if strings.TrimSpace(options.AssigneeID) == "" {
+		options.AssigneeID = config.AssigneeID
+	}
+	if strings.TrimSpace(options.TasklistID) == "" {
+		options.TasklistID = config.TasklistID
+	}
+	if strings.TrimSpace(options.FollowerID) == "" {
+		options.FollowerID = config.FollowerID
+	}
+	if strings.TrimSpace(options.Due) == "" {
+		options.Due = config.Due
+	}
+	if strings.TrimSpace(options.WebhookURL) == "" {
+		options.WebhookURL = config.WebhookURL
+	}
+	if strings.TrimSpace(options.WebhookSecret) == "" {
+		options.WebhookSecret = firstNonEmpty(server.decryptFeishuSecret(config, "feishu-webhook-secret"), os.Getenv("OMEGA_FEISHU_WEBHOOK_SECRET"))
+	}
+	if strings.TrimSpace(options.ReviewToken) == "" {
+		options.ReviewToken = firstNonEmpty(server.decryptFeishuSecret(config, "feishu-review-token"), os.Getenv("OMEGA_FEISHU_REVIEW_TOKEN"))
+	}
+	if !options.CreateDoc {
+		options.CreateDoc = config.CreateDoc
+	}
+	if strings.TrimSpace(options.DocFolderToken) == "" {
+		options.DocFolderToken = config.DocFolderToken
+	}
+	if strings.TrimSpace(options.DirectUserID) == "" && strings.TrimSpace(options.ChatID) == "" && strings.TrimSpace(options.WebhookURL) == "" && !feishuReviewTaskModeEnabled(options) {
+		options.DirectUserID = server.currentFeishuUserID(ctx)
+	}
+	return options
+}
+
+func (server *Server) currentFeishuUserID(ctx context.Context) string {
+	path, err := exec.LookPath("lark-cli")
+	if err != nil {
+		return ""
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	users, _, err := getCurrentFeishuUserWithLarkCLI(timeoutCtx, path)
+	if err != nil || len(users) == 0 {
+		return ""
+	}
+	for _, user := range users {
+		if strings.TrimSpace(user.OpenID) != "" {
+			return strings.TrimSpace(user.OpenID)
+		}
+	}
+	for _, user := range users {
+		if strings.TrimSpace(user.UserID) != "" {
+			return strings.TrimSpace(user.UserID)
+		}
+	}
+	return ""
+}
+
 func feishuReviewPacketFromRecords(database WorkspaceDatabase, checkpoint map[string]any, pipeline map[string]any, item map[string]any, attempt map[string]any) map[string]any {
 	reviewPacket := mapValue(attempt["reviewPacket"])
 	runWorkpad := map[string]any{}
@@ -221,9 +328,12 @@ func feishuReviewPacketFromRecords(database WorkspaceDatabase, checkpoint map[st
 }
 
 func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
-	card := buildFeishuReviewCard(packet)
+	card := buildFeishuReviewCardWithOptions(packet, options)
 	docMarkdown := buildFeishuReviewDocMarkdown(packet)
-	webhook := strings.TrimSpace(os.Getenv("OMEGA_FEISHU_WEBHOOK_URL"))
+	webhook := strings.TrimSpace(options.WebhookURL)
+	if webhook == "" {
+		webhook = strings.TrimSpace(os.Getenv("OMEGA_FEISHU_WEBHOOK_URL"))
+	}
 	if webhook == "" {
 		webhook = strings.TrimSpace(os.Getenv("FEISHU_BOT_WEBHOOK"))
 	}
@@ -235,7 +345,7 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 		return result, err
 	}
 	if webhook != "" {
-		result, err := sendFeishuWebhookInteractiveCard(ctx, webhook, card)
+		result, err := sendFeishuWebhookInteractiveCardWithSecret(ctx, webhook, options.WebhookSecret, card)
 		result["docMode"] = "card-summary"
 		result["docPreview"] = truncateForProof(docMarkdown, 1200)
 		return result, err
@@ -258,17 +368,97 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 		}
 		return result, err
 	}
+	directUserID := strings.TrimSpace(options.DirectUserID)
+	if directUserID != "" {
+		result, cardErr := sendFeishuInteractiveCardToUser(ctx, directUserID, card)
+		if result != nil {
+			result["docMode"] = "card-summary"
+			result["docPreview"] = truncateForProof(docMarkdown, 1200)
+			result["fallback"] = "current-user"
+			return result, cardErr
+		}
+		result, err := sendFeishuTextToUser(ctx, directUserID, renderFeishuReviewText(packet))
+		if result != nil {
+			result["format"] = "text-fallback"
+			result["docMode"] = "text-summary"
+			result["fallback"] = "current-user"
+			if cardErr != nil {
+				result["interactiveCardError"] = cardErr.Error()
+			}
+		}
+		return result, err
+	}
 	return map[string]any{
 		"status":       "needs-configuration",
 		"provider":     "feishu",
-		"reason":       "Set OMEGA_FEISHU_WEBHOOK_URL, OMEGA_FEISHU_REVIEW_CHAT_ID, or task review options with lark-cli installed.",
+		"reason":       "Set OMEGA_FEISHU_WEBHOOK_URL, OMEGA_FEISHU_REVIEW_CHAT_ID, task review options, or run lark-cli auth login for current-user direct delivery.",
 		"cardPreview":  card,
 		"docPreview":   truncateForProof(docMarkdown, 2000),
 		"checkpointId": text(mapValue(packet["checkpoint"]), "id"),
 	}, nil
 }
 
+func sendFeishuFailurePacket(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
+	message := renderFeishuFailureText(packet)
+	if webhook := strings.TrimSpace(firstNonEmpty(options.WebhookURL, os.Getenv("OMEGA_FEISHU_WEBHOOK_URL"), os.Getenv("FEISHU_BOT_WEBHOOK"))); webhook != "" {
+		card := map[string]any{
+			"config": map[string]any{"wide_screen_mode": true},
+			"header": map[string]any{
+				"template": "red",
+				"title":    map[string]any{"tag": "plain_text", "content": "Omega run needs attention"},
+			},
+			"elements": []any{
+				map[string]any{"tag": "markdown", "content": message},
+			},
+		}
+		result, err := sendFeishuWebhookInteractiveCardWithSecret(ctx, webhook, options.WebhookSecret, card)
+		if result != nil {
+			result["format"] = "failure-card"
+		}
+		return result, err
+	}
+	if chatID := strings.TrimSpace(options.ChatID); chatID != "" {
+		return sendFeishuText(ctx, chatID, message)
+	}
+	if directUserID := strings.TrimSpace(options.DirectUserID); directUserID != "" {
+		result, err := sendFeishuTextToUser(ctx, directUserID, message)
+		if result != nil {
+			result["fallback"] = "current-user"
+		}
+		return result, err
+	}
+	return map[string]any{
+		"status":   "needs-configuration",
+		"provider": "feishu",
+		"reason":   "Set a Feishu chat/webhook/task route, or run lark-cli auth login for current-user direct delivery.",
+	}, nil
+}
+
+func renderFeishuFailureText(packet map[string]any) string {
+	item := mapValue(packet["item"])
+	attempt := mapValue(packet["attempt"])
+	pipeline := mapValue(packet["pipeline"])
+	reason := firstNonEmpty(text(attempt, "failureReason"), text(attempt, "statusReason"), text(attempt, "errorMessage"), "Run failed or stalled.")
+	detail := firstNonEmpty(text(attempt, "failureDetail"), text(attempt, "stderrSummary"))
+	lines := []string{
+		"**Omega 运行需要处理**",
+		fmt.Sprintf("- Work Item: %s %s", firstNonEmpty(text(item, "key"), text(item, "id")), text(item, "title")),
+		fmt.Sprintf("- Pipeline: %s", text(pipeline, "id")),
+		fmt.Sprintf("- Attempt: %s", text(attempt, "id")),
+		fmt.Sprintf("- Stage: %s", firstNonEmpty(text(attempt, "failureStageId"), text(attempt, "currentStageId"))),
+		fmt.Sprintf("- Reason: %s", reason),
+	}
+	if detail != "" {
+		lines = append(lines, "", truncateForProof(detail, 900))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func buildFeishuReviewCard(packet map[string]any) map[string]any {
+	return buildFeishuReviewCardWithOptions(packet, feishuReviewSendOptions{})
+}
+
+func buildFeishuReviewCardWithOptions(packet map[string]any, options feishuReviewSendOptions) map[string]any {
 	checkpoint := mapValue(packet["checkpoint"])
 	item := mapValue(packet["item"])
 	attempt := mapValue(packet["attempt"])
@@ -278,7 +468,7 @@ func buildFeishuReviewCard(packet map[string]any) map[string]any {
 	checkpointID := text(checkpoint, "id")
 	publicAppURL := strings.TrimRight(strings.TrimSpace(os.Getenv("OMEGA_PUBLIC_APP_URL")), "/")
 	publicAPIURL := strings.TrimRight(strings.TrimSpace(os.Getenv("OMEGA_PUBLIC_API_URL")), "/")
-	token := strings.TrimSpace(os.Getenv("OMEGA_FEISHU_REVIEW_TOKEN"))
+	token := strings.TrimSpace(firstNonEmpty(options.ReviewToken, os.Getenv("OMEGA_FEISHU_REVIEW_TOKEN")))
 	reviewURL := ""
 	if publicAppURL != "" && text(item, "id") != "" {
 		reviewURL = publicAppURL + "/#/work-items/" + text(item, "id")
@@ -384,8 +574,12 @@ func renderFeishuReviewText(packet map[string]any) string {
 }
 
 func sendFeishuWebhookInteractiveCard(ctx context.Context, webhook string, card map[string]any) (map[string]any, error) {
+	return sendFeishuWebhookInteractiveCardWithSecret(ctx, webhook, os.Getenv("OMEGA_FEISHU_WEBHOOK_SECRET"), card)
+}
+
+func sendFeishuWebhookInteractiveCardWithSecret(ctx context.Context, webhook string, secret string, card map[string]any) (map[string]any, error) {
 	payload := map[string]any{"msg_type": "interactive", "card": card}
-	if secret := strings.TrimSpace(os.Getenv("OMEGA_FEISHU_WEBHOOK_SECRET")); secret != "" {
+	if secret := strings.TrimSpace(secret); secret != "" {
 		timestamp := fmt.Sprint(time.Now().Unix())
 		payload["timestamp"] = timestamp
 		payload["sign"] = signFeishuWebhook(timestamp, secret)

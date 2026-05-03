@@ -38,6 +38,71 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestObservabilityDash
 - 飞书 Task bridge 目前仍依赖本机 `lark-cli` 和 JobSupervisor tick，后续可增加常驻状态页和失败重试队列。
 - Page Pilot isolated-devflow 已有安全边界和 PR 交付基础，后续继续补跨进程恢复、持久 preview process table 和截图级 proof。
 
+## 2026-05-02: Workflow / Prompt 契约样例补齐
+
+### 目标
+
+把 Workspace Agent Studio 可复制的 Markdown 样例从简短提示升级为更接近真实运行的契约配置，让用户可以按文件准备 workflow、prompt、agent、runtime、review、delivery 和 Page Pilot 策略。
+
+### 入口
+
+- `docs/test-workflow-fixtures/authoring-guide.md`
+- `docs/test-workflow-fixtures/workflow.md`
+- `docs/test-workflow-fixtures/prompts.md`
+- `docs/test-workflow-fixtures/stage-policy.md`
+- `docs/test-workflow-fixtures/agent-profiles-trae.md`
+- `docs/test-workflow-fixtures/runtime-policy.md`
+- `docs/test-workflow-fixtures/review-policy.md`
+- `docs/test-workflow-fixtures/delivery-policy.md`
+- `docs/test-workflow-fixtures/page-pilot-policy.md`
+
+### 运行时行为
+
+本次不改变 runtime 行为。新增样例会被用户复制到 Workspace Agent Studio 后，进入现有 workflow contract、stage policy、prompt sections 和 agent profile 保存链路。
+
+### 验证
+
+本次为文档和配置样例更新，无新增代码测试。
+
+### 后续工作
+
+- 将这些 fixtures 做成 UI 内置模板选择，减少手动复制。
+- 对 Markdown contract 增加导入校验和差异预览。
+
+## 2026-05-02: Workspace Agent Studio 模板导入
+
+### 目标
+
+把 workflow / prompt / stage policy 从“手动复制到页面”升级为可导入配置，降低用户准备项目模板的成本，同时保持 Repository-first 的执行边界。
+
+### 数据/API
+
+- 新增 `POST /agent-profile/import-template`。
+- `source=fixtures`：读取 Omega 内置 `docs/test-workflow-fixtures/`。
+- `source=repository`：读取当前 Repository target 的 `{repository.path}/.omega/`。
+- `source=path`：读取显式本地目录，主要用于测试和后续高级导入。
+
+### 运行时行为
+
+- 导入 workflow 后会更新 `workflowTemplate` 和 `workflowMarkdown`。
+- 导入 stage policy 后会更新 `stagePolicy`。
+- 导入 prompts 后会把对应 Agent 章节合并为 workflow prompt sections，并把角色 / 规则摘要同步到 Agent Profile。
+- 保存后进入 SQLite 一等 Agent Profile 表；新 Pipeline run 会按现有 profile resolution 使用这些配置。
+- 执行时仍坚持 Repository-first：仓库 `.omega/WORKFLOW.md` 优先，页面导入的配置作为 workspace / repository profile 默认值。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+```
+
+### 后续工作
+
+- 增加导入前 diff preview。
+- 增加模板版本历史和恢复点。
+- 增加导出为 `.omega` 文件包。
+
 ## 2026-05-02: Repository-first 审计表与 Proof 预览
 
 ### 目标
@@ -2485,4 +2550,87 @@ go test ./services/local-runtime/internal/omegalocal
 
 ```bash
 go test ./services/local-runtime/internal/omegalocal
+```
+
+## 2026-05-02: 通用 Action Executor handler 治理
+
+### 功能作用
+
+把已经接入 contract state runner 的 Rework 与审批后 Delivery handler 从大文件中拆出，避免默认 DevFlow 继续把编排、执行、状态持久化全部堆在一个函数里。对用户侧行为无变化，但为后续继续扩展可配置 action、替换 handler 或做 UI 编排打基础。
+
+### 实现架构
+
+- `devflow_rework_actions.go`
+  - 构建返工 checklist。
+  - 调用 coding runner 执行返工。
+  - 运行 repository validation。
+  - 推送分支、更新 PR 描述并刷新 PR / checks / feedback。
+- `devflow_delivery_actions.go`
+  - 记录 Human Review approved proof。
+  - 合并前刷新 PR checks。
+  - 执行真实 PR merge，并在失败时写 GitHub outbound sync proof。
+  - 更新 handoff bundle。
+- `devflow_cycle.go` 现在只在 Rework 处创建 handler 上下文并调用 `runDevFlowContractState`。
+- `server.go` 现在只在 Human Review approved continuation 中创建 Delivery handler，并负责最终 Pipeline / Attempt / Workpad 状态落库。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+```
+
+## 2026-05-02: 服务端写入收口与可执行迁移
+
+### 功能作用
+
+把本地 runtime 的数据治理再往产品化推进一层：数据库升级从“记录版本”变成“按版本执行”，前端从“可本地模拟写业务状态”变成“必须通过 Mission Control 写入真实状态”。这能减少本地调试时 UI 与 SQLite 真实状态不一致的问题，也让后续桌面版升级已有用户数据库时更可控。
+
+### 实现架构
+
+- SQLite：
+  - `sqlite_migrations.go` 定义可执行 migration 列表。
+  - `Initialize` 先建 `omega_migrations`，再执行 pending migration。
+  - migration 成功后写入版本；失败不写入，避免“看起来已升级但实际没执行”的状态。
+- Web：
+  - `missionControlWrites.ts` 统一提供写入守卫。
+  - Work Item 创建、删除、运行、属性修改和 Agent Profile 保存不再走浏览器 fallback。
+  - 浏览器只保存 UI 偏好，canonical workspace 数据由 Go local runtime 写。
+- Go runtime：
+  - `server_routes.go` 独立承载 HTTP 路由入口，降低 `server.go` 的继续膨胀风险。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestSQLiteMigrations|TestMigrationsAndPipelineTemplates'
+npm run test -- apps/web/src/__tests__/missionControlWrites.test.ts apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
+```
+
+## 2026-05-02: 飞书绑定配置与 Agent Runner 连通性测试
+
+### 功能作用
+
+把飞书审核链路从“靠环境变量配置”推进到 Workspace Settings 中可见、可保存、可测试；同时让每个 Agent 在选择 runner/model 后能立即做连通性检查，避免真正执行到一半才发现 CLI、账号或模型不可用。
+
+### 实现架构
+
+- Go runtime：
+  - 新增 `feishu_config.go`，提供 `GET /feishu/config`、`PUT /feishu/config`、`POST /feishu/config/test`。
+  - 飞书配置写入 SQLite `omega_settings`，webhook secret 和 review token 复用 runner credential 的 AES-GCM 加密能力。
+  - `sendFeishuReviewForPipelineIfConfigured` 会合并页面配置和环境变量，优先使用页面保存的 chat/task/webhook 配置。
+  - JobSupervisor 的 Feishu Task bridge 开关新增页面配置来源。
+  - 新增 `runner_preflight.go`，提供 `POST /agent-runner/preflight`，按 Codex / opencode / Claude Code / Trae Agent 运行真实 CLI preflight。
+- Web：
+  - Provider Access 面板新增飞书绑定表单，支持 chat、task、webhook、审核人、任务清单、文档目录、Task bridge、密钥显隐和保存。
+  - Workspace Agent Studio 的 Agents tab 增加 Test connection，并在 Agent 列表中展示 tested / failed / missing。
+- 测试：
+  - 后端覆盖飞书密钥加密落库、public masking、Trae Agent preflight 读取加密凭据。
+  - 前端 API client 覆盖 Feishu config 读写/test 和 Agent runner preflight 调用。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
+npm run lint
+npm run build
 ```

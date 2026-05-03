@@ -230,7 +230,11 @@ func (server *Server) failDevFlowCycleJobWithResult(ctx context.Context, pipelin
 	database, _ = failAttemptRecord(database, attemptID, pipeline, failure.Error(), result)
 	upsertRunWorkpad(&database, attemptID)
 	touch(&database)
-	return server.Repo.Save(context.Background(), database)
+	if err := server.Repo.Save(context.Background(), database); err != nil {
+		return err
+	}
+	server.sendFeishuAttemptFailureIfConfigured(ctx, pipelineID, attemptID)
+	return nil
 }
 
 func (server *Server) completeDevFlowCycleJob(ctx context.Context, pipelineID string, attemptID string, result map[string]any) (map[string]any, map[string]any, error) {
@@ -1765,162 +1769,49 @@ Rules:
 		if stageID == "" {
 			stageID = "rework"
 		}
-		notePath := filepath.Join(proofDir, fmt.Sprintf("rework-agent-note-%d.md", cycle))
-		promptPath := filepath.Join(proofDir, fmt.Sprintf("rework-prompt-%d.md", cycle))
-		reworkVariables := cloneStringMap(promptVariables)
-		reworkVariables["pullRequestUrl"] = prURL
-		roundFeedback := ""
-		reworkPrompt := ""
-		buildReworkChecklist := func() error {
-			roundFeedback = strings.TrimSpace(feedback)
-			if checklistPrompt := reworkChecklistPromptFromAttempt(currentAttempt, ""); checklistPrompt != "" {
-				roundFeedback = strings.TrimSpace(checklistPrompt + "\n\nLatest review feedback:\n" + feedback)
-			}
-			checklistPath := filepath.Join(proofDir, fmt.Sprintf("rework-checklist-%d.md", cycle))
-			checklist := fmt.Sprintf("# Rework Checklist %d\n\n- Source stage: `%s`\n- Target stage: `%s`\n- Pull request: %s\n\n## Feedback\n\n%s\n", cycle, fromStageID, stageID, prURL, stringOr(roundFeedback, "No review feedback was provided."))
-			if err := os.WriteFile(checklistPath, []byte(checklist), 0o644); err != nil {
-				return err
-			}
-			recordAgent(stageID, "master", "passed", "Build rework checklist from review, PR, check, and human feedback.", filepath.Base(checklistPath), "Rework checklist captured for the next coding pass.", []string{checklistPath}, map[string]any{"runner": "local-orchestrator", "status": "passed", "reviewCycle": cycle})
-			return nil
-		}
-		applyRework := func() error {
-			if strings.TrimSpace(roundFeedback) == "" {
-				roundFeedback = strings.TrimSpace(feedback)
-			}
-			reworkVariables["reviewFeedback"] = roundFeedback
-			reworkVariables["reworkNotePath"] = notePath
-			reworkFallback := fmt.Sprintf(`You are the rework coding agent for Omega.
-
-Repository: %s
-Repository path: %s
-Work item: %s
-Title: %s
-Pull request: %s
-
-Requirement:
-%s
-
-Rework checklist to address:
-%s
-
-Rules:
-- Continue in the same repository checkout, same branch, and same pull request.
-- Address the review feedback with a real code change.
-- Keep the diff minimal and reviewable.
-- Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
-- Write a short completion note to %s with these sections:
-  - Review feedback addressed
-  - What changed
-  - Files changed
-  - Validation run
-  - Remaining risk
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, roundFeedback, notePath)
-			reworkPrompt = renderWorkflowPromptSection(template, "rework", reworkVariables, reworkFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
-			if err := os.WriteFile(promptPath, []byte(reworkPrompt), 0o644); err != nil {
-				return err
-			}
-			recordAgent(stageID, "coding", "running", reworkPrompt, "", "Rework agent is applying review feedback in the same workspace.", []string{promptPath}, map[string]any{"runner": codingRunnerID, "status": "running", "reviewCycle": cycle})
-			reworkModel, reworkEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
-			turn := codingRunner.RunTurn(ctx, AgentTurnRequest{
-				Role:              "rework",
-				StageID:           stageID,
-				Runner:            codingRunnerID,
-				Workspace:         repoWorkspace,
-				Prompt:            reworkPrompt,
-				OutputPath:        notePath,
-				Sandbox:           "workspace-write",
-				Model:             reworkModel,
-				Env:               reworkEnv,
-				HeartbeatInterval: runnerHeartbeatInterval,
-				OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "coding", codingRunnerID),
-			})
-			if turn.Error != nil {
-				recordAgent(stageID, "coding", "failed", reworkPrompt, filepath.Base(notePath), "Rework agent failed before producing an acceptable repository diff.", []string{promptPath, notePath}, turn.Process)
-				return fmt.Errorf("rework agent failed: %w", turn.Error)
-			}
-			statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short")
-			if err != nil {
-				return fmt.Errorf("read rework changes: %w", err)
-			}
-			if strings.TrimSpace(statusOutput) == "" {
-				recordAgent(stageID, "coding", "failed", reworkPrompt, filepath.Base(notePath), "Rework agent produced no repository changes.", []string{promptPath, notePath}, turn.Process)
-				return errors.New("rework agent produced no repository changes")
-			}
-			if _, err := runCommand(repoWorkspace, "git", "add", "-A"); err != nil {
-				return fmt.Errorf("stage rework changes: %w", err)
-			}
-			if _, err := runCommand(repoWorkspace, "git", "commit", "-m", fmt.Sprintf("Omega rework for %s round %d", text(item, "key"), cycle)); err != nil {
-				return fmt.Errorf("commit rework changes: %w", err)
-			}
-			commitSha, _ = runCommand(repoWorkspace, "git", "rev-parse", "HEAD")
-			commitSummary, _ = runCommand(repoWorkspace, "git", "show", "--stat", "--oneline", "--no-renames", "HEAD")
-			diffText, _ = runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
-			changedNames, err = runCommand(repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
-			if err != nil {
-				return fmt.Errorf("list rework changed files: %w", err)
-			}
-			changedFiles = uniqueStrings(append(changedFiles, compactLines(changedNames)...))
-			if err := os.WriteFile(filepath.Join(proofDir, fmt.Sprintf("git-diff-rework-%d.patch", cycle)), []byte(diffText), 0o644); err != nil {
-				return err
-			}
-			reworkSummaryPath := filepath.Join(proofDir, fmt.Sprintf("rework-summary-%d.md", cycle))
-			reworkSummary := fmt.Sprintf("# Rework Round %d\n\n- Branch: `%s`\n- Commit: `%s`\n- Changed files:\n%s\n```text\n%s\n```\n", cycle, branchName, strings.TrimSpace(commitSha), markdownFileList(compactLines(changedNames)), truncateForProof(commitSummary, 4000))
-			if err := os.WriteFile(reworkSummaryPath, []byte(reworkSummary), 0o644); err != nil {
-				return err
-			}
-			recordAgent(stageID, "coding", "passed", reworkPrompt, filepath.Base(reworkSummaryPath), fmt.Sprintf("Rework agent produced %d changed file(s).", len(compactLines(changedNames))), []string{promptPath, notePath, reworkSummaryPath, filepath.Join(proofDir, fmt.Sprintf("git-diff-rework-%d.patch", cycle))}, turn.Process)
-			return nil
-		}
-		validateRework := func() error {
-			testOutput, testErr = runRepositoryValidation(repoWorkspace)
-			testStatus := "passed"
-			if testErr != nil {
-				testStatus = "failed"
-			}
-			testReportPath := filepath.Join(proofDir, fmt.Sprintf("test-report-rework-%d.md", cycle))
-			testVariables := cloneStringMap(promptVariables)
-			testVariables["changedFiles"] = strings.Join(changedFiles, ", ")
-			testVariables["testOutput"] = testOutput
-			testFallback := fmt.Sprintf("Validate %s after rework round %d. Changed files: %s", text(item, "key"), cycle, strings.Join(changedFiles, ", "))
-			testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, testFallback)
-			testReport := fmt.Sprintf("# Rework Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after rework round %d.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), cycle, stringOr(testFailureSummary(testErr, testOutput), "None"))
-			if err := os.WriteFile(testReportPath, []byte(testReport), 0o644); err != nil {
-				return err
-			}
-			recordAgent(stageID, "testing", testStatus, testPrompt, filepath.Base(testReportPath), "Repository validation completed after rework.", []string{testReportPath}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput})
-			if testErr != nil {
-				return fmt.Errorf("repository validation failed after rework: %w", testErr)
-			}
-			return nil
-		}
-		updatePullRequest := func() error {
-			if err := pushDevFlowBranch(repoWorkspace, branchName); err != nil {
-				return fmt.Errorf("push rework branch: %w", err)
-			}
-			reworkPRBody := buildDevFlowPullRequestBody(item, changedFiles, testOutput, stringOr(feedback, humanChangeRequest), diffText)
-			if output, err := updateDevFlowPullRequestDescriptionIfChanged(repoWorkspace, prURL, prTitle, reworkPRBody); err != nil {
-				server.logDebug(ctx, "github.pr.description_update_skipped", "Pull request description update skipped after rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output+"\n"+err.Error(), 1200)})
-			} else {
-				server.logInfo(ctx, "github.pr.description_updated", "Pull request description updated after rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output, 1200)})
-			}
-			prDiff, _ = runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
-			checksOutput, _ = runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
-			remoteChecks, remoteChecksRaw = githubPullRequestChecks(ctx, repoWorkspace, prURL, repoSlug)
-			if strings.TrimSpace(remoteChecksRaw) != "" {
-				checksOutput = remoteChecksRaw
-			}
-			remoteCheckSummary = githubCheckSummaryWithRequired(remoteChecks, template.Runtime.RequiredChecks)
-			pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
-			checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, remoteChecks)
-			return nil
-		}
-		return runDevFlowContractState(template, stageID, []devFlowContractActionStep{
-			{ID: "build_rework_checklist", Type: "build_rework_checklist", Agent: "master", Run: buildReworkChecklist},
-			{ID: "apply_rework", Type: "run_agent", Agent: "coding", Run: applyRework},
-			{ID: "validate_rework", Type: "run_validation", Agent: "testing", Run: validateRework},
-			{ID: "update_pull_request", Type: "ensure_pr", Agent: "delivery", Run: updatePullRequest},
+		handler := newDevFlowReworkActionHandler(devFlowReworkActionHandler{
+			server:                  server,
+			ctx:                     ctx,
+			template:                template,
+			profile:                 profile,
+			codingProfile:           codingProfile,
+			codingRunner:            codingRunner,
+			codingRunnerID:          codingRunnerID,
+			runnerHeartbeatInterval: runnerHeartbeatInterval,
+			pipeline:                pipeline,
+			item:                    item,
+			currentAttempt:          currentAttempt,
+			proofDir:                proofDir,
+			repoWorkspace:           repoWorkspace,
+			repoSlug:                repoSlug,
+			branchName:              branchName,
+			prURL:                   prURL,
+			prTitle:                 prTitle,
+			effectiveDescription:    effectiveDescription,
+			attemptID:               attemptID,
+			humanChangeRequest:      humanChangeRequest,
+			promptVariables:         promptVariables,
+			stageID:                 stageID,
+			fromStageID:             fromStageID,
+			cycle:                   cycle,
+			feedback:                feedback,
+			recordAgent:             recordAgent,
+			commitSha:               &commitSha,
+			commitSummary:           &commitSummary,
+			diffText:                &diffText,
+			changedNames:            &changedNames,
+			changedFiles:            &changedFiles,
+			testOutput:              &testOutput,
+			testErr:                 &testErr,
+			prDiff:                  &prDiff,
+			checksOutput:            &checksOutput,
+			remoteChecks:            &remoteChecks,
+			remoteChecksRaw:         &remoteChecksRaw,
+			remoteCheckSummary:      &remoteCheckSummary,
+			pullRequestFeedback:     &pullRequestFeedback,
+			checkLogFeedback:        &checkLogFeedback,
 		})
+		return runDevFlowContractState(template, stageID, handler.contractSteps())
 	}
 	remoteReworkCycle := 0
 	for {

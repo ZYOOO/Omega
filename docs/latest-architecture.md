@@ -35,6 +35,7 @@ flowchart TD
 ## 前端与桌面层
 
 - `apps/web` 是 React SPA，负责 Workboard、Work Item 详情、Workspace 设置、Page Pilot 入口、Observability 和 Runner/Profile 配置。
+- 前端不再作为业务状态写入者。创建 / 删除 / 运行 Work Item、状态 / 优先级修改和 Agent Profile 保存必须走 Go local runtime；浏览器只保留 theme、折叠状态、Page Pilot preview URL 等 UI 偏好。
 - Electron Desktop 直接承载同一 Web UI，并负责启动或连接：
   - Go local runtime
   - Web Vite dev server 或生产静态资源
@@ -51,12 +52,14 @@ Go runtime 是本地控制面和执行面，主要职责：
 - 调用 Agent runner，记录 heartbeat、stdout/stderr、exit code、runner telemetry。
 - 执行 git / gh / checks / merge / PR description 更新。
 - 生成 Run Workpad、review packet、run report、handoff bundle。
+- HTTP 路由入口位于 `server_routes.go`；`server.go` 保留核心 handler 和兼容逻辑，后续 API 域继续拆分。
 
 ## 数据存储
 
 当前采用本地 SQLite 为主，兼容旧 JSON snapshot：
 
 - 一等表：Agent Profile、Repository Target、Runtime Log、Checkpoint、Attempt 等核心记录已逐步 SQLite 化。
+- `omega_migrations` 已由 metadata 记录升级为可执行增量迁移：每个版本拥有 `Up` 步骤，启动时只执行未应用版本，成功后才记录。
 - Pipeline run 中保存 workflow snapshot，避免后续模板变化影响正在执行的 Attempt。
 - Run Workpad 聚合 Plan、Acceptance Criteria、Validation、Notes、Blockers、PR、Review Feedback、Retry Reason，详情页优先消费它。
 
@@ -120,7 +123,8 @@ services/local-runtime/workflows/devflow-pr.md
 
 保留边界：
 
-- 部分 handler 代码仍在 `devflow_cycle.go` / `server.go` 中，下一步会拆成独立 handler 文件。
+- Rework 与审批后 Delivery handler 已拆到 `devflow_rework_actions.go` / `devflow_delivery_actions.go`；`devflow_cycle.go` / `server.go` 只负责上下文组装、state runner 调用和最终状态持久化。
+- 首次 implementation 主链路的 coding / validation / ensure PR 执行体仍复用 DevFlow adapter 的可靠实现，后续可继续按同样模式拆为独立 handler。
 - Fast human-requested rework continuation 仍复用 DevFlow adapter 的上下文组装，但执行语义已和 Rework / Review contract 对齐。
 
 ## Agent Runner
@@ -204,4 +208,3 @@ go test ./services/local-runtime/internal/omegalocal
 ```bash
 go test ./services/local-runtime/internal/omegalocal
 ```
-

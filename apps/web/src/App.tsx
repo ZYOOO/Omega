@@ -3,19 +3,14 @@ import {
   buildAuthorizeUrl,
   connectionProviders,
   createActivityFeed,
-  createMissionFromRun,
   createSampleRun,
   createManualWorkItem,
   createWorkboardView,
-  applyMissionControlEvents,
   groupWorkItemsByStatus,
   grantProviderConnection,
   loadWorkspaceSession,
   revokeProviderConnection,
-  saveWorkspaceSession,
-  titleFromMarkdownDescription,
-  updateWorkItemPriority,
-  updateWorkItemStatus
+  titleFromMarkdownDescription
 } from "./core";
 import { runOperationViaMissionControlApi } from "./missionControlApiClient";
 import type { MissionControlRunnerPreset } from "./missionControlApiClient";
@@ -30,6 +25,7 @@ import { RequirementComposer } from "./components/RequirementComposer";
 import { WorkspaceChrome, type PrimaryNav, type UiTheme } from "./components/WorkspaceChrome";
 import { WorkspaceAgentStudio } from "./components/WorkspaceAgentStudio";
 import { WorkItemDetailPage } from "./components/WorkItemDetailPage";
+import { missionControlUnavailableMessage, requireMissionControlApi } from "./missionControlWrites";
 import { isWorkItemDetailHash, parseWorkItemDetailHash, workItemDetailHash } from "./workItemRoutes";
 import {
   applyPagePilotInstruction,
@@ -41,6 +37,7 @@ import {
   fetchAttemptActionPlan,
   fetchAttemptTimeline,
   fetchExecutionLocks,
+  fetchFeishuConfig,
   fetchCheckpoints,
   fetchAgentDefinitions,
   fetchGitHubOAuthConfig,
@@ -63,16 +60,21 @@ import {
   fetchRunWorkpads,
   fetchRuntimeLogs,
   fetchRunnerCredentials,
+  importProjectAgentProfileTemplate,
   patchRunWorkpad,
   releaseExecutionLock,
   requestCheckpointChanges,
   retryAttempt,
   runCurrentPipelineStage,
   runDevFlowCycle,
+  searchFeishuUsers,
   sendFeishuNotification,
   startGitHubCliLogin,
   startPipeline,
   startGitHubOAuth,
+  testAgentRunner,
+  testFeishuConfig,
+  updateFeishuConfig,
   updateGitHubOAuthConfig,
   updateLocalWorkspaceRoot,
   updateLlmProviderSelection,
@@ -80,11 +82,15 @@ import {
   updateProjectAgentProfile,
   updateRunnerCredential,
   type AgentDefinitionInfo,
+  type AgentProfileDraftInfo,
+  type AgentRunnerPreflightResult,
   type AttemptActionPlanInfo,
   type AttemptRecordInfo,
   type AttemptTimelineInfo,
   type CheckpointRecordInfo,
   type ExecutionLockInfo,
+  type FeishuConfigInfo,
+  type FeishuUserCandidate,
   type GitHubOAuthConfigInfo,
   type GitHubPullRequestStatusResult,
   type GitHubStatusInfo,
@@ -386,6 +392,23 @@ const defaultGitHubOAuthConfig: GitHubOAuthConfigInfo = {
   tokenUrl: "https://github.com/login/oauth/access_token",
   secretConfigured: false,
   source: "empty"
+};
+
+const defaultFeishuConfig: FeishuConfigInfo = {
+  mode: "chat",
+  chatId: "",
+  assigneeId: "",
+  assigneeLabel: "",
+  tasklistId: "",
+  followerId: "",
+  due: "",
+  webhookUrl: "",
+  webhookSecretConfigured: false,
+  reviewTokenConfigured: false,
+  createDoc: false,
+  docFolderToken: "",
+  taskBridgeEnabled: false,
+  larkCliAvailable: false
 };
 
 const visibleConnectionProviders = connectionProviders.filter((provider) =>
@@ -814,6 +837,17 @@ function App() {
   const [providerFeedback, setProviderFeedback] = useState("");
   const [githubDeviceLoginUrl, setGitHubDeviceLoginUrl] = useState("");
   const [githubStatus, setGitHubStatus] = useState<GitHubStatusInfo | null>(null);
+  const [feishuConfig, setFeishuConfig] = useState<FeishuConfigInfo>(defaultFeishuConfig);
+  const [feishuConfigDraft, setFeishuConfigDraft] = useState(defaultFeishuConfig);
+  const [feishuWebhookSecretDraft, setFeishuWebhookSecretDraft] = useState("");
+  const [feishuReviewTokenDraft, setFeishuReviewTokenDraft] = useState("");
+  const [feishuWebhookSecretVisible, setFeishuWebhookSecretVisible] = useState(false);
+  const [feishuReviewTokenVisible, setFeishuReviewTokenVisible] = useState(false);
+  const [testingFeishuConfig, setTestingFeishuConfig] = useState(false);
+  const [feishuReviewerQuery, setFeishuReviewerQuery] = useState("");
+  const [feishuReviewerCandidates, setFeishuReviewerCandidates] = useState<FeishuUserCandidate[]>([]);
+  const [searchingFeishuReviewer, setSearchingFeishuReviewer] = useState(false);
+  const [feishuReviewerMessage, setFeishuReviewerMessage] = useState("");
   const [githubRepoOwner, setGitHubRepoOwner] = useState("");
   const [githubRepoName, setGitHubRepoName] = useState("");
   const [githubRepoInfo, setGitHubRepoInfo] = useState<GitHubRepositoryInfo | null>(null);
@@ -831,6 +865,8 @@ function App() {
   const [agentConfigTab, setAgentConfigTab] = useState<AgentConfigTab>("workflow");
   const [selectedAgentProfileId, setSelectedAgentProfileId] = useState(defaultAgentProfiles[0].id);
   const [runtimeConfigTab, setRuntimeConfigTab] = useState<RuntimeConfigTab>("omega");
+  const [agentPreflightResults, setAgentPreflightResults] = useState<Record<string, AgentRunnerPreflightResult>>({});
+  const [testingAgentProfileId, setTestingAgentProfileId] = useState("");
   const [workspaceFolderPickerMessage, setWorkspaceFolderPickerMessage] = useState("");
   const [workspaceSectionOpen, setWorkspaceSectionOpen] = useState(true);
   const [connectionsSectionOpen, setConnectionsSectionOpen] = useState(true);
@@ -1017,32 +1053,31 @@ function App() {
       return;
     }
     let cancelled = false;
-    void fetchAttemptActionPlan(missionControlApiUrl, activeDetailAttempt.id)
-      .then((actionPlan) => {
-        if (!cancelled) {
-          setActiveAttemptActionPlan(actionPlan);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setActiveAttemptActionPlan(null);
-        }
-      });
-    void fetchAttemptTimeline(missionControlApiUrl, activeDetailAttempt.id)
-      .then((timeline) => {
-        if (!cancelled) {
-          setActiveAttemptTimeline(timeline);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setActiveAttemptTimeline(null);
-        }
-      });
+    const loadAttemptDetail = async () => {
+      const attemptId = activeDetailAttempt.id;
+      const [actionPlanResult, timelineResult] = await Promise.allSettled([
+        fetchAttemptActionPlan(missionControlApiUrl, attemptId),
+        fetchAttemptTimeline(missionControlApiUrl, attemptId)
+      ]);
+      if (!cancelled) {
+        setActiveAttemptActionPlan(actionPlanResult.status === "fulfilled" ? actionPlanResult.value : null);
+        setActiveAttemptTimeline(timelineResult.status === "fulfilled" ? timelineResult.value : null);
+      }
+    };
+    void loadAttemptDetail();
+    const shouldPollAttemptDetail = ["running", "waiting-human", "stalled", "failed"].includes(activeDetailAttempt.status);
+    const timer = shouldPollAttemptDetail
+      ? window.setInterval(() => {
+          void loadAttemptDetail();
+        }, 2500)
+      : null;
     return () => {
       cancelled = true;
+      if (timer) {
+        window.clearInterval(timer);
+      }
     };
-  }, [activeDetailAttempt?.id, missionControlApiUrl]);
+  }, [activeDetailAttempt?.id, activeDetailAttempt?.status, missionControlApiUrl]);
   useEffect(() => {
     if (!missionControlApiUrl || !activeDetailAttempt?.pullRequestUrl) {
       setActivePullRequestStatus(null);
@@ -1162,7 +1197,8 @@ function App() {
       nextCapabilities,
       nextWorkspaceRoot,
       nextGitHubOAuthConfig,
-      nextGitHubStatus
+      nextGitHubStatus,
+      nextFeishuConfig
     ] = await Promise.all([
       fetchObservability(missionControlApiUrl, { windowDays: observabilityWindowDays, groupBy: observabilityGroupBy, limit: 10 }),
       fetchLlmProviders(missionControlApiUrl),
@@ -1183,7 +1219,8 @@ function App() {
       fetchLocalCapabilities(missionControlApiUrl),
       fetchLocalWorkspaceRoot(missionControlApiUrl).catch(() => ({ workspaceRoot: "" })),
       fetchGitHubOAuthConfig(missionControlApiUrl).catch(() => defaultGitHubOAuthConfig),
-      fetchGitHubStatus(missionControlApiUrl).catch(() => null)
+      fetchGitHubStatus(missionControlApiUrl).catch(() => null),
+      fetchFeishuConfig(missionControlApiUrl).catch(() => defaultFeishuConfig)
     ]);
     setObservability(normalizeObservability(nextObservability));
     setLlmProviders(nextProviders);
@@ -1206,8 +1243,35 @@ function App() {
     setLocalWorkspaceRootDraft((currentDraft) => currentDraft || nextWorkspaceRoot.workspaceRoot);
     setGitHubOAuthConfig(nextGitHubOAuthConfig);
     setGitHubStatus(nextGitHubStatus);
+    setFeishuConfig(nextFeishuConfig);
+    setFeishuConfigDraft((currentDraft) => ({
+      ...nextFeishuConfig,
+      webhookSecretMasked: nextFeishuConfig.webhookSecretMasked,
+      reviewTokenMasked: nextFeishuConfig.reviewTokenMasked,
+      webhookSecretConfigured: nextFeishuConfig.webhookSecretConfigured,
+      reviewTokenConfigured: nextFeishuConfig.reviewTokenConfigured,
+      chatId: currentDraft.chatId || nextFeishuConfig.chatId,
+      assigneeId: currentDraft.assigneeId || nextFeishuConfig.assigneeId,
+      assigneeLabel: currentDraft.assigneeLabel || nextFeishuConfig.assigneeLabel,
+      tasklistId: currentDraft.tasklistId || nextFeishuConfig.tasklistId,
+      followerId: currentDraft.followerId || nextFeishuConfig.followerId,
+      due: currentDraft.due || nextFeishuConfig.due,
+      webhookUrl: currentDraft.webhookUrl || nextFeishuConfig.webhookUrl,
+      docFolderToken: currentDraft.docFolderToken || nextFeishuConfig.docFolderToken
+    }));
     if (nextGitHubStatus?.authenticated) {
       setConnections((current) => grantProviderConnection(current, "github", nextGitHubStatus.account ?? "gh-cli"));
+    }
+    if (
+      nextFeishuConfig.larkCliAvailable ||
+      nextFeishuConfig.chatId ||
+      nextFeishuConfig.assigneeId ||
+      nextFeishuConfig.tasklistId ||
+      nextFeishuConfig.webhookUrl
+    ) {
+      setConnections((current) =>
+        grantProviderConnection(current, "feishu", nextFeishuConfig.larkCliAvailable ? "lark-cli" : nextFeishuConfig.mode || "configured")
+      );
     }
     setGitHubOAuthDraft((currentDraft) => ({
       clientId: nextGitHubOAuthConfig.clientId || currentDraft.clientId,
@@ -1410,48 +1474,6 @@ function App() {
   }, [activeNav, missionControlApiUrl, observabilityGroupBy, observabilityWindowDays]);
 
   useEffect(() => {
-    if (!workspaceLoaded) return;
-
-    const session = {
-      projects,
-      requirements,
-      workItems,
-      missionState: { ...missionState, workItems },
-      connections,
-      activeNav: activeNav === "Settings" ? "Projects" : activeNav,
-      selectedProviderId,
-      selectedWorkItemId,
-      inspectorOpen,
-      activeInspectorPanel,
-      runnerPreset,
-      statusFilter,
-      assigneeFilter,
-      sortDirection,
-      collapsedGroups
-    };
-
-    saveWorkspaceSession(run, session);
-  }, [
-    activeInspectorPanel,
-    activeNav,
-    assigneeFilter,
-    collapsedGroups,
-    connections,
-    inspectorOpen,
-    missionState,
-    projects,
-    requirements,
-    runnerPreset,
-    run,
-    selectedProviderId,
-    selectedWorkItemId,
-    sortDirection,
-    statusFilter,
-    workspaceLoaded,
-    workItems
-  ]);
-
-  useEffect(() => {
     if (!missionControlApiUrl || activeNav !== "Settings") return;
     let cancelled = false;
     fetchProjectAgentProfile(missionControlApiUrl, {
@@ -1508,18 +1530,15 @@ function App() {
       creatingItemRef.current = true;
       setIsCreatingItem(true);
       setRunnerMessage("Creating requirement...");
-      if (missionControlApiUrl) {
-        const session = await createWorkItemViaApi(missionControlApiUrl, run, item);
-        setProjects(session.projects);
-        setRequirements(session.requirements);
-        setWorkItems(session.workItems);
-        setMissionState(session.missionState);
-        await refreshControlPlane().catch((error) => {
-          console.warn("Control plane refresh after work item create failed", error);
-        });
-      } else {
-        setWorkItems((current) => [...current, item]);
-      }
+      const apiUrl = requireMissionControlApi(missionControlApiUrl, "Creating a requirement");
+      const session = await createWorkItemViaApi(apiUrl, run, item);
+      setProjects(session.projects);
+      setRequirements(session.requirements);
+      setWorkItems(session.workItems);
+      setMissionState(session.missionState);
+      await refreshControlPlane().catch((error) => {
+        console.warn("Control plane refresh after work item create failed", error);
+      });
 
       setSelectedWorkItemId(item.id);
       setShowInlineCreate(false);
@@ -1552,26 +1571,6 @@ function App() {
     return (item.status === "Ready" || item.status === "Backlog") && !pipelinesByWorkItemId.has(item.id) && runningWorkItemId !== item.id;
   }
 
-  function applyDeletedWorkItemState(nextWorkItems: WorkItem[], deletedItem: WorkItem) {
-    const nextSelectedId = selectedWorkItemId === deletedItem.id ? nextWorkItems[0]?.id ?? "" : selectedWorkItemId;
-    const nextRequirementIds = new Set(nextWorkItems.map((item) => item.requirementId).filter(Boolean));
-    setWorkItems(nextWorkItems);
-    setRequirements((current) =>
-      deletedItem.requirementId && !nextRequirementIds.has(deletedItem.requirementId)
-        ? current.filter((requirement) => requirement.id !== deletedItem.requirementId)
-        : current
-    );
-    setMissionState((current) => ({
-      ...current,
-      workItems: current.workItems.filter((candidate) => candidate.id !== deletedItem.id)
-    }));
-    setSelectedWorkItemId(nextSelectedId);
-    if (activeWorkItemDetailId === deletedItem.id) {
-      setActiveWorkItemDetailId("");
-      window.history.replaceState(null, "", "#workboard");
-    }
-  }
-
   async function deleteWorkItem(item: WorkItem) {
     if (!canDeleteWorkItem(item)) {
       setRunnerMessage("Only not-started items without execution history can be deleted.");
@@ -1581,22 +1580,18 @@ function App() {
     if (!confirmed) return;
     try {
       setRunnerMessage(`Deleting ${item.key}...`);
-      if (missionControlApiUrl) {
-        const session = await deleteWorkItemViaApi(missionControlApiUrl, run, item.id);
-        setProjects(session.projects);
-        setRequirements(session.requirements);
-        setWorkItems(session.workItems);
-        setMissionState(session.missionState);
-        setConnections(session.connections);
-        setSelectedWorkItemId((current) => (current === item.id ? session.workItems[0]?.id ?? "" : current));
-        if (activeWorkItemDetailId === item.id) {
-          setActiveWorkItemDetailId("");
-          window.history.replaceState(null, "", "#workboard");
-        }
-        setRunnerMessage(`Deleted ${item.key}.`);
-        return;
+      const apiUrl = requireMissionControlApi(missionControlApiUrl, "Deleting a work item");
+      const session = await deleteWorkItemViaApi(apiUrl, run, item.id);
+      setProjects(session.projects);
+      setRequirements(session.requirements);
+      setWorkItems(session.workItems);
+      setMissionState(session.missionState);
+      setConnections(session.connections);
+      setSelectedWorkItemId((current) => (current === item.id ? session.workItems[0]?.id ?? "" : current));
+      if (activeWorkItemDetailId === item.id) {
+        setActiveWorkItemDetailId("");
+        window.history.replaceState(null, "", "#workboard");
       }
-      applyDeletedWorkItemState(workItems.filter((candidate) => candidate.id !== item.id), item);
       setRunnerMessage(`Deleted ${item.key}.`);
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "Delete work item failed.");
@@ -1624,15 +1619,13 @@ function App() {
     setActiveInspectorPanel("properties");
     setInspectorOpen(false);
     if (!missionControlApiUrl) {
-      setWorkItems((current) => updateWorkItemStatus(current, item.id, "In Review"));
-      setRunnerMessage("Mission Control API is not configured; using UI-only demo state.");
+      setRunnerMessage(missionControlUnavailableMessage("Running a work item"));
       return;
     }
 
     const hasCodeTarget = Boolean(item.repositoryTargetId || (item.target && item.target !== "No target"));
     if (hasCodeTarget && item.repositoryTargetId) {
       setRunningWorkItemId(item.id);
-      setWorkItems((current) => updateWorkItemStatus(current, item.id, "Planning"));
       setRunnerMessage(`Planning pipeline and assigning agents for ${item.key}...`);
       try {
         const planningSession = await patchWorkItemViaApi(missionControlApiUrl, run, item.id, { status: "Planning" });
@@ -1682,7 +1675,6 @@ function App() {
     const runner: MissionControlRunnerPreset =
       runnerPreset === "local-proof" && hasCodeTarget ? "demo-code" : runnerPreset;
     setRunningWorkItemId(item.id);
-    setWorkItems((current) => updateWorkItemStatus(current, item.id, "Planning"));
     setRunnerMessage(`Preparing ${item.key} for ${runner}...`);
     try {
       const planningSession = await patchWorkItemViaApi(missionControlApiUrl, run, item.id, { status: "Planning" });
@@ -1690,9 +1682,7 @@ function App() {
       setRequirements(planningSession.requirements);
       setMissionState(planningSession.missionState);
       setWorkItems(planningSession.workItems);
-      const mission = missionControlApiUrl
-        ? await fetchMissionFromWorkItem(missionControlApiUrl, item)
-        : createMissionFromRun(run, item);
+      const mission = await fetchMissionFromWorkItem(missionControlApiUrl, item);
       const runningSession = await patchWorkItemViaApi(missionControlApiUrl, run, item.id, { status: "In Review" });
       setProjects(runningSession.projects);
       setRequirements(runningSession.requirements);
@@ -1706,16 +1696,11 @@ function App() {
         runner
       );
       const session = await fetchWorkspaceSession(missionControlApiUrl, run);
-      if (session) {
-        setProjects(session.projects);
-        setRequirements(session.requirements);
-        setMissionState(session.missionState);
-        setWorkItems(session.workItems);
-      } else {
-        const nextState = applyMissionControlEvents(missionState, response.events);
-        setMissionState(nextState);
-        setWorkItems(nextState.workItems);
-      }
+      if (!session) throw new Error("Mission Control did not return a workspace session after operation.");
+      setProjects(session.projects);
+      setRequirements(session.requirements);
+      setMissionState(session.missionState);
+      setWorkItems(session.workItems);
       if (response.status === "passed") {
         const changed = response.changedFiles?.length ? ` Changed: ${response.changedFiles.join(", ")}.` : "";
         const branch = response.branchName ? ` Branch: ${response.branchName}.` : "";
@@ -1795,6 +1780,10 @@ function App() {
         state: run.id
       });
       navigateToExternalUrl(authorizeUrl);
+      return;
+    }
+    if (provider.id === "feishu") {
+      setProviderFeedback("Fill Feishu binding details, then save and test the connection.");
       return;
     }
     setConnections((current) => grantProviderConnection(current, provider.id));
@@ -2153,7 +2142,7 @@ function App() {
 
   async function notifyFeishu() {
     if (!missionControlApiUrl) return;
-    const chatId = feishuChatId.trim();
+    const chatId = feishuChatId.trim() || feishuConfig.chatId.trim();
     if (!chatId) return;
     const text = pendingCheckpoint
       ? `Omega checkpoint waiting: ${pendingCheckpoint.title}. ${pendingCheckpoint.summary}`
@@ -2163,6 +2152,136 @@ function App() {
       setRunnerMessage(`Feishu notification ${result.status}${result.messageId ? `: ${result.messageId}` : ""}.`);
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "Feishu notification failed.");
+    }
+  }
+
+  async function saveFeishuAccessConfig() {
+    if (!missionControlApiUrl) {
+      setProviderFeedback("Feishu binding requires the local runtime.");
+      return;
+    }
+    try {
+      const saved = await updateFeishuConfig(missionControlApiUrl, {
+        mode: feishuConfigDraft.mode || "chat",
+        chatId: feishuConfigDraft.chatId,
+        assigneeId: feishuConfigDraft.assigneeId,
+        assigneeLabel: feishuConfigDraft.assigneeLabel,
+        tasklistId: feishuConfigDraft.tasklistId,
+        followerId: feishuConfigDraft.followerId,
+        due: feishuConfigDraft.due,
+        webhookUrl: feishuConfigDraft.webhookUrl,
+        webhookSecret: feishuWebhookSecretDraft,
+        reviewToken: feishuReviewTokenDraft,
+        createDoc: feishuConfigDraft.createDoc,
+        docFolderToken: feishuConfigDraft.docFolderToken,
+        taskBridgeEnabled: feishuConfigDraft.taskBridgeEnabled
+      });
+      setFeishuConfig(saved);
+      setFeishuConfigDraft(saved);
+      setFeishuWebhookSecretDraft("");
+      setFeishuReviewTokenDraft("");
+      setFeishuWebhookSecretVisible(false);
+      setFeishuReviewTokenVisible(false);
+      setConnections((current) => grantProviderConnection(current, "feishu", saved.mode || "configured"));
+      setProviderFeedback("Feishu review channel saved. Human Review can now use this binding.");
+    } catch (error) {
+      setProviderFeedback(error instanceof Error ? error.message : "Feishu config save failed.");
+    }
+  }
+
+  async function runFeishuAccessTest() {
+    if (!missionControlApiUrl) return;
+    setTestingFeishuConfig(true);
+    try {
+      const result = await testFeishuConfig(missionControlApiUrl);
+      setProviderFeedback(
+        result.status === "ready"
+          ? result.message ?? "Feishu binding is ready."
+          : result.message ?? "Feishu binding needs attention."
+      );
+    } catch (error) {
+      setProviderFeedback(error instanceof Error ? error.message : "Feishu preflight failed.");
+    } finally {
+      setTestingFeishuConfig(false);
+    }
+  }
+
+  async function searchFeishuReviewerWithQuery(query: string) {
+    if (!missionControlApiUrl) {
+      setProviderFeedback("Feishu reviewer lookup requires the local runtime.");
+      return;
+    }
+    const reviewerQuery = query.trim();
+    if (!reviewerQuery) {
+      setFeishuReviewerMessage("Enter a name, enterprise email, or mobile number.");
+      return;
+    }
+    setSearchingFeishuReviewer(true);
+    setFeishuReviewerMessage("");
+    setFeishuReviewerCandidates([]);
+    try {
+      const result = await searchFeishuUsers(missionControlApiUrl, reviewerQuery);
+      setFeishuReviewerCandidates(result.users ?? []);
+      setFeishuReviewerMessage(
+        result.users?.length
+          ? result.message ?? "Select a reviewer from the results."
+          : "No matching Feishu reviewer found."
+      );
+    } catch (error) {
+      setFeishuReviewerMessage(error instanceof Error ? error.message : "Feishu reviewer lookup failed.");
+    } finally {
+      setSearchingFeishuReviewer(false);
+    }
+  }
+
+  function searchFeishuReviewer() {
+    void searchFeishuReviewerWithQuery(feishuReviewerQuery);
+  }
+
+  function useCurrentFeishuReviewer() {
+    setFeishuReviewerQuery("me");
+    void searchFeishuReviewerWithQuery("me");
+  }
+
+  function selectFeishuReviewer(candidate: FeishuUserCandidate) {
+    const assigneeId = candidate.openId || candidate.userId || candidate.unionId || "";
+    const label = candidate.name || candidate.email || candidate.mobile || assigneeId;
+    if (!assigneeId) {
+      setFeishuReviewerMessage("This result does not include a usable Feishu user id.");
+      return;
+    }
+    setFeishuConfigDraft((current) => ({
+      ...current,
+      mode: "task",
+      assigneeId,
+      assigneeLabel: label
+    }));
+    setFeishuReviewerMessage(`Selected reviewer: ${label}. Save the Feishu binding to use it.`);
+  }
+
+  async function runAgentProfilePreflight(profile: AgentProfileDraftInfo) {
+    if (!missionControlApiUrl) {
+      setAgentConfigSavedMessage("Agent preflight requires the local runtime.");
+      return;
+    }
+    setTestingAgentProfileId(profile.id);
+    try {
+      const result = await testAgentRunner(missionControlApiUrl, {
+        agentId: profile.id,
+        label: profile.label,
+        runner: profile.runner,
+        model: profile.model
+      });
+      setAgentPreflightResults((current) => ({ ...current, [profile.id]: result }));
+      setAgentConfigSavedMessage(
+        result.status === "ready"
+          ? `${profile.label} runner is ready.`
+          : `${profile.label} runner needs attention: ${result.message ?? "preflight failed."}`
+      );
+    } catch (error) {
+      setAgentConfigSavedMessage(error instanceof Error ? error.message : "Agent preflight failed.");
+    } finally {
+      setTestingAgentProfileId("");
     }
   }
 
@@ -2330,9 +2449,8 @@ function App() {
       repositoryTargetId: activeRepositoryWorkspace?.id || agentConfigDraft.repositoryTargetId || undefined,
       agentProfiles: agentConfigDraft.agentProfiles
     };
-    window.localStorage.setItem(agentConfigurationStorageKey, JSON.stringify(profileToSave));
     if (!missionControlApiUrl) {
-      setAgentConfigSavedMessage("Saved as local project draft.");
+      setAgentConfigSavedMessage(missionControlUnavailableMessage("Saving the agent profile"));
       return;
     }
     try {
@@ -2341,6 +2459,27 @@ function App() {
       setAgentConfigSavedMessage("Saved to local runtime. New pipeline runs will use this profile.");
     } catch (error) {
       setAgentConfigSavedMessage(error instanceof Error ? error.message : "Agent profile save failed.");
+    }
+  }
+
+  async function importWorkspaceAgentTemplate(source: "fixtures" | "repository") {
+    if (!missionControlApiUrl) {
+      setAgentConfigSavedMessage(missionControlUnavailableMessage("Importing the agent template"));
+      return;
+    }
+    try {
+      const result = await importProjectAgentProfileTemplate(missionControlApiUrl, {
+        projectId: primaryProject?.id ?? agentConfigDraft.projectId ?? "project_omega",
+        repositoryTargetId: activeRepositoryWorkspace?.id || agentConfigDraft.repositoryTargetId || undefined,
+        source
+      });
+      setAgentConfigDraft(normalizeAgentConfigurationDraft(result.profile));
+      setAgentConfigOpen(true);
+      setAgentConfigSavedMessage(
+        `Imported ${result.summary.files?.length ?? 0} template file(s) from ${source === "repository" ? "repository .omega" : "built-in fixtures"}.`
+      );
+    } catch (error) {
+      setAgentConfigSavedMessage(error instanceof Error ? error.message : "Agent template import failed.");
     }
   }
 
@@ -3107,6 +3246,8 @@ function App() {
               agentConfigSavedMessage={agentConfigSavedMessage}
               agentConfigTab={agentConfigTab}
               agentRunnerOptions={agentRunnerOptions}
+              agentPreflightResults={agentPreflightResults}
+              testingAgentProfileId={testingAgentProfileId}
               localCapabilities={localCapabilities}
               pipelineTemplates={pipelineTemplates}
               primaryProjectName={primaryProject?.name ?? "Omega"}
@@ -3116,6 +3257,8 @@ function App() {
               onSave={saveAgentConfigurationDraft}
               onSelectAgentProfile={setSelectedAgentProfileId}
               onSaveRunnerCredential={saveRunnerAccountCredential}
+              onImportTemplate={importWorkspaceAgentTemplate}
+              onTestAgentProfile={runAgentProfilePreflight}
               onSetAgentConfigOpen={setAgentConfigOpen}
               onSetAgentConfigTab={setAgentConfigTab}
               onSetRuntimeConfigTab={setRuntimeConfigTab}
@@ -3530,7 +3673,7 @@ function App() {
                   onChange={async (event) => {
                     const nextStatus = event.currentTarget.value as WorkItemStatus;
                     if (!missionControlApiUrl) {
-                      setWorkItems((current) => updateWorkItemStatus(current, selectedWorkItem.id, nextStatus));
+                      setRunnerMessage(missionControlUnavailableMessage("Updating work item status"));
                       return;
                     }
                     try {
@@ -3558,7 +3701,7 @@ function App() {
                   onChange={async (event) => {
                     const nextPriority = event.currentTarget.value as WorkItemPriority;
                     if (!missionControlApiUrl) {
-                      setWorkItems((current) => updateWorkItemPriority(current, selectedWorkItem.id, nextPriority));
+                      setRunnerMessage(missionControlUnavailableMessage("Updating work item priority"));
                       return;
                     }
                     try {
@@ -3701,37 +3844,231 @@ function App() {
                       </details>
                     </>
                   ) : null}
-                  <div className="scope-list">
-                    {provider.scopes.map((scope) => (
-                      <span key={scope}>{scope}</span>
-                    ))}
-                  </div>
-                  <div className="permission-list">
-                    {provider.permissions.map((permission) => (
-                      <div key={permission.id}>
-                        <span>{permission.label}</span>
-                        <small>{permission.risk}</small>
+                  {provider.id === "feishu" ? (
+                    <div className="feishu-cli-panel">
+                      <div className={feishuConfig.larkCliAvailable ? "provider-tool-status ready" : "provider-tool-status missing"}>
+                        <strong>{feishuConfig.larkCliAvailable ? "lark-cli ready" : "lark-cli missing"}</strong>
+                        <span>{feishuConfig.larkCliVersion || "Run lark-cli config init first."}</span>
                       </div>
-                    ))}
-                  </div>
-                  <div className="provider-actions">
-                    <button
-                      disabled={oauthNeedsClientId(provider)}
-                      onClick={() => connectProvider(provider)}
-                    >
-                      {provider.id === "github"
-                        ? "Continue with GitHub"
-                        : provider.authMethod === "oauth"
-                        ? "Open OAuth"
-                        : "Connect"}
-                    </button>
-                    <button
-                      disabled={connections[provider.id].status !== "connected"}
-                      onClick={() => disconnectProvider(provider.id)}
-                    >
-                      Disconnect
-                    </button>
-                  </div>
+                      <button type="button" className="primary-action" disabled={testingFeishuConfig} onClick={runFeishuAccessTest}>
+                        {testingFeishuConfig ? "Testing..." : "Test Feishu connection"}
+                      </button>
+                      <div className="feishu-reviewer-lookup">
+                        <div>
+                          <span className="section-label">Reviewer</span>
+                          <strong>{feishuConfigDraft.assigneeLabel || feishuConfigDraft.assigneeId || "Not selected"}</strong>
+                          <small>Search by name after lark-cli user login, or by enterprise email/mobile with app contact permissions.</small>
+                        </div>
+                        <div className="feishu-reviewer-search">
+                          <input
+                            value={feishuReviewerQuery}
+                            onChange={(event) => setFeishuReviewerQuery(event.currentTarget.value)}
+                            placeholder="Name, email, or mobile"
+                            aria-label="Feishu reviewer search"
+                          />
+                          <button type="button" disabled={searchingFeishuReviewer} onClick={searchFeishuReviewer}>
+                            {searchingFeishuReviewer ? "Searching..." : "Search"}
+                          </button>
+                          <button type="button" disabled={searchingFeishuReviewer} onClick={useCurrentFeishuReviewer}>
+                            Use current user
+                          </button>
+                        </div>
+                        {feishuReviewerMessage ? <p className="provider-inline-message">{feishuReviewerMessage}</p> : null}
+                        {feishuReviewerCandidates.length ? (
+                          <div className="feishu-reviewer-results">
+                            {feishuReviewerCandidates.map((candidate) => {
+                              const candidateId = candidate.openId || candidate.userId || candidate.unionId || candidate.email || candidate.name || "candidate";
+                              const label = candidate.name || candidate.email || candidate.mobile || candidateId;
+                              const detail = [candidate.email, candidate.mobile, candidate.openId || candidate.userId].filter(Boolean).join(" · ");
+                              return (
+                                <button key={candidateId} type="button" onClick={() => selectFeishuReviewer(candidate)}>
+                                  <strong>{label}</strong>
+                                  {detail ? <small>{detail}</small> : null}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                        <button type="button" className="primary-action" onClick={saveFeishuAccessConfig}>
+                          Save Feishu binding
+                        </button>
+                      </div>
+                      <details className="provider-advanced feishu-routing-advanced">
+                        <summary>Advanced delivery overrides</summary>
+                        <div className="provider-config-grid feishu-binding-form">
+                          <label>
+                            <span>Review channel</span>
+                            <select
+                              value={feishuConfigDraft.mode}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, mode: event.currentTarget.value }))
+                              }
+                              aria-label="Feishu review channel"
+                            >
+                              <option value="chat">Chat message</option>
+                              <option value="task">Task review</option>
+                              <option value="webhook">Bot webhook</option>
+                            </select>
+                          </label>
+                          <label>
+                            <span>Chat ID</span>
+                            <input
+                              value={feishuConfigDraft.chatId}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, chatId: event.currentTarget.value }))
+                              }
+                              placeholder="oc_xxx or chat id"
+                            />
+                          </label>
+                          <label>
+                            <span>Task assignee</span>
+                            <input
+                              value={feishuConfigDraft.assigneeId}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, assigneeId: event.currentTarget.value }))
+                              }
+                              placeholder="open_id / user_id"
+                            />
+                          </label>
+                          <label>
+                            <span>Task assignee label</span>
+                            <input
+                              value={feishuConfigDraft.assigneeLabel ?? ""}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, assigneeLabel: event.currentTarget.value }))
+                              }
+                              placeholder="optional display name"
+                            />
+                          </label>
+                          <label>
+                            <span>Tasklist ID</span>
+                            <input
+                              value={feishuConfigDraft.tasklistId}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, tasklistId: event.currentTarget.value }))
+                              }
+                              placeholder="optional"
+                            />
+                          </label>
+                          <label>
+                            <span>Bot webhook URL</span>
+                            <input
+                              value={feishuConfigDraft.webhookUrl}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, webhookUrl: event.currentTarget.value }))
+                              }
+                              placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                            />
+                          </label>
+                          <label className="secret-input-field">
+                            <span>Webhook secret</span>
+                            <span className="secret-input-shell">
+                              <input
+                                type={feishuWebhookSecretVisible ? "text" : "password"}
+                                value={feishuWebhookSecretDraft}
+                                onChange={(event) => setFeishuWebhookSecretDraft(event.currentTarget.value)}
+                                placeholder={feishuConfig.webhookSecretConfigured ? feishuConfig.webhookSecretMasked ?? "********" : "optional"}
+                              />
+                              <button
+                                type="button"
+                                className="secret-toggle-button"
+                                aria-label={feishuWebhookSecretVisible ? "Hide webhook secret" : "Show webhook secret"}
+                                onClick={() => setFeishuWebhookSecretVisible((open) => !open)}
+                              >
+                                {feishuWebhookSecretVisible ? "hide" : "show"}
+                              </button>
+                            </span>
+                          </label>
+                          <label className="secret-input-field">
+                            <span>Review token</span>
+                            <span className="secret-input-shell">
+                              <input
+                                type={feishuReviewTokenVisible ? "text" : "password"}
+                                value={feishuReviewTokenDraft}
+                                onChange={(event) => setFeishuReviewTokenDraft(event.currentTarget.value)}
+                                placeholder={feishuConfig.reviewTokenConfigured ? feishuConfig.reviewTokenMasked ?? "********" : "optional callback token"}
+                              />
+                              <button
+                                type="button"
+                                className="secret-toggle-button"
+                                aria-label={feishuReviewTokenVisible ? "Hide review token" : "Show review token"}
+                                onClick={() => setFeishuReviewTokenVisible((open) => !open)}
+                              >
+                                {feishuReviewTokenVisible ? "hide" : "show"}
+                              </button>
+                            </span>
+                          </label>
+                          <label className="provider-check-field">
+                            <input
+                              type="checkbox"
+                              checked={feishuConfigDraft.createDoc}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, createDoc: event.currentTarget.checked }))
+                              }
+                            />
+                            <span>Create review doc for long packets</span>
+                          </label>
+                          <label className="provider-check-field">
+                            <input
+                              type="checkbox"
+                              checked={feishuConfigDraft.taskBridgeEnabled}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, taskBridgeEnabled: event.currentTarget.checked }))
+                              }
+                            />
+                            <span>Enable local task bridge sync</span>
+                          </label>
+                          <label>
+                            <span>Doc folder token</span>
+                            <input
+                              value={feishuConfigDraft.docFolderToken}
+                              onChange={(event) =>
+                                setFeishuConfigDraft((current) => ({ ...current, docFolderToken: event.currentTarget.value }))
+                              }
+                              placeholder="optional"
+                            />
+                          </label>
+                        </div>
+                      </details>
+                    </div>
+                  ) : null}
+                  {provider.id !== "feishu" ? (
+                    <>
+                      <div className="scope-list">
+                        {provider.scopes.map((scope) => (
+                          <span key={scope}>{scope}</span>
+                        ))}
+                      </div>
+                      <div className="permission-list">
+                        {provider.permissions.map((permission) => (
+                          <div key={permission.id}>
+                            <span>{permission.label}</span>
+                            <small>{permission.risk}</small>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  ) : null}
+                  {provider.id !== "feishu" ? (
+                    <div className="provider-actions">
+                      <button
+                        disabled={oauthNeedsClientId(provider)}
+                        onClick={() => connectProvider(provider)}
+                      >
+                        {provider.id === "github"
+                          ? "Continue with GitHub"
+                          : provider.authMethod === "oauth"
+                          ? "Open OAuth"
+                          : "Connect"}
+                      </button>
+                      <button
+                        disabled={connections[provider.id].status !== "connected"}
+                        onClick={() => disconnectProvider(provider.id)}
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
               ))}
           </details>

@@ -75,7 +75,7 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 	summary := server.reconcileAttemptIntegrityInDatabase(ctx, &database)
 	mergeSupervisorSummary(summary, server.scanWorkflowContracts(ctx, &database))
 	mergeSupervisorSummary(summary, server.scanRemoteAttemptSignals(ctx, &database, options))
-	if feishuReviewTaskBridgeEnabled() {
+	if server.feishuReviewTaskBridgeEnabled(ctx) {
 		if bridgeResult, _, err := server.tickFeishuReviewTaskBridge(ctx, "", options.Limit, false); err == nil {
 			summary["feishuReviewTaskBridge"] = bridgeResult
 		} else {
@@ -91,6 +91,14 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 	if intValue(summary["changed"]) > 0 {
 		if err := server.Repo.Save(ctx, database); err != nil {
 			return nil, err
+		}
+		for _, attempt := range database.Tables.Attempts {
+			if boolValue(attempt["feishuFailureNotifyPending"]) {
+				server.sendFeishuAttemptFailureIfConfigured(ctx, text(attempt, "pipelineId"), text(attempt, "id"))
+			}
+		}
+		for _, pipelineID := range uniqueStrings(stringSlice(summary["feishuReviewPipelines"])) {
+			server.sendFeishuReviewForPipelineIfConfigured(ctx, pipelineID)
 		}
 	}
 	for _, job := range jobs {
@@ -224,6 +232,9 @@ func (server *Server) scanWorkerHostLeases(ctx context.Context, database *Worksp
 		if server.hasRegisteredAttemptJob(text(attempt, "id")) {
 			continue
 		}
+		if server.refreshDatabaseWhenAttemptChanged(ctx, database, attempt) {
+			continue
+		}
 		item := findWorkItem(*database, text(attempt, "itemId"))
 		target := findRepositoryTarget(*database, text(attempt, "repositoryTargetId"))
 		if item != nil && target != nil {
@@ -234,6 +245,7 @@ func (server *Server) scanWorkerHostLeases(ctx context.Context, database *Worksp
 		nextAttempt := cloneMap(attempt)
 		nextAttempt["status"] = "stalled"
 		nextAttempt["statusReason"] = "No active local worker host lease for running attempt."
+		nextAttempt["feishuFailureNotifyPending"] = true
 		nextAttempt["stalledAt"] = nowISO()
 		nextAttempt["updatedAt"] = text(nextAttempt, "stalledAt")
 		events := arrayMaps(nextAttempt["events"])
@@ -458,15 +470,18 @@ func supervisorRetryPolicyForAttempt(database WorkspaceDatabase, attempt map[str
 
 func (server *Server) reconcileAttemptIntegrityInDatabase(ctx context.Context, database *WorkspaceDatabase) map[string]any {
 	summary := map[string]any{
-		"status":              "ok",
-		"changed":             0,
-		"linkedCheckpoints":   0,
-		"backfilledAttempts":  0,
-		"checkedCheckpoints":  0,
-		"pendingCheckpoints":  0,
-		"unresolvedGateLinks": 0,
-		"checkedAttempts":     0,
-		"stalledAttempts":     0,
+		"status":                   "ok",
+		"changed":                  0,
+		"linkedCheckpoints":        0,
+		"backfilledAttempts":       0,
+		"checkedCheckpoints":       0,
+		"pendingCheckpoints":       0,
+		"unresolvedGateLinks":      0,
+		"checkedAttempts":          0,
+		"stalledAttempts":          0,
+		"recoveredHumanGates":      0,
+		"recoveredProofHumanGates": 0,
+		"feishuReviewPipelines":    []any{},
 	}
 	if database == nil {
 		return summary
@@ -504,6 +519,11 @@ func (server *Server) reconcileAttemptIntegrityInDatabase(ctx context.Context, d
 			summary["unresolvedGateLinks"] = intValue(summary["unresolvedGateLinks"]) + 1
 			continue
 		}
+		if server.recoverOrphanedHumanReviewAttempt(ctx, database, pipelineIndex, attemptIndex, checkpoint) {
+			summary["recoveredHumanGates"] = intValue(summary["recoveredHumanGates"]) + 1
+			summary["feishuReviewPipelines"] = append(arrayValues(summary["feishuReviewPipelines"]), pipelineID)
+			summary["changed"] = intValue(summary["changed"]) + 1
+		}
 		nextAttemptID := text(database.Tables.Attempts[attemptIndex], "id")
 		if text(checkpoint, "attemptId") == nextAttemptID {
 			continue
@@ -515,7 +535,223 @@ func (server *Server) reconcileAttemptIntegrityInDatabase(ctx context.Context, d
 		summary["linkedCheckpoints"] = intValue(summary["linkedCheckpoints"]) + 1
 		summary["changed"] = intValue(summary["changed"]) + 1
 	}
+	proofRecovered, reviewPipelines := server.recoverProofBackedHumanReviewAttempts(ctx, database)
+	if proofRecovered > 0 {
+		summary["recoveredProofHumanGates"] = proofRecovered
+		summary["recoveredHumanGates"] = intValue(summary["recoveredHumanGates"]) + proofRecovered
+		summary["changed"] = intValue(summary["changed"]) + proofRecovered
+		for _, pipelineID := range reviewPipelines {
+			summary["feishuReviewPipelines"] = append(arrayValues(summary["feishuReviewPipelines"]), pipelineID)
+		}
+	}
 	return summary
+}
+
+func (server *Server) recoverOrphanedHumanReviewAttempt(ctx context.Context, database *WorkspaceDatabase, pipelineIndex int, attemptIndex int, checkpoint map[string]any) bool {
+	if database == nil || pipelineIndex < 0 || attemptIndex < 0 || text(checkpoint, "stageId") != "human_review" {
+		return false
+	}
+	attempt := database.Tables.Attempts[attemptIndex]
+	if text(attempt, "status") != "stalled" || !attemptHasWorkerOrphanMark(attempt) {
+		return false
+	}
+	nextAttempt := cloneMap(attempt)
+	nextAttempt["status"] = "waiting-human"
+	nextAttempt["currentStageId"] = "human_review"
+	nextAttempt["recoveredAt"] = nowISO()
+	nextAttempt["updatedAt"] = text(nextAttempt, "recoveredAt")
+	delete(nextAttempt, "statusReason")
+	delete(nextAttempt, "stalledAt")
+	delete(nextAttempt, "feishuFailureNotifyPending")
+	events := arrayMaps(nextAttempt["events"])
+	events = append(events, map[string]any{
+		"type":      "attempt.worker.orphaned.recovered",
+		"message":   "Pending Human Review checkpoint recovered from an orphaned worker mark.",
+		"stageId":   "human_review",
+		"createdAt": text(nextAttempt, "recoveredAt"),
+	})
+	nextAttempt["events"] = events
+	database.Tables.Attempts[attemptIndex] = nextAttempt
+
+	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
+	pipeline = markDevFlowStageProgress(pipeline, "human_review", "needs-human", "Waiting for explicit human approval.")
+	pipeline["status"] = "waiting-human"
+	run := mapValue(pipeline["run"])
+	appendRunEvent(run, "attempt.worker.orphaned.recovered", "Human Review checkpoint restored after stale supervisor state was detected.", "human_review", "job-supervisor")
+	pipeline["run"] = run
+	pipeline["updatedAt"] = nowISO()
+	database.Tables.Pipelines[pipelineIndex] = pipeline
+
+	if item := findWorkItem(*database, text(nextAttempt, "itemId")); item != nil {
+		*database = updateWorkItem(*database, text(item, "id"), map[string]any{"status": "In Review", "stageId": "human_review"})
+	}
+	server.logInfo(ctx, "job_supervisor.human_review.recovered", "Pending Human Review checkpoint recovered from stale worker orphan state.", map[string]any{
+		"attemptId":    text(nextAttempt, "id"),
+		"pipelineId":   text(nextAttempt, "pipelineId"),
+		"workItemId":   text(nextAttempt, "itemId"),
+		"checkpointId": text(checkpoint, "id"),
+	})
+	return true
+}
+
+func (server *Server) recoverProofBackedHumanReviewAttempts(ctx context.Context, database *WorkspaceDatabase) (int, []string) {
+	if database == nil {
+		return 0, nil
+	}
+	recovered := 0
+	reviewPipelines := []string{}
+	for attemptIndex, attempt := range database.Tables.Attempts {
+		if text(attempt, "status") != "stalled" || !attemptHasWorkerOrphanMark(attempt) {
+			continue
+		}
+		pipelineID := text(attempt, "pipelineId")
+		if pipelineHasPendingHumanReviewCheckpoint(*database, pipelineID) {
+			continue
+		}
+		pipelineIndex := findByID(database.Tables.Pipelines, pipelineID)
+		if pipelineIndex < 0 {
+			continue
+		}
+		proofDir := proofDirForSupervisorRecovery(*database, attempt)
+		if proofDir == "" || !fileExists(filepath.Join(proofDir, "human-review-request.md")) || !fileExists(filepath.Join(proofDir, "handoff-bundle.json")) {
+			continue
+		}
+		var handoff map[string]any
+		if raw, err := os.ReadFile(filepath.Join(proofDir, "handoff-bundle.json")); err == nil {
+			_ = json.Unmarshal(raw, &handoff)
+		}
+		if text(handoff, "pipelineId") != "" && text(handoff, "pipelineId") != pipelineID {
+			continue
+		}
+		var reviewPacket map[string]any
+		if raw, err := os.ReadFile(filepath.Join(proofDir, "attempt-review-packet.json")); err == nil {
+			_ = json.Unmarshal(raw, &reviewPacket)
+		}
+
+		pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
+		pipeline = markDevFlowStageProgress(pipeline, "code_review_round_2", "passed", "Review approved the diff against the requirement.")
+		pipeline = markDevFlowStageProgress(pipeline, "human_review", "needs-human", "Waiting for explicit human approval before delivery.")
+		run := mapValue(pipeline["run"])
+		appendRunEvent(run, "attempt.worker.orphaned.recovered", "Human Review proof was recovered after a stale worker orphan mark.", "human_review", "job-supervisor")
+		appendRunEvent(run, "checkpoint.requested", "Human review is required before delivery.", "human_review", "human")
+		pipeline["run"] = run
+		pipeline["status"] = "waiting-human"
+		pipeline["updatedAt"] = nowISO()
+		database.Tables.Pipelines[pipelineIndex] = pipeline
+
+		nextAttempt := cloneMap(attempt)
+		nextAttempt["status"] = "waiting-human"
+		nextAttempt["currentStageId"] = "human_review"
+		nextAttempt["workspacePath"] = firstNonEmpty(text(nextAttempt, "workspacePath"), strings.TrimSuffix(proofDir, string(filepath.Separator)+filepath.Join(".omega", "proof")), text(handoff, "workspacePath"))
+		nextAttempt["branchName"] = firstNonEmpty(text(nextAttempt, "branchName"), text(handoff, "branchName"), text(reviewPacket, "branchName"))
+		nextAttempt["pullRequestUrl"] = firstNonEmpty(text(nextAttempt, "pullRequestUrl"), text(handoff, "pullRequestUrl"), text(reviewPacket, "pullRequestUrl"))
+		if len(reviewPacket) > 0 {
+			nextAttempt["reviewPacket"] = reviewPacket
+		} else if packet := mapValue(handoff["reviewPacket"]); len(packet) > 0 {
+			nextAttempt["reviewPacket"] = packet
+		}
+		if proofFiles, err := collectFiles(proofDir); err == nil {
+			nextAttempt["proofFiles"] = proofFiles
+		}
+		nextAttempt["stages"] = attemptStageSnapshot(pipeline)
+		nextAttempt["recoveredAt"] = nowISO()
+		nextAttempt["lastSeenAt"] = text(nextAttempt, "recoveredAt")
+		nextAttempt["updatedAt"] = text(nextAttempt, "recoveredAt")
+		delete(nextAttempt, "statusReason")
+		delete(nextAttempt, "stalledAt")
+		delete(nextAttempt, "feishuFailureNotifyPending")
+		events := arrayMaps(nextAttempt["events"])
+		events = append(events, map[string]any{
+			"type":      "attempt.worker.orphaned.recovered",
+			"message":   "Human Review proof and handoff bundle recovered after stale worker orphan state.",
+			"stageId":   "human_review",
+			"createdAt": text(nextAttempt, "recoveredAt"),
+		})
+		nextAttempt["events"] = events
+		database.Tables.Attempts[attemptIndex] = nextAttempt
+
+		upsertPendingCheckpoint(database, pipeline)
+		if item := findWorkItem(*database, text(nextAttempt, "itemId")); item != nil {
+			*database = updateWorkItem(*database, text(item, "id"), map[string]any{"status": "In Review", "stageId": "human_review"})
+		}
+		upsertRunWorkpad(database, text(nextAttempt, "id"))
+		server.logInfo(ctx, "job_supervisor.human_review.proof_recovered", "Human Review checkpoint recovered from proof files after stale worker orphan state.", map[string]any{
+			"attemptId":  text(nextAttempt, "id"),
+			"pipelineId": pipelineID,
+			"workItemId": text(nextAttempt, "itemId"),
+			"proofDir":   proofDir,
+		})
+		recovered++
+		reviewPipelines = append(reviewPipelines, pipelineID)
+	}
+	return recovered, reviewPipelines
+}
+
+func attemptHasWorkerOrphanMark(attempt map[string]any) bool {
+	if strings.Contains(text(attempt, "statusReason"), "No active local worker host lease") {
+		return true
+	}
+	for _, event := range arrayMaps(attempt["events"]) {
+		if text(event, "type") == "attempt.worker.orphaned" {
+			return true
+		}
+		if strings.Contains(text(event, "message"), "No active local worker host lease") {
+			return true
+		}
+	}
+	return false
+}
+
+func pipelineHasPendingHumanReviewCheckpoint(database WorkspaceDatabase, pipelineID string) bool {
+	for _, checkpoint := range database.Tables.Checkpoints {
+		if text(checkpoint, "pipelineId") == pipelineID && text(checkpoint, "stageId") == "human_review" && text(checkpoint, "status") == "pending" {
+			return true
+		}
+	}
+	return false
+}
+
+func proofDirForSupervisorRecovery(database WorkspaceDatabase, attempt map[string]any) string {
+	if workspace := text(attempt, "workspacePath"); workspace != "" {
+		proofDir := filepath.Join(workspace, ".omega", "proof")
+		if fileExists(proofDir) {
+			return proofDir
+		}
+	}
+	pipelineID := text(attempt, "pipelineId")
+	for index := len(database.Tables.ProofRecords) - 1; index >= 0; index-- {
+		proof := database.Tables.ProofRecords[index]
+		if !strings.Contains(text(proof, "operationId"), pipelineID) {
+			continue
+		}
+		sourcePath := text(proof, "sourcePath")
+		if sourcePath == "" {
+			continue
+		}
+		proofDir := filepath.Dir(sourcePath)
+		if fileExists(filepath.Join(proofDir, "human-review-request.md")) {
+			return proofDir
+		}
+	}
+	for index := len(database.Tables.Attempts) - 1; index >= 0; index-- {
+		other := database.Tables.Attempts[index]
+		if text(other, "pipelineId") != pipelineID || text(other, "workspacePath") == "" {
+			continue
+		}
+		proofDir := filepath.Join(text(other, "workspacePath"), ".omega", "proof")
+		if fileExists(proofDir) {
+			return proofDir
+		}
+	}
+	return ""
+}
+
+func fileExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func (server *Server) scanRunnableWork(ctx context.Context, database *WorkspaceDatabase, options jobSupervisorTickOptions, jobs *[]map[string]any) map[string]any {
@@ -742,9 +978,13 @@ func (server *Server) markStalledAttempts(ctx context.Context, database *Workspa
 		if err != nil || now.Sub(lastSeen) <= threshold {
 			continue
 		}
+		if server.refreshDatabaseWhenAttemptChanged(ctx, database, attempt) {
+			continue
+		}
 		nextAttempt := cloneMap(attempt)
 		nextAttempt["status"] = "stalled"
 		nextAttempt["statusReason"] = fmt.Sprintf("No heartbeat for %d seconds.", int(now.Sub(lastSeen).Seconds()))
+		nextAttempt["feishuFailureNotifyPending"] = true
 		nextAttempt["stalledAt"] = nowISO()
 		nextAttempt["updatedAt"] = text(nextAttempt, "stalledAt")
 		events := arrayMaps(nextAttempt["events"])
@@ -768,6 +1008,26 @@ func (server *Server) markStalledAttempts(ctx context.Context, database *Workspa
 		})
 	}
 	return summary
+}
+
+func (server *Server) refreshDatabaseWhenAttemptChanged(ctx context.Context, database *WorkspaceDatabase, attempt map[string]any) bool {
+	if database == nil || text(attempt, "id") == "" {
+		return false
+	}
+	fresh, err := mustLoad(server, ctx)
+	if err != nil {
+		return false
+	}
+	index := findByID(fresh.Tables.Attempts, text(attempt, "id"))
+	if index < 0 {
+		return false
+	}
+	freshAttempt := fresh.Tables.Attempts[index]
+	if text(freshAttempt, "status") == text(attempt, "status") && text(freshAttempt, "updatedAt") == text(attempt, "updatedAt") {
+		return false
+	}
+	*database = fresh
+	return true
 }
 
 func (server *Server) markPipelineStalled(database *WorkspaceDatabase, attempt map[string]any) {

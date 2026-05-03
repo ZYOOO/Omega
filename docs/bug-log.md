@@ -2,6 +2,34 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-02: Work Item 详情页误把等待审核显示成返工/阻塞信号
+
+### 现象
+
+Work Item 进入 Human Review 后，详情页 Delivery flow 下方出现 `Feedback route: rework`，Run Workpad 中 `Rework checklist`、`Blockers`、`Retry reason` 等卡片也被染成黄色。用户看到后会误以为当前已经进入返工或失败重试，但实际状态只是等待人工审核。
+
+同一轮 Human Review 没有发送飞书消息，checkpoint 的 `feishuReview` 为空。
+
+### 原因
+
+- 前端只要发现 workflow contract 中存在 `rework` 阶段，就展示 `Feedback route`。这把“系统具备返工路线”误显示成“当前已经有反馈要返工”。
+- Run Workpad 会直接消费历史 `reworkChecklist` / `retryReason` / pending checkpoint，导致历史捕获或等待人工审核被当成当前阻塞。
+- 后端进入 Human Review 后，如果没有 chat、task、webhook 目标，会在自动发送前直接 `feishu.review.skipped`，没有把 `needs-configuration` 写回 checkpoint。`lark-cli` ready 只代表本机凭证可用，不代表已经知道要发给哪个群或任务负责人。
+
+### 修复
+
+- `Feedback route` 只在真实存在 request changes、rework assessment、retry available、failed/stalled/canceled attempt 时展示。
+- Run Workpad 不再把 pending Human Review checkpoint 当作 blocker；历史 rework checklist 只有在当前确实需要返工或重试时才展示为黄色。
+- 自动飞书审核发送取消静默跳过：缺少投递目标时会把 `needs-configuration` 结果写入 checkpoint，并记录 `feishu.review.needs_target`，方便页面和日志解释原因。
+- 修复 `Action plan` 摘要缺 CSS 导致文字挤在一起的问题。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestUsesLarkCLIInteractiveCard|TestFeishuConfigPreflightUsesLocalLarkCLIProfile'
+```
+
 ## 2026-04-30: Page Pilot 集成路径偏离已验证 direct pilot 体验
 
 ### 现象
@@ -1000,4 +1028,52 @@ npm run lint
 
 ```bash
 node --check apps/desktop/src/pilot-preload.cjs
+```
+
+## 2026-05-03: OMG-30 DevFlow 两次失败与 Human Review 状态漂移
+
+### 现象
+
+测试 Work Item `OMG-30` 时连续失败两次。第一次进入 failed，第二次已经创建 PR 并进入 Human Review 相关日志，但页面最后显示为 stalled / blocked。Work Item 详情页的 Delivery flow 也不会自动更新，需要手动刷新页面才能看到最新阶段。
+
+### 原因
+
+- 第一次失败是真实仓库校验失败：`git diff --check HEAD~1 HEAD` 检测到 `customer-health.html` 第 1177 行 trailing whitespace。
+- 第二次不是 Agent 业务失败，而是 JobSupervisor 在 DevFlow job 已经写入 `waiting-human` 后，用旧内存快照继续扫描 running attempt，并把它误判为 `No active local worker host lease for running attempt.`。
+- Work Item 详情页只跟随 Workboard 主轮询，`action-plan` / `timeline` 只在进入详情时加载一次；阶段变化后没有独立刷新。
+
+### 修复
+
+- JobSupervisor 在标记 stalled 前会重新读取数据库；如果 attempt 的状态或 `updatedAt` 已经被后台 job 更新，就刷新本地快照并跳过本轮 stale 写入。
+- Integrity scan 增加 Human Review checkpoint 自愈：如果 pending `human_review` checkpoint 存在，而 attempt 被 stale supervisor 标为 orphaned stalled，会恢复为 `waiting-human`，pipeline 恢复为 `waiting-human`，Work Item 恢复为 `In Review`。
+- Work Item 详情页对 active attempt 的 `action-plan` / `timeline` 增加 2.5 秒轮询，并改为 `Promise.allSettled`，避免 action plan 单接口失败时把 timeline 一起清空。
+- stalled / failed attempt 会标记 `feishuFailureNotifyPending`，保存后触发飞书失败通知。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+```
+
+## 2026-05-03: 飞书测试消息成功但 Human Review / 失败通知未自动发送
+
+### 现象
+
+设置页里的飞书测试消息可以成功发到当前用户，但 DevFlow 到 Human Review 或失败时没有自动给飞书发消息。
+
+### 原因
+
+测试消息走的是一次性 `lark-cli im +messages-send --as bot --user-id <current-user>`。而自动 Human Review 发送只消费已保存的 chat / task / webhook 配置；当前数据库配置为空，没有 chat id、assignee、tasklist 或 webhook，因此自动链路记录为 `needs-configuration`。
+
+### 修复
+
+- 自动 Human Review 发送在没有显式 chat/task/webhook 路由时，会通过 `lark-cli contact +get-user --as user` 读取当前登录用户的 `open_id`，再走 bot direct message fallback。
+- 失败通知复用同一 current-user fallback；如果没有显式路由但 `lark-cli` 已登录，仍能把 failed / stalled 信息发给当前用户。
+- `feishuReview` 写回中增加 `route=direct-user`、`fallback=current-user` 和 `userId`，便于从 checkpoint 里追踪实际投递路径。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget|TestFeishuAutoReviewFallsBackToCurrentLarkUser'
 ```

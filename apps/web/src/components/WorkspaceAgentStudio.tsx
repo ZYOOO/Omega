@@ -1,5 +1,11 @@
 import { useMemo, useState } from "react";
-import type { AgentProfileDraftInfo, LocalCapabilityInfo, PipelineTemplateInfo, RunnerCredentialInfo } from "../omegaControlApiClient";
+import type {
+  AgentProfileDraftInfo,
+  AgentRunnerPreflightResult,
+  LocalCapabilityInfo,
+  PipelineTemplateInfo,
+  RunnerCredentialInfo
+} from "../omegaControlApiClient";
 
 export type AgentConfigTab = "workflow" | "prompts" | "agents" | "runtime";
 export type RuntimeConfigTab = "omega" | "codex" | "opencode" | "claude" | "trae";
@@ -136,9 +142,12 @@ type WorkspaceAgentStudioProps = {
   pipelineTemplates: PipelineTemplateInfo[];
   primaryProjectName: string;
   runnerCredentials: RunnerCredentialInfo[];
+  agentPreflightResults: Record<string, AgentRunnerPreflightResult>;
+  testingAgentProfileId: string;
   runtimeConfigTab: RuntimeConfigTab;
   selectedAgentProfileId: string;
   onSave: () => void;
+  onImportTemplate: (source: "fixtures" | "repository") => void;
   onSelectAgentProfile: (profileId: string) => void;
   onSaveRunnerCredential: (input: {
     id?: string;
@@ -149,6 +158,7 @@ type WorkspaceAgentStudioProps = {
     baseUrl?: string;
     secret?: string;
   }) => void;
+  onTestAgentProfile: (profile: AgentProfileDraft) => void;
   onSetAgentConfigOpen: (open: boolean) => void;
   onSetAgentConfigTab: (tab: AgentConfigTab) => void;
   onSetRuntimeConfigTab: (tab: RuntimeConfigTab) => void;
@@ -339,11 +349,15 @@ export function WorkspaceAgentStudio({
   pipelineTemplates,
   primaryProjectName,
   runnerCredentials,
+  agentPreflightResults,
+  testingAgentProfileId,
   runtimeConfigTab,
   selectedAgentProfileId,
   onSave,
+  onImportTemplate,
   onSelectAgentProfile,
   onSaveRunnerCredential,
+  onTestAgentProfile,
   onSetAgentConfigOpen,
   onSetAgentConfigTab,
   onSetRuntimeConfigTab,
@@ -536,6 +550,14 @@ export function WorkspaceAgentStudio({
               <strong>{readyRunnerCount}/{agentConfigDraft.agentProfiles.length}</strong>
             </span>
           </div>
+        </div>
+        <div className="studio-import-actions" aria-label="Import workspace agent template">
+          <button type="button" onClick={() => onImportTemplate("fixtures")}>
+            Import sample template
+          </button>
+          <button type="button" onClick={() => onImportTemplate("repository")} disabled={!activeRepositoryWorkspaceLabel}>
+            Import from repository .omega
+          </button>
         </div>
 
         {agentConfigOpen ? (
@@ -811,6 +833,9 @@ export function WorkspaceAgentStudio({
                       localCapabilities,
                       agentRunnerOptions.find((option) => option.value === profile.runner)?.capabilityId
                     );
+                    const preflight = agentPreflightResults[profile.id];
+                    const preflightClass =
+                      preflight?.status === "ready" ? "ready" : preflight?.status === "failed" ? "missing" : runnerReady ? "untested" : "missing";
                     return (
                       <button
                         key={profile.id}
@@ -826,15 +851,44 @@ export function WorkspaceAgentStudio({
                       >
                         <strong>{profile.label}</strong>
                         <span>{profile.runner} · {profile.model}</span>
+                        <small className={`agent-preflight-chip ${preflightClass}`}>
+                          {preflight?.status === "ready" ? "tested" : preflight?.status === "failed" ? "failed" : runnerReady ? "test needed" : "missing"}
+                        </small>
                       </button>
                     );
                   })}
                 </div>
                 <div className="control-form agent-profile-editor">
                   <div className="agent-profile-editor-header">
-                    <span className="section-label">Agent override</span>
-                    <strong>{selectedAgentProfile.label}</strong>
+                    <div>
+                      <span className="section-label">Agent override</span>
+                      <strong>{selectedAgentProfile.label}</strong>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-action compact-action"
+                      disabled={testingAgentProfileId === selectedAgentProfile.id}
+                      onClick={() => onTestAgentProfile(selectedAgentProfile)}
+                    >
+                      {testingAgentProfileId === selectedAgentProfile.id ? "Testing..." : "Test connection"}
+                    </button>
                   </div>
+                  {agentPreflightResults[selectedAgentProfile.id] ? (
+                    <div
+                      className={`agent-preflight-result ${
+                        agentPreflightResults[selectedAgentProfile.id].status === "ready" ? "ready" : "missing"
+                      }`}
+                      role="status"
+                    >
+                      <strong>
+                        {agentPreflightResults[selectedAgentProfile.id].status === "ready" ? "Ready" : "Needs attention"}
+                      </strong>
+                      <span>{agentPreflightResults[selectedAgentProfile.id].message}</span>
+                      {agentPreflightResults[selectedAgentProfile.id].effectiveModel ? (
+                        <small>model: {agentPreflightResults[selectedAgentProfile.id].effectiveModel}</small>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <div className="agent-settings-grid">
                     <label className="agent-setting-field">
                       <span>Runner</span>

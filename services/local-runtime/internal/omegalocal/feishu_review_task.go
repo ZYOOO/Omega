@@ -26,13 +26,21 @@ func feishuReviewTaskBridgeEnabled() bool {
 	return value == "1" || value == "true" || value == "yes"
 }
 
+func (server *Server) feishuReviewTaskBridgeEnabled(ctx context.Context) bool {
+	record, err := server.feishuConfig(ctx)
+	if err == nil && record.TaskBridgeEnabled {
+		return true
+	}
+	return feishuReviewTaskBridgeEnabled()
+}
+
 func sendFeishuReviewTask(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
 	checkpoint := mapValue(packet["checkpoint"])
 	item := mapValue(packet["item"])
 	attempt := mapValue(packet["attempt"])
 	checkpointID := text(checkpoint, "id")
 	nonce := feishuReviewNonce(checkpointID, text(attempt, "id"))
-	doc := createFeishuReviewDocIfConfigured(ctx, packet, nonce)
+	doc := createFeishuReviewDocIfConfigured(ctx, packet, nonce, options)
 	description := renderFeishuReviewTaskDescription(packet, nonce, doc)
 	summary := fmt.Sprintf("%s · 人工审核 · %s", stringOr(text(item, "key"), text(item, "id")), stringOr(text(item, "title"), text(checkpoint, "title")))
 
@@ -78,10 +86,11 @@ func sendFeishuReviewTask(ctx context.Context, packet map[string]any, options fe
 	return result, nil
 }
 
-func createFeishuReviewDocIfConfigured(ctx context.Context, packet map[string]any, nonce string) map[string]any {
+func createFeishuReviewDocIfConfigured(ctx context.Context, packet map[string]any, nonce string, options feishuReviewSendOptions) map[string]any {
 	enabled := strings.ToLower(strings.TrimSpace(os.Getenv("OMEGA_FEISHU_REVIEW_CREATE_DOC")))
-	folderToken := strings.TrimSpace(os.Getenv("OMEGA_FEISHU_REVIEW_DOC_FOLDER_TOKEN"))
-	if enabled != "1" && enabled != "true" && enabled != "yes" && folderToken == "" {
+	folderToken := strings.TrimSpace(firstNonEmpty(options.DocFolderToken, os.Getenv("OMEGA_FEISHU_REVIEW_DOC_FOLDER_TOKEN")))
+	docEnabled := options.CreateDoc || enabled == "1" || enabled == "true" || enabled == "yes" || folderToken != ""
+	if !docEnabled {
 		return map[string]any{"mode": "preview-only"}
 	}
 	item := mapValue(packet["item"])

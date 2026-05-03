@@ -652,23 +652,27 @@ function ReworkReturnSignal({
   pipeline?: PipelineRecordInfo;
   runWorkpad?: RunWorkpadRecordInfo;
 }) {
-  const stages = actionPlan?.states?.length ? actionPlan.states : pipeline?.run?.stages ?? attempt?.stages ?? [];
-  const hasReworkStage = stages.some((stage) => {
-    const stageRecord = stage as Record<string, unknown>;
-    return /rework/i.test(`${recordString(stageRecord, "id")} ${recordString(stageRecord, "title")}`);
-  });
   const rejectedEvent = pipeline?.run?.events?.find((event) => /rejected|changes requested|request changes/i.test(`${event.type ?? ""} ${event.message ?? ""}`));
   const assessment = recordValue(runWorkpad?.workpad?.reworkAssessment) || recordValue(attempt?.reworkAssessment);
   const checklist = recordValue(runWorkpad?.workpad?.reworkChecklist) || recordValue(attempt?.reworkChecklist);
   const retry = recordValue(actionPlan?.retry);
   const checklistItems = asStringArray(checklist?.checklist);
-  if (!hasReworkStage && !rejectedEvent && !assessment && !checklistItems.length && !attempt?.humanChangeRequest && !recordString(retry, "reason")) {
+  const retryAvailable = recordBool(retry, "available");
+  const isRetryableAttempt = attempt ? ["failed", "stalled", "canceled"].includes(attempt.status) : false;
+  const hasFeedbackRoute = Boolean(
+    rejectedEvent ||
+    attempt?.humanChangeRequest ||
+    recordString(assessment, "strategy") ||
+    retryAvailable ||
+    isRetryableAttempt
+  );
+  if (!hasFeedbackRoute) {
     return null;
   }
-  const route = recordString(assessment, "strategy") || (hasReworkStage ? "rework" : "waiting");
+  const route = recordString(assessment, "strategy") || "rework";
   const reason =
     recordString(assessment, "rationale") ||
-    recordString(checklist, "retryReason") ||
+    (retryAvailable || isRetryableAttempt ? recordString(checklist, "retryReason") : "") ||
     recordString(retry, "reason") ||
     attempt?.humanChangeRequest ||
     rejectedEvent?.message ||
@@ -710,11 +714,15 @@ function buildRunWorkpadSections({
   const planArtifacts = proofCards.filter((proof) => /plan|solution|implementation|summary/i.test(`${proof.label} ${proof.kind}`));
   const validationOps = operations.filter((operation) => /test|check|validation/i.test(`${operation.stageId ?? ""} ${operation.agentId ?? ""} ${operation.summary ?? ""}`));
   const reviewOps = operations.filter((operation) => /review|rework/i.test(`${operation.stageId ?? ""} ${operation.agentId ?? ""} ${operation.summary ?? ""}`));
-  const recordedBlockers = asStringArray(workpad?.blockers);
+  const recordedBlockers = asStringArray(workpad?.blockers).filter((blocker) => {
+    if (checkpoint?.status === "pending" && /human review|人工|审批/i.test(blocker)) return false;
+    return true;
+  });
+  const checkpointBlocker = checkpoint && checkpoint.status !== "pending" ? `${checkpoint.title}: ${checkpoint.summary}` : "";
   const blockers = recordedBlockers.length ? recordedBlockers : [
     attempt?.failureReason,
     attempt?.errorMessage,
-    checkpoint ? `${checkpoint.title}: ${checkpoint.summary}` : "",
+    checkpointBlocker,
     pullRequestStatus?.deliveryGate && pullRequestStatus.deliveryGate !== "passed" ? `PR gate: ${pullRequestStatus.deliveryGate}` : ""
   ].filter(Boolean) as string[];
   const recordedFeedback = asStringArray(workpad?.reviewFeedback);
@@ -733,9 +741,8 @@ function buildRunWorkpadSections({
     checkFeedback[0] ||
     reviewOps.map((operation) => operation.summary || operation.runnerProcess?.stderr || "").find(Boolean) ||
     reviewEvents.map((event) => event.message).find(Boolean);
-  const retryReason =
-    workpad?.retryReason ||
-    (attempt && ["failed", "stalled", "canceled"].includes(attempt.status) ? retryReasonForAttempt(attempt) : "");
+  const isRetryableAttempt = attempt ? ["failed", "stalled", "canceled"].includes(attempt.status) : false;
+  const retryReason = isRetryableAttempt ? (workpad?.retryReason || retryReasonForAttempt(attempt)) : "";
   const acceptanceCriteria = asStringArray(workpad?.acceptanceCriteria);
   const criteria = acceptanceCriteria.length
     ? acceptanceCriteria
@@ -749,8 +756,11 @@ function buildRunWorkpadSections({
   const reworkStrategy = recordString(reworkAssessment, "strategy");
   const reworkChecklist = asStringArray(recordValue(reworkAssessment)?.checklist);
   const patchHistory = patchHistoryFromRecord(runWorkpad);
+  const rejectedEvent = pipeline?.run?.events?.find((event) => /rejected|changes requested|request changes/i.test(`${event.type ?? ""} ${event.message ?? ""}`));
+  const hasFeedbackRoute = Boolean(rejectedEvent || attempt?.humanChangeRequest || reworkStrategy || isRetryableAttempt);
+  const shouldShowReworkChecklist = hasFeedbackRoute && runtimeReworkChecklistItems.length > 0;
   const sections: WorkpadSection[] = [
-    ...(runtimeReworkChecklistItems.length
+    ...(shouldShowReworkChecklist
       ? [{
           id: "rework-checklist",
           label: "Rework checklist",
@@ -1109,6 +1119,11 @@ function recordString(value: unknown, key: string): string {
   if (!value || typeof value !== "object" || Array.isArray(value)) return "";
   const raw = (value as Record<string, unknown>)[key];
   return typeof raw === "string" ? raw : "";
+}
+
+function recordBool(value: unknown, key: string): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return (value as Record<string, unknown>)[key] === true;
 }
 
 function formatTimestamp(value: string): string {

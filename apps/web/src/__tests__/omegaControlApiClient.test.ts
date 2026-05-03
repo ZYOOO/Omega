@@ -15,6 +15,7 @@ import {
   fetchGitHubRepositories,
   fetchGitHubStatus,
   fetchHandoffBundles,
+  fetchFeishuConfig,
   fetchLocalCapabilities,
   fetchLlmProviderSelection,
   fetchLlmProviders,
@@ -29,14 +30,19 @@ import {
   fetchWorkflowTemplates,
   fetchRunWorkpads,
   exportRuntimeLogs,
+  importProjectAgentProfileTemplate,
   patchRunWorkpad,
   requestCheckpointChanges,
   runCurrentPipelineStage,
+  searchFeishuUsers,
   sendFeishuNotification,
   startGitHubCliLogin,
   startGitHubOAuth,
   startPipeline,
+  testAgentRunner,
+  testFeishuConfig,
   updateGitHubOAuthConfig,
+  updateFeishuConfig,
   updateLlmProviderSelection,
   updateWorkflowTemplate,
   validateWorkflowTemplate,
@@ -580,5 +586,159 @@ describe("omegaControlApiClient", () => {
     await expect(
       requestCheckpointChanges("http://omega.local", "pipeline_item_1:intake", "Needs clearer acceptance criteria", fetchImpl)
     ).resolves.toMatchObject({ status: "rejected" });
+  });
+
+  it("binds Feishu config and runs provider preflight", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/feishu/config") && !init) {
+        return Promise.resolve(jsonResponse({
+          mode: "chat",
+          chatId: "",
+          assigneeLabel: "",
+          webhookSecretConfigured: false,
+          reviewTokenConfigured: false,
+          createDoc: false,
+          taskBridgeEnabled: false,
+          larkCliAvailable: true,
+          larkCliVersion: "1.0.23"
+        }));
+      }
+      if (url.endsWith("/feishu/config") && init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          mode: "task",
+          chatId: "oc_test",
+          assigneeId: "ou_test",
+          assigneeLabel: "Reviewer",
+          webhookSecret: "webhook-secret",
+          reviewToken: "review-token"
+        });
+        return Promise.resolve(jsonResponse({
+          mode: "task",
+          chatId: "oc_test",
+          assigneeId: "ou_test",
+          assigneeLabel: "Reviewer",
+          webhookSecretConfigured: true,
+          webhookSecretMasked: "********",
+          reviewTokenConfigured: true,
+          reviewTokenMasked: "********",
+          createDoc: true,
+          taskBridgeEnabled: true,
+          larkCliAvailable: true,
+          larkCliVersion: "1.0.23"
+        }));
+      }
+      if (url.endsWith("/feishu/config/test")) {
+        expect(init?.method).toBe("POST");
+        return Promise.resolve(jsonResponse({ provider: "feishu", status: "ready", tool: "lark-cli" }));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchFeishuConfig("http://omega.local", fetchImpl)).resolves.toMatchObject({ larkCliAvailable: true });
+    await expect(
+      updateFeishuConfig(
+        "http://omega.local",
+        {
+          mode: "task",
+          chatId: "oc_test",
+          assigneeId: "ou_test",
+          assigneeLabel: "Reviewer",
+          webhookSecret: "webhook-secret",
+          reviewToken: "review-token",
+          createDoc: true,
+          taskBridgeEnabled: true
+        },
+        fetchImpl
+      )
+    ).resolves.toMatchObject({ webhookSecretConfigured: true, reviewTokenConfigured: true });
+    await expect(testFeishuConfig("http://omega.local", fetchImpl)).resolves.toMatchObject({ status: "ready" });
+  });
+
+  it("searches Feishu reviewers through the local service", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://omega.local/feishu/users/search");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({ query: "王审核", limit: 10 });
+      return Promise.resolve(jsonResponse({
+        status: "ready",
+        users: [{ openId: "ou_reviewer", name: "王审核", email: "reviewer@example.test" }]
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(searchFeishuUsers("http://omega.local", "王审核", fetchImpl)).resolves.toMatchObject({
+      users: [{ openId: "ou_reviewer", name: "王审核" }]
+    });
+  });
+
+  it("runs Agent runner preflight before selecting a runtime account", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://omega.local/agent-runner/preflight");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        agentId: "coding",
+        runner: "trae-agent",
+        model: "doubao:ep-test-001"
+      });
+      return Promise.resolve(jsonResponse({
+        agentId: "coding",
+        runner: "trae-agent",
+        model: "doubao:ep-test-001",
+        effectiveModel: "doubao:ep-test-001",
+        status: "ready",
+        credentialConfigured: true,
+        message: "Runner command and local account preflight passed."
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(
+      testAgentRunner(
+        "http://omega.local",
+        { agentId: "coding", label: "Coding", runner: "trae-agent", model: "doubao:ep-test-001" },
+        fetchImpl
+      )
+    ).resolves.toMatchObject({ status: "ready", credentialConfigured: true });
+  });
+
+  it("imports an Agent Profile template through the local control plane", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://omega.local/agent-profile/import-template");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        projectId: "project_omega",
+        repositoryTargetId: "repo_1",
+        source: "repository"
+      });
+      return Promise.resolve(jsonResponse({
+        profile: {
+          projectId: "project_omega",
+          repositoryTargetId: "repo_1",
+          workflowTemplate: "devflow-pr",
+          workflowMarkdown: "workflow: devflow-pr",
+          stagePolicy: "Coding: repository only",
+          skillAllowlist: "browser-use",
+          mcpAllowlist: "github",
+          codexPolicy: "workspace-write",
+          claudePolicy: "",
+          agentProfiles: []
+        },
+        summary: {
+          source: "repository",
+          basePath: "/repo/.omega",
+          files: [{ name: "workflow", path: "/repo/.omega/workflow.md" }]
+        }
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(
+      importProjectAgentProfileTemplate(
+        "http://omega.local",
+        { projectId: "project_omega", repositoryTargetId: "repo_1", source: "repository" },
+        fetchImpl
+      )
+    ).resolves.toMatchObject({
+      profile: { repositoryTargetId: "repo_1" },
+      summary: { files: [{ name: "workflow" }] }
+    });
   });
 });

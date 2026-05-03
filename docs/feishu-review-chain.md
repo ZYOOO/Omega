@@ -47,7 +47,14 @@ DevFlow 在进入 `human_review.waiting` 后会自动检查配置：
 - 有 `OMEGA_FEISHU_REVIEW_MODE=task`、`OMEGA_FEISHU_REVIEW_ASSIGNEE_ID` 或 `OMEGA_FEISHU_REVIEW_TASKLIST_ID` 时自动创建飞书审核任务。
 - 有 `OMEGA_FEISHU_WEBHOOK_URL` 或 `FEISHU_BOT_WEBHOOK` 时自动推送卡片。
 - 或有 `OMEGA_FEISHU_REVIEW_CHAT_ID` 且本机存在 `lark-cli` 时发送本地 CLI interactive card。
-- 没有配置时只记录 debug log，不阻塞主链路。
+  - 只有 `lark-cli` App ID / App Secret 但没有 chat/task/webhook 投递目标时，不会发送消息；runtime 会把 `needs-configuration` 写入 checkpoint.`feishuReview` 并记录 `feishu.review.needs_target`，不阻塞主链路。
+- `POST /feishu/users/search`
+  - Settings 里的 Reviewer lookup 使用这个接口，不再要求用户手动填写 `open_id`。
+  - 用户本机登录 `lark-cli` 后，可按姓名搜索审核人。
+  - 如果输入企业邮箱或手机号，runtime 会优先使用 App 机器人凭据调用用户 ID 解析接口作为兜底。
+  - 选中候选人后，Omega 只保存内部 assignee id 和展示名；Human Review 的 Task 模式继续使用这份 assignee。
+
+这里的边界要分清：`lark-cli` ready 只代表本机有可用的飞书应用凭证；真正推送 Human Review 还需要知道发往哪个群、哪个任务负责人 / 任务清单，或哪个机器人 webhook。任务负责人不再需要用户去后台找 `open_id`，推荐在 Settings 里通过 Reviewer lookup 搜索并选择。
 
 ## 消息结构
 
@@ -73,6 +80,39 @@ Task 审核模式包含：
 - checkpoint `feishuReview`：保存 `format=task-review`、`taskGuid`、`taskUrl`、`nonce`、doc 信息和 raw CLI 输出。
 
 ## 配置
+
+权限清单和开放平台配置步骤见 [飞书应用权限配置说明](./feishu-bot-permissions.md)。
+
+推荐页面配置路径：
+
+1. 本机执行 `lark-cli config init`，填入飞书自建应用的 App ID / App Secret。
+2. 如需按姓名搜索审核人，再执行 `lark-cli auth login`，使本机 CLI 具备用户身份。
+3. Omega Settings -> Provider Access -> Feishu -> `Test Feishu connection`。
+4. 在 `Reviewer` 搜索框输入姓名、企业邮箱或手机号，选择候选人。
+   - 如果审核人就是当前登录的飞书账号，可以直接点 `Use current user`；这会调用 `lark-cli contact +get-user`，不依赖联系人搜索结果。
+5. 点击 `Save Feishu binding`。
+6. 新的 Human Review checkpoint 会使用保存的审核人创建飞书 Task。
+
+### 页面绑定
+
+现在推荐先在 Omega Desktop / Web 的 `Settings -> Provider access -> Feishu` 中检查本机 `lark-cli` profile：
+
+- 页面默认只展示 `lark-cli` 状态和 `Test Feishu connection`。
+- `Test Feishu connection` 会读取 `lark-cli config show`，确认本机已经配置 App ID / App Secret，不再要求先填写 Chat ID、Task assignee 或 webhook。
+- Chat / Task / webhook 的投递覆盖项收在 `Advanced delivery overrides`，只在需要指定固定群、固定审核人、webhook fallback 或长 Review Packet 文档时填写。
+- 如果使用 `Advanced delivery overrides`，secret 类字段会加密存入本机 SQLite，页面只显示 masked 状态。
+
+高级覆盖项包括：
+
+- `Review channel`：选择 Chat message、Task review 或 Bot webhook。
+- `Chat ID`：飞书群或会话 id，用于发送审核卡片或文本通知。
+- `Task assignee` / `Tasklist ID`：Task review 模式下创建审核任务。
+- `Bot webhook URL` / `Webhook secret`：机器人 webhook 模式；secret 会加密存入本机 SQLite，页面只显示 masked 状态。
+- `Review token`：飞书 callback 校验 token；同样加密存储。
+- `Create review doc for long packets` / `Doc folder token`：长 Review Packet 发布为飞书文档。
+- `Enable local task bridge sync`：让 JobSupervisor tick 自动同步飞书任务完成状态。
+
+### 环境变量兜底
 
 推荐的无公网审核配置：
 
@@ -107,6 +147,23 @@ export OMEGA_FEISHU_REVIEW_CHAT_ID="oc_xxx"
 
 当前本机测试结果：已安装 `lark-cli version 1.0.23`，并确认 `im +messages-send` 支持 `--msg-type interactive --content`。真实发送仍需要完成 `lark-cli` 登录 / profile 配置，并提供目标群或会话的 chat id。
 
+### 当前用户直投 fallback
+
+2026-05-03 起，如果没有配置 chat id、Task assignee/tasklist 或 webhook，但本机已经完成 `lark-cli auth login`，Omega 会自动读取当前登录用户：
+
+```bash
+lark-cli contact +get-user --as user --format json
+```
+
+拿到 `open_id` 后，Human Review 审核包和 failed/stalled 通知会通过 bot direct message 发给当前用户。这个模式适合单人本机测试，不需要额外查 open_id，也不需要公网。
+
+需要注意：
+
+- 直投 fallback 只解决“本机当前用户能收到通知”；多人审核或团队群聊仍建议配置 chat id、Task assignee 或 webhook。
+- 如果 `lark-cli` 未登录、bot 没有发送权限，checkpoint 会记录 `needs-configuration`。
+- checkpoint 的 `feishuReview` 会记录 `route=direct-user`、`fallback=current-user` 和 `userId`，方便回溯实际发送路径。
+- failed / stalled attempt 会在 JobSupervisor 或失败持久化后自动尝试发送失败通知，避免只在页面里看到 blocked。
+
 ## 公网与本地回复边界
 
 出站消息不需要公网：
@@ -121,7 +178,7 @@ export OMEGA_FEISHU_REVIEW_CHAT_ID="oc_xxx"
 - 如果不暴露公网，可以保留卡片通知和 `Open review`，审核人回到 Omega Web 操作；这条路径和飞书消息同步同级，但按钮不直接改 checkpoint。
 - Task 审核模式不依赖按钮回调。完成飞书任务后，本机调用 `/feishu/review-task/sync` 即可把审核通过同步回 Omega。
 - 任务评论可以由本地事件桥或手动脚本转发到 `/feishu/review-task/comment`。这一步同样只调用本机 `127.0.0.1` runtime，不要求公网。
-- 如果启用 `OMEGA_FEISHU_TASK_BRIDGE_ENABLED=true`，JobSupervisor 会在 tick 中顺带运行 Task bridge；也可以手动调用 `/feishu/review-task/bridge/tick` 做 dry-run 检查。
+- 如果在页面开启 `Enable local task bridge sync`，或设置 `OMEGA_FEISHU_TASK_BRIDGE_ENABLED=true`，JobSupervisor 会在 tick 中顺带运行 Task bridge；也可以手动调用 `/feishu/review-task/bridge/tick` 做 dry-run 检查。
 
 ## 同步语义
 
@@ -132,6 +189,7 @@ export OMEGA_FEISHU_REVIEW_CHAT_ID="oc_xxx"
 - 飞书任务评论里的问题 / 缺少信息不会直接拒绝，只会写入 checkpoint `feishuReview.lastComment`，供操作者补充上下文。
 - 飞书 callback 建议配置 `OMEGA_FEISHU_REVIEW_TOKEN`，避免未经授权的外部请求直接修改 checkpoint。
 - 每次发送结果会写入 checkpoint 的 `feishuReview` 字段，包含 `status`、`provider`、`tool`、`format`、message/card preview 等信息。
+- 没有显式路由但 `lark-cli` 已登录时，会使用当前用户直投 fallback；该路径不要求公网。
 
 ## Task 审核使用方法
 

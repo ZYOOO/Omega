@@ -1635,6 +1635,151 @@ func TestJobSupervisorMarksOrphanedWorkerAttemptStalled(t *testing.T) {
 	}
 }
 
+func TestJobSupervisorDoesNotOverwriteFreshWaitingHumanAttempt(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	item := map[string]any{"id": "item_waiting", "key": "OMG-waiting", "repositoryTargetId": "repo_waiting", "status": "In Review"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow", StageProfiles: []StageProfile{{ID: "todo", Title: "Todo", Agent: "requirement"}}})
+	pipeline["id"] = "pipeline_waiting"
+	freshAttempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	freshAttempt["id"] = "attempt_waiting"
+	freshAttempt["status"] = "waiting-human"
+	freshAttempt["updatedAt"] = "2026-05-03T04:00:10Z"
+	staleAttempt := cloneMap(freshAttempt)
+	staleAttempt["status"] = "running"
+	staleAttempt["updatedAt"] = "2026-05-03T04:00:00Z"
+	freshDatabase := WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems: []map[string]any{item},
+		Pipelines: []map[string]any{pipeline},
+		Attempts:  []map[string]any{freshAttempt},
+	}}
+	if err := server.Repo.Save(context.Background(), freshDatabase); err != nil {
+		t.Fatal(err)
+	}
+	staleDatabase := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems: []map[string]any{item},
+		Pipelines: []map[string]any{pipeline},
+		Attempts:  []map[string]any{staleAttempt},
+	}}
+
+	summary := server.scanWorkerHostLeases(context.Background(), staleDatabase)
+	if summary["orphanedWorkerAttempts"] != 0 || text(staleDatabase.Tables.Attempts[0], "status") != "waiting-human" {
+		t.Fatalf("stale scan should refresh instead of stalling: summary=%+v attempt=%+v", summary, staleDatabase.Tables.Attempts[0])
+	}
+}
+
+func TestJobSupervisorRecoversOrphanedHumanReviewAttempt(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	item := map[string]any{"id": "item_human_orphan", "key": "OMG-human-orphan", "repositoryTargetId": "repo_human_orphan", "status": "Blocked"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow", StageProfiles: []StageProfile{
+		{ID: "todo", Title: "Todo", Agent: "requirement"},
+		{ID: "human_review", Title: "Human Review", Agent: "human", HumanGate: true},
+	}})
+	pipeline["id"] = "pipeline_human_orphan"
+	pipeline["status"] = "stalled"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_human_orphan"
+	attempt["status"] = "stalled"
+	attempt["statusReason"] = "No active local worker host lease for running attempt."
+	checkpoint := map[string]any{
+		"id":         "pipeline_human_orphan:human_review",
+		"pipelineId": "pipeline_human_orphan",
+		"attemptId":  "attempt_human_orphan",
+		"stageId":    "human_review",
+		"status":     "pending",
+		"title":      "Human Review",
+		"summary":    "Waiting for approval.",
+	}
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems:    []map[string]any{item},
+		Pipelines:    []map[string]any{pipeline},
+		Attempts:     []map[string]any{attempt},
+		Checkpoints:  []map[string]any{checkpoint},
+		ProofRecords: []map[string]any{},
+	}}
+
+	summary := server.reconcileAttemptIntegrityInDatabase(context.Background(), database)
+	if summary["recoveredHumanGates"] != 1 || text(database.Tables.Attempts[0], "status") != "waiting-human" {
+		t.Fatalf("human review recovery failed: summary=%+v attempt=%+v", summary, database.Tables.Attempts[0])
+	}
+	if text(database.Tables.Pipelines[0], "status") != "waiting-human" || text(database.Tables.WorkItems[0], "status") != "In Review" {
+		t.Fatalf("pipeline/item state not recovered: pipeline=%+v item=%+v", database.Tables.Pipelines[0], database.Tables.WorkItems[0])
+	}
+}
+
+func TestJobSupervisorRecoversProofBackedHumanReviewAttempt(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	root := t.TempDir()
+	workspace := filepath.Join(root, "OMG-30-devflow-pr")
+	proofDir := filepath.Join(workspace, ".omega", "proof")
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proofDir, "human-review-request.md"), []byte("Review the PR."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{
+		"pipelineId":     "pipeline_proof_human",
+		"workItemId":     "item_proof_human",
+		"workspacePath":  workspace,
+		"branchName":     "omega/OMG-30-devflow",
+		"pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/39",
+		"reviewPacket":   map[string]any{"summary": "Review packet ready.", "risk": map[string]any{"level": "low"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONFile(filepath.Join(proofDir, "attempt-review-packet.json"), map[string]any{"summary": "Review approved.", "risk": map[string]any{"level": "low"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proofDir, "solution-plan.md"), []byte("plan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	item := map[string]any{"id": "item_proof_human", "key": "OMG-30", "repositoryTargetId": "repo_test", "status": "Blocked"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow", StageProfiles: []StageProfile{
+		{ID: "todo", Title: "Todo intake", Agent: "requirement"},
+		{ID: "in_progress", Title: "Implementation and PR", Agent: "coding"},
+		{ID: "code_review_round_2", Title: "Code Review Round 2", Agent: "review"},
+		{ID: "human_review", Title: "Human Review", Agent: "human", HumanGate: true},
+		{ID: "merging", Title: "Merging", Agent: "delivery"},
+	}})
+	pipeline["id"] = "pipeline_proof_human"
+	pipeline["status"] = "stalled"
+	pipeline = markDevFlowStageProgress(pipeline, "todo", "passed", "")
+	pipeline = markDevFlowStageProgress(pipeline, "in_progress", "passed", "")
+	pipeline = markDevFlowStageProgress(pipeline, "code_review_round_2", "running", "")
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "code_review_round_2")
+	attempt["id"] = "attempt_proof_human"
+	attempt["status"] = "stalled"
+	attempt["events"] = append(arrayMaps(attempt["events"]), map[string]any{
+		"type":      "attempt.worker.orphaned",
+		"message":   "No active local worker host lease for running attempt.",
+		"stageId":   "code_review_round_2",
+		"createdAt": nowISO(),
+	})
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems: []map[string]any{item},
+		Pipelines: []map[string]any{pipeline},
+		Attempts:  []map[string]any{attempt},
+		ProofRecords: []map[string]any{{
+			"id": "proof_plan", "operationId": "pipeline_proof_human:agent:001", "sourcePath": filepath.Join(proofDir, "solution-plan.md"),
+		}},
+	}}
+
+	summary := server.reconcileAttemptIntegrityInDatabase(context.Background(), database)
+	if summary["recoveredProofHumanGates"] != 1 || text(database.Tables.Attempts[0], "status") != "waiting-human" {
+		t.Fatalf("proof recovery failed: summary=%+v attempt=%+v", summary, database.Tables.Attempts[0])
+	}
+	if len(database.Tables.Checkpoints) != 1 || text(database.Tables.Checkpoints[0], "status") != "pending" || text(database.Tables.Checkpoints[0], "attemptId") != "attempt_proof_human" {
+		t.Fatalf("checkpoint not rebuilt: %+v", database.Tables.Checkpoints)
+	}
+	if text(database.Tables.Attempts[0], "pullRequestUrl") != "https://github.com/ZYOOO/TestRepo/pull/39" || text(database.Tables.Attempts[0], "workspacePath") != workspace {
+		t.Fatalf("delivery metadata not recovered: %+v", database.Tables.Attempts[0])
+	}
+	if got := stringSlice(summary["feishuReviewPipelines"]); len(got) != 1 || got[0] != "pipeline_proof_human" {
+		t.Fatalf("review pipeline notification missing: %+v", summary)
+	}
+}
+
 func TestJobSupervisorScanRecoverableAttemptsRespectsBackoffAndLimit(t *testing.T) {
 	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -4517,6 +4662,191 @@ func TestRunnerCredentialEncryptsAndInjectsTraeEnv(t *testing.T) {
 	}
 }
 
+func TestFeishuConfigEncryptsSecretsAndPublicMasking(t *testing.T) {
+	api, repo := newTestAPI(t)
+	var saved map[string]any
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/feishu/config", map[string]any{
+		"mode":              "task",
+		"chatId":            "oc_test",
+		"assigneeId":        "ou_test",
+		"tasklistId":        "tasklist_test",
+		"webhookUrl":        "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+		"webhookSecret":     "secret-webhook",
+		"reviewToken":       "secret-review",
+		"createDoc":         true,
+		"docFolderToken":    "folder_test",
+		"taskBridgeEnabled": true,
+	}), &saved)
+	if saved["webhookSecretConfigured"] != true || saved["reviewTokenConfigured"] != true {
+		t.Fatalf("expected saved Feishu secrets to be masked as configured: %+v", saved)
+	}
+	if saved["webhookSecretMasked"] != "********" || saved["reviewTokenMasked"] != "********" {
+		t.Fatalf("expected masked Feishu secrets in public response: %+v", saved)
+	}
+	stored, err := repo.GetSetting(context.Background(), feishuConfigSettingKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprint(stored), "secret-webhook") || strings.Contains(fmt.Sprint(stored), "secret-review") {
+		t.Fatalf("stored Feishu config leaked plaintext secrets: %+v", stored)
+	}
+	var fetched map[string]any
+	decode(t, requestJSON(t, http.MethodGet, api.URL+"/feishu/config", nil), &fetched)
+	if fetched["chatId"] != "oc_test" || fetched["taskBridgeEnabled"] != true {
+		t.Fatalf("expected persisted Feishu config, got %+v", fetched)
+	}
+}
+
+func TestFeishuConfigPreflightUsesLocalLarkCLIProfile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake lark-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	lark := filepath.Join(bin, "lark-cli")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'lark-cli version 1.0.23\n'
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "show" ]; then
+  printf '{"appId":"cli_test","appSecret":"****","brand":"feishu","profile":"cli_test"}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(lark, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/feishu/config/test", nil), &result)
+	if result["status"] != "ready" || result["tool"] != "lark-cli" {
+		t.Fatalf("expected lark-cli preflight to pass without route overrides, got %+v", result)
+	}
+}
+
+func TestFeishuUserSearchUsesLocalLarkCLI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake lark-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	lark := filepath.Join(bin, "lark-cli")
+	script := `#!/bin/sh
+if [ "$1" = "contact" ] && [ "$2" = "+search-user" ]; then
+  printf '{"data":{"users":[{"open_id":"ou_reviewer","name":"王审核","email":"reviewer@example.test"}]}}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(lark, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/feishu/users/search", map[string]any{"query": "王审核"}), &result)
+	users := arrayMaps(result["users"])
+	if result["status"] != "ready" || len(users) != 1 || text(users[0], "openId") != "ou_reviewer" {
+		t.Fatalf("expected reviewer candidate from lark-cli, got %+v", result)
+	}
+}
+
+func TestFeishuUserSearchCanResolveCurrentUser(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake lark-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	lark := filepath.Join(bin, "lark-cli")
+	script := `#!/bin/sh
+if [ "$1" = "contact" ] && [ "$2" = "+get-user" ]; then
+  printf '{"data":{"user":{"open_id":"ou_me","name":"当前用户","email":"me@example.test"}}}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(lark, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/feishu/users/search", map[string]any{"query": "me"}), &result)
+	users := arrayMaps(result["users"])
+	if result["status"] != "ready" || len(users) != 1 || text(users[0], "openId") != "ou_me" {
+		t.Fatalf("expected current user candidate from lark-cli, got %+v", result)
+	}
+}
+
+func TestFeishuUserSearchFallsBackToEmailIDLookup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake lark-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	lark := filepath.Join(bin, "lark-cli")
+	script := `#!/bin/sh
+if [ "$1" = "contact" ] && [ "$2" = "+search-user" ]; then
+  printf 'login required\n' >&2
+  exit 2
+fi
+if [ "$1" = "api" ]; then
+  printf '{"data":{"user_list":[{"user_id":"ou_email_user","email":"reviewer@example.test"}]}}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(lark, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/feishu/users/search", map[string]any{"query": "reviewer@example.test"}), &result)
+	users := arrayMaps(result["users"])
+	if len(users) != 1 || text(users[0], "openId") != "ou_email_user" {
+		t.Fatalf("expected email fallback candidate, got %+v", result)
+	}
+}
+
+func TestAgentRunnerPreflightUsesTraeCredential(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake trae-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	trae := filepath.Join(bin, "trae-cli")
+	script := "#!/bin/sh\nif [ \"$1\" = \"show-config\" ]; then printf 'model=%s\\nkey=%s\\n' \"$TRAE_MODEL\" \"$DOUBAO_API_KEY\"; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(trae, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var credential map[string]any
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
+		"runner":   "trae-agent",
+		"provider": "doubao",
+		"label":    "Trae Doubao",
+		"model":    "ep-test-001",
+		"apiKey":   "secret-trae-key",
+	}), &credential)
+
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-runner/preflight", map[string]any{
+		"agentId": "coding",
+		"label":   "Coding",
+		"runner":  "trae-agent",
+		"model":   "doubao:ep-test-001",
+	}), &result)
+	if result["status"] != "ready" {
+		t.Fatalf("expected ready preflight, got %+v", result)
+	}
+	if result["credentialConfigured"] != true || result["effectiveModel"] != "doubao:ep-test-001" {
+		t.Fatalf("expected credential-backed Trae preflight, got %+v", result)
+	}
+	if strings.Contains(fmt.Sprint(result), "secret-trae-key") {
+		t.Fatalf("preflight leaked API key: %+v", result)
+	}
+}
+
 func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)
@@ -5213,6 +5543,75 @@ func TestFeishuReviewRequestSendsInteractiveWebhookCard(t *testing.T) {
 	checkpoint := loaded.Tables.Checkpoints[0]
 	if text(mapValue(checkpoint["feishuReview"]), "status") != "sent" {
 		t.Fatalf("checkpoint feishu review = %+v", checkpoint["feishuReview"])
+	}
+}
+
+func TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget(t *testing.T) {
+	root := t.TempDir()
+	fakeLark := filepath.Join(root, "lark-cli")
+	if err := os.WriteFile(fakeLark, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	seedFeishuReviewCheckpoint(t, server.Repo, nil)
+
+	server.sendFeishuReviewForPipelineIfConfigured(context.Background(), "pipeline_1")
+
+	loaded, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := mapValue(loaded.Tables.Checkpoints[0]["feishuReview"])
+	if text(review, "status") != "needs-configuration" {
+		t.Fatalf("checkpoint feishu review = %+v", review)
+	}
+	if text(review, "reason") == "" || text(review, "checkpointId") != "pipeline_1:human_review" {
+		t.Fatalf("checkpoint feishu review missing routing detail = %+v", review)
+	}
+}
+
+func TestFeishuAutoReviewFallsBackToCurrentLarkUser(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	root := t.TempDir()
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	seedFeishuReviewCheckpoint(t, server.Repo, nil)
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args.txt")
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argsFile + "\ncase \"$*\" in\n*\"contact +get-user\"*) printf '%s' '{\"data\":{\"user\":{\"open_id\":\"ou_current\",\"name\":\"Current User\"}}}' ;;\n*\"im +messages-send\"*) printf '%s' '{\"message_id\":\"om_current\"}' ;;\n*) printf '%s' '{}' ;;\nesac\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	server.sendFeishuReviewForPipelineIfConfigured(context.Background(), "pipeline_1")
+
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argsText := string(args)
+	if !strings.Contains(argsText, "contact +get-user --as user") || !strings.Contains(argsText, "im +messages-send --as bot --user-id ou_current") {
+		t.Fatalf("lark-cli args missing current-user fallback: %s", argsText)
+	}
+	loaded, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := mapValue(loaded.Tables.Checkpoints[0]["feishuReview"])
+	if text(review, "status") != "sent" || text(review, "route") != "direct-user" || text(review, "userId") != "ou_current" {
+		t.Fatalf("checkpoint feishu review = %+v", review)
 	}
 }
 

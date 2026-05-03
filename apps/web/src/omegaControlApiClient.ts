@@ -107,6 +107,88 @@ export interface RunnerCredentialUpdate {
   apiKey?: string;
 }
 
+export interface FeishuConfigInfo {
+  mode: string;
+  chatId: string;
+  assigneeId: string;
+  assigneeLabel?: string;
+  tasklistId: string;
+  followerId: string;
+  due: string;
+  webhookUrl: string;
+  webhookSecretConfigured: boolean;
+  webhookSecretMasked?: string;
+  reviewTokenConfigured: boolean;
+  reviewTokenMasked?: string;
+  createDoc: boolean;
+  docFolderToken: string;
+  taskBridgeEnabled: boolean;
+  larkCliAvailable: boolean;
+  larkCliVersion?: string;
+  updatedAt?: string;
+}
+
+export interface FeishuConfigUpdate {
+  mode: string;
+  chatId?: string;
+  assigneeId?: string;
+  assigneeLabel?: string;
+  tasklistId?: string;
+  followerId?: string;
+  due?: string;
+  webhookUrl?: string;
+  webhookSecret?: string;
+  reviewToken?: string;
+  createDoc?: boolean;
+  docFolderToken?: string;
+  taskBridgeEnabled?: boolean;
+}
+
+export interface ProviderPreflightResult {
+  provider?: string;
+  status: string;
+  tool?: string;
+  path?: string;
+  message?: string;
+  raw?: string;
+}
+
+export interface FeishuUserCandidate {
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+  name?: string;
+  email?: string;
+  mobile?: string;
+  avatarUrl?: string;
+  source?: string;
+}
+
+export interface FeishuUserSearchResult {
+  status: string;
+  query?: string;
+  message?: string;
+  error?: string;
+  users: FeishuUserCandidate[];
+}
+
+export interface AgentRunnerPreflightResult {
+  agentId: string;
+  label?: string;
+  runner: string;
+  model?: string;
+  effectiveModel?: string;
+  command?: string;
+  path?: string;
+  status: string;
+  message?: string;
+  credentialConfigured?: boolean;
+  credentialProvider?: string;
+  credentialModel?: string;
+  stdout?: string;
+  stderr?: string;
+}
+
 export interface PipelineTemplateInfo {
   id: string;
   name: string;
@@ -184,6 +266,15 @@ export interface ProjectAgentProfileInfo {
   agentProfiles: AgentProfileDraftInfo[];
   source?: string;
   updatedAt?: string;
+}
+
+export interface AgentProfileImportResult {
+  profile: ProjectAgentProfileInfo;
+  summary: {
+    source?: string;
+    basePath?: string;
+    files?: Array<{ name?: string; path?: string }>;
+  };
 }
 
 export interface LocalCapabilityInfo {
@@ -1030,6 +1121,79 @@ export async function updateRunnerCredential(
   return response.json() as Promise<RunnerCredentialInfo>;
 }
 
+export async function fetchFeishuConfig(
+  apiUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<FeishuConfigInfo> {
+  return fetchJson<FeishuConfigInfo>(apiUrl, "/feishu/config", fetchImpl);
+}
+
+export async function updateFeishuConfig(
+  apiUrl: string,
+  config: FeishuConfigUpdate,
+  fetchImpl: typeof fetch = fetch
+): Promise<FeishuConfigInfo> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/feishu/config`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(config)
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, "Omega control API failed: /feishu/config"));
+  }
+  return response.json() as Promise<FeishuConfigInfo>;
+}
+
+export async function testFeishuConfig(
+  apiUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<ProviderPreflightResult> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/feishu/config/test`, { method: "POST" });
+  const result = await response.json().catch(() => ({ status: "failed", message: `HTTP ${response.status}` })) as ProviderPreflightResult;
+  if (!response.ok && response.status >= 500) {
+    throw new Error(result.message ?? "Feishu preflight failed.");
+  }
+  return result;
+}
+
+export async function searchFeishuUsers(
+  apiUrl: string,
+  query: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<FeishuUserSearchResult> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/feishu/users/search`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ query, limit: 10 })
+  });
+  const result = await response.json().catch(() => ({ status: "failed", users: [], message: `HTTP ${response.status}` })) as FeishuUserSearchResult;
+  if (!response.ok && response.status >= 500) {
+    throw new Error(result.message ?? result.error ?? "Feishu reviewer search failed.");
+  }
+  return result;
+}
+
+export async function testAgentRunner(
+  apiUrl: string,
+  input: { agentId: string; label?: string; runner: string; model?: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<AgentRunnerPreflightResult> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/agent-runner/preflight`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  const result = await response.json().catch(() => ({
+    agentId: input.agentId,
+    label: input.label,
+    runner: input.runner,
+    model: input.model,
+    status: "failed",
+    message: `HTTP ${response.status}`
+  })) as AgentRunnerPreflightResult;
+  return result;
+}
+
 export async function fetchPipelineTemplates(
   apiUrl: string,
   fetchImpl: typeof fetch = fetch
@@ -1103,6 +1267,14 @@ export async function updateProjectAgentProfile(
   fetchImpl: typeof fetch = fetch
 ): Promise<ProjectAgentProfileInfo> {
   return putJson<ProjectAgentProfileInfo>(apiUrl, "/agent-profile", profile, fetchImpl);
+}
+
+export async function importProjectAgentProfileTemplate(
+  apiUrl: string,
+  input: { projectId?: string; repositoryTargetId?: string; source?: "fixtures" | "repository" | "path"; basePath?: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<AgentProfileImportResult> {
+  return postJson<AgentProfileImportResult>(apiUrl, "/agent-profile/import-template", input, fetchImpl);
 }
 
 export async function fetchLocalCapabilities(

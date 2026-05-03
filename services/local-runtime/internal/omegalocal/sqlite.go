@@ -19,19 +19,6 @@ type SQLiteRepository struct {
 	Path string
 }
 
-var sqliteMigrations = []struct {
-	Version string
-	Name    string
-}{
-	{Version: "20260424_001", Name: "bootstrap_go_local_service_schema"},
-	{Version: "20260427_001", Name: "agent_profiles_first_class_table"},
-	{Version: "20260428_001", Name: "page_pilot_runs_first_class_table"},
-	{Version: "20260429_001", Name: "runtime_logs_append_only_table"},
-	{Version: "20260501_001", Name: "runtime_logs_query_extensions"},
-	{Version: "20260502_001", Name: "workflow_templates_first_class_table"},
-	{Version: "20260502_002", Name: "repository_audit_tables"},
-}
-
 func NewSQLiteRepository(path string) *SQLiteRepository {
 	return &SQLiteRepository{Path: path}
 }
@@ -41,6 +28,20 @@ func (repo *SQLiteRepository) Initialize(ctx context.Context) error {
 		return err
 	}
 	if err := repo.exec(ctx, `
+PRAGMA journal_mode = WAL;
+CREATE TABLE IF NOT EXISTS omega_migrations (
+  version TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at TEXT NOT NULL
+);
+`); err != nil {
+		return err
+	}
+	return repo.applyPendingSQLiteMigrations(ctx)
+}
+
+func (repo *SQLiteRepository) initializeBaselineSchema(ctx context.Context) error {
+	return repo.exec(ctx, `
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS omega_migrations (
   version TEXT PRIMARY KEY,
@@ -197,24 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_runtime_logs_created_at ON runtime_logs(created_a
 CREATE INDEX IF NOT EXISTS idx_runtime_logs_level ON runtime_logs(level, created_at);
 CREATE INDEX IF NOT EXISTS idx_runtime_logs_pipeline ON runtime_logs(pipeline_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runtime_logs_attempt ON runtime_logs(attempt_id, created_at);
-`); err != nil {
-		return err
-	}
-	if err := repo.ensureRuntimeLogQueryExtensions(ctx); err != nil {
-		return err
-	}
-
-	for _, migration := range sqliteMigrations {
-		if err := repo.exec(ctx, fmt.Sprintf(
-			"INSERT OR IGNORE INTO omega_migrations (version, name, applied_at) VALUES (%s, %s, %s);",
-			sqlQuote(migration.Version),
-			sqlQuote(migration.Name),
-			sqlQuote(nowISO()),
-		)); err != nil {
-			return err
-		}
-	}
-	return nil
+`)
 }
 
 func (repo *SQLiteRepository) ensureRuntimeLogQueryExtensions(ctx context.Context) error {
