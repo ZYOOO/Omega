@@ -1,11 +1,35 @@
-const runtimeUrl = process.env.OMEGA_RUNTIME_URL || "http://127.0.0.1:3888";
-const projectId = process.env.OMEGA_PAGE_PILOT_PROJECT_ID || "project_req_omega_001";
-const repositoryTargetId = process.env.OMEGA_PAGE_PILOT_REPOSITORY_TARGET_ID || "repo_ZYOOO_TestRepo";
-const repositoryLabel = process.env.OMEGA_PAGE_PILOT_REPOSITORY_LABEL || "ZYOOO/TestRepo";
-const persistedRunKey = "omega-page-pilot-last-run";
-const conversationHistoryKey = "omega-page-pilot-conversation-history";
-const statusBarDockKey = "omega-page-pilot-status-dock";
-const statusBarPositionKey = "omega-page-pilot-status-position";
+let ipcRenderer = null;
+try {
+  ({ ipcRenderer } = require("electron"));
+} catch (_error) {
+  ipcRenderer = null;
+}
+
+function readPilotConfig() {
+  const prefix = "--omega-page-pilot-config=";
+  const raw = (process.argv || []).find((entry) => entry.startsWith(prefix));
+  if (!raw) return {};
+  try {
+    return JSON.parse(decodeURIComponent(raw.slice(prefix.length)));
+  } catch (_error) {
+    return {};
+  }
+}
+
+const pilotConfig = readPilotConfig();
+const runtimeUrl = pilotConfig.runtimeUrl || process.env.OMEGA_RUNTIME_URL || "http://127.0.0.1:3888";
+const projectId = pilotConfig.projectId || process.env.OMEGA_PAGE_PILOT_PROJECT_ID || "project_req_omega_001";
+const repositoryTargetId = pilotConfig.repositoryTargetId || process.env.OMEGA_PAGE_PILOT_REPOSITORY_TARGET_ID || "repo_ZYOOO_TestRepo";
+const repositoryLabel = pilotConfig.repositoryLabel || process.env.OMEGA_PAGE_PILOT_REPOSITORY_LABEL || "ZYOOO/TestRepo";
+const storageScope = [repositoryTargetId, pilotConfig.url || ""]
+  .filter(Boolean)
+  .join(":")
+  .replace(/[^a-zA-Z0-9._:-]+/g, "-")
+  .slice(0, 180) || "default";
+const persistedRunKey = `omega-page-pilot-last-run:${storageScope}`;
+const conversationHistoryKey = `omega-page-pilot-conversation-history:${storageScope}`;
+const statusBarDockKey = `omega-page-pilot-status-dock:${storageScope}`;
+const statusBarPositionKey = `omega-page-pilot-status-position:${storageScope}`;
 
 function sourceElementFor(element) {
   const sourceElement = element.closest("[data-omega-source]");
@@ -230,6 +254,73 @@ function injectStyles() {
     .omega-pilot-fab span {
       position: relative;
       z-index: 1;
+    }
+    .omega-pilot-back {
+      position: fixed;
+      left: 0;
+      top: 50%;
+      z-index: 2;
+      width: 18px;
+      height: 86px;
+      box-sizing: border-box;
+      border: 0;
+      border-radius: 0 999px 999px 0;
+      padding: 0;
+      background: transparent;
+      color: transparent;
+      box-shadow: none;
+      font: inherit;
+      font-size: 0;
+      font-weight: 900;
+      pointer-events: auto;
+      cursor: pointer;
+      backdrop-filter: blur(14px);
+      overflow: hidden;
+      transform: translateY(-50%);
+      transition: width 160ms ease, background 160ms ease, box-shadow 160ms ease, color 160ms ease;
+    }
+    .omega-pilot-back::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 22px;
+      width: 4px;
+      height: 42px;
+      border-radius: 0 999px 999px 0;
+      background: transparent;
+      transition: background 160ms ease, width 160ms ease;
+    }
+    .omega-pilot-back::after {
+      content: "返回";
+      position: absolute;
+      left: 18px;
+      top: 50%;
+      transform: translate(-8px, -50%);
+      color: #244174;
+      font-size: 13px;
+      opacity: 0;
+      white-space: nowrap;
+      transition: opacity 160ms ease, transform 160ms ease;
+    }
+    .omega-pilot-back:hover,
+    .omega-pilot-back:focus-visible {
+      width: 76px;
+      border: 1px solid rgba(201, 216, 255, 0.72);
+      border-color: var(--omega-feishu-primary);
+      background: rgba(255, 255, 255, 0.94);
+      color: var(--omega-feishu-primary);
+      box-shadow: 0 12px 32px rgba(31, 35, 41, 0.14);
+      outline: none;
+    }
+    .omega-pilot-back:hover::before,
+    .omega-pilot-back:focus-visible::before {
+      width: 5px;
+      background: var(--omega-feishu-primary);
+    }
+    .omega-pilot-back:hover::after,
+    .omega-pilot-back:focus-visible::after {
+      opacity: 1;
+      transform: translate(0, -50%);
     }
     .omega-pilot-fab:hover:not(:disabled),
     .omega-pilot-fab:focus-visible {
@@ -487,13 +578,29 @@ function injectStyles() {
       transition: width 160ms ease, border-radius 160ms ease, transform 160ms ease, opacity 160ms ease;
     }
     .omega-pilot-topbar.is-tucked {
-      opacity: 0.96;
+      opacity: 0;
     }
     .omega-pilot-topbar.is-tucked:not(.is-top) {
-      transform: translate(-50%, calc(100% - 8px));
+      transform: translate(-50%, calc(100% + 12px));
     }
     .omega-pilot-topbar.is-tucked.is-top {
-      transform: translate(-50%, calc(-100% + 8px));
+      transform: translate(-50%, calc(-100% - 12px));
+    }
+    .omega-pilot-topbar.is-tucked::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      width: min(680px, calc(100vw - 64px));
+      height: 24px;
+      transform: translateX(-50%);
+      pointer-events: auto;
+      background: transparent;
+    }
+    .omega-pilot-topbar.is-tucked:not(.is-top)::before {
+      top: -24px;
+    }
+    .omega-pilot-topbar.is-tucked.is-top::before {
+      bottom: -24px;
     }
     .omega-pilot-topbar.is-top {
       top: 0;
@@ -567,6 +674,11 @@ function injectStyles() {
       font-weight: 900;
       cursor: pointer;
     }
+    .omega-pilot-topbar-actions button:disabled {
+      cursor: not-allowed;
+      opacity: 0.48;
+      filter: grayscale(0.2);
+    }
     .omega-pilot-topbar-actions .primary {
       border-color: var(--omega-feishu-primary);
       background: var(--omega-feishu-primary);
@@ -576,6 +688,9 @@ function injectStyles() {
       border-color: #f8c7c5;
       background: var(--omega-feishu-danger-soft);
       color: var(--omega-feishu-danger);
+    }
+    .omega-pilot-topbar-actions .omega-pilot-hidden-reload {
+      display: none;
     }
     .omega-pilot-detail-popover {
       grid-column: 1 / -1;
@@ -879,6 +994,26 @@ function persistStatusBarPosition(position) {
 window.addEventListener("DOMContentLoaded", () => {
   injectStyles();
   const root = createElement("div", "omega-pilot-root");
+  if (pilotConfig.hostedInOmega || pilotConfig.returnUrl) {
+    const back = createElement("button", "omega-pilot-back", "");
+    back.type = "button";
+    back.title = "返回控制台";
+    back.setAttribute("aria-label", "返回控制台");
+    back.addEventListener("click", () => {
+      if (ipcRenderer) {
+        ipcRenderer.invoke("omega-preview:close").catch(() => {
+          if (pilotConfig.returnUrl) window.location.href = pilotConfig.returnUrl;
+        });
+        return;
+      }
+      if (pilotConfig.returnUrl) {
+        window.location.href = pilotConfig.returnUrl;
+      } else {
+        window.history.back();
+      }
+    });
+    root.appendChild(back);
+  }
   const fab = createElement("button", "omega-pilot-fab");
   fab.appendChild(createElement("span", "", "☝"));
   fab.type = "button";
@@ -1209,17 +1344,19 @@ window.addEventListener("DOMContentLoaded", () => {
 
     const actions = createElement("div", "omega-pilot-topbar-actions");
     if (runRecord) {
-      const confirm = createElement("button", "primary", "Confirm");
-      const discard = createElement("button", "danger", "Discard");
-      const reload = createElement("button", "", "Reload");
+      const reload = createElement("button", "omega-pilot-hidden-reload", "Reload");
       const startNew = createElement("button", "", "New");
-      confirm.type = discard.type = reload.type = startNew.type = "button";
-      confirm.disabled = runRecord.status !== "applied";
-      discard.disabled = runRecord.status !== "applied";
-      actions.append(confirm, discard, reload, startNew);
-      confirm.addEventListener("click", () => deliverRun(runRecord, confirm, discard));
-      discard.addEventListener("click", () => discardRun(runRecord, confirm, discard));
-      reload.addEventListener("click", () => window.location.reload());
+      reload.type = startNew.type = "button";
+      if (runRecord.status === "applied") {
+        const confirm = createElement("button", "primary", "Confirm");
+        const discard = createElement("button", "danger", "Discard");
+        confirm.type = discard.type = "button";
+        actions.append(confirm, discard);
+        confirm.addEventListener("click", () => deliverRun(runRecord, confirm, discard));
+        discard.addEventListener("click", () => discardRun(runRecord, confirm, discard));
+      }
+      actions.append(reload, startNew);
+      reload.addEventListener("click", () => refreshLivePreviewFromButton(reload, "manual-reload", runRecord));
       startNew.addEventListener("click", () => {
         run = null;
         clearPersistedRun();
@@ -1227,6 +1364,21 @@ window.addEventListener("DOMContentLoaded", () => {
         tray?.remove();
         tray = null;
         setStatus("Ready for a new Page Pilot selection.");
+      });
+    } else if (errorText) {
+      const reload = createElement("button", "omega-pilot-hidden-reload", "Reload");
+      const startNew = createElement("button", "primary", "New");
+      reload.type = startNew.type = "button";
+      actions.append(reload, startNew);
+      reload.addEventListener("click", () => refreshLivePreviewFromButton(reload, "manual-reload"));
+      startNew.addEventListener("click", () => {
+        run = null;
+        clearPersistedRun();
+        resetAnnotations();
+        statusBarExpanded = false;
+        tray?.remove();
+        tray = null;
+        startSelecting("Ready for a new Page Pilot selection.");
       });
     }
 
@@ -1284,6 +1436,33 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  async function refreshLivePreview(reason, runRecord = null) {
+    if (!ipcRenderer) {
+      window.location.reload();
+      return { ok: true, action: "browser-reload" };
+    }
+    const result = await ipcRenderer.invoke("omega-preview:reload", {
+      reason,
+      runId: runRecord?.id || "",
+      changedFiles: runRecord?.changedFiles || [],
+    });
+    if (!result?.ok) {
+      throw new Error(result?.error || "Preview Runtime refresh failed.");
+    }
+    return result;
+  }
+
+  function refreshLivePreviewFromButton(button, reason, runRecord = null) {
+    button.disabled = true;
+    setStatus("Preview Runtime Supervisor 正在刷新预览...");
+    refreshLivePreview(reason, runRecord).then((result) => {
+      setStatus(result.action === "server-restart" ? "已重启 dev server 并刷新预览。" : "已刷新预览。");
+    }).catch((error) => {
+      button.disabled = false;
+      setStatus(error instanceof Error ? error.message : "Preview Runtime refresh failed.");
+    });
+  }
+
   function deliverRun(runRecord, confirm, discard) {
     const submittedAnnotations = runRecord.submittedAnnotations || [];
     const events = runRecord.processEvents || [];
@@ -1300,6 +1479,10 @@ window.addEventListener("DOMContentLoaded", () => {
       repositoryTargetId,
       instruction: runRecord.instruction || "",
       selection: runRecord.selection,
+      conversationBatch: runRecord.conversationBatch ? { ...runRecord.conversationBatch, status: "delivering" } : null,
+      submittedAnnotations,
+      processEvents: [...events, processEvent("User confirmed the Page Pilot changes for delivery.")],
+      previewRuntimeProfile: pilotConfig.previewRuntimeProfile || null,
     }).then((delivered) => {
       const deliveredBatch = runRecord.conversationBatch ? { ...runRecord.conversationBatch, status: "delivered" } : null;
       if (deliveredBatch) persistConversationBatch(deliveredBatch);
@@ -1340,8 +1523,8 @@ window.addEventListener("DOMContentLoaded", () => {
       run = enriched;
       persistRun(enriched);
       renderRunPanel(enriched);
-      setStatus("已撤销代码变更，正在刷新预览...");
-      window.setTimeout(() => window.location.reload(), 450);
+      setStatus("已撤销代码变更，Preview Runtime Supervisor 正在刷新预览...");
+      return refreshLivePreview("discard", enriched);
     }).catch((error) => {
       confirm.disabled = false;
       discard.disabled = false;
@@ -1421,11 +1604,16 @@ window.addEventListener("DOMContentLoaded", () => {
       setStatus("正在把批注提交给 Omega Agent...");
       try {
         const applied = await postJson("/page-pilot/apply", {
+          runId: run?.status === "applied" ? run.id : undefined,
           projectId,
           repositoryTargetId,
           runner: "profile",
           instruction,
           selection: primary.selection,
+          conversationBatch: batch,
+          submittedAnnotations,
+          processEvents: events,
+          previewRuntimeProfile: pilotConfig.previewRuntimeProfile || null,
         });
         const completedEvents = [
           ...events,
@@ -1439,8 +1627,8 @@ window.addEventListener("DOMContentLoaded", () => {
         run = enrichRunRecord(applied, { submittedAnnotations, processEvents: completedEvents, conversationBatch: batch });
         persistRun(run);
         renderRunPanel(run);
-        setStatus(`Agent 已应用：${(run.changedFiles || []).join(", ") || "source changed"}。正在刷新预览...`);
-        window.setTimeout(() => window.location.reload(), 650);
+        setStatus(`Agent 已应用：${(run.changedFiles || []).join(", ") || "source changed"}。Preview Runtime Supervisor 正在刷新预览...`);
+        await refreshLivePreview("apply", run);
       } catch (error) {
         const failedEvents = [...events, processEvent(error instanceof Error ? error.message : "Page Pilot agent apply failed.")];
         batch.status = "failed";

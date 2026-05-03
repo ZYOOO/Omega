@@ -2,6 +2,141 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-02: Work Item 详情页误把等待审核显示成返工/阻塞信号
+
+### 现象
+
+Work Item 进入 Human Review 后，详情页 Delivery flow 下方出现 `Feedback route: rework`，Run Workpad 中 `Rework checklist`、`Blockers`、`Retry reason` 等卡片也被染成黄色。用户看到后会误以为当前已经进入返工或失败重试，但实际状态只是等待人工审核。
+
+同一轮 Human Review 没有发送飞书消息，checkpoint 的 `feishuReview` 为空。
+
+### 原因
+
+- 前端只要发现 workflow contract 中存在 `rework` 阶段，就展示 `Feedback route`。这把“系统具备返工路线”误显示成“当前已经有反馈要返工”。
+- Run Workpad 会直接消费历史 `reworkChecklist` / `retryReason` / pending checkpoint，导致历史捕获或等待人工审核被当成当前阻塞。
+- 后端进入 Human Review 后，如果没有 chat、task、webhook 目标，会在自动发送前直接 `feishu.review.skipped`，没有把 `needs-configuration` 写回 checkpoint。`lark-cli` ready 只代表本机凭证可用，不代表已经知道要发给哪个群或任务负责人。
+
+### 修复
+
+- `Feedback route` 只在真实存在 request changes、rework assessment、retry available、failed/stalled/canceled attempt 时展示。
+- Run Workpad 不再把 pending Human Review checkpoint 当作 blocker；历史 rework checklist 只有在当前确实需要返工或重试时才展示为黄色。
+- 自动飞书审核发送取消静默跳过：缺少投递目标时会把 `needs-configuration` 结果写入 checkpoint，并记录 `feishu.review.needs_target`，方便页面和日志解释原因。
+- 修复 `Action plan` 摘要缺 CSS 导致文字挤在一起的问题。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestUsesLarkCLIInteractiveCard|TestFeishuConfigPreflightUsesLocalLarkCLIProfile'
+```
+
+## 2026-04-30: Page Pilot 集成路径偏离已验证 direct pilot 体验
+
+### 现象
+
+Page Pilot 入口增加 repo 选择和 preview source 后，打开目标页面时进入了 Omega 中转式 BrowserView：目标页只出现简化工具条，圈选结果回传到 Omega 页面继续填写指令。这和此前已验证的 Electron direct pilot 不一致，旧版目标页内的多批注、整体说明、Apply、Confirm、Discard 和结果面板没有作为主交互出现。
+
+### 原因
+
+为了快速接入 Repository Workspace 选择、隔离 preview workspace 和 preview URL 解析，曾把 Page Pilot 拆成“Omega 页面配置 + 目标页简化圈选 + 回传 Omega overlay”的两段式流程。该流程复用了部分能力，但本质上重写了用户操作路径，破坏了功能二“在真实目标页面内完成选择和修改”的设计。
+
+### 修复
+
+- `omega-preview:open` 改回加载 `pilot-preload.cjs`，沿用已验证的 direct pilot 目标页内交互。
+- Page Pilot React 页面收敛为启动器，只负责选择 repo、选择预览来源和打开 direct pilot。
+- Electron 打开目标页时通过 additional arguments 注入 `projectId`、`repositoryTargetId`、`repositoryLabel`，旧 direct pilot 不再依赖固定 env/default repo。
+- 目标页内新增 `返回` 按钮，可关闭 BrowserView 回到 Omega 页面。
+- 保留隔离 preview workspace 解析能力，不再保留简化 `preview-preload.cjs` 作为主路径。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+```
+
+## 2026-04-30: Page Pilot apply 复用旧 runtime 导致 workspace 解析失败
+
+### 现象
+
+Direct pilot 进入目标页面后可以正常圈选和提交批注，但 apply 失败并显示：
+
+```text
+Page Pilot needs a local repository workspace for HMR; bind a local repository target or run the local runtime from the matching GitHub worktree
+```
+
+同时目标 GitHub repo 的隔离 preview workspace 已经存在。
+
+### 原因
+
+Electron 桌面壳会优先复用 `http://127.0.0.1:3888/health` 上已有的 Go local runtime。前面已经把 Go runtime 的 Page Pilot repo 解析改成支持 Omega 管理的隔离 preview workspace，但本机端口上仍运行着旧进程，导致 apply 仍走旧错误分支。
+
+### 修复
+
+- 重启 Go local runtime 和 Electron 桌面壳，让当前 `page_pilot.go` 生效。
+- Direct pilot 的错误状态栏新增 `Reload` / `New` 操作；遇到后端修复或 repo 重新准备后，可以在目标页面里直接刷新或重新开始一轮选择，不再像卡死。
+- Direct pilot 的 `runtimeUrl` 改为由 Electron main process 从已启动/复用的 Go local runtime service 注入，不再只依赖 `pilot-preload.cjs` 默认值或 env。
+- Direct pilot 的 localStorage 状态按 `repositoryTargetId + target URL` 分作用域，避免旧目标页或旧 repo 的失败状态污染新一轮 Page Pilot。
+
+### 验证
+
+```bash
+curl http://127.0.0.1:3888/health
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget'
+node --check apps/desktop/src/pilot-preload.cjs
+node --check apps/desktop/src/main.cjs
+```
+
+## 2026-04-30: Page Pilot delivered 后仍显示确认/撤销动作
+
+### 现象
+
+Direct pilot 点击 `Confirm` 并完成 delivery 后，顶部标题已经显示 `Page Pilot Delivered`，但右侧仍显示 `Confirm` / `Discard` 按钮，看起来仍可继续确认或撤销。
+
+### 原因
+
+旧版结果栏无论 run status 是 `applied`、`delivered` 还是 `discarded` 都渲染同一组动作，只是用 `disabled` 尝试阻止非 applied 状态。但样式没有明显 disabled 视觉，导致 delivered 后仍像可点击状态。
+
+### 修复
+
+- 只有 `status = applied` 时渲染 `Confirm` / `Discard`。
+- `delivered` / `discarded` 状态只保留 `Reload` / `New`。
+- 为状态栏按钮补充 disabled 视觉兜底。
+
+### 验证
+
+```bash
+node --check apps/desktop/src/pilot-preload.cjs
+```
+
+## 2026-04-30: Page Pilot 入口不明显且缺少目标 repo 确认
+
+### 现象
+
+Electron 启动后默认展示首页，功能二入口只存在于 Workboard 左侧导航中的 `Page Pilot`。用户无法从首页直接发现功能二；进入 Page Pilot 后也没有显式 Repository Workspace 选择步骤，容易把功能二理解成固定项目演示。
+
+后续验证中还发现：Page Pilot 默认 immersive 样式会隐藏 App chrome，并让 preview 区域占满窗口；在没有可用 preview URL 或 Electron HMR 没刷新到最新代码时，页面只剩右下角 AI 浮球，看起来像 Electron 白屏。Electron 窗口也没有浏览器地址栏式刷新按钮，用户难以主动刷新。
+
+### 原因
+
+功能二底层已有 Electron preview / apply / deliver 能力，但产品入口仍停留在调试阶段：导航项存在，缺少首页 CTA、深链和从 Work Item 详情进入的上下文入口。
+
+### 修复
+
+- 首页增加 `打开 Page Pilot` / `启动 Page Pilot`。
+- 支持 `#page-pilot` 深链。
+- Page Pilot 页面新增 Repository Workspace 选择器。
+- Work Item 详情页增加 `Open in Page Pilot`，自动携带当前 item 的 `repositoryTargetId`。
+- 取消 Page Pilot 默认全屏沉浸式入口，保留左侧导航和普通页面布局，避免没有 preview 时出现空白页。
+- Electron 增加 `omega-app:reload` IPC 和 `window.omegaDesktop.reloadApp()`，Page Pilot 页面提供 `Reload app` 按钮。
+- `Open preview` 在 Electron 中改为调用 BrowserView bridge，避免只更新 iframe 导致跨端口页面空白或无法 inspect。
+- Preview source 增加 Dev server URL、HTML file、Omega proxy，避免把所有目标页面都假设成“已有端口服务”。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+```
+
 ## 2026-04-29: Orchestrator auto-run test cleaned TempDir before background job fully released
 
 ### 现象
@@ -751,4 +886,194 @@ go test ./services/local-runtime/internal/omegalocal
 npm run lint
 npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=15000
 npm run build
+```
+
+## 2026-04-30: Page Pilot Open preview 看起来没有反应
+
+### 现象
+
+用户在 Page Pilot 选择 repo 后点击 Open preview，页面下方仍为空白；输入 `127.0.0.1:3009` 或 `http://127.0.0.1:3009/` 时也不容易判断按钮是否真的打到 Electron 后台。
+
+### 原因
+
+- Electron 主进程的 `omega-preview:open` 没有捕获 `loadURL` 失败，目标端口未启动时 renderer 侧只看到像“无反应”的状态。
+- 前端 URL 规范化把无协议的 `127.0.0.1:3009` 当成相对路径，导致实际打开 `http://localhost:3000/127.0.0.1:3009`。
+- 曾尝试按仓库名从用户本机常见目录推断 worktree，这和 Repository Workspace 必须明确绑定的设计不一致。
+
+### 修复
+
+- Electron `omega-preview:open` 增加成功/失败日志，并把失败原因返回给 UI。
+- Page Pilot 前端会把无协议的 localhost / 127.0.0.1 地址规范成 `http://...`。
+- 移除默认目录猜测：local target 只使用显式 path；GitHub target 走 Omega 管理的隔离 preview workspace。
+- Go runtime apply 同步只认显式 local target 或隔离 preview workspace，避免预览和写入目录不一致。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget'
+```
+
+## 2026-04-30: Page Pilot 注入控件遮挡目标页面观察
+
+### 现象
+
+在目标项目页面里打开 Page Pilot 后，返回控制台按钮固定占用左上角；顶部/底部控制条点击隐藏后仍保留一小段可见残边，会干扰用户检查自己的页面布局。
+
+### 原因
+
+旧注入层把返回入口作为常驻按钮渲染，并通过 `translate(... - 8px)` 的方式保留状态条边缘用于唤回。这个设计方便发现入口，但不符合 Page Pilot 需要尽量不影响目标页面观察的原则。
+
+### 修复
+
+- 返回入口改为左侧透明边缘热区，默认不显示文字和按钮底色；鼠标移入或键盘聚焦时才展开为“返回”按钮。
+- 状态条收起后整体移出视野，不再露出 8px 残边。
+- 状态条通过透明热区唤回，保留可恢复性，同时避免视觉遮挡。
+
+### 验证
+
+```bash
+node --check apps/desktop/src/pilot-preload.cjs
+git diff --check
+```
+
+## 2026-04-30: GitHub delivery preflight 扩展后测试假 `gh` 合约不完整
+
+### 现象
+
+新增 GitHub delivery contract preflight 后，局部测试通过，但运行完整 Go runtime 测试时，DevFlow PR 周期用例在 preflight 阶段失败。
+
+### 原因
+
+测试中的 fake `gh` 只覆盖了旧链路需要的 `pr create`、`pr checks`、`pr merge` 等命令。新 preflight 会先调用 `gh auth status`、`gh repo view --json nameWithOwner,viewerPermission,defaultBranchRef` 和 `gh pr list --json number`，fake `gh` 对这些命令返回了不符合 JSON 合约的内容，导致运行前检查误判失败。
+
+### 修复
+
+- 扩展测试 fake `gh`，补齐 auth、repo view、pr list 的最小可信返回。
+- 新增 `TestGitHubDeliveryContractPreflightChecksPermissions`，专门验证权限不足时会在 preflight 阶段阻止运行。
+- 完整回归 `go test ./services/local-runtime/internal/omegalocal`，确保新 preflight 不破坏既有 DevFlow PR 周期。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+```
+
+## 2026-05-01: Page Pilot 启动器重复入口和实现文案干扰用户
+
+### 现象
+
+Page Pilot 页面顶部同时出现 `Workboard`、`Reload app` 和 `Open direct pilot`，但左侧导航已经能回到 Workboard，下面的预览来源表单也有打开入口。预览来源卡片还展示“沿用旧版目标页内操作体验”等实现说明，用户测试时会看到与当前任务无关的信息。
+
+### 原因
+
+旧版启动器保留了开发期调试入口和内部迁移说明，没有按最终用户任务重新收敛页面信息层级，导致同一操作出现两次，并暴露实现细节。
+
+### 修复
+
+- 移除顶部 direct pilot launcher 区块。
+- 移除 `Workboard` / `Reload app` / 顶部 `Open direct pilot` 重复按钮。
+- 预览来源卡片只保留 source selector、输入框和一个打开按钮。
+- 删除“沿用旧版目标页内操作体验”等内部说明和多余状态 chip；只有真实启动或错误状态才显示反馈。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+npm run lint
+```
+
+## 2026-05-01: Page Pilot 打开按钮暴露内部叫法
+
+### 现象
+
+Page Pilot 启动器按钮使用 `Open direct pilot`，状态文案也出现 `Direct Page Pilot`。这个词来自开发期区分不同预览实现的内部命名，用户不需要理解，也容易被误认为是过时功能。
+
+### 修复
+
+- 按钮文案改为“打开页面编辑”。
+- Electron 缺失和打开中的状态文案改为“页面编辑需要 Electron 桌面壳”“正在打开目标页面...”。
+- 功能测试清单中同步使用“页面编辑模式”。
+
+### 后续修正
+
+Page Pilot 启动器页面整体是英文 UI，因此按钮和状态文案最终统一为英文：
+
+- `Open page editor`
+- `Page editing requires the Electron desktop shell.`
+- `Opening target page...`
+
+相关 placeholder、仓库说明和成功状态也统一成英文，避免同一页面中英混杂。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+npm run lint
+```
+
+## 2026-05-01: Page Pilot 结果栏 Reload 与自动刷新重复
+
+### 现象
+
+目标页内 Page Pilot Apply 后，顶部结果栏同时显示 `Confirm`、`Discard`、`Reload`、`New`。由于 apply / discard / refresh 已经接入 Preview Runtime reload supervisor，常驻 `Reload` 容易让用户误以为需要手动刷新。
+
+### 修复
+
+- 保留 `refreshLivePreviewFromButton`、`omega-preview:reload` 和相关事件绑定逻辑。
+- 给结果栏中的 Reload 按钮增加专用 class，并通过样式隐藏。
+- `New`、`Confirm`、`Discard` 仍然可见。
+
+### 验证
+
+```bash
+node --check apps/desktop/src/pilot-preload.cjs
+```
+
+## 2026-05-03: OMG-30 DevFlow 两次失败与 Human Review 状态漂移
+
+### 现象
+
+测试 Work Item `OMG-30` 时连续失败两次。第一次进入 failed，第二次已经创建 PR 并进入 Human Review 相关日志，但页面最后显示为 stalled / blocked。Work Item 详情页的 Delivery flow 也不会自动更新，需要手动刷新页面才能看到最新阶段。
+
+### 原因
+
+- 第一次失败是真实仓库校验失败：`git diff --check HEAD~1 HEAD` 检测到 `customer-health.html` 第 1177 行 trailing whitespace。
+- 第二次不是 Agent 业务失败，而是 JobSupervisor 在 DevFlow job 已经写入 `waiting-human` 后，用旧内存快照继续扫描 running attempt，并把它误判为 `No active local worker host lease for running attempt.`。
+- Work Item 详情页只跟随 Workboard 主轮询，`action-plan` / `timeline` 只在进入详情时加载一次；阶段变化后没有独立刷新。
+
+### 修复
+
+- JobSupervisor 在标记 stalled 前会重新读取数据库；如果 attempt 的状态或 `updatedAt` 已经被后台 job 更新，就刷新本地快照并跳过本轮 stale 写入。
+- Integrity scan 增加 Human Review checkpoint 自愈：如果 pending `human_review` checkpoint 存在，而 attempt 被 stale supervisor 标为 orphaned stalled，会恢复为 `waiting-human`，pipeline 恢复为 `waiting-human`，Work Item 恢复为 `In Review`。
+- Work Item 详情页对 active attempt 的 `action-plan` / `timeline` 增加 2.5 秒轮询，并改为 `Promise.allSettled`，避免 action plan 单接口失败时把 timeline 一起清空。
+- stalled / failed attempt 会标记 `feishuFailureNotifyPending`，保存后触发飞书失败通知。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+```
+
+## 2026-05-03: 飞书测试消息成功但 Human Review / 失败通知未自动发送
+
+### 现象
+
+设置页里的飞书测试消息可以成功发到当前用户，但 DevFlow 到 Human Review 或失败时没有自动给飞书发消息。
+
+### 原因
+
+测试消息走的是一次性 `lark-cli im +messages-send --as bot --user-id <current-user>`。而自动 Human Review 发送只消费已保存的 chat / task / webhook 配置；当前数据库配置为空，没有 chat id、assignee、tasklist 或 webhook，因此自动链路记录为 `needs-configuration`。
+
+### 修复
+
+- 自动 Human Review 发送在没有显式 chat/task/webhook 路由时，会通过 `lark-cli contact +get-user --as user` 读取当前登录用户的 `open_id`，再走 bot direct message fallback。
+- 失败通知复用同一 current-user fallback；如果没有显式路由但 `lark-cli` 已登录，仍能把 failed / stalled 信息发给当前用户。
+- `feishuReview` 写回中增加 `route=direct-user`、`fallback=current-user` 和 `userId`，便于从 checkpoint 里追踪实际投递路径。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget|TestFeishuAutoReviewFallsBackToCurrentLarkUser'
 ```

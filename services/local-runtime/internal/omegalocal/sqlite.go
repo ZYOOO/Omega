@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,16 +17,6 @@ import (
 
 type SQLiteRepository struct {
 	Path string
-}
-
-var sqliteMigrations = []struct {
-	Version string
-	Name    string
-}{
-	{Version: "20260424_001", Name: "bootstrap_go_local_service_schema"},
-	{Version: "20260427_001", Name: "agent_profiles_first_class_table"},
-	{Version: "20260428_001", Name: "page_pilot_runs_first_class_table"},
-	{Version: "20260429_001", Name: "runtime_logs_append_only_table"},
 }
 
 func NewSQLiteRepository(path string) *SQLiteRepository {
@@ -43,6 +34,20 @@ CREATE TABLE IF NOT EXISTS omega_migrations (
   name TEXT NOT NULL,
   applied_at TEXT NOT NULL
 );
+`); err != nil {
+		return err
+	}
+	return repo.applyPendingSQLiteMigrations(ctx)
+}
+
+func (repo *SQLiteRepository) initializeBaselineSchema(ctx context.Context) error {
+	return repo.exec(ctx, `
+PRAGMA journal_mode = WAL;
+CREATE TABLE IF NOT EXISTS omega_migrations (
+  version TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS omega_settings (
   key TEXT PRIMARY KEY,
   value_json TEXT NOT NULL,
@@ -54,6 +59,21 @@ CREATE TABLE IF NOT EXISTS workspace_snapshots (
   saved_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, team TEXT NOT NULL, status TEXT NOT NULL, labels_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS repository_targets (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  label TEXT NOT NULL,
+  owner TEXT,
+  repo TEXT,
+  path TEXT,
+  url TEXT,
+  default_branch TEXT,
+  target_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repository_targets_project ON repository_targets(project_id, kind, updated_at);
 CREATE TABLE IF NOT EXISTS requirements (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, repository_target_id TEXT, source TEXT NOT NULL, source_external_ref TEXT, title TEXT NOT NULL, raw_text TEXT NOT NULL, structured_json TEXT NOT NULL, acceptance_criteria_json TEXT NOT NULL, risks_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, key TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL, priority TEXT NOT NULL, assignee TEXT NOT NULL, labels_json TEXT NOT NULL, team TEXT NOT NULL, stage_id TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mission_control_states (run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, work_items_json TEXT NOT NULL, events_json TEXT NOT NULL, sync_intents_json TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -67,6 +87,40 @@ CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, pipeline_id TEXT NO
 CREATE TABLE IF NOT EXISTS missions (id TEXT PRIMARY KEY, pipeline_id TEXT NOT NULL, work_item_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, mission_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, stage_id TEXT NOT NULL, agent_id TEXT NOT NULL, status TEXT NOT NULL, prompt TEXT NOT NULL, required_proof_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS proof_records (id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, label TEXT NOT NULL, value TEXT NOT NULL, source_path TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS handoff_bundles (
+  id TEXT PRIMARY KEY,
+  attempt_id TEXT,
+  pipeline_id TEXT,
+  work_item_id TEXT,
+  repository_target_id TEXT,
+  source_path TEXT,
+  bundle_json TEXT NOT NULL,
+  summary_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_handoff_bundles_attempt ON handoff_bundles(attempt_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_handoff_bundles_work_item ON handoff_bundles(work_item_id, updated_at);
+CREATE TABLE IF NOT EXISTS operation_queue (
+  id TEXT PRIMARY KEY,
+  operation_id TEXT NOT NULL,
+  pipeline_id TEXT,
+  attempt_id TEXT,
+  work_item_id TEXT,
+  repository_target_id TEXT,
+  stage_id TEXT,
+  agent_id TEXT,
+  status TEXT NOT NULL,
+  priority INTEGER NOT NULL,
+  not_before TEXT,
+  locked_by TEXT,
+  lock_expires_at TEXT,
+  attempt_count INTEGER NOT NULL,
+  queue_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operation_queue_status ON operation_queue(status, priority, updated_at);
 CREATE TABLE IF NOT EXISTS run_workpads (
   id TEXT PRIMARY KEY,
   attempt_id TEXT NOT NULL,
@@ -80,6 +134,20 @@ CREATE TABLE IF NOT EXISTS run_workpads (
 );
 CREATE INDEX IF NOT EXISTS idx_run_workpads_attempt ON run_workpads(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_run_workpads_work_item ON run_workpads(work_item_id, updated_at);
+CREATE TABLE IF NOT EXISTS workflow_templates (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  repository_target_id TEXT,
+  template_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  markdown TEXT NOT NULL,
+  validation_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_templates_scope ON workflow_templates(project_id, scope, COALESCE(repository_target_id, ''), template_id);
 CREATE TABLE IF NOT EXISTS agent_profiles (
   id TEXT PRIMARY KEY,
   scope TEXT NOT NULL,
@@ -116,6 +184,7 @@ CREATE TABLE IF NOT EXISTS runtime_logs (
   entity_id TEXT,
   project_id TEXT,
   repository_target_id TEXT,
+  requirement_id TEXT,
   work_item_id TEXT,
   pipeline_id TEXT,
   attempt_id TEXT,
@@ -129,21 +198,38 @@ CREATE INDEX IF NOT EXISTS idx_runtime_logs_created_at ON runtime_logs(created_a
 CREATE INDEX IF NOT EXISTS idx_runtime_logs_level ON runtime_logs(level, created_at);
 CREATE INDEX IF NOT EXISTS idx_runtime_logs_pipeline ON runtime_logs(pipeline_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runtime_logs_attempt ON runtime_logs(attempt_id, created_at);
-`); err != nil {
+`)
+}
+
+func (repo *SQLiteRepository) ensureRuntimeLogQueryExtensions(ctx context.Context) error {
+	output, err := repo.query(ctx, `.mode json
+PRAGMA table_info(runtime_logs);
+`)
+	if err != nil {
 		return err
 	}
-
-	for _, migration := range sqliteMigrations {
-		if err := repo.exec(ctx, fmt.Sprintf(
-			"INSERT OR IGNORE INTO omega_migrations (version, name, applied_at) VALUES (%s, %s, %s);",
-			sqlQuote(migration.Version),
-			sqlQuote(migration.Name),
-			sqlQuote(nowISO()),
-		)); err != nil {
+	var columns []map[string]any
+	if strings.TrimSpace(output) != "" {
+		if err := json.Unmarshal([]byte(output), &columns); err != nil {
 			return err
 		}
 	}
-	return nil
+	hasRequirementID := false
+	for _, column := range columns {
+		if text(column, "name") == "requirement_id" {
+			hasRequirementID = true
+			break
+		}
+	}
+	if !hasRequirementID {
+		if err := repo.exec(ctx, "ALTER TABLE runtime_logs ADD COLUMN requirement_id TEXT;"); err != nil {
+			return err
+		}
+	}
+	return repo.exec(ctx, `
+CREATE INDEX IF NOT EXISTS idx_runtime_logs_requirement ON runtime_logs(requirement_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_logs_work_item ON runtime_logs(work_item_id, created_at);
+`)
 }
 
 func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDatabase) error {
@@ -167,6 +253,7 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 		"DELETE FROM mission_control_states;",
 		"DELETE FROM work_items;",
 		"DELETE FROM requirements;",
+		"DELETE FROM repository_targets;",
 		"DELETE FROM projects;",
 		"DELETE FROM connections;",
 		"DELETE FROM ui_preferences;",
@@ -175,8 +262,11 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 		"DELETE FROM pipelines;",
 		"DELETE FROM proof_records;",
 		"DELETE FROM operations;",
+		"DELETE FROM handoff_bundles;",
+		"DELETE FROM operation_queue;",
 		"DELETE FROM missions;",
 		"DELETE FROM run_workpads;",
+		"DELETE FROM workflow_templates;",
 		fmt.Sprintf("INSERT INTO workspace_snapshots (id, database_json, saved_at) VALUES ('default', %s, %s);", sqlQuote(string(raw)), sqlQuote(database.SavedAt)),
 	}
 
@@ -185,6 +275,14 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 			"INSERT OR REPLACE INTO projects VALUES (%s,%s,%s,%s,%s,%s,%s,%s);",
 			q(project, "id"), q(project, "name"), q(project, "description"), q(project, "team"), q(project, "status"),
 			jsonQ(project["labels"]), q(project, "createdAt"), q(project, "updatedAt"),
+		))
+	}
+	for _, target := range repositoryTargetRecordsFromProjects(database.Tables.Projects) {
+		sqlText = append(sqlText, fmt.Sprintf(
+			"INSERT OR REPLACE INTO repository_targets VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+			q(target, "id"), q(target, "projectId"), q(target, "kind"), q(target, "label"),
+			nullableQ(target["owner"]), nullableQ(target["repo"]), nullableQ(target["path"]), nullableQ(target["url"]),
+			nullableQ(target["defaultBranch"]), jsonQ(target["target"]), q(target, "createdAt"), q(target, "updatedAt"),
 		))
 	}
 	for _, requirement := range database.Tables.Requirements {
@@ -258,10 +356,34 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 		sqlText = append(sqlText, fmt.Sprintf("INSERT OR REPLACE INTO proof_records VALUES (%s,%s,%s,%s,%s,%s);",
 			q(proof, "id"), q(proof, "operationId"), q(proof, "label"), q(proof, "value"), nullableQ(proof["sourcePath"]), q(proof, "createdAt")))
 	}
+	for _, bundle := range handoffBundleRecordsFromDatabase(database) {
+		sqlText = append(sqlText, fmt.Sprintf(
+			"INSERT OR REPLACE INTO handoff_bundles VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+			q(bundle, "id"), nullableQ(bundle["attemptId"]), nullableQ(bundle["pipelineId"]), nullableQ(bundle["workItemId"]),
+			nullableQ(bundle["repositoryTargetId"]), nullableQ(bundle["sourcePath"]), jsonQ(bundle["bundle"]), jsonQ(bundle["summary"]),
+			q(bundle, "createdAt"), q(bundle, "updatedAt"),
+		))
+	}
+	for _, queueItem := range operationQueueRecordsFromDatabase(database) {
+		sqlText = append(sqlText, fmt.Sprintf(
+			"INSERT OR REPLACE INTO operation_queue VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%d,%s,%s,%s);",
+			q(queueItem, "id"), q(queueItem, "operationId"), nullableQ(queueItem["pipelineId"]), nullableQ(queueItem["attemptId"]),
+			nullableQ(queueItem["workItemId"]), nullableQ(queueItem["repositoryTargetId"]), nullableQ(queueItem["stageId"]),
+			nullableQ(queueItem["agentId"]), q(queueItem, "status"), intValue(queueItem["priority"]),
+			nullableQ(queueItem["notBefore"]), nullableQ(queueItem["lockedBy"]), nullableQ(queueItem["lockExpiresAt"]),
+			intValue(queueItem["attemptCount"]), jsonQ(queueItem["queue"]), q(queueItem, "createdAt"), q(queueItem, "updatedAt"),
+		))
+	}
 	for _, workpad := range database.Tables.RunWorkpads {
 		sqlText = append(sqlText, fmt.Sprintf("INSERT OR REPLACE INTO run_workpads VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);",
 			q(workpad, "id"), q(workpad, "attemptId"), q(workpad, "pipelineId"), q(workpad, "workItemId"), nullableQ(workpad["repositoryTargetId"]),
 			q(workpad, "status"), jsonQ(workpad["workpad"]), q(workpad, "createdAt"), q(workpad, "updatedAt")))
+	}
+	for _, workflowTemplate := range database.Tables.WorkflowTemplates {
+		sqlText = append(sqlText, fmt.Sprintf("INSERT OR REPLACE INTO workflow_templates VALUES (%s,%s,%s,%s,%s,%s,%d,%s,%s,%s,%s);",
+			q(workflowTemplate, "id"), q(workflowTemplate, "scope"), q(workflowTemplate, "projectId"), nullableQ(workflowTemplate["repositoryTargetId"]),
+			q(workflowTemplate, "templateId"), q(workflowTemplate, "source"), intValue(workflowTemplate["version"]), q(workflowTemplate, "markdown"),
+			jsonQ(workflowTemplate["validation"]), q(workflowTemplate, "createdAt"), q(workflowTemplate, "updatedAt")))
 	}
 	sqlText = append(sqlText, "COMMIT;")
 	return repo.exec(ctx, strings.Join(sqlText, "\n"))
@@ -558,8 +680,8 @@ func (repo *SQLiteRepository) AppendRuntimeLog(ctx context.Context, record Runti
 	return repo.exec(ctx, fmt.Sprintf(`
 INSERT OR REPLACE INTO runtime_logs (
   id, level, event_type, message, entity_type, entity_id, project_id, repository_target_id,
-  work_item_id, pipeline_id, attempt_id, stage_id, agent_id, request_id, details_json, created_at
-) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+  requirement_id, work_item_id, pipeline_id, attempt_id, stage_id, agent_id, request_id, details_json, created_at
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
 `,
 		sqlQuote(record.ID),
 		sqlQuote(strings.ToUpper(record.Level)),
@@ -569,6 +691,7 @@ INSERT OR REPLACE INTO runtime_logs (
 		nullableQ(record.EntityID),
 		nullableQ(record.ProjectID),
 		nullableQ(record.RepositoryTargetID),
+		nullableQ(record.RequirementID),
 		nullableQ(record.WorkItemID),
 		nullableQ(record.PipelineID),
 		nullableQ(record.AttemptID),
@@ -581,11 +704,26 @@ INSERT OR REPLACE INTO runtime_logs (
 }
 
 func (repo *SQLiteRepository) ListRuntimeLogs(ctx context.Context, filters map[string]string, limit int) ([]RuntimeLogRecord, error) {
-	if err := repo.Initialize(ctx); err != nil {
+	page, err := repo.ListRuntimeLogsPage(ctx, filters, limit)
+	if err != nil {
 		return nil, err
 	}
-	if limit <= 0 || limit > 500 {
+	return page.Items, nil
+}
+
+func (repo *SQLiteRepository) ListRuntimeLogsPage(ctx context.Context, filters map[string]string, limit int) (RuntimeLogPage, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return RuntimeLogPage{}, err
+	}
+	maxLimit := 500
+	if filters["export"] == "1" {
+		maxLimit = 5000
+	}
+	if limit <= 0 || limit > maxLimit {
 		limit = 100
+		if filters["export"] == "1" {
+			limit = maxLimit
+		}
 	}
 	where := []string{"1=1"}
 	for key, column := range map[string]string{
@@ -607,12 +745,25 @@ func (repo *SQLiteRepository) ListRuntimeLogs(ctx context.Context, filters map[s
 			where = append(where, fmt.Sprintf("%s = %s", column, sqlQuote(value)))
 		}
 	}
+	if requirementID := strings.TrimSpace(filters["requirementId"]); requirementID != "" {
+		if scope := repo.runtimeLogRequirementScope(ctx, requirementID); scope != "" {
+			where = append(where, scope)
+		}
+	}
 	if value := strings.TrimSpace(filters["createdAfter"]); value != "" {
 		where = append(where, fmt.Sprintf("created_at >= %s", sqlQuote(value)))
 	}
 	if value := strings.TrimSpace(filters["createdBefore"]); value != "" {
 		where = append(where, fmt.Sprintf("created_at <= %s", sqlQuote(value)))
 	}
+	if value := strings.TrimSpace(filters["query"]); value != "" {
+		like := sqlQuote("%" + strings.ToLower(value) + "%")
+		where = append(where, fmt.Sprintf("(LOWER(event_type) LIKE %s OR LOWER(message) LIKE %s OR LOWER(details_json) LIKE %s OR LOWER(level) LIKE %s)", like, like, like, like))
+	}
+	if cursor := decodeRuntimeLogCursor(filters["cursor"]); cursor.CreatedAt != "" && cursor.ID != "" {
+		where = append(where, fmt.Sprintf("(created_at < %s OR (created_at = %s AND id < %s))", sqlQuote(cursor.CreatedAt), sqlQuote(cursor.CreatedAt), sqlQuote(cursor.ID)))
+	}
+	queryLimit := limit + 1
 	output, err := repo.query(ctx, fmt.Sprintf(`.mode json
 SELECT
   id,
@@ -623,6 +774,7 @@ SELECT
   entity_id AS entityId,
   project_id AS projectId,
   repository_target_id AS repositoryTargetId,
+  requirement_id AS requirementId,
   work_item_id AS workItemId,
   pipeline_id AS pipelineId,
   attempt_id AS attemptId,
@@ -633,18 +785,22 @@ SELECT
   created_at AS createdAt
 FROM runtime_logs
 WHERE %s
-ORDER BY created_at DESC
+ORDER BY created_at DESC, id DESC
 LIMIT %d;
-`, strings.Join(where, " AND "), limit))
+`, strings.Join(where, " AND "), queryLimit))
 	if err != nil {
-		return nil, err
+		return RuntimeLogPage{}, err
 	}
 	if strings.TrimSpace(output) == "" {
-		return []RuntimeLogRecord{}, nil
+		return RuntimeLogPage{Items: []RuntimeLogRecord{}, Limit: limit, HasMore: false}, nil
 	}
 	var rows []map[string]any
 	if err := json.Unmarshal([]byte(output), &rows); err != nil {
-		return nil, err
+		return RuntimeLogPage{}, err
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
 	}
 	logs := make([]RuntimeLogRecord, 0, len(rows))
 	for _, row := range rows {
@@ -657,6 +813,7 @@ LIMIT %d;
 			EntityID:           text(row, "entityId"),
 			ProjectID:          text(row, "projectId"),
 			RepositoryTargetID: text(row, "repositoryTargetId"),
+			RequirementID:      text(row, "requirementId"),
 			WorkItemID:         text(row, "workItemId"),
 			PipelineID:         text(row, "pipelineId"),
 			AttemptID:          text(row, "attemptId"),
@@ -671,7 +828,87 @@ LIMIT %d;
 		}
 		logs = append(logs, record)
 	}
-	return logs, nil
+	nextCursor := ""
+	if hasMore && len(logs) > 0 {
+		last := logs[len(logs)-1]
+		nextCursor = encodeRuntimeLogCursor(runtimeLogCursor{CreatedAt: last.CreatedAt, ID: last.ID})
+	}
+	return RuntimeLogPage{Items: logs, Limit: limit, NextCursor: nextCursor, HasMore: hasMore}, nil
+}
+
+type runtimeLogCursor struct {
+	CreatedAt string `json:"createdAt"`
+	ID        string `json:"id"`
+}
+
+func encodeRuntimeLogCursor(cursor runtimeLogCursor) string {
+	raw, err := json.Marshal(cursor)
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeRuntimeLogCursor(value string) runtimeLogCursor {
+	if strings.TrimSpace(value) == "" {
+		return runtimeLogCursor{}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return runtimeLogCursor{}
+	}
+	var cursor runtimeLogCursor
+	_ = json.Unmarshal(raw, &cursor)
+	return cursor
+}
+
+func (repo *SQLiteRepository) runtimeLogRequirementScope(ctx context.Context, requirementID string) string {
+	terms := []string{fmt.Sprintf("requirement_id = %s", sqlQuote(requirementID))}
+	database, err := repo.Load(ctx)
+	if err == nil && database != nil {
+		workItemIDs := map[string]bool{}
+		pipelineIDs := map[string]bool{}
+		attemptIDs := map[string]bool{}
+		for _, item := range database.Tables.WorkItems {
+			if text(item, "requirementId") == requirementID {
+				workItemIDs[text(item, "id")] = true
+			}
+		}
+		for _, pipeline := range database.Tables.Pipelines {
+			if workItemIDs[text(pipeline, "workItemId")] {
+				pipelineIDs[text(pipeline, "id")] = true
+			}
+		}
+		for _, attempt := range database.Tables.Attempts {
+			if workItemIDs[text(attempt, "itemId")] || pipelineIDs[text(attempt, "pipelineId")] {
+				attemptIDs[text(attempt, "id")] = true
+			}
+		}
+		if clause := sqlInClause("work_item_id", workItemIDs); clause != "" {
+			terms = append(terms, clause)
+		}
+		if clause := sqlInClause("pipeline_id", pipelineIDs); clause != "" {
+			terms = append(terms, clause)
+		}
+		if clause := sqlInClause("attempt_id", attemptIDs); clause != "" {
+			terms = append(terms, clause)
+		}
+	}
+	terms = append(terms, fmt.Sprintf("details_json LIKE %s", sqlQuote("%"+requirementID+"%")))
+	return "(" + strings.Join(terms, " OR ") + ")"
+}
+
+func sqlInClause(column string, values map[string]bool) string {
+	quoted := []string{}
+	for value := range values {
+		if strings.TrimSpace(value) != "" {
+			quoted = append(quoted, sqlQuote(value))
+		}
+	}
+	if len(quoted) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s IN (%s)", column, strings.Join(quoted, ","))
 }
 
 func (repo *SQLiteRepository) exec(ctx context.Context, input string) error {
@@ -732,6 +969,9 @@ func ensureTables(database *WorkspaceDatabase) {
 	}
 	if database.Tables.RunWorkpads == nil {
 		database.Tables.RunWorkpads = []map[string]any{}
+	}
+	if database.Tables.WorkflowTemplates == nil {
+		database.Tables.WorkflowTemplates = []map[string]any{}
 	}
 }
 

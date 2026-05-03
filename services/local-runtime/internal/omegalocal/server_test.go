@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -192,6 +193,16 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	if len(template.StageProfiles) != 8 {
 		t.Fatalf("stage profiles = %+v", template.StageProfiles)
 	}
+	if len(template.StateProfiles) != 8 {
+		t.Fatalf("state profiles should come from workflow action graph: %+v", template.StateProfiles)
+	}
+	actionPlan := workflowActionPlan(template)
+	if len(actionPlan) < 12 || workflowExecutionMode(template) != "contract-action-executor" {
+		t.Fatalf("workflow action plan missing: mode=%s actions=%+v", workflowExecutionMode(template), actionPlan)
+	}
+	if len(template.TaskClasses) != 2 || template.TaskClasses[0].ID != "simple" || template.TaskClasses[1].WorkpadMode != "full" {
+		t.Fatalf("workflow task classes missing: %+v", template.TaskClasses)
+	}
 	implementation := template.StageProfiles[1]
 	if implementation.ID != "in_progress" || strings.Join(implementation.AgentIDs, ",") != "architect,coding,testing" {
 		t.Fatalf("implementation agents should come from workflow markdown: %+v", implementation)
@@ -215,15 +226,73 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	}, template)
 	run := mapValue(pipeline["run"])
 	workflow := mapValue(run["workflow"])
-	if workflow["source"] == "" || len(arrayMaps(workflow["reviewRounds"])) != 2 {
+	if workflow["source"] == "" || len(arrayMaps(workflow["reviewRounds"])) != 2 || len(arrayMaps(workflow["actions"])) == 0 || text(workflow, "executionMode") != "contract-action-executor" {
 		t.Fatalf("pipeline run should preserve workflow metadata: %+v", workflow)
+	}
+	if len(arrayMaps(workflow["taskClasses"])) != 2 || len(arrayMaps(workflow["states"])) != 8 {
+		t.Fatalf("pipeline run should preserve workflow state/action policy: %+v", workflow)
 	}
 	stages := arrayMaps(run["stages"])
 	if got := anySlice(stages[1]["agentIds"]); len(got) != 3 || got[0] != "architect" || got[2] != "testing" {
 		t.Fatalf("pipeline stages did not preserve workflow agents: %+v", stages[1])
 	}
-	if got := anySlice(stages[1]["outputArtifacts"]); len(got) == 0 || got[len(got)-1] != "test-report" {
+	if got := anySlice(stages[1]["outputArtifacts"]); len(got) == 0 || got[len(got)-1] != "pull-request" {
 		t.Fatalf("pipeline stages did not preserve workflow artifacts: %+v", stages[1])
+	}
+}
+
+func TestWorkflowContractParsesStateActionsAndRejectsBrokenActionRoute(t *testing.T) {
+	markdown := `---
+id: custom-flow
+name: Custom Flow
+states:
+  - id: todo
+    title: Todo
+    agentId: requirement
+    agents: [requirement]
+    actions:
+      - id: capture
+        type: write_requirement_artifact
+        agent: requirement
+        prompt: requirement
+    transitions:
+      passed: coding
+  - id: coding
+    title: Coding
+    agentId: coding
+    agents: [coding]
+    actions:
+      - id: implement
+        type: run_agent
+        agent: coding
+        prompt: coding
+        requiresDiff: true
+        transitions:
+          passed: missing
+taskClasses:
+  - id: simple
+    workpadMode: compact
+---
+
+## Prompt: coding
+Ship {{title}}.
+`
+	template, err := parseWorkflowTemplateMarkdown(markdown, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(template.StateProfiles) != 2 || len(template.StageProfiles) != 2 || len(workflowActionPlan(&template)) != 2 {
+		t.Fatalf("workflow state/action parse failed: %+v", template)
+	}
+	if !template.StateProfiles[1].Actions[0].RequiresDiff {
+		t.Fatalf("requiresDiff should be parsed: %+v", template.StateProfiles[1].Actions[0])
+	}
+	if got := template.TaskClasses[0].WorkpadMode; got != "compact" {
+		t.Fatalf("task class not parsed: %+v", template.TaskClasses)
+	}
+	validation := validateWorkflowTemplate(template)
+	if validation.ok() || !strings.Contains(strings.Join(validation.Errors, "; "), "unknown stage") {
+		t.Fatalf("expected action transition validation failure, got %+v", validation)
 	}
 }
 
@@ -357,6 +426,18 @@ func TestDevFlowStageStatusAfterChangesRequestedQueuesRework(t *testing.T) {
 	status, next = devFlowStageStatusAfterInvocation("rework", "testing", "passed")
 	if status != "passed" || next != "code_review_round_1" {
 		t.Fatalf("stage status after rework = %s next=%s", status, next)
+	}
+	workflow := map[string]any{"transitions": []any{
+		map[string]any{"from": "code_review_round_1", "on": "changes_requested", "to": "human_review"},
+		map[string]any{"from": "rework", "on": "passed", "to": "code_review_round_2"},
+	}}
+	status, next = devFlowStageStatusAfterInvocationWithWorkflow(workflow, "code_review_round_1", "review", "changes-requested")
+	if status != "passed" || next != "human_review" {
+		t.Fatalf("contract changes-requested route = %s next=%s", status, next)
+	}
+	status, next = devFlowStageStatusAfterInvocationWithWorkflow(workflow, "rework", "testing", "passed")
+	if status != "passed" || next != "code_review_round_2" {
+		t.Fatalf("contract rework pass route = %s next=%s", status, next)
 	}
 }
 
@@ -768,16 +849,7 @@ func TestJobSupervisorTickMarksStalledRunningAttempt(t *testing.T) {
 		"projectId": "project_omega", "key": "OMG-stalled", "title": "Detect stalled run", "description": "Runner stopped heartbeating.",
 		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "ZYOOO/TestRepo", "createdAt": timestamp, "updatedAt": timestamp,
 	}
-	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
-		ID:          "devflow-pr",
-		Name:        "DevFlow PR cycle",
-		Description: "DevFlow",
-		StageProfiles: []StageProfile{
-			{ID: "todo", Title: "Requirement", Agent: "requirement"},
-			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
-			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
-		},
-	})
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
 	run := mapValue(pipeline["run"])
 	stages := arrayMaps(run["stages"])
 	stages[0]["status"] = "passed"
@@ -965,27 +1037,19 @@ func TestPrepareDevFlowAttemptRetryLinksAttempts(t *testing.T) {
 		"id": "item_retry", "projectId": "project_omega", "key": "OMG-retry", "title": "Retry failed attempt", "description": "Retry this failed work.",
 		"status": "Blocked", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": repoPath, "repositoryTargetId": "repo_retry", "createdAt": nowISO(), "updatedAt": nowISO(),
 	}
-	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
-		ID:          "devflow-pr",
-		Name:        "DevFlow PR cycle",
-		Description: "DevFlow",
-		StageProfiles: []StageProfile{
-			{ID: "todo", Title: "Requirement", Agent: "requirement"},
-			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
-			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
-		},
-	})
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
 	pipeline["id"] = "pipeline_retry"
 	pipeline["status"] = "failed"
 	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
 	attempt["id"] = "attempt_retry_old"
 	attempt["status"] = "failed"
 	attempt["errorMessage"] = "Coding agent produced no repository changes."
+	attempt["failureReviewFeedback"] = "Review found missing proof and asked for a focused validation note."
 	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
 	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
 
-	updated, retryPipeline, retryAttempt, err := server.prepareDevFlowAttemptRetry(ctx, *database, "attempt_retry_old", "Operator retry after failed diff.")
+	updated, retryPipeline, retryAttempt, err := server.prepareDevFlowAttemptRetry(ctx, *database, "attempt_retry_old", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -995,9 +1059,19 @@ func TestPrepareDevFlowAttemptRetryLinksAttempts(t *testing.T) {
 	if text(retryPipeline, "status") != "running" {
 		t.Fatalf("retry pipeline = %+v", retryPipeline)
 	}
+	if !strings.Contains(text(retryAttempt, "retryReason"), "Review found missing proof") {
+		t.Fatalf("retry reason should come from the rework checklist = %+v", retryAttempt)
+	}
+	reworkChecklist := mapValue(retryAttempt["reworkChecklist"])
+	if text(reworkChecklist, "status") != "needs-rework" || !strings.Contains(text(reworkChecklist, "prompt"), "focused validation note") {
+		t.Fatalf("retry attempt should carry rework checklist = %+v", reworkChecklist)
+	}
 	oldAttempt := updated.Tables.Attempts[findByID(updated.Tables.Attempts, "attempt_retry_old")]
 	if text(oldAttempt, "retryAttemptId") != text(retryAttempt, "id") {
 		t.Fatalf("old attempt retry link = %+v", oldAttempt)
+	}
+	if text(mapValue(oldAttempt["reworkChecklist"]), "status") != "needs-rework" {
+		t.Fatalf("old attempt checklist = %+v", oldAttempt)
 	}
 	itemAfter := findWorkItem(updated, "item_retry")
 	if text(itemAfter, "status") != "In Review" {
@@ -1387,16 +1461,7 @@ func TestJobSupervisorScanRecoverableAttemptsRetriesWithPolicy(t *testing.T) {
 		"id": "item_supervisor_retry", "projectId": "project_omega", "key": "OMG-retry-supervisor", "title": "Supervisor retry", "description": "Retry this failed work.",
 		"status": "Blocked", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": repoPath, "repositoryTargetId": "repo_supervisor_retry", "createdAt": nowISO(), "updatedAt": nowISO(),
 	}
-	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{
-		ID:          "devflow-pr",
-		Name:        "DevFlow PR cycle",
-		Description: "DevFlow",
-		StageProfiles: []StageProfile{
-			{ID: "todo", Title: "Requirement", Agent: "requirement"},
-			{ID: "in_progress", Title: "Implementation", Agent: "coding"},
-			{ID: "human_review", Title: "Human Review", Agent: "delivery", HumanGate: true},
-		},
-	})
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
 	pipeline["id"] = "pipeline_supervisor_retry"
 	pipeline["status"] = "failed"
 	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
@@ -1426,6 +1491,38 @@ func TestJobSupervisorScanRecoverableAttemptsRetriesWithPolicy(t *testing.T) {
 	}
 	if text(mapValue(jobs[0]["lock"]), "attemptId") != text(retryAttempt, "id") {
 		t.Fatalf("retry job should carry workspace lock: %+v", jobs[0])
+	}
+	policy := mapValue(jobs[0]["recoveryPolicy"])
+	if text(policy, "class") != "transient_network" || text(policy, "action") != "wait-and-retry" {
+		t.Fatalf("retry job missing recovery policy: %+v", jobs[0])
+	}
+	actionPlan := mapValue(jobs[0]["actionPlan"])
+	if text(actionPlan, "executionMode") != "contract-action-executor" || text(actionPlan, "currentStateId") != "todo" || text(actionPlan, "currentActionId") != "capture_requirement" {
+		t.Fatalf("retry job missing action plan summary: %+v", jobs[0])
+	}
+	recoverable := arrayMaps(summary["recoverableAttempts"])
+	if len(recoverable) == 0 || text(mapValue(recoverable[0]["actionPlan"]), "retryAction") != "retry_attempt" {
+		t.Fatalf("recoverable attempt missing action plan summary: %+v", summary)
+	}
+}
+
+func TestJobSupervisorRecoveryPolicyBlocksPermissionAutoRetry(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{Attempts: []map[string]any{
+		{
+			"id": "attempt_permission_failed", "pipelineId": "pipeline_permission", "itemId": "item_permission", "status": "failed",
+			"updatedAt":    time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano),
+			"errorMessage": "gh repo view returned viewerPermission=READ and cannot create pull requests",
+		},
+	}}}
+	jobs := []map[string]any{}
+	summary := server.scanRecoverableAttempts(context.Background(), database, jobSupervisorTickOptions{AutoRetryFailed: true, MaxRetryAttempts: 2, Limit: 5}, &jobs)
+	if summary["manualRecoveryRequired"] != 1 || summary["acceptedRetryAttempts"] != 0 || len(jobs) != 0 {
+		t.Fatalf("permission failure should require manual action: summary=%+v jobs=%+v", summary, jobs)
+	}
+	record := arrayMaps(summary["recoverableAttempts"])[0]
+	if text(record, "decision") != "manual-fix-permission" || text(mapValue(record["recoveryPolicy"]), "class") != "permission_failure" {
+		t.Fatalf("record should explain permission recovery: %+v", record)
 	}
 }
 
@@ -1538,6 +1635,151 @@ func TestJobSupervisorMarksOrphanedWorkerAttemptStalled(t *testing.T) {
 	}
 }
 
+func TestJobSupervisorDoesNotOverwriteFreshWaitingHumanAttempt(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	item := map[string]any{"id": "item_waiting", "key": "OMG-waiting", "repositoryTargetId": "repo_waiting", "status": "In Review"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow", StageProfiles: []StageProfile{{ID: "todo", Title: "Todo", Agent: "requirement"}}})
+	pipeline["id"] = "pipeline_waiting"
+	freshAttempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	freshAttempt["id"] = "attempt_waiting"
+	freshAttempt["status"] = "waiting-human"
+	freshAttempt["updatedAt"] = "2026-05-03T04:00:10Z"
+	staleAttempt := cloneMap(freshAttempt)
+	staleAttempt["status"] = "running"
+	staleAttempt["updatedAt"] = "2026-05-03T04:00:00Z"
+	freshDatabase := WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems: []map[string]any{item},
+		Pipelines: []map[string]any{pipeline},
+		Attempts:  []map[string]any{freshAttempt},
+	}}
+	if err := server.Repo.Save(context.Background(), freshDatabase); err != nil {
+		t.Fatal(err)
+	}
+	staleDatabase := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems: []map[string]any{item},
+		Pipelines: []map[string]any{pipeline},
+		Attempts:  []map[string]any{staleAttempt},
+	}}
+
+	summary := server.scanWorkerHostLeases(context.Background(), staleDatabase)
+	if summary["orphanedWorkerAttempts"] != 0 || text(staleDatabase.Tables.Attempts[0], "status") != "waiting-human" {
+		t.Fatalf("stale scan should refresh instead of stalling: summary=%+v attempt=%+v", summary, staleDatabase.Tables.Attempts[0])
+	}
+}
+
+func TestJobSupervisorRecoversOrphanedHumanReviewAttempt(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	item := map[string]any{"id": "item_human_orphan", "key": "OMG-human-orphan", "repositoryTargetId": "repo_human_orphan", "status": "Blocked"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow", StageProfiles: []StageProfile{
+		{ID: "todo", Title: "Todo", Agent: "requirement"},
+		{ID: "human_review", Title: "Human Review", Agent: "human", HumanGate: true},
+	}})
+	pipeline["id"] = "pipeline_human_orphan"
+	pipeline["status"] = "stalled"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_human_orphan"
+	attempt["status"] = "stalled"
+	attempt["statusReason"] = "No active local worker host lease for running attempt."
+	checkpoint := map[string]any{
+		"id":         "pipeline_human_orphan:human_review",
+		"pipelineId": "pipeline_human_orphan",
+		"attemptId":  "attempt_human_orphan",
+		"stageId":    "human_review",
+		"status":     "pending",
+		"title":      "Human Review",
+		"summary":    "Waiting for approval.",
+	}
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems:    []map[string]any{item},
+		Pipelines:    []map[string]any{pipeline},
+		Attempts:     []map[string]any{attempt},
+		Checkpoints:  []map[string]any{checkpoint},
+		ProofRecords: []map[string]any{},
+	}}
+
+	summary := server.reconcileAttemptIntegrityInDatabase(context.Background(), database)
+	if summary["recoveredHumanGates"] != 1 || text(database.Tables.Attempts[0], "status") != "waiting-human" {
+		t.Fatalf("human review recovery failed: summary=%+v attempt=%+v", summary, database.Tables.Attempts[0])
+	}
+	if text(database.Tables.Pipelines[0], "status") != "waiting-human" || text(database.Tables.WorkItems[0], "status") != "In Review" {
+		t.Fatalf("pipeline/item state not recovered: pipeline=%+v item=%+v", database.Tables.Pipelines[0], database.Tables.WorkItems[0])
+	}
+}
+
+func TestJobSupervisorRecoversProofBackedHumanReviewAttempt(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	root := t.TempDir()
+	workspace := filepath.Join(root, "OMG-30-devflow-pr")
+	proofDir := filepath.Join(workspace, ".omega", "proof")
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proofDir, "human-review-request.md"), []byte("Review the PR."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{
+		"pipelineId":     "pipeline_proof_human",
+		"workItemId":     "item_proof_human",
+		"workspacePath":  workspace,
+		"branchName":     "omega/OMG-30-devflow",
+		"pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/39",
+		"reviewPacket":   map[string]any{"summary": "Review packet ready.", "risk": map[string]any{"level": "low"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONFile(filepath.Join(proofDir, "attempt-review-packet.json"), map[string]any{"summary": "Review approved.", "risk": map[string]any{"level": "low"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proofDir, "solution-plan.md"), []byte("plan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	item := map[string]any{"id": "item_proof_human", "key": "OMG-30", "repositoryTargetId": "repo_test", "status": "Blocked"}
+	pipeline := makePipelineWithTemplate(item, &PipelineTemplate{ID: "devflow-pr", Name: "DevFlow", StageProfiles: []StageProfile{
+		{ID: "todo", Title: "Todo intake", Agent: "requirement"},
+		{ID: "in_progress", Title: "Implementation and PR", Agent: "coding"},
+		{ID: "code_review_round_2", Title: "Code Review Round 2", Agent: "review"},
+		{ID: "human_review", Title: "Human Review", Agent: "human", HumanGate: true},
+		{ID: "merging", Title: "Merging", Agent: "delivery"},
+	}})
+	pipeline["id"] = "pipeline_proof_human"
+	pipeline["status"] = "stalled"
+	pipeline = markDevFlowStageProgress(pipeline, "todo", "passed", "")
+	pipeline = markDevFlowStageProgress(pipeline, "in_progress", "passed", "")
+	pipeline = markDevFlowStageProgress(pipeline, "code_review_round_2", "running", "")
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "code_review_round_2")
+	attempt["id"] = "attempt_proof_human"
+	attempt["status"] = "stalled"
+	attempt["events"] = append(arrayMaps(attempt["events"]), map[string]any{
+		"type":      "attempt.worker.orphaned",
+		"message":   "No active local worker host lease for running attempt.",
+		"stageId":   "code_review_round_2",
+		"createdAt": nowISO(),
+	})
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems: []map[string]any{item},
+		Pipelines: []map[string]any{pipeline},
+		Attempts:  []map[string]any{attempt},
+		ProofRecords: []map[string]any{{
+			"id": "proof_plan", "operationId": "pipeline_proof_human:agent:001", "sourcePath": filepath.Join(proofDir, "solution-plan.md"),
+		}},
+	}}
+
+	summary := server.reconcileAttemptIntegrityInDatabase(context.Background(), database)
+	if summary["recoveredProofHumanGates"] != 1 || text(database.Tables.Attempts[0], "status") != "waiting-human" {
+		t.Fatalf("proof recovery failed: summary=%+v attempt=%+v", summary, database.Tables.Attempts[0])
+	}
+	if len(database.Tables.Checkpoints) != 1 || text(database.Tables.Checkpoints[0], "status") != "pending" || text(database.Tables.Checkpoints[0], "attemptId") != "attempt_proof_human" {
+		t.Fatalf("checkpoint not rebuilt: %+v", database.Tables.Checkpoints)
+	}
+	if text(database.Tables.Attempts[0], "pullRequestUrl") != "https://github.com/ZYOOO/TestRepo/pull/39" || text(database.Tables.Attempts[0], "workspacePath") != workspace {
+		t.Fatalf("delivery metadata not recovered: %+v", database.Tables.Attempts[0])
+	}
+	if got := stringSlice(summary["feishuReviewPipelines"]); len(got) != 1 || got[0] != "pipeline_proof_human" {
+		t.Fatalf("review pipeline notification missing: %+v", summary)
+	}
+}
+
 func TestJobSupervisorScanRecoverableAttemptsRespectsBackoffAndLimit(t *testing.T) {
 	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -1555,6 +1797,22 @@ func TestJobSupervisorScanRecoverableAttemptsRespectsBackoffAndLimit(t *testing.
 
 func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
 	api, repo := newTestAPI(t)
+	database := WorkspaceDatabase{Tables: WorkspaceTables{
+		Requirements: []map[string]any{{
+			"id": "req_runtime_1", "projectId": "project_omega", "source": "manual", "title": "Runtime logs", "rawText": "Trace approval",
+			"structured": map[string]any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "status": "converted", "createdAt": "2026-04-29T09:00:00Z", "updatedAt": "2026-04-29T09:00:00Z",
+		}},
+		WorkItems: []map[string]any{{
+			"id": "item_runtime_1", "projectId": "project_omega", "key": "OMG-runtime", "title": "Runtime", "description": "Runtime", "status": "Running",
+			"priority": "High", "assignee": "requirement", "labels": []any{}, "team": "Omega", "stageId": "human_review", "target": "target", "requirementId": "req_runtime_1",
+			"createdAt": "2026-04-29T09:00:00Z", "updatedAt": "2026-04-29T09:00:00Z",
+		}},
+		Pipelines: []map[string]any{{"id": "pipeline_item_manual_1", "workItemId": "item_runtime_1", "runId": "run_runtime_1", "status": "running", "run": map[string]any{}, "createdAt": "2026-04-29T09:00:00Z", "updatedAt": "2026-04-29T09:00:00Z"}},
+		Attempts:  []map[string]any{{"id": "attempt_missing", "itemId": "item_runtime_1", "pipelineId": "pipeline_item_manual_1", "status": "failed", "trigger": "manual", "runner": "codex", "startedAt": "2026-04-29T09:00:00Z", "stages": []any{}, "events": []any{}, "createdAt": "2026-04-29T09:00:00Z", "updatedAt": "2026-04-29T09:00:00Z"}},
+	}}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
 	if err := repo.AppendRuntimeLog(context.Background(), RuntimeLogRecord{
 		ID:         "log_error_1",
 		Level:      "ERROR",
@@ -1562,7 +1820,7 @@ func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
 		Message:    "Missing attempt was detected.",
 		PipelineID: "pipeline_item_manual_1",
 		AttemptID:  "attempt_missing",
-		Details:    map[string]any{"pipelineId": "pipeline_item_manual_1"},
+		Details:    map[string]any{"pipelineId": "pipeline_item_manual_1", "note": "approval failed in review gate"},
 		CreatedAt:  "2026-04-29T10:00:00Z",
 	}); err != nil {
 		t.Fatal(err)
@@ -1574,6 +1832,17 @@ func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
 		Message:   "GET /health -> 200",
 		Details:   map[string]any{"path": "/health"},
 		CreatedAt: "2026-04-28T10:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AppendRuntimeLog(context.Background(), RuntimeLogRecord{
+		ID:            "log_req_1",
+		Level:         "INFO",
+		EventType:     "requirement.trace",
+		Message:       "Requirement trace collected.",
+		RequirementID: "req_runtime_1",
+		Details:       map[string]any{"requirementId": "req_runtime_1"},
+		CreatedAt:     "2026-04-29T09:30:00Z",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1589,6 +1858,32 @@ func TestRuntimeLogsAPIListsAndFiltersRecords(t *testing.T) {
 	decode(t, mustGet(t, api.URL+"/runtime-logs?eventType=checkpoint.approve.missing_attempt&createdAfter=2026-04-29T00%3A00%3A00Z"), &logs)
 	if len(logs) != 1 || logs[0].ID != "log_error_1" {
 		t.Fatalf("time filtered logs = %+v", logs)
+	}
+	decode(t, mustGet(t, api.URL+"/runtime-logs?requirementId=req_runtime_1&q=approval"), &logs)
+	if len(logs) != 1 || logs[0].ID != "log_error_1" {
+		t.Fatalf("requirement/search filtered logs = %+v", logs)
+	}
+	var page RuntimeLogPage
+	decode(t, mustGet(t, api.URL+"/runtime-logs?page=1&limit=1&requirementId=req_runtime_1"), &page)
+	if len(page.Items) != 1 || !page.HasMore || page.NextCursor == "" || page.Items[0].ID != "log_error_1" {
+		t.Fatalf("runtime log page = %+v", page)
+	}
+	var nextPage RuntimeLogPage
+	decode(t, mustGet(t, api.URL+"/runtime-logs?page=1&limit=1&requirementId=req_runtime_1&cursor="+url.QueryEscape(page.NextCursor)), &nextPage)
+	if len(nextPage.Items) != 1 || nextPage.Items[0].ID != "log_req_1" {
+		t.Fatalf("runtime log next page = %+v", nextPage)
+	}
+	exportResponse := mustGet(t, api.URL+"/runtime-logs/export?format=csv&requirementId=req_runtime_1")
+	defer exportResponse.Body.Close()
+	if exportResponse.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d", exportResponse.StatusCode)
+	}
+	rawExport, err := io.ReadAll(exportResponse.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawExport), "requirementId") || !strings.Contains(string(rawExport), "Requirement trace collected.") {
+		t.Fatalf("csv export = %s", string(rawExport))
 	}
 
 	var summary map[string]any
@@ -1818,7 +2113,13 @@ func TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof(t *testing.T) {
 	gh := filepath.Join(bin, "gh")
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %s
-if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf 'ok\n'
+elif [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf '{"nameWithOwner":"acme/demo","viewerPermission":"WRITE","defaultBranchRef":{"name":"main"}}'
+elif [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '[]'
+elif [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   printf 'https://github.com/acme/demo/pull/123\n'
 elif [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   printf 'no checks found\n'
@@ -1931,6 +2232,7 @@ echo "fake coding agent completed"
 		"code-review-round-1.md",
 		"code-review-round-2.md",
 		"human-review-request.md",
+		"attempt-review-packet.json",
 		"attempt-run-report.md",
 		"handoff-bundle.json",
 	} {
@@ -1953,11 +2255,26 @@ echo "fake coding agent completed"
 	if artifacts := arrayMaps(handoff["artifacts"]); len(artifacts) < 7 {
 		t.Fatalf("handoff artifacts = %+v", artifacts)
 	}
+	reviewPacket := mapValue(handoff["reviewPacket"])
+	if text(mapValue(reviewPacket["diffPreview"]), "summary") == "" || text(mapValue(reviewPacket["testPreview"]), "status") == "" || text(mapValue(reviewPacket["risk"]), "level") == "" || len(arrayMaps(reviewPacket["recommendedActions"])) == 0 {
+		t.Fatalf("handoff review packet = %+v", reviewPacket)
+	}
+	packetRaw, err := os.ReadFile(filepath.Join(proofDir, "attempt-review-packet.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var packetFile map[string]any
+	if err := json.Unmarshal(packetRaw, &packetFile); err != nil {
+		t.Fatal(err)
+	}
+	if text(mapValue(packetFile["diffPreview"]), "summary") != text(mapValue(reviewPacket["diffPreview"]), "summary") {
+		t.Fatalf("packet file should match handoff packet: file=%+v handoff=%+v", packetFile, reviewPacket)
+	}
 	reportRaw, err := os.ReadFile(filepath.Join(proofDir, "attempt-run-report.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(reportRaw), "Attempt Run Report") || !strings.Contains(string(reportRaw), "https://github.com/acme/demo/pull/123") {
+	if !strings.Contains(string(reportRaw), "Attempt Run Report") || !strings.Contains(string(reportRaw), "Diff Preview") || !strings.Contains(string(reportRaw), "Recommended Actions") || !strings.Contains(string(reportRaw), "https://github.com/acme/demo/pull/123") {
 		t.Fatalf("attempt report = %s", string(reportRaw))
 	}
 	planRaw, err := os.ReadFile(filepath.Join(proofDir, "solution-plan.md"))
@@ -2669,11 +2986,12 @@ func TestObservabilityDashboardMetrics(t *testing.T) {
 	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 	database.Tables.Checkpoints = append(database.Tables.Checkpoints, checkpoint)
 	database.Tables.Attempts = append(database.Tables.Attempts,
-		map[string]any{"id": "attempt_done", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "done", "currentStageId": "done", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "in_progress", "title": "Implementation", "status": "passed", "startedAt": startedAt, "completedAt": completedAt}}},
-		map[string]any{"id": "attempt_failed", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "failed", "currentStageId": "in_progress", "errorMessage": "tests failed", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "code_review", "title": "Review", "status": "failed", "durationMs": 240000}}},
-		map[string]any{"id": "attempt_running", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "running", "currentStageId": "in_progress", "lastSeenAt": startedAt, "startedAt": startedAt, "updatedAt": startedAt, "stages": []map[string]any{}},
-		map[string]any{"id": "attempt_waiting", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "waiting-human", "currentStageId": "human_review", "lastSeenAt": completedAt, "startedAt": startedAt, "updatedAt": completedAt, "stages": []map[string]any{}},
+		map[string]any{"id": "attempt_done", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "done", "runner": "codex", "currentStageId": "done", "pullRequestUrl": "https://github.com/acme/demo/pull/10", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "in_progress", "title": "Implementation", "status": "passed", "startedAt": startedAt, "completedAt": completedAt}}},
+		map[string]any{"id": "attempt_failed", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "failed", "runner": "codex", "currentStageId": "in_progress", "pullRequestUrl": "https://github.com/acme/demo/pull/11", "errorMessage": "tests failed", "startedAt": startedAt, "finishedAt": completedAt, "updatedAt": completedAt, "stages": []map[string]any{{"id": "code_review", "title": "Review", "status": "failed", "durationMs": 240000}}},
+		map[string]any{"id": "attempt_running", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "running", "runner": "opencode", "currentStageId": "in_progress", "lastSeenAt": startedAt, "startedAt": startedAt, "updatedAt": startedAt, "stages": []map[string]any{}},
+		map[string]any{"id": "attempt_waiting", "itemId": text(item, "id"), "pipelineId": text(pipeline, "id"), "repositoryTargetId": "repo_1", "status": "waiting-human", "runner": "claude-code", "currentStageId": "human_review", "lastSeenAt": completedAt, "startedAt": startedAt, "updatedAt": completedAt, "stages": []map[string]any{}},
 	)
+	database.Tables.ProofRecords = append(database.Tables.ProofRecords, map[string]any{"id": "proof_merge", "operationId": "operation_merge", "label": "merge proof", "value": "https://github.com/acme/demo/pull/10", "createdAt": completedAt})
 	if err := repo.Save(context.Background(), *database); err != nil {
 		t.Fatal(err)
 	}
@@ -2700,6 +3018,26 @@ func TestObservabilityDashboardMetrics(t *testing.T) {
 	if len(slowStages) == 0 || slowStages[0]["stageId"] != "code_review" {
 		t.Fatalf("slow stages = %+v", slowStages)
 	}
+	stageAverages := arrayMaps(dashboard["stageAverageDurations"])
+	if len(stageAverages) < 2 || stageAverages[0]["stageId"] != "code_review" || intNumber(stageAverages[0]["averageDurationMs"]) != 240000 {
+		t.Fatalf("stage averages = %+v", stageAverages)
+	}
+	runnerUsage := arrayMaps(dashboard["runnerUsage"])
+	if len(runnerUsage) == 0 || runnerUsage[0]["runner"] != "codex" || intNumber(runnerUsage[0]["count"]) != 2 || intNumber(runnerUsage[0]["successCount"]) != 1 || intNumber(runnerUsage[0]["failureCount"]) != 1 {
+		t.Fatalf("runner usage = %+v", runnerUsage)
+	}
+	checkpointWaits := mapValue(dashboard["checkpointWaitTimes"])
+	if intNumber(checkpointWaits["total"]) != 1 || intNumber(checkpointWaits["pending"]) != 1 || intNumber(checkpointWaits["maxWaitSeconds"]) <= 0 {
+		t.Fatalf("checkpoint waits = %+v", checkpointWaits)
+	}
+	pullRequests := mapValue(dashboard["pullRequests"])
+	if intNumber(pullRequests["created"]) != 2 || intNumber(pullRequests["merged"]) != 1 || intNumber(pullRequests["open"]) != 1 {
+		t.Fatalf("pull request metrics = %+v", pullRequests)
+	}
+	trends := arrayMaps(dashboard["trends"])
+	if len(trends) == 0 || intNumber(trends[0]["attemptsStarted"]) != 4 || intNumber(trends[0]["pullRequestsCreated"]) != 2 || intNumber(trends[0]["pullRequestsMerged"]) != 1 {
+		t.Fatalf("trends = %+v", trends)
+	}
 	waiting := arrayMaps(dashboard["waitingHumanQueue"])
 	if len(waiting) != 1 || waiting[0]["checkpointId"] != "checkpoint_dashboard" {
 		t.Fatalf("waiting queue = %+v", waiting)
@@ -2711,6 +3049,24 @@ func TestObservabilityDashboardMetrics(t *testing.T) {
 	actions := arrayMaps(dashboard["recommendedActions"])
 	if len(actions) == 0 {
 		t.Fatalf("recommended actions missing: %+v", dashboard)
+	}
+	groups := arrayMaps(dashboard["groups"])
+	if len(groups) == 0 {
+		t.Fatalf("grouped observability missing: %+v", dashboard)
+	}
+	recentFailures := arrayMaps(dashboard["recentFailures"])
+	if len(recentFailures) == 0 || text(recentFailures[0], "attemptId") != "attempt_failed" {
+		t.Fatalf("recent failures = %+v", recentFailures)
+	}
+	drilldown := arrayMaps(dashboard["slowStageDrilldown"])
+	if len(drilldown) == 0 || text(drilldown[0], "stageId") != "code_review" {
+		t.Fatalf("slow stage drilldown = %+v", drilldown)
+	}
+	var grouped map[string]any
+	decode(t, mustGet(t, api.URL+"/observability?windowDays=30&groupBy=runner&limit=2"), &grouped)
+	groupedDashboard := mapValue(grouped["dashboard"])
+	if text(groupedDashboard, "groupBy") != "runner" || len(arrayMaps(groupedDashboard["groups"])) == 0 {
+		t.Fatalf("runner grouping missing: %+v", groupedDashboard)
 	}
 }
 
@@ -3311,6 +3667,10 @@ func TestGitHubPRStatusUsesGhViewAndChecks(t *testing.T) {
 	bin := t.TempDir()
 	gh := filepath.Join(bin, "gh")
 	script := `#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ] && echo "$*" | grep -q 'comments,reviews'; then
+  printf '%s' '{"comments":[{"author":{"login":"reviewer"},"body":"Please tighten empty-state copy.","createdAt":"2026-04-30T08:00:00Z","url":"https://github.com/acme/demo/pull/12#issuecomment-1"}],"reviews":[{"author":{"login":"lead"},"state":"CHANGES_REQUESTED","body":"Update the retry explanation.","submittedAt":"2026-04-30T08:01:00Z","url":"https://github.com/acme/demo/pull/12#pullrequestreview-1"}]}'
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s' '{"number":12,"title":"Omega delivery","state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","headRefName":"omega/OMG-1-coding","baseRefName":"main","url":"https://github.com/acme/demo/pull/12"}'
   exit 0
@@ -3352,9 +3712,80 @@ exit 1
 	if len(actions) != 1 || actions[0]["type"] != "checks-pending" {
 		t.Fatalf("recommended actions = %+v", actions)
 	}
+	feedback := arrayMaps(result["reviewFeedback"])
+	if len(feedback) != 2 || feedback[0]["kind"] != "pr-comment" || feedback[1]["kind"] != "pr-review" {
+		t.Fatalf("review feedback = %+v", feedback)
+	}
 	branchSync := mapValue(result["branchSync"])
 	if branchSync["status"] != "unknown" {
 		t.Fatalf("branch sync = %+v", branchSync)
+	}
+}
+
+func TestGitHubPullRequestFeedbackFromView(t *testing.T) {
+	feedback := githubPullRequestFeedbackFromView(map[string]any{
+		"comments": []any{
+			map[string]any{"author": map[string]any{"login": "designer"}, "body": "The secondary button contrast is too low.", "url": "https://example.test/comment"},
+		},
+		"reviews": []any{
+			map[string]any{"author": map[string]any{"login": "reviewer"}, "state": "CHANGES_REQUESTED", "body": "Add validation proof before merge."},
+			map[string]any{"author": map[string]any{"login": "maintainer"}, "state": "COMMENTED"},
+		},
+	})
+	if len(feedback) != 3 {
+		t.Fatalf("feedback = %+v", feedback)
+	}
+	prompt := githubPullRequestFeedbackPrompt(feedback)
+	for _, expected := range []string{"secondary button contrast", "Add validation proof", "Review state: COMMENTED"} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("prompt missing %q in:\n%s", expected, prompt)
+		}
+	}
+}
+
+func TestGitHubPullRequestReviewThreadFeedbackFromGraphQL(t *testing.T) {
+	feedback := githubPullRequestReviewThreadFeedbackFromGraphQL(map[string]any{
+		"data": map[string]any{
+			"repository": map[string]any{
+				"pullRequest": map[string]any{
+					"reviewThreads": map[string]any{
+						"nodes": []any{
+							map[string]any{
+								"isResolved": false,
+								"path":       "src/Button.tsx",
+								"line":       float64(42),
+								"comments": map[string]any{"nodes": []any{
+									map[string]any{
+										"author":    map[string]any{"login": "reviewer"},
+										"body":      "Please keep the button copy short.",
+										"createdAt": "2026-05-01T01:00:00Z",
+										"url":       "https://github.com/acme/demo/pull/1#discussion_r1",
+										"diffHunk":  "@@ -1,2 +1,2 @@",
+									},
+								}},
+							},
+							map[string]any{
+								"isResolved": true,
+								"path":       "src/Card.tsx",
+								"line":       float64(9),
+								"comments": map[string]any{"nodes": []any{
+									map[string]any{"body": "Resolved copy note."},
+								}},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if len(feedback) != 2 {
+		t.Fatalf("feedback = %+v", feedback)
+	}
+	if text(feedback[0], "kind") != "pr-review-thread" || text(feedback[0], "state") != "unresolved" || text(feedback[0], "path") != "src/Button.tsx" || text(feedback[0], "line") != "42" {
+		t.Fatalf("unresolved thread feedback missing line context: %+v", feedback[0])
+	}
+	if !boolValue(feedback[1]["resolved"]) || text(feedback[1], "state") != "resolved" {
+		t.Fatalf("resolved thread state missing: %+v", feedback[1])
 	}
 }
 
@@ -3372,6 +3803,10 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   printf '%s' '[{"name":"lint","state":"FAILURE","link":"https://github.com/acme/demo/actions/runs/3"},{"name":"test","state":"SUCCESS","link":"https://github.com/acme/demo/actions/runs/4"}]'
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "view" ] && [ "$3" = "3" ]; then
+  printf '%s' 'lint	Failing test output: expected button text to be shorter'
   exit 0
 fi
 exit 1
@@ -3393,6 +3828,10 @@ exit 1
 	actions := arrayMaps(result["recommendedActions"])
 	if len(actions) == 0 || actions[0]["type"] != "checks-failed" {
 		t.Fatalf("recommended actions = %+v", actions)
+	}
+	checkFeedback := arrayMaps(result["checkLogFeedback"])
+	if len(checkFeedback) != 1 || !strings.Contains(text(checkFeedback[0], "message"), "expected button text") {
+		t.Fatalf("check log feedback = %+v", checkFeedback)
 	}
 }
 
@@ -3680,6 +4119,114 @@ func TestGitHubBindRepositoryTargetPersistsProjectTarget(t *testing.T) {
 	}
 }
 
+func TestCreateProjectAndBindRepositoryTarget(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	var created WorkspaceDatabase
+	decode(t, postJSON(t, api.URL+"/projects", map[string]any{
+		"name":        "Pilot Project",
+		"description": "Repository onboarding",
+	}), &created)
+	createdProject := map[string]any{}
+	for _, project := range created.Tables.Projects {
+		if text(project, "id") == "project_pilot-project" {
+			createdProject = project
+			break
+		}
+	}
+	if text(createdProject, "name") != "Pilot Project" {
+		t.Fatalf("project was not created: %+v", created.Tables.Projects)
+	}
+
+	var bound WorkspaceDatabase
+	decode(t, postJSON(t, api.URL+"/github/bind-repository-target", map[string]any{
+		"projectId":     "project_pilot-project",
+		"owner":         "acme",
+		"repo":          "pilot",
+		"nameWithOwner": "acme/pilot",
+		"defaultBranch": "main",
+		"url":           "https://github.com/acme/pilot",
+	}), &bound)
+	for _, project := range bound.Tables.Projects {
+		if text(project, "id") != "project_pilot-project" {
+			continue
+		}
+		targets := arrayMaps(project["repositoryTargets"])
+		if len(targets) != 1 || text(targets[0], "id") != "repo_acme_pilot" {
+			t.Fatalf("repository target not scoped to project: %+v", project)
+		}
+		return
+	}
+	loaded, _ := repo.Load(context.Background())
+	t.Fatalf("created project missing after bind: %+v", loaded.Tables.Projects)
+}
+
+func TestRepositoryAuditTablesAndProofPreview(t *testing.T) {
+	api, repo := newTestAPI(t)
+	proofDir := t.TempDir()
+	handoffPath := filepath.Join(proofDir, "handoff-bundle.json")
+	if err := os.WriteFile(handoffPath, []byte(`{"changedFiles":["index.html"],"pullRequestUrl":"https://github.com/acme/demo/pull/7"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	timestamp := nowISO()
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       timestamp,
+		Tables: WorkspaceTables{
+			Projects: []map[string]any{{
+				"id": "project_omega", "name": "Omega", "description": "", "team": "Omega", "status": "Active", "labels": []any{}, "createdAt": timestamp, "updatedAt": timestamp,
+				"repositoryTargets": []any{map[string]any{"id": "repo_acme_demo", "kind": "github", "owner": "acme", "repo": "demo", "url": "https://github.com/acme/demo", "defaultBranch": "main", "createdAt": timestamp, "updatedAt": timestamp}},
+			}},
+			WorkItems: []map[string]any{{
+				"id": "item_1", "projectId": "project_omega", "key": "OMG-1", "title": "Audit", "description": "Audit proof.", "status": "Running", "priority": "High", "assignee": "delivery", "labels": []any{}, "team": "Omega", "stageId": "delivery", "target": "repo", "repositoryTargetId": "repo_acme_demo", "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "runId": "run_1", "status": "running", "run": map[string]any{}, "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			Attempts: []map[string]any{{
+				"id": "attempt_1", "itemId": "item_1", "pipelineId": "pipeline_1", "repositoryTargetId": "repo_acme_demo", "status": "running", "trigger": "manual", "runner": "codex", "stages": []any{}, "events": []any{}, "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			Missions: []map[string]any{{
+				"id": "mission_1", "pipelineId": "pipeline_1", "workItemId": "item_1", "title": "Delivery", "status": "running", "mission": map[string]any{}, "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			Operations: []map[string]any{{
+				"id": "operation_1", "missionId": "mission_1", "stageId": "delivery", "agentId": "delivery", "status": "running", "prompt": "Publish proof.", "requiredProof": []any{"handoff"}, "createdAt": timestamp, "updatedAt": timestamp,
+			}},
+			ProofRecords: []map[string]any{{
+				"id": "proof_1", "operationId": "operation_1", "label": "handoff-bundle", "value": "handoff-bundle.json", "sourcePath": handoffPath, "createdAt": timestamp,
+			}},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+
+	var targets []map[string]any
+	decode(t, mustGet(t, api.URL+"/repository-targets?projectId=project_omega"), &targets)
+	if len(targets) != 1 || text(targets[0], "id") != "repo_acme_demo" {
+		t.Fatalf("repository targets = %+v", targets)
+	}
+
+	var bundles []map[string]any
+	decode(t, mustGet(t, api.URL+"/handoff-bundles?attemptId=attempt_1"), &bundles)
+	if len(bundles) != 1 || text(mapValue(bundles[0]["summary"]), "pullRequest") == "" {
+		t.Fatalf("handoff bundles = %+v", bundles)
+	}
+
+	var queue []map[string]any
+	decode(t, mustGet(t, api.URL+"/operation-queue?status=running"), &queue)
+	if len(queue) != 1 || text(queue[0], "operationId") != "operation_1" {
+		t.Fatalf("operation queue = %+v", queue)
+	}
+
+	var preview map[string]any
+	decode(t, mustGet(t, api.URL+"/proof-records/proof_1/preview"), &preview)
+	if preview["available"] != true || !strings.Contains(text(preview, "content"), "index.html") {
+		t.Fatalf("proof preview = %+v", preview)
+	}
+}
+
 func TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)
@@ -3752,8 +4299,8 @@ func TestLocalCapabilitiesReportsInstalledCliTools(t *testing.T) {
 	if byID["lark-cli"]["available"] != true || byID["lark-cli"]["category"] != "feishu" {
 		t.Fatalf("lark-cli capability = %+v", byID["lark-cli"])
 	}
-	if byID["codex"]["available"] != false || byID["opencode"]["available"] != false {
-		t.Fatalf("ai cli capabilities = codex:%+v opencode:%+v", byID["codex"], byID["opencode"])
+	if byID["codex"]["available"] != false || byID["opencode"]["available"] != false || byID["trae-agent"]["available"] != false {
+		t.Fatalf("ai cli capabilities = codex:%+v opencode:%+v trae-agent:%+v", byID["codex"], byID["opencode"], byID["trae-agent"])
 	}
 }
 
@@ -3963,6 +4510,343 @@ func TestProfileRunnerRegistrySelectsConfiguredAgentRunner(t *testing.T) {
 	}
 }
 
+func TestTraeAgentRunnerUsesTraeCLI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake trae-cli script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	trae := filepath.Join(bin, "trae-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > trae-args.txt\nprintf '%s\\n' 'trae agent runner ok'\n"
+	if err := os.WriteFile(trae, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "trae-agent",
+			"model":  "doubao-seed-1.6",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+	if saved.AgentProfiles[0].Runner != "trae-agent" {
+		t.Fatalf("saved profile = %+v", saved)
+	}
+
+	mission := map[string]any{
+		"id":               "mission_OMG-91_coding",
+		"sourceIssueKey":   "OMG-91",
+		"sourceWorkItemId": "item_manual_91",
+		"title":            "Use configured trae runner",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run using Trae Agent.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	if result.RunnerProcess["runner"] != "trae-agent" || result.RunnerProcess["command"] != "trae-cli" {
+		t.Fatalf("runner process = %+v", result.RunnerProcess)
+	}
+	if !strings.Contains(result.Stdout, "trae agent runner ok") {
+		t.Fatalf("stdout = %q", result.Stdout)
+	}
+	args, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "run Run using Trae Agent.") || !strings.Contains(string(args), "--working-dir") || !strings.Contains(string(args), "--provider doubao") {
+		t.Fatalf("trae args = %s", args)
+	}
+}
+
+func TestRunnerCredentialEncryptsAndInjectsTraeEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake trae-cli script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	trae := filepath.Join(bin, "trae-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > trae-args.txt\nprintf '%s\\n' \"$DOUBAO_API_KEY\" \"$DOUBAO_BASE_URL\" > trae-env.txt\nprintf '%s\\n' 'trae env ok'\n"
+	if err := os.WriteFile(trae, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var credential map[string]any
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
+		"runner":   "trae-agent",
+		"provider": "doubao",
+		"label":    "Trae Doubao",
+		"model":    "ep-test-001",
+		"baseUrl":  "https://ark.example.test/api/v3",
+		"apiKey":   "secret-trae-key",
+	}), &credential)
+	if credential["secretConfigured"] != true {
+		t.Fatalf("credential response leaked secret or was not configured: %+v", credential)
+	}
+	if _, ok := credential["apiKey"]; ok {
+		t.Fatalf("credential response leaked apiKey: %+v", credential)
+	}
+	if _, ok := credential["secret"]; ok {
+		t.Fatalf("credential response leaked secret: %+v", credential)
+	}
+	stored, err := repo.GetSetting(context.Background(), "runnerCredential:trae-agent-doubao")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprint(stored), "secret-trae-key") {
+		t.Fatalf("stored credential contains plaintext: %+v", stored)
+	}
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "trae-agent",
+			"model":  "gpt-5.4-mini",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+
+	mission := map[string]any{
+		"id":               "mission_OMG-92_coding",
+		"sourceIssueKey":   "OMG-92",
+		"sourceWorkItemId": "item_manual_92",
+		"title":            "Use encrypted Trae account",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run with encrypted account.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	envOutput, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-env.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(envOutput)); got != "secret-trae-key\nhttps://ark.example.test/api/v3" {
+		t.Fatalf("trae env = %q", got)
+	}
+	args, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(args), "secret-trae-key") || !strings.Contains(string(args), "--model ep-test-001") {
+		t.Fatalf("trae args = %s", args)
+	}
+}
+
+func TestFeishuConfigEncryptsSecretsAndPublicMasking(t *testing.T) {
+	api, repo := newTestAPI(t)
+	var saved map[string]any
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/feishu/config", map[string]any{
+		"mode":              "task",
+		"chatId":            "oc_test",
+		"assigneeId":        "ou_test",
+		"tasklistId":        "tasklist_test",
+		"webhookUrl":        "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+		"webhookSecret":     "secret-webhook",
+		"reviewToken":       "secret-review",
+		"createDoc":         true,
+		"docFolderToken":    "folder_test",
+		"taskBridgeEnabled": true,
+	}), &saved)
+	if saved["webhookSecretConfigured"] != true || saved["reviewTokenConfigured"] != true {
+		t.Fatalf("expected saved Feishu secrets to be masked as configured: %+v", saved)
+	}
+	if saved["webhookSecretMasked"] != "********" || saved["reviewTokenMasked"] != "********" {
+		t.Fatalf("expected masked Feishu secrets in public response: %+v", saved)
+	}
+	stored, err := repo.GetSetting(context.Background(), feishuConfigSettingKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprint(stored), "secret-webhook") || strings.Contains(fmt.Sprint(stored), "secret-review") {
+		t.Fatalf("stored Feishu config leaked plaintext secrets: %+v", stored)
+	}
+	var fetched map[string]any
+	decode(t, requestJSON(t, http.MethodGet, api.URL+"/feishu/config", nil), &fetched)
+	if fetched["chatId"] != "oc_test" || fetched["taskBridgeEnabled"] != true {
+		t.Fatalf("expected persisted Feishu config, got %+v", fetched)
+	}
+}
+
+func TestFeishuConfigPreflightUsesLocalLarkCLIProfile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake lark-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	lark := filepath.Join(bin, "lark-cli")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'lark-cli version 1.0.23\n'
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "show" ]; then
+  printf '{"appId":"cli_test","appSecret":"****","brand":"feishu","profile":"cli_test"}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(lark, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/feishu/config/test", nil), &result)
+	if result["status"] != "ready" || result["tool"] != "lark-cli" {
+		t.Fatalf("expected lark-cli preflight to pass without route overrides, got %+v", result)
+	}
+}
+
+func TestFeishuUserSearchUsesLocalLarkCLI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake lark-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	lark := filepath.Join(bin, "lark-cli")
+	script := `#!/bin/sh
+if [ "$1" = "contact" ] && [ "$2" = "+search-user" ]; then
+  printf '{"data":{"users":[{"open_id":"ou_reviewer","name":"王审核","email":"reviewer@example.test"}]}}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(lark, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/feishu/users/search", map[string]any{"query": "王审核"}), &result)
+	users := arrayMaps(result["users"])
+	if result["status"] != "ready" || len(users) != 1 || text(users[0], "openId") != "ou_reviewer" {
+		t.Fatalf("expected reviewer candidate from lark-cli, got %+v", result)
+	}
+}
+
+func TestFeishuUserSearchCanResolveCurrentUser(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake lark-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	lark := filepath.Join(bin, "lark-cli")
+	script := `#!/bin/sh
+if [ "$1" = "contact" ] && [ "$2" = "+get-user" ]; then
+  printf '{"data":{"user":{"open_id":"ou_me","name":"当前用户","email":"me@example.test"}}}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(lark, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/feishu/users/search", map[string]any{"query": "me"}), &result)
+	users := arrayMaps(result["users"])
+	if result["status"] != "ready" || len(users) != 1 || text(users[0], "openId") != "ou_me" {
+		t.Fatalf("expected current user candidate from lark-cli, got %+v", result)
+	}
+}
+
+func TestFeishuUserSearchFallsBackToEmailIDLookup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake lark-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	lark := filepath.Join(bin, "lark-cli")
+	script := `#!/bin/sh
+if [ "$1" = "contact" ] && [ "$2" = "+search-user" ]; then
+  printf 'login required\n' >&2
+  exit 2
+fi
+if [ "$1" = "api" ]; then
+  printf '{"data":{"user_list":[{"user_id":"ou_email_user","email":"reviewer@example.test"}]}}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(lark, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/feishu/users/search", map[string]any{"query": "reviewer@example.test"}), &result)
+	users := arrayMaps(result["users"])
+	if len(users) != 1 || text(users[0], "openId") != "ou_email_user" {
+		t.Fatalf("expected email fallback candidate, got %+v", result)
+	}
+}
+
+func TestAgentRunnerPreflightUsesTraeCredential(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake trae-cli script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	trae := filepath.Join(bin, "trae-cli")
+	script := "#!/bin/sh\nif [ \"$1\" = \"show-config\" ]; then printf 'model=%s\\nkey=%s\\n' \"$TRAE_MODEL\" \"$DOUBAO_API_KEY\"; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(trae, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var credential map[string]any
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
+		"runner":   "trae-agent",
+		"provider": "doubao",
+		"label":    "Trae Doubao",
+		"model":    "ep-test-001",
+		"apiKey":   "secret-trae-key",
+	}), &credential)
+
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-runner/preflight", map[string]any{
+		"agentId": "coding",
+		"label":   "Coding",
+		"runner":  "trae-agent",
+		"model":   "doubao:ep-test-001",
+	}), &result)
+	if result["status"] != "ready" {
+		t.Fatalf("expected ready preflight, got %+v", result)
+	}
+	if result["credentialConfigured"] != true || result["effectiveModel"] != "doubao:ep-test-001" {
+		t.Fatalf("expected credential-backed Trae preflight, got %+v", result)
+	}
+	if strings.Contains(fmt.Sprint(result), "secret-trae-key") {
+		t.Fatalf("preflight leaked API key: %+v", result)
+	}
+}
+
 func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)
@@ -3973,7 +4857,7 @@ func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 		"agentProfiles": []map[string]any{{
 			"id":     "coding",
 			"label":  "Coding",
-			"runner": "opencode",
+			"runner": "trae-agent",
 			"model":  "gpt-5.4-mini",
 		}},
 	}
@@ -4012,8 +4896,49 @@ func TestProfileRunnerPreflightRejectsUnavailableRunner(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text(body, "error"), "opencode") || !strings.Contains(text(body, "error"), "cannot start") {
+	if !strings.Contains(text(body, "error"), "trae-agent") || !strings.Contains(text(body, "error"), "cannot start") {
 		t.Fatalf("error body = %+v", body)
+	}
+}
+
+func TestGitHubDeliveryContractPreflightChecksPermissions(t *testing.T) {
+	bin := t.TempDir()
+	gh := filepath.Join(bin, "gh")
+	script := `#!/bin/sh
+case "$1 $2" in
+  "auth status")
+    exit 0
+    ;;
+  "repo view")
+    printf '%s' '{"nameWithOwner":"ZYOOO/TestRepo","viewerPermission":"WRITE","defaultBranchRef":{"name":"main"}}'
+    exit 0
+    ;;
+  "pr list")
+    printf '%s' '[]'
+    exit 0
+    ;;
+esac
+echo "unexpected gh args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	checks := githubDeliveryContractPreflight(context.Background(), map[string]any{
+		"kind":  "github",
+		"owner": "ZYOOO",
+		"repo":  "TestRepo",
+	})
+	statusByID := map[string]string{}
+	for _, check := range checks {
+		statusByID[check.ID] = check.Status
+	}
+	for _, id := range []string{"github-auth", "github-repository", "github-branch-permission", "github-pr-create-permission", "github-checks-read-permission"} {
+		if statusByID[id] != "passed" {
+			t.Fatalf("%s should pass, checks=%+v", id, checks)
+		}
 	}
 }
 
@@ -4084,13 +5009,79 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 		"domContext":     map[string]any{"tagName": "h1"},
 		"sourceMapping":  map[string]any{"source": "src/Page.tsx:headline", "file": "src/Page.tsx", "symbol": "headline"},
 	}
-	var applied map[string]any
-	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+	conflictScope := "devflow:repo_local_page:item_other"
+	conflictLock := map[string]any{
+		"id":                 executionLockID(conflictScope),
+		"scope":              conflictScope,
+		"status":             "claimed",
+		"attemptId":          "attempt_other",
+		"repositoryTargetId": "repo_local_page",
+		"repositoryPath":     targetRepo,
+		"expiresAt":          time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+		"createdAt":          nowISO(),
+		"updatedAt":          nowISO(),
+	}
+	if err := repo.SetSetting(context.Background(), text(conflictLock, "id"), conflictLock); err != nil {
+		t.Fatal(err)
+	}
+	conversationBatch := map[string]any{
+		"id":                  "page_pilot_batch_test",
+		"createdAt":           "17:05:38",
+		"primaryAnnotationId": 1,
+		"instruction":         `replace text with "New headline"`,
+		"annotations": []any{map[string]any{
+			"id":        1,
+			"comment":   "Rename the headline",
+			"selection": selection,
+		}},
+		"status": "running",
+	}
+	submittedAnnotations := []any{map[string]any{
+		"id":        1,
+		"comment":   "Rename the headline",
+		"selection": selection,
+	}}
+	processEvents := []any{
+		map[string]any{"at": "17:05:38", "text": "Captured 1 page annotation(s)."},
+		map[string]any{"at": "17:05:38", "text": "Submitting selection context to the single Page Pilot Agent."},
+	}
+	previewRuntimeProfile := map[string]any{
+		"agentId":            "preview-runtime-agent",
+		"stageId":            "preview_runtime",
+		"repositoryTargetId": "repo_local_page",
+		"workingDirectory":   targetRepo,
+		"previewUrl":         "http://127.0.0.1:3009/",
+		"source":             "npm:dev",
+		"reloadStrategy":     "hmr-wait",
+		"devCommand":         "npm run dev -- --host 127.0.0.1 --port 3009",
+		"evidence":           []any{"package.json"},
+	}
+	blockedByOperation := postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
 		"projectId":          "project_omega",
 		"repositoryTargetId": "repo_local_page",
 		"instruction":        `replace text with "New headline"`,
 		"selection":          selection,
 		"runner":             "profile",
+	})
+	if blockedByOperation.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Page Pilot apply should be blocked by an active repository lock, status = %d", blockedByOperation.StatusCode)
+	}
+	_ = blockedByOperation.Body.Close()
+	conflictLock["status"] = "released"
+	if err := repo.SetSetting(context.Background(), text(conflictLock, "id"), conflictLock); err != nil {
+		t.Fatal(err)
+	}
+	var applied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":             "project_omega",
+		"repositoryTargetId":    "repo_local_page",
+		"instruction":           `replace text with "New headline"`,
+		"selection":             selection,
+		"runner":                "profile",
+		"conversationBatch":     conversationBatch,
+		"submittedAnnotations":  submittedAnnotations,
+		"processEvents":         processEvents,
+		"previewRuntimeProfile": previewRuntimeProfile,
 	}), &applied)
 	if applied["status"] != "applied" || applied["repositoryPath"] != targetRepo {
 		t.Fatalf("applied = %+v", applied)
@@ -4109,6 +5100,61 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if got := arrayValues(applied["changedFiles"]); len(got) != 1 || got[0] != "src/Page.tsx" {
 		t.Fatalf("changed files = %+v", applied["changedFiles"])
 	}
+	if batch := mapValue(applied["conversationBatch"]); text(batch, "status") != "applied" || text(batch, "runId") != runID || len(arrayMaps(batch["annotations"])) != 1 {
+		t.Fatalf("conversation batch should be persisted on apply: %+v", batch)
+	}
+	if len(arrayMaps(applied["submittedAnnotations"])) != 1 || len(arrayMaps(applied["processEvents"])) != 2 {
+		t.Fatalf("conversation details missing from apply result: %+v", applied)
+	}
+	if primary := mapValue(applied["primaryTarget"]); fmt.Sprint(primary["annotationId"]) != "1" {
+		t.Fatalf("primary target missing: %+v", primary)
+	}
+	if profile := mapValue(applied["previewRuntimeProfile"]); text(profile, "source") != "npm:dev" || text(profile, "workingDirectory") != targetRepo {
+		t.Fatalf("preview runtime profile should be persisted on apply: %+v", profile)
+	}
+	if report := mapValue(applied["sourceMappingReport"]); report["strongSourceMappings"].(float64) != 1 || text(report, "status") != "strong" {
+		t.Fatalf("source mapping report should count strong mappings: %+v", report)
+	}
+	lock := mapValue(applied["executionLock"])
+	if text(lock, "status") != "claimed" || text(lock, "ownerType") != "page-pilot" || text(lock, "pagePilotRunId") != runID {
+		t.Fatalf("Page Pilot apply should hold a live-preview lock: %+v", lock)
+	}
+	selectionRoundTwo := cloneMap(selection)
+	selectionRoundTwo["textSnapshot"] = "New headline"
+	var reapplied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"runId":                 runID,
+		"projectId":             "project_omega",
+		"repositoryTargetId":    "repo_local_page",
+		"instruction":           `replace text with "Round two headline"`,
+		"selection":             selectionRoundTwo,
+		"runner":                "profile",
+		"conversationBatch":     conversationBatch,
+		"submittedAnnotations":  submittedAnnotations,
+		"processEvents":         processEvents,
+		"previewRuntimeProfile": previewRuntimeProfile,
+	}), &reapplied)
+	if text(reapplied, "id") != runID || intNumber(reapplied["roundNumber"]) != 2 {
+		t.Fatalf("multi-round apply should keep the same run and increment round: %+v", reapplied)
+	}
+	raw, err = os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Round two headline") {
+		t.Fatalf("multi-round source not patched: %s", raw)
+	}
+	blockedApply := postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_page",
+		"instruction":        `replace text with "Another headline"`,
+		"selection":          selection,
+		"runner":             "profile",
+	})
+	if blockedApply.StatusCode != http.StatusBadRequest {
+		t.Fatalf("second Page Pilot apply should be blocked by live-preview lock, status = %d", blockedApply.StatusCode)
+	}
+	_ = blockedApply.Body.Close()
 	storedRun, err := repo.GetPagePilotRun(context.Background(), runID)
 	if err != nil {
 		t.Fatal(err)
@@ -4118,6 +5164,21 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	}
 	if text(storedRun, "requirementId") == "" || text(storedRun, "workItemId") == "" || text(storedRun, "pipelineId") == "" {
 		t.Fatalf("stored run should link Page Pilot back to feature-one records: %+v", storedRun)
+	}
+	if batch := mapValue(storedRun["conversationBatch"]); text(batch, "status") != "applied" || len(arrayMaps(batch["annotations"])) != 1 {
+		t.Fatalf("stored run should keep server-side Page Pilot conversation: %+v", storedRun)
+	}
+	if profile := mapValue(storedRun["previewRuntimeProfile"]); text(profile, "agentId") != "preview-runtime-agent" {
+		t.Fatalf("stored run should keep preview runtime profile: %+v", storedRun)
+	}
+	if prPreview := mapValue(storedRun["prPreview"]); text(prPreview, "body") == "" {
+		t.Fatalf("stored run should keep PR preview: %+v", storedRun)
+	}
+	if visualProof := mapValue(storedRun["visualProof"]); text(visualProof, "kind") != "dom-snapshot" {
+		t.Fatalf("stored run should keep visual proof: %+v", storedRun)
+	}
+	if report := mapValue(storedRun["sourceMappingReport"]); text(report, "status") != "strong" {
+		t.Fatalf("stored run should keep source mapping report: %+v", storedRun)
 	}
 	linkedDatabase, err := repo.Load(context.Background())
 	if err != nil {
@@ -4163,12 +5224,22 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if discarded["status"] != "discarded" {
 		t.Fatalf("discarded = %+v", discarded)
 	}
+	if batch := mapValue(discarded["conversationBatch"]); text(batch, "status") != "discarded" {
+		t.Fatalf("discard should mark conversation discarded: %+v", batch)
+	}
 	raw, err = os.ReadFile(sourceFile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(raw), "Old headline") {
 		t.Fatalf("source not discarded: %s", raw)
+	}
+	releasedLock, err := repo.GetSetting(context.Background(), text(lock, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(releasedLock, "status") != "released" {
+		t.Fatalf("discard should release Page Pilot lock: %+v", releasedLock)
 	}
 	discardedDatabase, err := repo.Load(context.Background())
 	if err != nil {
@@ -4184,25 +5255,50 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	}
 
 	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
-		"projectId":          "project_omega",
-		"repositoryTargetId": "repo_local_page",
-		"instruction":        `replace text with "New headline"`,
-		"selection":          selection,
-		"runner":             "profile",
+		"projectId":             "project_omega",
+		"repositoryTargetId":    "repo_local_page",
+		"instruction":           `replace text with "New headline"`,
+		"selection":             selection,
+		"runner":                "profile",
+		"conversationBatch":     conversationBatch,
+		"submittedAnnotations":  submittedAnnotations,
+		"processEvents":         processEvents,
+		"previewRuntimeProfile": previewRuntimeProfile,
 	}), &applied)
 	runID = text(applied, "id")
+	lock = mapValue(applied["executionLock"])
 
 	var delivered map[string]any
 	decode(t, postJSON(t, api.URL+"/page-pilot/deliver", map[string]any{
-		"runId":              runID,
-		"projectId":          "project_omega",
-		"repositoryTargetId": "repo_local_page",
-		"instruction":        `replace text with "New headline"`,
-		"selection":          selection,
-		"branchName":         "omega/page-pilot-test",
+		"runId":                 runID,
+		"projectId":             "project_omega",
+		"repositoryTargetId":    "repo_local_page",
+		"instruction":           `replace text with "New headline"`,
+		"selection":             selection,
+		"branchName":            "omega/page-pilot-test",
+		"conversationBatch":     mapValue(applied["conversationBatch"]),
+		"submittedAnnotations":  arrayMaps(applied["submittedAnnotations"]),
+		"processEvents":         append(arrayMaps(applied["processEvents"]), map[string]any{"at": "17:06:00", "text": "User confirmed the Page Pilot changes for delivery."}),
+		"previewRuntimeProfile": mapValue(applied["previewRuntimeProfile"]),
 	}), &delivered)
 	if delivered["status"] != "delivered" || delivered["branchName"] != "omega/page-pilot-test" || delivered["commitSha"] == "" {
 		t.Fatalf("delivered = %+v", delivered)
+	}
+	if batch := mapValue(delivered["conversationBatch"]); text(batch, "status") != "delivered" || len(arrayMaps(delivered["processEvents"])) != 3 {
+		t.Fatalf("delivery should keep conversation context: %+v", delivered)
+	}
+	if profile := mapValue(delivered["previewRuntimeProfile"]); text(profile, "reloadStrategy") != "hmr-wait" {
+		t.Fatalf("delivery should keep preview runtime profile: %+v", delivered)
+	}
+	if report := mapValue(delivered["sourceMappingReport"]); text(report, "status") != "strong" {
+		t.Fatalf("delivery should keep source mapping report: %+v", delivered)
+	}
+	releasedLock, err = repo.GetSetting(context.Background(), text(lock, "id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(releasedLock, "status") != "released" {
+		t.Fatalf("delivery should release Page Pilot lock: %+v", releasedLock)
 	}
 	deliveredRun, err := repo.Load(context.Background())
 	if err != nil {
@@ -4214,6 +5310,146 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	}
 	if branch := strings.TrimSpace(runGit(t, targetRepo, "branch", "--show-current")); branch != "omega/page-pilot-test" {
 		t.Fatalf("branch = %s", branch)
+	}
+}
+
+func TestPagePilotDomOnlySelectionUsesSourceLocator(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	targetRepo := createDemoGitRepo(t)
+	sourceFile := filepath.Join(targetRepo, "src", "Page.tsx")
+	if err := os.WriteFile(sourceFile, []byte("export function Page() {\n  return <button className=\"card-action\">Start trial</button>;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, targetRepo, "add", ".")
+	runGit(t, targetRepo, "commit", "-m", "add page")
+
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{
+		"id":            "repo_local_dom_only",
+		"kind":          "local",
+		"path":          targetRepo,
+		"defaultBranch": "main",
+	}}
+	project["defaultRepositoryTargetId"] = "repo_local_dom_only"
+	database.Tables.Projects[0] = project
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_dom_only",
+		"workflowTemplate":   "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "local-proof",
+			"model":  "local",
+		}},
+	}), &ProjectAgentProfile{})
+
+	selection := map[string]any{
+		"elementKind":    "button",
+		"stableSelector": `.card-action`,
+		"textSnapshot":   "Start trial",
+		"styleSnapshot":  map[string]any{"fontWeight": "700"},
+		"domContext":     map[string]any{"tagName": "button"},
+		"sourceMapping":  map[string]any{"source": "DOM-only", "file": "", "symbol": ""},
+	}
+	var applied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_dom_only",
+		"instruction":        `replace text with "Launch now"`,
+		"selection":          selection,
+		"runner":             "profile",
+	}), &applied)
+	if applied["status"] != "applied" {
+		t.Fatalf("applied = %+v", applied)
+	}
+	raw, err := os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Launch now") {
+		t.Fatalf("DOM-only source locator did not patch candidate source: %s", raw)
+	}
+	report := mapValue(applied["sourceMappingReport"])
+	if text(report, "status") != "dom-only" || report["domOnlySelections"].(float64) != 1 {
+		t.Fatalf("source mapping report = %+v", report)
+	}
+	locator := mapValue(applied["sourceLocator"])
+	if text(locator, "status") != "candidates-ready" {
+		t.Fatalf("source locator = %+v", locator)
+	}
+	candidates := arrayMaps(arrayMaps(locator["results"])[0]["candidates"])
+	if len(candidates) == 0 || text(candidates[0], "file") != "src/Page.tsx" {
+		t.Fatalf("source candidates = %+v", candidates)
+	}
+	promptBytes, err := os.ReadFile(stringSlice(applied["proofFiles"])[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := string(promptBytes)
+	if !strings.Contains(prompt, "Source locator candidates") || !strings.Contains(prompt, "src/Page.tsx") {
+		t.Fatalf("prompt should include source locator candidates:\n%s", prompt)
+	}
+}
+
+func TestPagePilotPreviewRuntimeStartPersistsGoProfile(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	targetRepo := createDemoGitRepo(t)
+	if err := os.WriteFile(filepath.Join(targetRepo, "package.json"), []byte(`{"scripts":{"dev":"vite --host 127.0.0.1"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, targetRepo, "add", ".")
+	runGit(t, targetRepo, "commit", "-m", "add preview script")
+
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{
+		"id":            "repo_local_preview",
+		"kind":          "local",
+		"path":          targetRepo,
+		"defaultBranch": "main",
+	}}
+	project["defaultRepositoryTargetId"] = "repo_local_preview"
+	database.Tables.Projects[0] = project
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	preview := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		_, _ = response.Write([]byte("ok"))
+	}))
+	defer preview.Close()
+
+	var result map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/preview-runtime/start", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_local_preview",
+		"previewUrl":         preview.URL,
+	}), &result)
+	if result["ok"] != true || text(result, "status") != "external" {
+		t.Fatalf("preview runtime result = %+v", result)
+	}
+	profile := mapValue(result["profile"])
+	if text(profile, "agentId") != "preview-runtime-agent" || text(profile, "source") != "npm:dev" {
+		t.Fatalf("preview runtime profile = %+v", profile)
+	}
+	stored, err := repo.GetSetting(context.Background(), pagePilotPreviewRuntimeKey("repo_local_preview"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(mapValue(stored["profile"]), "workingDirectory") != targetRepo {
+		t.Fatalf("stored preview runtime = %+v", stored)
 	}
 }
 
@@ -4230,7 +5466,7 @@ func TestFeishuNotifyUsesLocalLarkCLI(t *testing.T) {
 	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", bin)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	response := postJSON(t, api.URL+"/feishu/notify", map[string]any{"chatId": "oc_demo", "text": "Pipeline waiting for review"})
 	var result map[string]any
@@ -4244,6 +5480,392 @@ func TestFeishuNotifyUsesLocalLarkCLI(t *testing.T) {
 	}
 	if !strings.Contains(string(args), "im +messages-send --chat-id oc_demo --text Pipeline waiting for review") {
 		t.Fatalf("lark-cli args = %s", string(args))
+	}
+}
+
+func TestFeishuReviewRequestSendsInteractiveWebhookCard(t *testing.T) {
+	api, repo := newTestAPI(t)
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       nowISO(),
+		Tables: WorkspaceTables{
+			Projects: []map[string]any{{"id": "project_omega", "name": "Omega", "status": "Active", "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Requirements: []map[string]any{{
+				"id": "req_1", "title": "Add review card", "description": strings.Repeat("Requirement detail. ", 20), "status": "converted", "structured": map[string]any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			WorkItems: []map[string]any{{
+				"id": "item_1", "projectId": "project_omega", "requirementId": "req_1", "key": "OMG-1", "title": "Add review card", "description": "Send review card.", "status": "In Review", "labels": []any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "status": "waiting-human", "templateId": "devflow-pr", "run": map[string]any{"stages": []any{}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Attempts: []map[string]any{{
+				"id": "attempt_1", "itemId": "item_1", "pipelineId": "pipeline_1", "status": "waiting-human", "branchName": "omega/OMG-1-devflow", "pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/1", "reviewPacket": map[string]any{"summary": "Review packet ready.", "risk": map[string]any{"level": "medium"}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Checkpoints: []map[string]any{{
+				"id": "pipeline_1:human_review", "pipelineId": "pipeline_1", "attemptId": "attempt_1", "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Waiting for approval.", "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	var received map[string]any
+	webhook := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		writeJSON(response, http.StatusOK, map[string]any{"StatusCode": 0, "message_id": "om_card"})
+	}))
+	defer webhook.Close()
+	t.Setenv("OMEGA_FEISHU_WEBHOOK_URL", webhook.URL)
+	t.Setenv("OMEGA_PUBLIC_APP_URL", "http://127.0.0.1:5173")
+	t.Setenv("OMEGA_PUBLIC_API_URL", "https://omega.example.test")
+	t.Setenv("OMEGA_FEISHU_REVIEW_TOKEN", "secret-token")
+
+	response := postJSON(t, api.URL+"/feishu/review-request", map[string]any{"checkpointId": "pipeline_1:human_review"})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "status") != "sent" || text(result, "format") != "interactive-card" {
+		t.Fatalf("review request result = %+v", result)
+	}
+	if text(received, "msg_type") != "interactive" {
+		t.Fatalf("webhook payload = %+v", received)
+	}
+	card := mapValue(received["card"])
+	if text(mapValue(card["header"]), "template") != "orange" {
+		t.Fatalf("card header = %+v", card["header"])
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := loaded.Tables.Checkpoints[0]
+	if text(mapValue(checkpoint["feishuReview"]), "status") != "sent" {
+		t.Fatalf("checkpoint feishu review = %+v", checkpoint["feishuReview"])
+	}
+}
+
+func TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget(t *testing.T) {
+	root := t.TempDir()
+	fakeLark := filepath.Join(root, "lark-cli")
+	if err := os.WriteFile(fakeLark, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	seedFeishuReviewCheckpoint(t, server.Repo, nil)
+
+	server.sendFeishuReviewForPipelineIfConfigured(context.Background(), "pipeline_1")
+
+	loaded, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := mapValue(loaded.Tables.Checkpoints[0]["feishuReview"])
+	if text(review, "status") != "needs-configuration" {
+		t.Fatalf("checkpoint feishu review = %+v", review)
+	}
+	if text(review, "reason") == "" || text(review, "checkpointId") != "pipeline_1:human_review" {
+		t.Fatalf("checkpoint feishu review missing routing detail = %+v", review)
+	}
+}
+
+func TestFeishuAutoReviewFallsBackToCurrentLarkUser(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	root := t.TempDir()
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	seedFeishuReviewCheckpoint(t, server.Repo, nil)
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args.txt")
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argsFile + "\ncase \"$*\" in\n*\"contact +get-user\"*) printf '%s' '{\"data\":{\"user\":{\"open_id\":\"ou_current\",\"name\":\"Current User\"}}}' ;;\n*\"im +messages-send\"*) printf '%s' '{\"message_id\":\"om_current\"}' ;;\n*) printf '%s' '{}' ;;\nesac\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	server.sendFeishuReviewForPipelineIfConfigured(context.Background(), "pipeline_1")
+
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argsText := string(args)
+	if !strings.Contains(argsText, "contact +get-user --as user") || !strings.Contains(argsText, "im +messages-send --as bot --user-id ou_current") {
+		t.Fatalf("lark-cli args missing current-user fallback: %s", argsText)
+	}
+	loaded, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := mapValue(loaded.Tables.Checkpoints[0]["feishuReview"])
+	if text(review, "status") != "sent" || text(review, "route") != "direct-user" || text(review, "userId") != "ou_current" {
+		t.Fatalf("checkpoint feishu review = %+v", review)
+	}
+}
+
+func TestFeishuReviewRequestUsesLarkCLIInteractiveCard(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       nowISO(),
+		Tables: WorkspaceTables{
+			Projects: []map[string]any{{"id": "project_omega", "name": "Omega", "status": "Active", "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Requirements: []map[string]any{{
+				"id": "req_1", "title": "Add review card", "description": "Requirement detail.", "status": "converted", "structured": map[string]any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			WorkItems: []map[string]any{{
+				"id": "item_1", "projectId": "project_omega", "requirementId": "req_1", "key": "OMG-1", "title": "Add review card", "description": "Send review card.", "status": "In Review", "labels": []any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "status": "waiting-human", "templateId": "devflow-pr", "run": map[string]any{"stages": []any{}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Attempts: []map[string]any{{
+				"id": "attempt_1", "itemId": "item_1", "pipelineId": "pipeline_1", "status": "waiting-human", "branchName": "omega/OMG-1-devflow", "pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/1", "reviewPacket": map[string]any{"summary": "Review packet ready.", "risk": map[string]any{"level": "medium"}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Checkpoints: []map[string]any{{
+				"id": "pipeline_1:human_review", "pipelineId": "pipeline_1", "attemptId": "attempt_1", "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Waiting for approval.", "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args.txt")
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsFile + "\nprintf '%s' '{\"message_id\":\"om_card\"}'\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OMEGA_PUBLIC_APP_URL", "http://127.0.0.1:5173")
+
+	response := postJSON(t, api.URL+"/feishu/review-request", map[string]any{"checkpointId": "pipeline_1:human_review", "chatId": "oc_demo"})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "status") != "sent" || text(result, "format") != "interactive-card" || text(result, "tool") != "lark-cli" {
+		t.Fatalf("review request result = %+v", result)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argsText := string(args)
+	for _, expected := range []string{"im +messages-send --chat-id oc_demo", "--msg-type interactive", "--content"} {
+		if !strings.Contains(argsText, expected) {
+			t.Fatalf("lark-cli args missing %q: %s", expected, argsText)
+		}
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(mapValue(loaded.Tables.Checkpoints[0]["feishuReview"]), "format") != "interactive-card" {
+		t.Fatalf("checkpoint feishu review = %+v", loaded.Tables.Checkpoints[0]["feishuReview"])
+	}
+}
+
+func TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, nil)
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args.txt")
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argsFile + "\ncase \"$*\" in\n*\"docs +create\"*) printf '%s' '{\"data\":{\"document\":{\"url\":\"https://docs.example/review\",\"document_id\":\"doc_123\"}}}' ;;\n*\"task +create\"*) printf '%s' '{\"task\":{\"guid\":\"task_123\",\"task_id\":\"task_123\",\"url\":\"https://task.example/task_123\"}}' ;;\n*\"task +comment\"*) printf '%s' '{\"comment_id\":\"comment_123\"}' ;;\n*) printf '%s' '{}' ;;\nesac\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OMEGA_FEISHU_REVIEW_CREATE_DOC", "true")
+
+	response := postJSON(t, api.URL+"/feishu/review-request", map[string]any{
+		"checkpointId": "pipeline_1:human_review",
+		"mode":         "task",
+		"assigneeId":   "ou_reviewer",
+		"tasklistId":   "tasklist_1",
+	})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "status") != "sent" || text(result, "format") != "task-review" || text(result, "taskGuid") != "task_123" {
+		t.Fatalf("task review result = %+v", result)
+	}
+	nonce := text(result, "nonce")
+	if !strings.Contains(nonce, "pipeline_1-human_review") || !strings.Contains(nonce, "attempt_1") {
+		t.Fatalf("nonce should bind checkpoint and attempt, got %q", nonce)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argsText := string(args)
+	for _, expected := range []string{"docs +create", "task +create", "--assignee ou_reviewer", "--tasklist-id tasklist_1", "task +comment"} {
+		if !strings.Contains(argsText, expected) {
+			t.Fatalf("lark-cli args missing %q: %s", expected, argsText)
+		}
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := mapValue(loaded.Tables.Checkpoints[0]["feishuReview"])
+	if text(review, "taskGuid") != "task_123" || text(review, "docMode") != "created" {
+		t.Fatalf("checkpoint task review = %+v", review)
+	}
+}
+
+func TestFeishuReviewTaskSyncApprovesCompletedTask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	bin := t.TempDir()
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\ncase \"$*\" in\n*\"task tasks get\"*) printf '%s' '{\"task\":{\"guid\":\"task_123\",\"status\":\"done\",\"completed_at\":\"2026-05-01T10:00:00Z\"}}' ;;\n*\"task +comment\"*) printf '%s' '{\"comment_id\":\"comment_123\"}' ;;\n*) printf '%s' '{}' ;;\nesac\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	response := postJSON(t, api.URL+"/feishu/review-task/sync", map[string]any{"checkpointId": "pipeline_1:human_review"})
+	var result map[string]any
+	decode(t, response, &result)
+	synced := arrayMaps(result["synced"])
+	if len(synced) != 1 || text(synced[0], "state") != "synced" || text(synced[0], "decision") != "approved" {
+		t.Fatalf("sync result = %+v", result)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(loaded.Tables.Checkpoints[0], "status") != "approved" {
+		t.Fatalf("checkpoint after sync = %+v", loaded.Tables.Checkpoints[0])
+	}
+}
+
+func TestFeishuReviewTaskBridgeDryRunListsPendingTasks(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+
+	response := postJSON(t, api.URL+"/feishu/review-task/bridge/tick", map[string]any{"dryRun": true, "limit": 5})
+	var result map[string]any
+	decode(t, response, &result)
+	pending := arrayMaps(result["pending"])
+	if text(result, "status") != "dry-run" || len(pending) != 1 || text(pending[0], "checkpointId") != "pipeline_1:human_review" {
+		t.Fatalf("bridge dry-run result = %+v", result)
+	}
+}
+
+func TestFeishuReviewTaskCommentRequestsChanges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	bin := t.TempDir()
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s' '{\"comment_id\":\"comment_123\"}'\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	response := postJSON(t, api.URL+"/feishu/review-task/comment", map[string]any{
+		"taskGuid": "task_123",
+		"comment":  "请改成章四，并同步页面文案",
+		"reviewer": "ou_reviewer",
+		"eventId":  "evt_1",
+	})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "classification") != "request_changes" || text(result, "decision") != "rejected" {
+		t.Fatalf("comment result = %+v", result)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := loaded.Tables.Checkpoints[0]
+	if text(checkpoint, "status") != "rejected" || !strings.Contains(text(checkpoint, "decisionNote"), "章四") {
+		t.Fatalf("checkpoint after comment = %+v", checkpoint)
+	}
+}
+
+func TestFeishuReviewTaskCommentNeedInfoRecordsOnly(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+
+	response := postJSON(t, api.URL+"/feishu/review-task/comment", map[string]any{
+		"taskGuid": "task_123",
+		"comment":  "这个字段从哪里来？",
+		"reviewer": "ou_reviewer",
+		"eventId":  "evt_2",
+	})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "classification") != "need_info" || text(result, "decision") != "need_info" {
+		t.Fatalf("comment result = %+v", result)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := loaded.Tables.Checkpoints[0]
+	review := mapValue(checkpoint["feishuReview"])
+	if text(checkpoint, "status") != "pending" || text(mapValue(review["lastComment"]), "state") != "need-info" {
+		t.Fatalf("checkpoint after need-info = %+v", checkpoint)
+	}
+}
+
+func TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath(t *testing.T) {
+	api, repo := newTestAPI(t)
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       nowISO(),
+		Tables: WorkspaceTables{
+			Projects:  []map[string]any{{"id": "project_omega", "name": "Omega", "status": "Active", "createdAt": nowISO(), "updatedAt": nowISO()}},
+			WorkItems: []map[string]any{{"id": "item_1", "projectId": "project_omega", "key": "OMG-1", "title": "Review item", "status": "In Review", "labels": []any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "status": "waiting-human", "templateId": "manual-review", "run": map[string]any{"stages": []any{map[string]any{"id": "human_review", "status": "needs-human"}, map[string]any{"id": "done", "status": "waiting"}}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Checkpoints: []map[string]any{{"id": "pipeline_1:human_review", "pipelineId": "pipeline_1", "stageId": "human_review", "status": "pending", "title": "Human Review", "summary": "Waiting.", "createdAt": nowISO(), "updatedAt": nowISO()}},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMEGA_FEISHU_REVIEW_TOKEN", "secret-token")
+
+	response := postJSON(t, api.URL+"/feishu/review-callback", map[string]any{"checkpointId": "pipeline_1:human_review", "action": "approve", "reviewer": "feishu-user", "token": "secret-token"})
+	var result map[string]any
+	decode(t, response, &result)
+	if text(result, "status") != "approved" {
+		t.Fatalf("callback result = %+v", result)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(loaded.Tables.Checkpoints[0], "status") != "approved" || !strings.Contains(text(loaded.Tables.Checkpoints[0], "decisionNote"), "feishu-user") {
+		t.Fatalf("checkpoint after callback = %+v", loaded.Tables.Checkpoints[0])
 	}
 }
 
@@ -4287,6 +5909,89 @@ func TestSQLiteSaveToleratesLegacyDuplicateRecordIDs(t *testing.T) {
 	}
 }
 
+func TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	previewRoot := t.TempDir()
+	t.Setenv("OMEGA_PAGE_PILOT_WORKSPACE_ROOT", previewRoot)
+	targetRepo := filepath.Join(previewRoot, safeSegment("ZYOOO_TestRepo"))
+	if err := os.MkdirAll(filepath.Join(targetRepo, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sourceFile := filepath.Join(targetRepo, "src", "Page.tsx")
+	if err := os.WriteFile(sourceFile, []byte("export function Page() {\n  return <h1>Old headline</h1>;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, targetRepo, "init")
+	runGit(t, targetRepo, "checkout", "-b", "main")
+	runGit(t, targetRepo, "config", "user.email", "omega-test@example.local")
+	runGit(t, targetRepo, "config", "user.name", "Omega Test")
+	runGit(t, targetRepo, "add", ".")
+	runGit(t, targetRepo, "commit", "-m", "add page")
+
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{
+		"id":            "repo_ZYOOO_TestRepo",
+		"kind":          "github",
+		"owner":         "ZYOOO",
+		"repo":          "TestRepo",
+		"url":           "https://github.com/ZYOOO/TestRepo",
+		"defaultBranch": "main",
+	}}
+	project["defaultRepositoryTargetId"] = "repo_ZYOOO_TestRepo"
+	database.Tables.Projects[0] = project
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_ZYOOO_TestRepo",
+		"workflowTemplate":   "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "local-proof",
+			"model":  "local",
+		}},
+	}), &saved)
+
+	selection := map[string]any{
+		"elementKind":    "title",
+		"stableSelector": `[data-omega-source="src/Page.tsx:headline"]`,
+		"textSnapshot":   "Old headline",
+		"styleSnapshot":  map[string]any{"fontSize": "32px"},
+		"domContext":     map[string]any{"tagName": "h1"},
+		"sourceMapping":  map[string]any{"source": "src/Page.tsx:headline", "file": "src/Page.tsx", "symbol": "headline"},
+	}
+	var applied map[string]any
+	decode(t, postJSON(t, api.URL+"/page-pilot/apply", map[string]any{
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_ZYOOO_TestRepo",
+		"instruction":        `replace text with "New headline"`,
+		"selection":          selection,
+		"runner":             "profile",
+	}), &applied)
+	if applied["status"] != "applied" || applied["repositoryPath"] != targetRepo {
+		t.Fatalf("applied = %+v", applied)
+	}
+	if text(applied, "executionMode") != "isolated-devflow" || text(mapValue(applied["isolation"]), "confirmAction") != "branch-commit-pr" {
+		t.Fatalf("isolated execution metadata missing: %+v", applied)
+	}
+	raw, err := os.ReadFile(sourceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "New headline") {
+		t.Fatalf("isolated workspace source not patched: %s", raw)
+	}
+}
+
 func newTestAPI(t *testing.T) (*httptest.Server, *SQLiteRepository) {
 	t.Helper()
 	root := t.TempDir()
@@ -4298,6 +6003,47 @@ func newTestAPI(t *testing.T) (*httptest.Server, *SQLiteRepository) {
 	api := httptest.NewServer(server.Handler())
 	t.Cleanup(api.Close)
 	return api, server.Repo
+}
+
+func seedFeishuReviewCheckpoint(t *testing.T, repo *SQLiteRepository, feishuReview map[string]any) {
+	t.Helper()
+	checkpoint := map[string]any{
+		"id":         "pipeline_1:human_review",
+		"pipelineId": "pipeline_1",
+		"attemptId":  "attempt_1",
+		"stageId":    "human_review",
+		"status":     "pending",
+		"title":      "Human Review",
+		"summary":    "Waiting for approval.",
+		"createdAt":  nowISO(),
+		"updatedAt":  nowISO(),
+	}
+	if feishuReview != nil {
+		checkpoint["feishuReview"] = feishuReview
+	}
+	database := WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       nowISO(),
+		Tables: WorkspaceTables{
+			Projects: []map[string]any{{"id": "project_omega", "name": "Omega", "status": "Active", "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Requirements: []map[string]any{{
+				"id": "req_1", "title": "Add review task", "description": "Requirement detail.", "status": "converted", "structured": map[string]any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			WorkItems: []map[string]any{{
+				"id": "item_1", "projectId": "project_omega", "requirementId": "req_1", "key": "OMG-1", "title": "Add review task", "description": "Send review task.", "status": "In Review", "labels": []any{}, "acceptanceCriteria": []any{}, "risks": []any{}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Pipelines: []map[string]any{{
+				"id": "pipeline_1", "workItemId": "item_1", "status": "waiting-human", "templateId": "manual-review", "run": map[string]any{"stages": []any{map[string]any{"id": "human_review", "title": "Human Review", "status": "needs-human"}, map[string]any{"id": "done", "title": "Done", "status": "waiting"}}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Attempts: []map[string]any{{
+				"id": "attempt_1", "itemId": "item_1", "pipelineId": "pipeline_1", "status": "waiting-human", "branchName": "omega/OMG-1-devflow", "pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/1", "reviewPacket": map[string]any{"summary": "Review packet ready.", "risk": map[string]any{"level": "medium"}}, "createdAt": nowISO(), "updatedAt": nowISO(),
+			}},
+			Checkpoints: []map[string]any{checkpoint},
+		},
+	}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func seedWorkspace(t *testing.T, repo *SQLiteRepository) {

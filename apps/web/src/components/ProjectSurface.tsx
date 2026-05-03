@@ -14,6 +14,8 @@ type ProjectSurfaceProps = {
   activeRepositoryWorkspacePipelines: PipelineRecordInfo[];
   repositorySyncMessage: string;
   syncingRepositoryKey: string;
+  newProjectName: string;
+  newProjectDescription: string;
   githubRepositoriesLoading: boolean;
   githubRepositoryQuery: string;
   githubRepoOwner: string;
@@ -24,6 +26,9 @@ type ProjectSurfaceProps = {
   onOpenProjectConfig: () => void;
   onSyncActiveRepository: () => void;
   onOpenWorkItems: () => void;
+  onNewProjectNameChange: (value: string) => void;
+  onNewProjectDescriptionChange: (value: string) => void;
+  onCreateProject: () => void;
   onRefreshRepositories: () => void;
   onRepositoryQueryChange: (value: string) => void;
   onCreateOrOpenWorkspace: () => void;
@@ -43,6 +48,8 @@ export function ProjectSurface({
   activeRepositoryWorkspacePipelines,
   repositorySyncMessage,
   syncingRepositoryKey,
+  newProjectName,
+  newProjectDescription,
   githubRepositoriesLoading,
   githubRepositoryQuery,
   githubRepoOwner,
@@ -53,6 +60,9 @@ export function ProjectSurface({
   onOpenProjectConfig,
   onSyncActiveRepository,
   onOpenWorkItems,
+  onNewProjectNameChange,
+  onNewProjectDescriptionChange,
+  onCreateProject,
   onRefreshRepositories,
   onRepositoryQueryChange,
   onCreateOrOpenWorkspace,
@@ -99,6 +109,27 @@ export function ProjectSurface({
           <span>Agent Pipeline</span>
           <span>Human Review</span>
           <span>Delivery</span>
+        </div>
+        <div className="project-create-form" aria-label="Create project">
+          <label>
+            <span>Project name</span>
+            <input
+              value={newProjectName}
+              onChange={(event) => onNewProjectNameChange(event.currentTarget.value)}
+              placeholder="New delivery project"
+            />
+          </label>
+          <label>
+            <span>Description</span>
+            <input
+              value={newProjectDescription}
+              onChange={(event) => onNewProjectDescriptionChange(event.currentTarget.value)}
+              placeholder="Optional project context"
+            />
+          </label>
+          <button type="button" className="primary-action" onClick={onCreateProject} disabled={!newProjectName.trim()}>
+            Create project
+          </button>
         </div>
       </div>
 

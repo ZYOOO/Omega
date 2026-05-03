@@ -59,6 +59,7 @@ GET /run-workpads
 GET /run-workpads?attemptId={attemptId}
 GET /run-workpads?pipelineId={pipelineId}
 GET /run-workpads?workItemId={workItemId}
+PATCH /run-workpads/{id}
 ```
 
 每条记录绑定一个明确 Attempt：
@@ -74,6 +75,12 @@ workpad
 createdAt
 updatedAt
 ```
+
+`fieldPatches` 是可选的字段级覆盖记录。旧做法：Workpad 每次刷新完全由 runtime 派生，Agent / supervisor 不能稳定写入单个字段。新做法：`PATCH /run-workpads/{id}` 写入 `fieldPatches`，runtime 后续刷新时先生成真实派生 Workpad，再叠加 field patches，避免人工 / supervisor 的 Blockers、Validation、Review Feedback 等被 heartbeat 或 attempt 更新冲掉。
+
+2026-04-30 更新：字段级 patch 新增 `fieldPatchSources` 和 `fieldPatchHistory`。旧做法只保留最终 patch 值，无法说明某个 Blocker / Validation / Retry Reason 来自 CI、人工审核、Agent 还是 supervisor。新做法要求 PATCH 写入者使用明确 `updatedBy`，并可附带 `reason` 与 `source`；runtime 会按字段记录来源，并追加最多 100 条变更历史。当前基础权限边界按写入者限制字段范围：operator / human-review 只能写 review、blocker、validation、retry 等人工判断字段；job-supervisor 可写运行门禁字段；agent 类写入者可写完整交接字段。详情页新增默认折叠的 Patch history 卡片。旧说法：UI 编辑入口仍是后续项。
+
+2026-05-01 更新：Work Item 详情页新增 Run Workpad 字段级编辑入口。旧做法：字段 patch 只能由 API、Agent 或 supervisor 写入，operator 只能看 Patch history，无法在 UI 中补充“真实 blocker / retry reason / review feedback”。新做法：Run Workpad header 提供 `Edit fields`，页内弹窗选择 operator 允许字段并提交到真实 `PATCH /run-workpads/{id}`；payload 固定写入 `updatedBy=operator`、`reason` 和 `source.kind=ui`，后端继续沿用字段权限、来源归因和历史审计。第一版 UI 开放 `Notes`、`Blockers`、`Review Feedback`、`Retry Reason`、`Validation`、`Rework Checklist`、`Rework Assessment`，不开放 PR / Plan / Review Packet 等应由运行时或 Agent 生成的字段，避免人工覆盖交付证据。
 
 `workpad` 内部结构：
 
@@ -109,8 +116,8 @@ runtime 会在 Attempt 创建、Agent invocation 持久化、Attempt complete / 
 
 - Requirement 正文限制最大高度，超出后内部滚动，light / dark 都必须保持可读。
 - Delivery Flow 使用紧凑网格展示，一行可展示多个阶段；running / waiting-human / merging 必须有清晰动画。
-- Run Workpad 每个区块默认折叠，只在标题行展示 label、摘要和展开按钮；展开后在区块内部滚动。
-- Agent Operations 展示结构化摘要，点击后展开 prompt、stdout、stderr、runner metadata。
+- Run Workpad 旧做法是每个区块默认折叠，展开后在卡片内部滚动。2026-04-30 更新：改为紧凑信号卡，卡片只展示 label、状态标题和一行真实来源摘要；点击卡片后打开页内弹窗浏览完整内容。
+- Agent Operations 旧做法是点击后行内展开 prompt、stdout、stderr、runner metadata。2026-04-30 更新：改为结构化摘要卡 + 页内弹窗浏览详情，避免一个 operation 把详情页撑长。
 - Artifacts 展示为可点击记录，点击后展开 source path / URL / stage，不再只显示不可操作卡片。
 - Run Timeline 默认折叠，只展示最新事件摘要；展开后展示当前 API 返回的完整事件列表，避免详情页默认被日志淹没。
 - Human Review approve 只批准 checkpoint，之后展示独立 `merging` 阶段，由后台 merge job 更新 checks、branch sync、conflict、merge 输出和失败原因。

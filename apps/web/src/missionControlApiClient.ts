@@ -1,7 +1,7 @@
 import type { Mission } from "./core";
 import type { MissionEvent } from "./core";
 
-export type MissionControlRunnerPreset = "local-proof" | "demo-code" | "codex";
+export type MissionControlRunnerPreset = "local-proof" | "demo-code" | "codex" | "opencode" | "claude-code" | "trae-agent";
 
 export interface RunOperationViaMissionControlApiInput {
   apiUrl: string;

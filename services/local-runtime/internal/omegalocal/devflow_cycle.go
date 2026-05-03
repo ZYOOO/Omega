@@ -230,7 +230,11 @@ func (server *Server) failDevFlowCycleJobWithResult(ctx context.Context, pipelin
 	database, _ = failAttemptRecord(database, attemptID, pipeline, failure.Error(), result)
 	upsertRunWorkpad(&database, attemptID)
 	touch(&database)
-	return server.Repo.Save(context.Background(), database)
+	if err := server.Repo.Save(context.Background(), database); err != nil {
+		return err
+	}
+	server.sendFeishuAttemptFailureIfConfigured(ctx, pipelineID, attemptID)
+	return nil
 }
 
 func (server *Server) completeDevFlowCycleJob(ctx context.Context, pipelineID string, attemptID string, result map[string]any) (map[string]any, map[string]any, error) {
@@ -262,6 +266,9 @@ func (server *Server) completeDevFlowCycleJob(ctx context.Context, pipelineID st
 	touch(&database)
 	if err := server.Repo.Save(context.Background(), database); err != nil {
 		return nil, nil, err
+	}
+	if text(result, "status") == "waiting-human" {
+		server.sendFeishuReviewForPipelineIfConfigured(ctx, text(pipeline, "id"))
 	}
 	return pipeline, item, nil
 }
@@ -409,26 +416,17 @@ func devFlowNextStageAfter(stageID string) string {
 	}
 }
 
+func devFlowNextStageAfterFromWorkflow(workflow map[string]any, stageID string) string {
+	return workflowActionTransitionTo(workflow, nil, stageID, "passed", devFlowNextStageAfter(stageID))
+}
+
 func devFlowStageStatusAfterInvocation(stageID string, agentID string, status string) (string, string) {
-	if status == "running" {
-		return "running", ""
-	}
-	if status == "failed" {
-		return "failed", ""
-	}
-	if status == "changes-requested" {
-		return "passed", "rework"
-	}
-	if status == "needs-human" || status == "waiting-human" {
-		return "needs-human", ""
-	}
-	if status != "passed" && status != "done" {
-		return "running", ""
-	}
-	if stageID == "in_progress" && agentID != "testing" {
-		return "running", ""
-	}
-	return "passed", devFlowNextStageAfter(stageID)
+	return devFlowStageStatusAfterInvocationWithWorkflow(nil, stageID, agentID, status)
+}
+
+func devFlowStageStatusAfterInvocationWithWorkflow(workflow map[string]any, stageID string, agentID string, status string) (string, string) {
+	route := workflowActionRoute(workflow, nil, stageID, agentID, status)
+	return route.StageStatus, route.NextStageID
 }
 
 func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelineID string, itemID string, attemptID string, invocation map[string]any) error {
@@ -447,7 +445,9 @@ func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelin
 		return nil
 	}
 	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
-	stageStatus, nextStageID := devFlowStageStatusAfterInvocation(text(invocation, "stageId"), text(invocation, "agentId"), text(invocation, "status"))
+	route := workflowActionRouteFromPipeline(pipeline, text(invocation, "stageId"), text(invocation, "agentId"), text(invocation, "status"))
+	stageStatus, nextStageID := route.StageStatus, route.NextStageID
+	invocation["actionRoute"] = workflowActionRouteMap(route)
 	pipeline = markDevFlowStageProgress(pipeline, text(invocation, "stageId"), stageStatus, text(invocation, "summary"))
 	run := mapValue(pipeline["run"])
 	if nextStageID != "" {
@@ -729,6 +729,18 @@ func completeAttemptRecord(database WorkspaceDatabase, attemptID string, pipelin
 	attempt["workspacePath"] = stringOr(result["workspacePath"], text(attempt, "workspacePath"))
 	attempt["branchName"] = stringOr(result["branchName"], text(attempt, "branchName"))
 	attempt["pullRequestUrl"] = stringOr(result["pullRequestUrl"], text(attempt, "pullRequestUrl"))
+	if feedback := arrayMaps(result["pullRequestFeedback"]); len(feedback) > 0 {
+		attempt["pullRequestFeedback"] = feedback
+	}
+	if feedback := arrayMaps(result["checkLogFeedback"]); len(feedback) > 0 {
+		attempt["checkLogFeedback"] = feedback
+	}
+	if reports := arrayMaps(result["githubOutboundSync"]); len(reports) > 0 {
+		attempt["githubOutboundSync"] = append(arrayMaps(attempt["githubOutboundSync"]), reports...)
+	}
+	if reviewPacket := mapValue(result["reviewPacket"]); len(reviewPacket) > 0 {
+		attempt["reviewPacket"] = reviewPacket
+	}
 	attempt["stdoutSummary"] = truncateForProof(stringOr(result["stdout"], ""), 800)
 	attempt["stderrSummary"] = truncateForProof(stringOr(result["stderr"], ""), 800)
 	attempt["stages"] = attemptStageSnapshot(pipeline)
@@ -779,6 +791,18 @@ func failAttemptRecord(database WorkspaceDatabase, attemptID string, pipeline ma
 		attempt["workspacePath"] = stringOr(result["workspacePath"], text(attempt, "workspacePath"))
 		attempt["branchName"] = stringOr(result["branchName"], text(attempt, "branchName"))
 		attempt["pullRequestUrl"] = stringOr(result["pullRequestUrl"], text(attempt, "pullRequestUrl"))
+		if feedback := arrayMaps(result["pullRequestFeedback"]); len(feedback) > 0 {
+			attempt["pullRequestFeedback"] = feedback
+		}
+		if feedback := arrayMaps(result["checkLogFeedback"]); len(feedback) > 0 {
+			attempt["checkLogFeedback"] = feedback
+		}
+		if reports := arrayMaps(result["githubOutboundSync"]); len(reports) > 0 {
+			attempt["githubOutboundSync"] = append(arrayMaps(attempt["githubOutboundSync"]), reports...)
+		}
+		if reviewPacket := mapValue(result["reviewPacket"]); len(reviewPacket) > 0 {
+			attempt["reviewPacket"] = reviewPacket
+		}
 		attempt["stdoutSummary"] = truncateForProof(stringOr(result["stdout"], ""), 800)
 	}
 	attempt["stderrSummary"] = truncateForProof(message, 800)
@@ -795,6 +819,7 @@ func failAttemptRecord(database WorkspaceDatabase, attemptID string, pipeline ma
 		"createdAt": timestamp,
 	})
 	attempt["events"] = events
+	attempt["reworkChecklist"] = buildReworkChecklist(database, pipeline, attempt)
 	database.Tables.Attempts[index] = attempt
 	return database, attempt
 }
@@ -832,6 +857,8 @@ func markAttemptCanceled(database WorkspaceDatabase, attemptID string, reason st
 		pipeline["status"] = "canceled"
 		pipeline["updatedAt"] = timestamp
 		database.Tables.Pipelines[pipelineIndex] = pipeline
+		attempt["reworkChecklist"] = buildReworkChecklist(database, pipeline, attempt)
+		database.Tables.Attempts[index] = attempt
 	}
 	if item := findWorkItem(database, text(attempt, "itemId")); item != nil {
 		database = updateWorkItem(database, text(item, "id"), map[string]any{"status": "Blocked"})
@@ -913,14 +940,7 @@ func devFlowAttemptTimeout(template *PipelineTemplate) time.Duration {
 }
 
 func devFlowTransitionTo(template *PipelineTemplate, from string, event string, fallback string) string {
-	if template != nil {
-		for _, transition := range template.Transitions {
-			if transition.From == from && transition.On == event && transition.To != "" {
-				return transition.To
-			}
-		}
-	}
-	return fallback
+	return workflowActionTransitionTo(nil, template, from, event, fallback)
 }
 
 func ensureDevFlowRepositoryWorkspace(workspace string, repoWorkspace string, cloneTarget string, branchName string, baseBranch string) (string, error) {
@@ -1079,10 +1099,31 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 	runnerHeartbeatInterval := devFlowRunnerHeartbeatInterval(template)
 	agentInvocations := []map[string]any{}
 	stageArtifacts := []map[string]any{}
+	pullRequestFeedback := []map[string]any{}
+	checkLogFeedback := []map[string]any{}
+	githubOutboundSync := []map[string]any{}
+	combinedFeedback := func(primary string) string {
+		parts := []string{}
+		if strings.TrimSpace(primary) != "" {
+			parts = append(parts, strings.TrimSpace(primary))
+		}
+		if feedback := githubPullRequestFeedbackPrompt(pullRequestFeedback); strings.TrimSpace(feedback) != "" {
+			parts = append(parts, "PR feedback:\n"+strings.TrimSpace(feedback))
+		}
+		if feedback := githubPullRequestFeedbackPrompt(checkLogFeedback); strings.TrimSpace(feedback) != "" {
+			parts = append(parts, "CI/check failure logs:\n"+strings.TrimSpace(feedback))
+		}
+		return strings.Join(parts, "\n\n")
+	}
 	recordAgent := func(stageID string, agentID string, status string, prompt string, artifact string, summary string, proofFiles []string, process map[string]any) {
 		startedAt := nowISO()
 		finishedAt := nowISO()
 		invocationID := fmt.Sprintf("%s:agent:%03d:%s:%s", text(pipeline, "id"), len(agentInvocations)+1, stageID, agentID)
+		process = cloneMap(process)
+		route := workflowActionRouteFromPipeline(pipeline, stageID, agentID, status)
+		if route.ActionID != "" || route.ActionType != "" {
+			process["actionRoute"] = workflowActionRouteMap(route)
+		}
 		invocation := map[string]any{
 			"id":          invocationID,
 			"stageId":     stageID,
@@ -1103,8 +1144,41 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		}
 		_ = server.persistDevFlowAgentInvocation(context.Background(), text(pipeline, "id"), text(item, "id"), attemptID, invocation)
 	}
+	recordGitHubOutboundSync := func(event string, status string, stageID string, summary string, prURL string, checksOutput string, changedFiles []string, failureReason string, failureDetail string, reviewPacket map[string]any) {
+		report := server.syncGitHubIssueOutbound(ctx, githubOutboundSyncInput{
+			RepositoryPath:      repoWorkspace,
+			Repository:          repoSlug,
+			WorkItem:            item,
+			Pipeline:            pipeline,
+			Attempt:             currentAttempt,
+			AttemptID:           attemptID,
+			Event:               event,
+			Status:              status,
+			StageID:             stageID,
+			Summary:             summary,
+			PullRequestURL:      prURL,
+			BranchName:          branchName,
+			ChangedFiles:        changedFiles,
+			ChecksOutput:        checksOutput,
+			PullRequestFeedback: pullRequestFeedback,
+			CheckLogFeedback:    checkLogFeedback,
+			ReviewPacket:        reviewPacket,
+			FailureReason:       failureReason,
+			FailureDetail:       failureDetail,
+		})
+		if text(report, "state") == "skipped" {
+			return
+		}
+		githubOutboundSync = append(githubOutboundSync, report)
+		artifact := fmt.Sprintf("github-outbound-sync-%03d.json", len(githubOutboundSync))
+		artifactPath := filepath.Join(proofDir, artifact)
+		if err := writeJSONFile(artifactPath, report); err == nil {
+			stageArtifacts = append(stageArtifacts, map[string]any{"stageId": stringOr(stageID, "delivery"), "agentId": "github", "artifact": artifact})
+		}
+	}
 	failureResult := func(stageID string, agentID string, reason string, detail string, reviewFeedback string) map[string]any {
-		return map[string]any{
+		recordGitHubOutboundSync("attempt.failed", "failed", stageID, reason, "", "", nil, reason, detail, nil)
+		result := map[string]any{
 			"status":                "failed",
 			"workspacePath":         workspace,
 			"repositoryPath":        repoWorkspace,
@@ -1116,12 +1190,24 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 			"failureDetail":         detail,
 			"failureReviewFeedback": reviewFeedback,
 		}
+		if len(pullRequestFeedback) > 0 {
+			result["pullRequestFeedback"] = pullRequestFeedback
+		}
+		if len(checkLogFeedback) > 0 {
+			result["checkLogFeedback"] = checkLogFeedback
+		}
+		if len(githubOutboundSync) > 0 {
+			result["githubOutboundSync"] = githubOutboundSync
+		}
+		return result
 	}
+	recordGitHubOutboundSync("attempt.started", "running", "todo", "Pipeline attempt started and repository workspace is ready.", "", "", nil, "", "", nil)
 
 	humanChangeRequest := latestHumanChangeRequestFromPipeline(pipeline)
+	reworkFeedbackInput := reworkChecklistPromptFromAttempt(currentAttempt, humanChangeRequest)
 	effectiveDescription := text(item, "description")
-	if humanChangeRequest != "" {
-		effectiveDescription = strings.TrimSpace(effectiveDescription + "\n\nHuman requested changes:\n" + humanChangeRequest)
+	if reworkFeedbackInput != "" {
+		effectiveDescription = strings.TrimSpace(effectiveDescription + "\n\nRework input:\n" + reworkFeedbackInput)
 	}
 	promptVariables := map[string]string{
 		"repository":     repoSlug,
@@ -1134,7 +1220,7 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		"codingNotePath": filepath.Join(proofDir, "coding-agent-note.md"),
 		"reworkNotePath": "",
 		"pullRequestUrl": "",
-		"reviewFeedback": humanChangeRequest,
+		"reviewFeedback": reworkFeedbackInput,
 		"changedFiles":   "",
 		"testOutput":     "",
 		"checksOutput":   "",
@@ -1159,7 +1245,7 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		promptPath := filepath.Join(proofDir, "human-rework-prompt.md")
 		reworkVariables := cloneStringMap(promptVariables)
 		reworkVariables["pullRequestUrl"] = prURL
-		reworkVariables["reviewFeedback"] = humanChangeRequest
+		reworkVariables["reviewFeedback"] = reworkFeedbackInput
 		reworkVariables["reworkNotePath"] = notePath
 		reworkFallback := fmt.Sprintf(`You are the rework coding agent for Omega.
 
@@ -1172,7 +1258,7 @@ Pull request: %s
 Requirement:
 %s
 
-Human feedback to address:
+Rework checklist to address:
 %s
 
 Rules:
@@ -1187,12 +1273,13 @@ Rules:
   - Files changed
   - Validation run
   - Remaining risk
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, humanChangeRequest, notePath)
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, reworkFeedbackInput, notePath)
 		reworkPrompt := renderWorkflowPromptSection(template, "rework", reworkVariables, reworkFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
 		if err := os.WriteFile(promptPath, []byte(reworkPrompt), 0o644); err != nil {
 			return nil, err
 		}
 		recordAgent("rework", "coding", "running", reworkPrompt, "", "Fast rework agent is applying human feedback on the existing PR branch.", []string{promptPath}, map[string]any{"runner": codingRunnerID, "status": "running", "strategy": text(reworkAssessment, "strategy")})
+		reworkModel, reworkEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
 		reworkTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
 			Role:              "rework",
 			StageID:           "rework",
@@ -1201,7 +1288,8 @@ Rules:
 			Prompt:            reworkPrompt,
 			OutputPath:        notePath,
 			Sandbox:           "workspace-write",
-			Model:             codingProfile.Model,
+			Model:             reworkModel,
+			Env:               reworkEnv,
 			HeartbeatInterval: runnerHeartbeatInterval,
 			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "rework", "coding", codingRunnerID),
 		})
@@ -1280,15 +1368,19 @@ Rules:
 		}
 		prDiff, _ := runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
 		checksOutput, _ := runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+		pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
+		checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, nil)
 
-		reviewRounds := defaultDevFlowReviewRounds()
-		if template != nil && len(template.ReviewRounds) > 0 {
-			reviewRounds = template.ReviewRounds
-		}
+		reviewRounds := devFlowReviewRoundsFromContract(template)
 		reviewApproved := true
 		reviewFeedback := ""
+		nextReviewStageID := ""
 		for _, reviewRound := range reviewRounds {
 			stageID := stringOr(reviewRound.StageID, "code_review")
+			if nextReviewStageID != "" && stageID != nextReviewStageID {
+				continue
+			}
+			nextReviewStageID = ""
 			artifact := stringOr(reviewRound.Artifact, stageID+".md")
 			reviewPath := filepath.Join(proofDir, strings.TrimSuffix(artifact, filepath.Ext(artifact))+"-human-rework"+filepath.Ext(artifact))
 			reviewDiff := diffText
@@ -1303,10 +1395,11 @@ Rules:
 			reviewVariables["testOutput"] = testOutput
 			reviewVariables["checksOutput"] = reviewChecks
 			reviewVariables["reviewFocus"] = reviewRound.Focus
-			reviewVariables["reviewFeedback"] = humanChangeRequest
+			reviewVariables["reviewFeedback"] = combinedFeedback(reworkFeedbackInput)
 			reviewVariables["diff"] = reviewDiff
-			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, humanChangeRequest)
+			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(reworkFeedbackInput))
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
+			reviewModel, reviewEnv := server.runnerCredentialModelAndEnv(ctx, reviewRunnerID, reviewProfile.Model)
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
 				Role:              "review",
 				StageID:           stageID,
@@ -1315,8 +1408,9 @@ Rules:
 				Prompt:            reviewPrompt,
 				OutputPath:        reviewPath,
 				Sandbox:           "read-only",
-				Model:             reviewProfile.Model,
+				Model:             reviewModel,
 				Effort:            "medium",
+				Env:               reviewEnv,
 				HeartbeatInterval: runnerHeartbeatInterval,
 				OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "review", reviewRunnerID),
 			})
@@ -1328,6 +1422,13 @@ Rules:
 			outcome := devFlowReviewOutcome(reviewPath)
 			if outcome.Verdict == "approved" {
 				recordAgent(stageID, "review", "passed", reviewPrompt, filepath.Base(reviewPath), outcome.Summary, []string{reviewPath}, reviewTurn.Process)
+				nextStageID := devFlowTransitionTo(template, stageID, "approved", "")
+				if nextStageID != "" && !devFlowReviewRoundStageExists(reviewRounds, nextStageID) {
+					break
+				}
+				if nextStageID != "" {
+					nextReviewStageID = nextStageID
+				}
 				continue
 			}
 			status := "changes-requested"
@@ -1351,17 +1452,27 @@ Rules:
 		}
 		recordAgent("human_review", "human", "waiting-human", "Review the human-requested rework, PR diff, proof, and agent verdicts. Approve to continue delivery or request changes to send the run back.", "human-review-request.md", "Waiting for explicit human approval after fast rework.", []string{humanReviewRequestPath}, map[string]any{"runner": "human", "status": "waiting-human"})
 
-		if reportPath, err := writeDevFlowRunReport(proofDir, devFlowRunReportInput{
-			Item:             item,
-			Repository:       repoSlug,
-			BranchName:       branchName,
-			PullRequestURL:   prURL,
-			ChangedFiles:     changedFiles,
-			TestOutput:       testOutput,
-			ChecksOutput:     checksOutput,
-			StageArtifacts:   stageArtifacts,
-			AgentInvocations: agentInvocations,
-		}); err != nil {
+		reportInput := devFlowRunReportInput{
+			Item:                item,
+			Repository:          repoSlug,
+			BranchName:          branchName,
+			PullRequestURL:      prURL,
+			ChangedFiles:        changedFiles,
+			DiffText:            stringOr(prDiff, diffText),
+			TestOutput:          testOutput,
+			ChecksOutput:        checksOutput,
+			PullRequestFeedback: pullRequestFeedback,
+			CheckLogFeedback:    checkLogFeedback,
+			StageArtifacts:      stageArtifacts,
+			AgentInvocations:    agentInvocations,
+		}
+		reviewPacket, reviewPacketPath, err := writeDevFlowReviewPacket(proofDir, reportInput)
+		if err != nil {
+			return nil, err
+		}
+		stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reviewPacketPath)})
+		reportInput.ReviewPacket = reviewPacket
+		if reportPath, err := writeDevFlowRunReport(proofDir, reportInput); err != nil {
 			return nil, err
 		} else {
 			stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reportPath)})
@@ -1391,6 +1502,7 @@ Rules:
 			"merged":             false,
 			"humanGate":          "pending",
 			"reworkAssessment":   reworkAssessment,
+			"reviewPacket":       reviewPacket,
 			"changedFiles":       changedFiles,
 			"artifacts":          stageArtifacts,
 			"agentInvocations":   agentInvocations,
@@ -1399,66 +1511,112 @@ Rules:
 			return nil, err
 		}
 		recordAgent("done", "delivery", "waiting-human", deliveryPrompt, "handoff-bundle.json", "Delivery is blocked by the human review checkpoint after fast rework.", []string{filepath.Join(proofDir, "handoff-bundle.json")}, map[string]any{"runner": "local-orchestrator", "status": "waiting-human"})
+		recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review after fast rework.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 		proofFiles, _ := collectFiles(proofDir)
 		return map[string]any{
-			"status":             "waiting-human",
-			"workflow":           mapValue(mapValue(pipeline["run"])["workflow"]),
-			"workspacePath":      workspace,
-			"repositoryPath":     repoWorkspace,
-			"branchName":         branchName,
-			"pullRequestUrl":     prURL,
-			"merged":             false,
-			"changedFiles":       changedFiles,
-			"stageArtifacts":     stageArtifacts,
-			"agentInvocations":   agentInvocations,
-			"proofFiles":         proofFiles,
-			"reworkAssessment":   reworkAssessment,
-			"humanChangeRequest": humanChangeRequest,
+			"status":              "waiting-human",
+			"workflow":            mapValue(mapValue(pipeline["run"])["workflow"]),
+			"workspacePath":       workspace,
+			"repositoryPath":      repoWorkspace,
+			"branchName":          branchName,
+			"pullRequestUrl":      prURL,
+			"merged":              false,
+			"changedFiles":        changedFiles,
+			"stageArtifacts":      stageArtifacts,
+			"agentInvocations":    agentInvocations,
+			"proofFiles":          proofFiles,
+			"reviewPacket":        reviewPacket,
+			"reworkAssessment":    reworkAssessment,
+			"humanChangeRequest":  humanChangeRequest,
+			"pullRequestFeedback": pullRequestFeedback,
+			"checkLogFeedback":    checkLogFeedback,
+			"githubOutboundSync":  githubOutboundSync,
 		}, nil
 	}
 
-	requirementArtifact := map[string]any{
-		"workItemId":          text(item, "id"),
-		"workItemKey":         text(item, "key"),
-		"title":               text(item, "title"),
-		"description":         effectiveDescription,
-		"source":              text(item, "source"),
-		"repositoryTargetId":  text(target, "id"),
-		"repositoryTarget":    repoSlug,
-		"repositoryClonePath": cloneTarget,
-		"defaultBranch":       baseBranch,
-		"acceptanceCriteria":  item["acceptanceCriteria"],
-		"createdAt":           nowISO(),
-	}
-	if err := writeJSONFile(filepath.Join(proofDir, "requirement-artifact.json"), requirementArtifact); err != nil {
-		return nil, err
-	}
-	requirementFallback := fmt.Sprintf("Structure requirement %s for repository %s.\n\nTitle: %s\n\nDescription:\n%s", text(item, "key"), repoSlug, text(item, "title"), effectiveDescription)
-	requirementPrompt := renderWorkflowPromptSection(template, "requirement", promptVariables, requirementFallback)
-	recordAgent("todo", "requirement", "passed", requirementPrompt, "requirement-artifact.json", "Requirement artifact captured with repository boundary and acceptance criteria.", []string{filepath.Join(proofDir, "requirement-artifact.json")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+	var (
+		commitSha          string
+		commitSummary      string
+		diffText           string
+		changedNames       string
+		changedFiles       []string
+		testOutput         string
+		testErr            error
+		prTitle            string
+		prBody             string
+		prURL              string
+		prDiff             string
+		checksOutput       string
+		remoteChecks       []map[string]any
+		remoteChecksRaw    string
+		remoteCheckSummary map[string]any
+	)
 
-	solutionPlan := fmt.Sprintf("# Solution Plan\n\n"+
-		"- Work item: `%s`\n"+
-		"- Repository: `%s`\n"+
-		"- Base branch: `%s`\n"+
-		"- Delivery branch: `%s`\n"+
-		"- Planned change: implement the requested product change in the repository, not a proof-only placeholder.\n\n"+
-		"## Stage Handoff\n\n"+
-		"1. Requirement intake reads the Omega work item and repository workspace boundary.\n"+
-		"2. Solution design passes the full requirement, acceptance criteria, and repository path to the coding agent.\n"+
-		"3. Coding agent edits the target repository and must produce a real git diff.\n"+
-		"4. Testing runs repository validation against the new commit.\n"+
-		"5. Review reads the PR diff and CI/check state before delivery.\n"+
-		"6. Human review records the gate decision.\n"+
-		"7. Delivery merges or leaves the PR waiting for manual review.\n",
-		text(item, "key"), repoSlug, baseBranch, branchName)
-	if err := os.WriteFile(filepath.Join(proofDir, "solution-plan.md"), []byte(solutionPlan), 0o644); err != nil {
-		return nil, err
+	writeRequirementArtifact := func() error {
+		requirementArtifact := map[string]any{
+			"workItemId":          text(item, "id"),
+			"workItemKey":         text(item, "key"),
+			"title":               text(item, "title"),
+			"description":         effectiveDescription,
+			"source":              text(item, "source"),
+			"repositoryTargetId":  text(target, "id"),
+			"repositoryTarget":    repoSlug,
+			"repositoryClonePath": cloneTarget,
+			"defaultBranch":       baseBranch,
+			"acceptanceCriteria":  item["acceptanceCriteria"],
+			"createdAt":           nowISO(),
+		}
+		if err := writeJSONFile(filepath.Join(proofDir, "requirement-artifact.json"), requirementArtifact); err != nil {
+			return err
+		}
+		requirementFallback := fmt.Sprintf("Structure requirement %s for repository %s.\n\nTitle: %s\n\nDescription:\n%s", text(item, "key"), repoSlug, text(item, "title"), effectiveDescription)
+		requirementPrompt := renderWorkflowPromptSection(template, "requirement", promptVariables, requirementFallback)
+		recordAgent("todo", "requirement", "passed", requirementPrompt, "requirement-artifact.json", "Requirement artifact captured with repository boundary and acceptance criteria.", []string{filepath.Join(proofDir, "requirement-artifact.json")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		return nil
 	}
-	solutionFallback := fmt.Sprintf("Design implementation for %s in %s.\n\nRequirement:\n%s", text(item, "key"), repoSlug, effectiveDescription)
-	solutionPrompt := renderWorkflowPromptSection(template, "architect", promptVariables, solutionFallback)
-	recordAgent("in_progress", "architect", "passed", solutionPrompt, "solution-plan.md", "Solution plan created and handed to the coding agent.", []string{filepath.Join(proofDir, "solution-plan.md")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
-	codingFallback := fmt.Sprintf(`You are the coding agent for Omega.
+	classifyTask := func() error {
+		classification := map[string]any{
+			"workItemId":         text(item, "id"),
+			"workItemKey":        text(item, "key"),
+			"repositoryTarget":   repoSlug,
+			"taskClass":          "default",
+			"planningMode":       "contract",
+			"validationMode":     "repository",
+			"selectedWorkflowId": text(pipeline, "templateId"),
+			"createdAt":          nowISO(),
+		}
+		if err := writeJSONFile(filepath.Join(proofDir, "task-classification.json"), classification); err != nil {
+			return err
+		}
+		recordAgent("in_progress", "master", "passed", "Classify task from workflow contract and repository target.", "task-classification.json", "Task classification captured from the active workflow contract.", []string{filepath.Join(proofDir, "task-classification.json")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		return nil
+	}
+	runArchitecture := func() error {
+		solutionPlan := fmt.Sprintf("# Solution Plan\n\n"+
+			"- Work item: `%s`\n"+
+			"- Repository: `%s`\n"+
+			"- Base branch: `%s`\n"+
+			"- Delivery branch: `%s`\n"+
+			"- Planned change: implement the requested product change in the repository, not a proof-only placeholder.\n\n"+
+			"## Stage Handoff\n\n"+
+			"1. Requirement intake reads the Omega work item and repository workspace boundary.\n"+
+			"2. Solution design passes the full requirement, acceptance criteria, and repository path to the coding agent.\n"+
+			"3. Coding agent edits the target repository and must produce a real git diff.\n"+
+			"4. Testing runs repository validation against the new commit.\n"+
+			"5. Review reads the PR diff and CI/check state before delivery.\n"+
+			"6. Human review records the gate decision.\n"+
+			"7. Delivery merges or leaves the PR waiting for manual review.\n",
+			text(item, "key"), repoSlug, baseBranch, branchName)
+		if err := os.WriteFile(filepath.Join(proofDir, "solution-plan.md"), []byte(solutionPlan), 0o644); err != nil {
+			return err
+		}
+		solutionFallback := fmt.Sprintf("Design implementation for %s in %s.\n\nRequirement:\n%s", text(item, "key"), repoSlug, effectiveDescription)
+		solutionPrompt := renderWorkflowPromptSection(template, "architect", promptVariables, solutionFallback)
+		recordAgent("in_progress", "architect", "passed", solutionPrompt, "solution-plan.md", "Solution plan created and handed to the coding agent.", []string{filepath.Join(proofDir, "solution-plan.md")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		return nil
+	}
+	runCoding := func() error {
+		codingFallback := fmt.Sprintf(`You are the coding agent for Omega.
 
 Repository: %s
 Repository path: %s
@@ -1480,236 +1638,210 @@ Rules:
   - Validation run
   - Known follow-up or risk
 `, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), effectiveDescription, filepath.Join(proofDir, "coding-agent-note.md"))
-	codingPrompt := renderWorkflowPromptSection(template, "coding", promptVariables, codingFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
-	if err := os.WriteFile(filepath.Join(proofDir, "coding-prompt.md"), []byte(codingPrompt), 0o644); err != nil {
-		return nil, err
-	}
-	recordAgent("in_progress", "coding", "running", codingPrompt, "", "Coding agent is editing the repository workspace.", []string{filepath.Join(proofDir, "coding-prompt.md")}, map[string]any{"runner": codingRunnerID, "status": "running"})
-	codingTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
-		Role:              "coding",
-		StageID:           "in_progress",
-		Runner:            codingRunnerID,
-		Workspace:         repoWorkspace,
-		Prompt:            codingPrompt,
-		OutputPath:        filepath.Join(proofDir, "coding-agent-note.md"),
-		Sandbox:           "workspace-write",
-		Model:             codingProfile.Model,
-		HeartbeatInterval: runnerHeartbeatInterval,
-		OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "in_progress", "coding", codingRunnerID),
-	})
-	codingProcess, codingErr := codingTurn.Process, codingTurn.Error
-	if codingErr != nil {
-		reason := "Coding agent failed before producing an acceptable repository diff."
-		recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
-		return failureResult("in_progress", "coding", reason, codingErr.Error(), ""), fmt.Errorf("coding agent failed: %w", codingErr)
-	}
-	statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short")
-	if err != nil {
-		return nil, fmt.Errorf("read coding agent changes: %w", err)
-	}
-	if strings.TrimSpace(statusOutput) == "" {
-		reason := "Coding agent completed but produced no repository changes, so there is no diff for review or delivery."
-		recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
-		return failureResult("in_progress", "coding", reason, "git status --short returned no changed files after the coding runner finished.", ""), errors.New("coding agent produced no repository changes")
-	}
-	if _, err := runCommand(repoWorkspace, "git", "add", "-A"); err != nil {
-		return nil, fmt.Errorf("stage coding agent changes: %w", err)
-	}
-	if _, err := runCommand(repoWorkspace, "git", "commit", "-m", "Omega implementation for "+text(item, "key")); err != nil {
-		return nil, fmt.Errorf("commit coding agent changes: %w", err)
-	}
-	commitSha, _ := runCommand(repoWorkspace, "git", "rev-parse", "HEAD")
-	commitSummary, _ := runCommand(repoWorkspace, "git", "show", "--stat", "--oneline", "--no-renames", "HEAD")
-	diffText, _ := runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
-	changedNames, err := runCommand(repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
-	if err != nil {
-		return nil, fmt.Errorf("list changed files: %w", err)
-	}
-	changedFiles := compactLines(changedNames)
-	if err := os.WriteFile(filepath.Join(proofDir, "git-diff.patch"), []byte(diffText), 0o644); err != nil {
-		return nil, err
-	}
-	implementationSummary := fmt.Sprintf("# Implementation\n\n- Branch: `%s`\n- Commit: `%s`\n- Changed files:\n%s\n```text\n%s\n```\n", branchName, strings.TrimSpace(commitSha), markdownFileList(changedFiles), truncateForProof(commitSummary, 4000))
-	if err := os.WriteFile(filepath.Join(proofDir, "implementation-summary.md"), []byte(implementationSummary), 0o644); err != nil {
-		return nil, err
-	}
-	recordAgent("in_progress", "coding", "passed", codingPrompt, "implementation-summary.md", fmt.Sprintf("Coding agent produced %d changed file(s).", len(changedFiles)), []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md"), filepath.Join(proofDir, "implementation-summary.md"), filepath.Join(proofDir, "git-diff.patch")}, codingProcess)
-
-	testOutput, testErr := runRepositoryValidation(repoWorkspace)
-	testStatus := "passed"
-	if testErr != nil {
-		testStatus = "failed"
-	}
-	testVariables := cloneStringMap(promptVariables)
-	testVariables["changedFiles"] = strings.Join(changedFiles, ", ")
-	testVariables["testOutput"] = testOutput
-	testFallback := fmt.Sprintf("Validate %s after coding changes. Changed files: %s", text(item, "key"), strings.Join(changedFiles, ", "))
-	testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, testFallback)
-	testReport := fmt.Sprintf("# Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after coding changes.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None"))
-	if err := os.WriteFile(filepath.Join(proofDir, "test-report.md"), []byte(testReport), 0o644); err != nil {
-		return nil, err
-	}
-	recordAgent("in_progress", "testing", testStatus, testPrompt, "test-report.md", "Repository validation completed.", []string{filepath.Join(proofDir, "test-report.md")}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput})
-	if testErr != nil {
-		reason := "Repository validation failed after the coding agent produced changes."
-		return failureResult("in_progress", "testing", reason, stringOr(testOutput, testErr.Error()), ""), fmt.Errorf("repository validation failed: %w", testErr)
-	}
-
-	if text(target, "kind") == "github" {
-		_, _ = runCommand(repoWorkspace, "gh", "auth", "setup-git")
-	}
-	if err := pushDevFlowBranch(repoWorkspace, branchName); err != nil {
-		return nil, fmt.Errorf("push branch: %w", err)
-	}
-
-	prTitle := text(item, "key") + " " + text(item, "title")
-	prBody := buildDevFlowPullRequestBody(item, changedFiles, testOutput, humanChangeRequest, diffText)
-	prURL, err := ensureDevFlowPullRequest(repoWorkspace, repoSlug, branchName, baseBranch, prTitle, prBody)
-	if err != nil {
-		return nil, fmt.Errorf("create pull request: %w", err)
-	}
-	if humanChangeRequest != "" {
-		if output, err := updateDevFlowPullRequestDescriptionIfChanged(repoWorkspace, prURL, prTitle, prBody); err != nil {
-			server.logDebug(ctx, "github.pr.description_update_skipped", "Pull request description update skipped after human-requested rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output+"\n"+err.Error(), 1200)})
-		} else {
-			server.logInfo(ctx, "github.pr.description_updated", "Pull request description updated after human-requested rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output, 1200)})
-		}
-	}
-	prDiff, _ := runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
-	checksOutput, _ := runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
-
-	reviewRounds := defaultDevFlowReviewRounds()
-	if template != nil && len(template.ReviewRounds) > 0 {
-		reviewRounds = template.ReviewRounds
-	}
-	maxReviewCycles := devFlowMaxReviewCycles(template)
-	runReworkTurn := func(cycle int, feedback string) error {
-		stageID := devFlowTransitionTo(template, "code_review_round_1", "changes_requested", "rework")
-		if stageID == "" {
-			stageID = "rework"
-		}
-		notePath := filepath.Join(proofDir, fmt.Sprintf("rework-agent-note-%d.md", cycle))
-		promptPath := filepath.Join(proofDir, fmt.Sprintf("rework-prompt-%d.md", cycle))
-		reworkVariables := cloneStringMap(promptVariables)
-		reworkVariables["pullRequestUrl"] = prURL
-		reworkVariables["reviewFeedback"] = feedback
-		reworkVariables["reworkNotePath"] = notePath
-		reworkFallback := fmt.Sprintf(`You are the rework coding agent for Omega.
-
-Repository: %s
-Repository path: %s
-Work item: %s
-Title: %s
-Pull request: %s
-
-Requirement:
-%s
-
-Review feedback to address:
-%s
-
-Rules:
-- Continue in the same repository checkout, same branch, and same pull request.
-- Address the review feedback with a real code change.
-- Keep the diff minimal and reviewable.
-- Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
-- Write a short completion note to %s with these sections:
-  - Review feedback addressed
-  - What changed
-  - Files changed
-  - Validation run
-  - Remaining risk
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, feedback, notePath)
-		reworkPrompt := renderWorkflowPromptSection(template, "rework", reworkVariables, reworkFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
-		if err := os.WriteFile(promptPath, []byte(reworkPrompt), 0o644); err != nil {
+		codingPrompt := renderWorkflowPromptSection(template, "coding", promptVariables, codingFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
+		if err := os.WriteFile(filepath.Join(proofDir, "coding-prompt.md"), []byte(codingPrompt), 0o644); err != nil {
 			return err
 		}
-		recordAgent(stageID, "coding", "running", reworkPrompt, "", "Rework agent is applying review feedback in the same workspace.", []string{promptPath}, map[string]any{"runner": codingRunnerID, "status": "running", "reviewCycle": cycle})
-		turn := codingRunner.RunTurn(ctx, AgentTurnRequest{
-			Role:              "rework",
-			StageID:           stageID,
+		recordAgent("in_progress", "coding", "running", codingPrompt, "", "Coding agent is editing the repository workspace.", []string{filepath.Join(proofDir, "coding-prompt.md")}, map[string]any{"runner": codingRunnerID, "status": "running"})
+		codingModel, codingEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
+		codingTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
+			Role:              "coding",
+			StageID:           "in_progress",
 			Runner:            codingRunnerID,
 			Workspace:         repoWorkspace,
-			Prompt:            reworkPrompt,
-			OutputPath:        notePath,
+			Prompt:            codingPrompt,
+			OutputPath:        filepath.Join(proofDir, "coding-agent-note.md"),
 			Sandbox:           "workspace-write",
-			Model:             codingProfile.Model,
+			Model:             codingModel,
+			Env:               codingEnv,
 			HeartbeatInterval: runnerHeartbeatInterval,
-			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "coding", codingRunnerID),
+			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "in_progress", "coding", codingRunnerID),
 		})
-		if turn.Error != nil {
-			recordAgent(stageID, "coding", "failed", reworkPrompt, filepath.Base(notePath), "Rework agent failed before producing an acceptable repository diff.", []string{promptPath, notePath}, turn.Process)
-			return fmt.Errorf("rework agent failed: %w", turn.Error)
+		codingProcess, codingErr := codingTurn.Process, codingTurn.Error
+		if codingErr != nil {
+			reason := "Coding agent failed before producing an acceptable repository diff."
+			recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
+			return fmt.Errorf("coding agent failed: %w", codingErr)
 		}
 		statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short")
 		if err != nil {
-			return fmt.Errorf("read rework changes: %w", err)
+			return fmt.Errorf("read coding agent changes: %w", err)
 		}
 		if strings.TrimSpace(statusOutput) == "" {
-			recordAgent(stageID, "coding", "failed", reworkPrompt, filepath.Base(notePath), "Rework agent produced no repository changes.", []string{promptPath, notePath}, turn.Process)
-			return errors.New("rework agent produced no repository changes")
+			reason := "Coding agent completed but produced no repository changes, so there is no diff for review or delivery."
+			recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
+			return errors.New("coding agent produced no repository changes")
 		}
 		if _, err := runCommand(repoWorkspace, "git", "add", "-A"); err != nil {
-			return fmt.Errorf("stage rework changes: %w", err)
+			return fmt.Errorf("stage coding agent changes: %w", err)
 		}
-		if _, err := runCommand(repoWorkspace, "git", "commit", "-m", fmt.Sprintf("Omega rework for %s round %d", text(item, "key"), cycle)); err != nil {
-			return fmt.Errorf("commit rework changes: %w", err)
+		if _, err := runCommand(repoWorkspace, "git", "commit", "-m", "Omega implementation for "+text(item, "key")); err != nil {
+			return fmt.Errorf("commit coding agent changes: %w", err)
 		}
 		commitSha, _ = runCommand(repoWorkspace, "git", "rev-parse", "HEAD")
 		commitSummary, _ = runCommand(repoWorkspace, "git", "show", "--stat", "--oneline", "--no-renames", "HEAD")
 		diffText, _ = runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
 		changedNames, err = runCommand(repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
 		if err != nil {
-			return fmt.Errorf("list rework changed files: %w", err)
+			return fmt.Errorf("list changed files: %w", err)
 		}
-		changedFiles = uniqueStrings(append(changedFiles, compactLines(changedNames)...))
-		if err := os.WriteFile(filepath.Join(proofDir, fmt.Sprintf("git-diff-rework-%d.patch", cycle)), []byte(diffText), 0o644); err != nil {
+		changedFiles = compactLines(changedNames)
+		if err := os.WriteFile(filepath.Join(proofDir, "git-diff.patch"), []byte(diffText), 0o644); err != nil {
 			return err
 		}
-		reworkSummaryPath := filepath.Join(proofDir, fmt.Sprintf("rework-summary-%d.md", cycle))
-		reworkSummary := fmt.Sprintf("# Rework Round %d\n\n- Branch: `%s`\n- Commit: `%s`\n- Changed files:\n%s\n```text\n%s\n```\n", cycle, branchName, strings.TrimSpace(commitSha), markdownFileList(compactLines(changedNames)), truncateForProof(commitSummary, 4000))
-		if err := os.WriteFile(reworkSummaryPath, []byte(reworkSummary), 0o644); err != nil {
+		implementationSummary := fmt.Sprintf("# Implementation\n\n- Branch: `%s`\n- Commit: `%s`\n- Changed files:\n%s\n```text\n%s\n```\n", branchName, strings.TrimSpace(commitSha), markdownFileList(changedFiles), truncateForProof(commitSummary, 4000))
+		if err := os.WriteFile(filepath.Join(proofDir, "implementation-summary.md"), []byte(implementationSummary), 0o644); err != nil {
 			return err
 		}
-		recordAgent(stageID, "coding", "passed", reworkPrompt, filepath.Base(reworkSummaryPath), fmt.Sprintf("Rework agent produced %d changed file(s).", len(compactLines(changedNames))), []string{promptPath, notePath, reworkSummaryPath, filepath.Join(proofDir, fmt.Sprintf("git-diff-rework-%d.patch", cycle))}, turn.Process)
+		recordAgent("in_progress", "coding", "passed", codingPrompt, "implementation-summary.md", fmt.Sprintf("Coding agent produced %d changed file(s).", len(changedFiles)), []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md"), filepath.Join(proofDir, "implementation-summary.md"), filepath.Join(proofDir, "git-diff.patch")}, codingProcess)
+		return nil
+	}
+	runValidation := func() error {
 		testOutput, testErr = runRepositoryValidation(repoWorkspace)
 		testStatus := "passed"
 		if testErr != nil {
 			testStatus = "failed"
 		}
-		testReportPath := filepath.Join(proofDir, fmt.Sprintf("test-report-rework-%d.md", cycle))
 		testVariables := cloneStringMap(promptVariables)
 		testVariables["changedFiles"] = strings.Join(changedFiles, ", ")
 		testVariables["testOutput"] = testOutput
-		testFallback := fmt.Sprintf("Validate %s after rework round %d. Changed files: %s", text(item, "key"), cycle, strings.Join(changedFiles, ", "))
+		testFallback := fmt.Sprintf("Validate %s after coding changes. Changed files: %s", text(item, "key"), strings.Join(changedFiles, ", "))
 		testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, testFallback)
-		testReport := fmt.Sprintf("# Rework Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after rework round %d.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), cycle, stringOr(testFailureSummary(testErr, testOutput), "None"))
-		if err := os.WriteFile(testReportPath, []byte(testReport), 0o644); err != nil {
+		testReport := fmt.Sprintf("# Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after coding changes.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None"))
+		if err := os.WriteFile(filepath.Join(proofDir, "test-report.md"), []byte(testReport), 0o644); err != nil {
 			return err
 		}
-		recordAgent(stageID, "testing", testStatus, testPrompt, filepath.Base(testReportPath), "Repository validation completed after rework.", []string{testReportPath}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput})
+		recordAgent("in_progress", "testing", testStatus, testPrompt, "test-report.md", "Repository validation completed.", []string{filepath.Join(proofDir, "test-report.md")}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput})
 		if testErr != nil {
-			return fmt.Errorf("repository validation failed after rework: %w", testErr)
+			return fmt.Errorf("repository validation failed: %w", testErr)
+		}
+		return nil
+	}
+	ensurePullRequest := func() error {
+		if text(target, "kind") == "github" {
+			_, _ = runCommand(repoWorkspace, "gh", "auth", "setup-git")
 		}
 		if err := pushDevFlowBranch(repoWorkspace, branchName); err != nil {
-			return fmt.Errorf("push rework branch: %w", err)
+			return fmt.Errorf("push branch: %w", err)
 		}
-		reworkPRBody := buildDevFlowPullRequestBody(item, changedFiles, testOutput, stringOr(feedback, humanChangeRequest), diffText)
-		if output, err := updateDevFlowPullRequestDescriptionIfChanged(repoWorkspace, prURL, prTitle, reworkPRBody); err != nil {
-			server.logDebug(ctx, "github.pr.description_update_skipped", "Pull request description update skipped after rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output+"\n"+err.Error(), 1200)})
-		} else {
-			server.logInfo(ctx, "github.pr.description_updated", "Pull request description updated after rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output, 1200)})
+		prTitle = text(item, "key") + " " + text(item, "title")
+		prBody = buildDevFlowPullRequestBody(item, changedFiles, testOutput, humanChangeRequest, diffText)
+		var err error
+		prURL, err = ensureDevFlowPullRequest(repoWorkspace, repoSlug, branchName, baseBranch, prTitle, prBody)
+		if err != nil {
+			return fmt.Errorf("create pull request: %w", err)
+		}
+		if humanChangeRequest != "" {
+			if output, err := updateDevFlowPullRequestDescriptionIfChanged(repoWorkspace, prURL, prTitle, prBody); err != nil {
+				server.logDebug(ctx, "github.pr.description_update_skipped", "Pull request description update skipped after human-requested rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output+"\n"+err.Error(), 1200)})
+			} else {
+				server.logInfo(ctx, "github.pr.description_updated", "Pull request description updated after human-requested rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output, 1200)})
+			}
 		}
 		prDiff, _ = runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
 		checksOutput, _ = runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
+		remoteChecks, remoteChecksRaw = githubPullRequestChecks(ctx, repoWorkspace, prURL, repoSlug)
+		if strings.TrimSpace(remoteChecksRaw) != "" {
+			checksOutput = remoteChecksRaw
+		}
+		remoteCheckSummary = githubCheckSummaryWithRequired(remoteChecks, template.Runtime.RequiredChecks)
 		return nil
 	}
-	reviewCycle := 1
+	if err := runDevFlowContractState(template, "todo", []devFlowContractActionStep{{ID: "capture_requirement", Type: "write_requirement_artifact", Agent: "requirement", Run: writeRequirementArtifact}}); err != nil {
+		return failureResult("todo", "requirement", "Workflow contract requirement action failed.", err.Error(), ""), err
+	}
+	if err := runDevFlowContractState(template, "in_progress", []devFlowContractActionStep{
+		{ID: "classify_task", Type: "classify_task", Agent: "master", Run: classifyTask},
+		{ID: "architecture_handoff", Type: "run_agent", Agent: "architect", Run: runArchitecture},
+		{ID: "implement_change", Type: "run_agent", Agent: "coding", Run: runCoding},
+		{ID: "validate_repository", Type: "run_validation", Agent: "testing", Run: runValidation},
+		{ID: "publish_pull_request", Type: "ensure_pr", Agent: "delivery", Run: ensurePullRequest},
+	}); err != nil {
+		return failureResult("in_progress", "delivery", "Workflow contract implementation action failed.", err.Error(), ""), err
+	}
+	pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
+	checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, remoteChecks)
+
+	reviewRounds := devFlowReviewRoundsFromContract(template)
+	maxReviewCycles := devFlowMaxReviewCycles(template)
+	runReworkTurn := func(cycle int, fromStageID string, feedback string) error {
+		stageID := devFlowTransitionTo(template, fromStageID, "changes_requested", "rework")
+		if stageID == "" {
+			stageID = "rework"
+		}
+		handler := newDevFlowReworkActionHandler(devFlowReworkActionHandler{
+			server:                  server,
+			ctx:                     ctx,
+			template:                template,
+			profile:                 profile,
+			codingProfile:           codingProfile,
+			codingRunner:            codingRunner,
+			codingRunnerID:          codingRunnerID,
+			runnerHeartbeatInterval: runnerHeartbeatInterval,
+			pipeline:                pipeline,
+			item:                    item,
+			currentAttempt:          currentAttempt,
+			proofDir:                proofDir,
+			repoWorkspace:           repoWorkspace,
+			repoSlug:                repoSlug,
+			branchName:              branchName,
+			prURL:                   prURL,
+			prTitle:                 prTitle,
+			effectiveDescription:    effectiveDescription,
+			attemptID:               attemptID,
+			humanChangeRequest:      humanChangeRequest,
+			promptVariables:         promptVariables,
+			stageID:                 stageID,
+			fromStageID:             fromStageID,
+			cycle:                   cycle,
+			feedback:                feedback,
+			recordAgent:             recordAgent,
+			commitSha:               &commitSha,
+			commitSummary:           &commitSummary,
+			diffText:                &diffText,
+			changedNames:            &changedNames,
+			changedFiles:            &changedFiles,
+			testOutput:              &testOutput,
+			testErr:                 &testErr,
+			prDiff:                  &prDiff,
+			checksOutput:            &checksOutput,
+			remoteChecks:            &remoteChecks,
+			remoteChecksRaw:         &remoteChecksRaw,
+			remoteCheckSummary:      &remoteCheckSummary,
+			pullRequestFeedback:     &pullRequestFeedback,
+			checkLogFeedback:        &checkLogFeedback,
+		})
+		return runDevFlowContractState(template, stageID, handler.contractSteps())
+	}
+	remoteReworkCycle := 0
+	for {
+		remoteFeedback, needsRemoteRework := devFlowRemoteGateFeedback(remoteCheckSummary, checkLogFeedback)
+		if !needsRemoteRework {
+			break
+		}
+		if remoteReworkCycle >= maxReviewCycles {
+			recordAgent("rework", "testing", "waiting-human", remoteFeedback, "remote-checks-feedback.md", "Remote checks still require attention after automated rework attempts.", []string{}, map[string]any{"runner": "github", "status": "waiting-human", "checkSummary": remoteCheckSummary})
+			break
+		}
+		remoteReworkCycle++
+		if err := runReworkTurn(remoteReworkCycle, "in_progress", remoteFeedback); err != nil {
+			reason := "Rework agent failed while applying remote check feedback."
+			return failureResult("rework", "coding", reason, err.Error(), remoteFeedback), err
+		}
+	}
+	reviewCycle := remoteReworkCycle + 1
 	for {
 		var reviewFeedback string
+		reworkFromStageID := "code_review_round_1"
 		needsRework := false
+		stopReviewSequence := false
+		nextReviewStageID := ""
 		for _, reviewRound := range reviewRounds {
 			stageID := stringOr(reviewRound.StageID, "code_review")
+			if nextReviewStageID != "" && stageID != nextReviewStageID {
+				continue
+			}
+			nextReviewStageID = ""
 			artifact := stringOr(reviewRound.Artifact, stageID+".md")
 			if reviewCycle > 1 {
 				artifact = strings.TrimSuffix(artifact, filepath.Ext(artifact)) + fmt.Sprintf("-cycle-%d%s", reviewCycle, filepath.Ext(artifact))
@@ -1728,8 +1860,10 @@ Rules:
 			reviewVariables["checksOutput"] = reviewChecks
 			reviewVariables["reviewFocus"] = reviewRound.Focus
 			reviewVariables["diff"] = reviewDiff
-			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, stringOr(reviewFeedback, humanChangeRequest))
+			reviewVariables["reviewFeedback"] = combinedFeedback(stringOr(reviewFeedback, humanChangeRequest))
+			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(stringOr(reviewFeedback, humanChangeRequest)))
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
+			reviewModel, reviewEnv := server.runnerCredentialModelAndEnv(ctx, reviewRunnerID, reviewProfile.Model)
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
 				Role:              "review",
 				StageID:           stageID,
@@ -1738,8 +1872,9 @@ Rules:
 				Prompt:            reviewPrompt,
 				OutputPath:        reviewPath,
 				Sandbox:           "read-only",
-				Model:             reviewProfile.Model,
+				Model:             reviewModel,
 				Effort:            "medium",
+				Env:               reviewEnv,
 				HeartbeatInterval: runnerHeartbeatInterval,
 				OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "review", reviewRunnerID),
 			})
@@ -1753,6 +1888,13 @@ Rules:
 			switch outcome.Verdict {
 			case "approved":
 				recordAgent(stageID, "review", "passed", reviewPrompt, artifact, outcome.Summary, []string{reviewPath}, reviewProcess)
+				nextStageID := devFlowTransitionTo(template, stageID, "approved", "")
+				if nextStageID != "" && !devFlowReviewRoundStageExists(reviewRounds, nextStageID) {
+					stopReviewSequence = true
+				}
+				if nextStageID != "" && !stopReviewSequence {
+					nextReviewStageID = nextStageID
+				}
 			case "needs_human_info":
 				recordAgent(stageID, "review", "needs-human", reviewPrompt, artifact, outcome.Summary, []string{reviewPath}, reviewProcess)
 				reviewFeedback = outcome.Summary
@@ -1762,15 +1904,17 @@ Rules:
 			case "changes_requested":
 				recordAgent(stageID, "review", "changes-requested", reviewPrompt, artifact, outcome.Summary, []string{reviewPath}, reviewProcess)
 				reviewFeedback = outcome.Summary
+				reworkFromStageID = stageID
 				needsRework = true
 				break
 			default:
 				recordAgent(stageID, "review", "changes-requested", reviewPrompt, artifact, outcome.Summary, []string{reviewPath}, reviewProcess)
 				reviewFeedback = outcome.Summary
+				reworkFromStageID = stageID
 				needsRework = true
 				break
 			}
-			if needsRework || outcome.Verdict == "needs_human_info" {
+			if needsRework || outcome.Verdict == "needs_human_info" || stopReviewSequence {
 				break
 			}
 		}
@@ -1782,7 +1926,7 @@ Rules:
 			break
 		}
 		reviewCycle++
-		if err := runReworkTurn(reviewCycle, reviewFeedback); err != nil {
+		if err := runReworkTurn(reviewCycle, reworkFromStageID, reviewFeedback); err != nil {
 			reason := "Rework agent failed while applying review feedback."
 			return failureResult("rework", "coding", reason, err.Error(), reviewFeedback), err
 		}
@@ -1795,17 +1939,27 @@ Rules:
 	}
 	recordAgent("human_review", "human", "waiting-human", "Review the PR, proof, and agent verdicts. Approve to continue delivery or request changes to send the run back.", "human-review-request.md", "Waiting for explicit human approval before delivery.", []string{humanReviewRequestPath}, map[string]any{"runner": "human", "status": "waiting-human"})
 
-	if reportPath, err := writeDevFlowRunReport(proofDir, devFlowRunReportInput{
-		Item:             item,
-		Repository:       repoSlug,
-		BranchName:       branchName,
-		PullRequestURL:   prURL,
-		ChangedFiles:     changedFiles,
-		TestOutput:       testOutput,
-		ChecksOutput:     checksOutput,
-		StageArtifacts:   stageArtifacts,
-		AgentInvocations: agentInvocations,
-	}); err != nil {
+	reportInput := devFlowRunReportInput{
+		Item:                item,
+		Repository:          repoSlug,
+		BranchName:          branchName,
+		PullRequestURL:      prURL,
+		ChangedFiles:        changedFiles,
+		DiffText:            stringOr(prDiff, diffText),
+		TestOutput:          testOutput,
+		ChecksOutput:        checksOutput,
+		PullRequestFeedback: pullRequestFeedback,
+		CheckLogFeedback:    checkLogFeedback,
+		StageArtifacts:      stageArtifacts,
+		AgentInvocations:    agentInvocations,
+	}
+	reviewPacket, reviewPacketPath, err := writeDevFlowReviewPacket(proofDir, reportInput)
+	if err != nil {
+		return nil, err
+	}
+	stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reviewPacketPath)})
+	reportInput.ReviewPacket = reviewPacket
+	if reportPath, err := writeDevFlowRunReport(proofDir, reportInput); err != nil {
 		return nil, err
 	} else {
 		stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reportPath)})
@@ -1832,6 +1986,7 @@ Rules:
 		"pullRequestUrl":     prURL,
 		"merged":             merged,
 		"humanGate":          "pending",
+		"reviewPacket":       reviewPacket,
 		"changedFiles":       changedFiles,
 		"artifacts":          stageArtifacts,
 		"agentInvocations":   agentInvocations,
@@ -1840,19 +1995,24 @@ Rules:
 		return nil, err
 	}
 	recordAgent("done", "delivery", "waiting-human", deliveryPrompt, "handoff-bundle.json", "Delivery is blocked by the human review checkpoint.", []string{filepath.Join(proofDir, "handoff-bundle.json")}, map[string]any{"runner": "local-orchestrator", "status": "waiting-human"})
+	recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 	proofFiles, _ := collectFiles(proofDir)
 	return map[string]any{
-		"status":           "waiting-human",
-		"workflow":         mapValue(mapValue(pipeline["run"])["workflow"]),
-		"workspacePath":    workspace,
-		"repositoryPath":   repoWorkspace,
-		"branchName":       branchName,
-		"pullRequestUrl":   prURL,
-		"merged":           merged,
-		"changedFiles":     changedFiles,
-		"stageArtifacts":   stageArtifacts,
-		"agentInvocations": agentInvocations,
-		"proofFiles":       proofFiles,
+		"status":              "waiting-human",
+		"workflow":            mapValue(mapValue(pipeline["run"])["workflow"]),
+		"workspacePath":       workspace,
+		"repositoryPath":      repoWorkspace,
+		"branchName":          branchName,
+		"pullRequestUrl":      prURL,
+		"merged":              merged,
+		"changedFiles":        changedFiles,
+		"stageArtifacts":      stageArtifacts,
+		"agentInvocations":    agentInvocations,
+		"proofFiles":          proofFiles,
+		"reviewPacket":        reviewPacket,
+		"pullRequestFeedback": pullRequestFeedback,
+		"checkLogFeedback":    checkLogFeedback,
+		"githubOutboundSync":  githubOutboundSync,
 	}, nil
 }
 

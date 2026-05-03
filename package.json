@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --config apps/web/vite.config.ts",
     "web:dev": "vite --config apps/web/vite.config.ts",
+    "desktop": "electron apps/desktop/src/main.cjs",
     "desktop:dev": "electron apps/desktop/src/main.cjs",
     "desktop:pilot": "electron apps/desktop/src/pilot-main.cjs",
     "build": "tsc -b && vite build --config apps/web/vite.config.ts",
@@ -19,6 +20,7 @@
     "go:test": "go test ./...",
     "codex:proof:smoke": "node scripts/codex-proof-smoke.mjs",
     "test": "vitest run --config apps/web/vite.config.ts",
+    "test:feature-p0": "npm run lint && npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000 && node --check apps/desktop/src/process-supervisor.cjs && node --check apps/desktop/src/pilot-preload.cjs && go test ./services/local-runtime/internal/omegalocal",
     "test:watch": "vitest --config apps/web/vite.config.ts",
     "coverage": "vitest run --coverage --config apps/web/vite.config.ts",
     "lint": "tsc -b --pretty false"

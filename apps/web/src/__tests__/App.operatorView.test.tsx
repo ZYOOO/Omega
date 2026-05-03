@@ -102,7 +102,7 @@ describe("App operator view", () => {
       if (url.endsWith("/workspace") && init?.method === "PUT") {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 2, pipelines: 1, checkpoints: 1, missions: 1, operations: 1, proofRecords: 3, events: 4 },
           pipelineStatus: { "waiting-human": 1 },
@@ -158,6 +158,9 @@ describe("App operator view", () => {
         return Promise.resolve(jsonResponse([
           { id: "git", command: "git", category: "source-control", available: true, version: "git version 2.45.0", required: true },
           { id: "codex", command: "codex", category: "ai-runner", available: true, version: "codex 0.98.0", required: false },
+          { id: "opencode", command: "opencode", category: "ai-runner", available: true, version: "opencode 1.14.31", required: false },
+          { id: "claude-code", command: "claude", category: "ai-runner", available: true, version: "claude 1.0.0", required: false },
+          { id: "trae-agent", command: "trae-cli", category: "ai-runner", available: false, version: "", required: false },
           { id: "lark-cli", command: "lark-cli", category: "feishu", available: false, required: false }
         ]));
       }
@@ -184,22 +187,26 @@ describe("App operator view", () => {
     fireEvent.click(screen.getByRole("button", { name: "Project config" }));
     expect(screen.getByText("Workspace folder")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Choose folder" })).toBeInTheDocument();
-    expect(screen.getByText("Project Agent Profile")).toBeInTheDocument();
+    expect(screen.getByText("Workspace Agent Studio")).toBeInTheDocument();
     expect(screen.getByText(/Agent orchestration/)).toBeInTheDocument();
-    const editProfileButton = screen.queryByRole("button", { name: "Edit profile" });
+    const editProfileButton = screen.queryByRole("button", { name: "Edit workspace defaults" });
     if (editProfileButton) fireEvent.click(editProfileButton);
     expect(screen.getByRole("button", { name: "Workflow" })).toBeInTheDocument();
-    expect(screen.getByLabelText("Workflow parser draft")).toBeInTheDocument();
+    expect(screen.getByLabelText("Workflow graph")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Prompts" }));
+    expect(screen.getByLabelText("Prompt sections")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Agents" }));
     expect(screen.getByLabelText("Agent roster")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Runtime files" }));
     expect(screen.getByRole("button", { name: ".codex/OMEGA.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "opencode profile" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: ".claude/CLAUDE.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Trae Agent profile" })).toBeInTheDocument();
     expect(screen.getByText("Runtime file preview")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved to local runtime"));
-    expect(localStorage.getItem("omega-agent-configuration-draft")).toContain("devflow-pr");
+    expect(localStorage.getItem("omega-agent-configuration-draft")).toBeNull();
   });
 
   it("renders execution locks, runner process telemetry, and pipeline stages", async () => {
@@ -227,7 +234,7 @@ describe("App operator view", () => {
           }
         }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 1, pipelines: 1, checkpoints: 0, missions: 1, operations: 1, proofRecords: 2, events: 3, runtimeLogs: 2 },
           pipelineStatus: { running: 1 },
@@ -448,7 +455,7 @@ describe("App operator view", () => {
           source: "app"
         }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 0, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: {},
@@ -523,7 +530,7 @@ describe("App operator view", () => {
           }
         }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 0, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: {},
@@ -739,7 +746,7 @@ describe("App operator view", () => {
       if (url.endsWith("/requirements")) {
         return Promise.resolve(jsonResponse(importedWorkspace.tables.requirements));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 0, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: {},
@@ -901,7 +908,7 @@ describe("App operator view", () => {
       if (url.endsWith("/workspace") && init?.method === "PUT") {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 2, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: {},
@@ -1083,7 +1090,7 @@ describe("App operator view", () => {
           events: []
         }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 0, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: {},
@@ -1165,7 +1172,7 @@ describe("App operator view", () => {
       if (url.endsWith("/workspace") && init?.method === "PUT") {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 1, pipelines: 1, checkpoints: 1, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: { "waiting-human": 1 },
@@ -1242,7 +1249,7 @@ describe("App operator view", () => {
       if (url.endsWith("/workspace") && init?.method === "PUT") {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 1, pipelines: 1, checkpoints: 1, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: { "waiting-human": 1 },
@@ -1318,7 +1325,7 @@ describe("App operator view", () => {
       if (url.endsWith("/workspace") && init?.method === "PUT") {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 1, pipelines: 1, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: { running: 1 },
@@ -1385,7 +1392,7 @@ describe("App operator view", () => {
       if (url.endsWith("/workspace") && init?.method === "PUT") {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 1, pipelines: 1, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: { running: 1 },
@@ -1551,7 +1558,7 @@ describe("App operator view", () => {
           attempt: { id: "attempt_52", itemId: "item_manual_52", pipelineId: "pipeline_item_manual_52", status: "running" }
         }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 1, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: {},
@@ -1779,7 +1786,7 @@ describe("App operator view", () => {
           lastTickStatus: "accepted"
         }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 3, pipelines: 2, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: { done: 1, "waiting-human": 1 },
@@ -1975,7 +1982,7 @@ describe("App operator view", () => {
         }]));
       }
       if (url.endsWith("/proof-records")) return Promise.resolve(jsonResponse([]));
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 1, pipelines: 1, checkpoints: 1, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: { "waiting-human": 1 },
@@ -2030,7 +2037,7 @@ describe("App operator view", () => {
           }
         }));
       }
-      if (url.endsWith("/observability")) {
+      if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
           counts: { workItems: 0, pipelines: 1, checkpoints: 1, missions: 0, operations: 0, proofRecords: 0, events: 0 },
           pipelineStatus: { "waiting-human": 1 },

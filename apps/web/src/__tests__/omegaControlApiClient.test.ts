@@ -14,21 +14,39 @@ import {
   fetchGitHubOAuthConfig,
   fetchGitHubRepositories,
   fetchGitHubStatus,
+  fetchHandoffBundles,
+  fetchFeishuConfig,
   fetchLocalCapabilities,
   fetchLlmProviderSelection,
   fetchLlmProviders,
   fetchObservability,
+  fetchOperationQueue,
+  fetchRuntimeLogPage,
   fetchPagePilotRuns,
   fetchPipelines,
   fetchPipelineTemplates,
+  fetchProofPreview,
+  fetchRepositoryTargets,
+  fetchWorkflowTemplates,
+  fetchRunWorkpads,
+  exportRuntimeLogs,
+  importProjectAgentProfileTemplate,
+  patchRunWorkpad,
   requestCheckpointChanges,
   runCurrentPipelineStage,
+  searchFeishuUsers,
   sendFeishuNotification,
   startGitHubCliLogin,
   startGitHubOAuth,
   startPipeline,
+  testAgentRunner,
+  testFeishuConfig,
   updateGitHubOAuthConfig,
-  updateLlmProviderSelection
+  updateFeishuConfig,
+  updateLlmProviderSelection,
+  updateWorkflowTemplate,
+  validateWorkflowTemplate,
+  restoreWorkflowTemplateDefault
 } from "../omegaControlApiClient";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -39,6 +57,102 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("omegaControlApiClient", () => {
+  it("reads and patches Run Workpad records through the local control plane", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (!init) {
+        expect(String(input)).toBe("http://omega.local/run-workpads?attemptId=attempt_1");
+        return Promise.resolve(jsonResponse([{ id: "attempt_1:workpad", workpad: { retryReason: "Review feedback" } }]));
+      }
+      expect(String(input)).toBe("http://omega.local/run-workpads/attempt_1%3Aworkpad");
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(String(init.body))).toMatchObject({
+        updatedBy: "job-supervisor",
+        reason: "CI gate changed",
+        source: { kind: "ci-check", id: "lint" },
+        workpad: { blockers: ["Required check pending"] }
+      });
+      return Promise.resolve(jsonResponse({
+        id: "attempt_1:workpad",
+        workpad: { blockers: ["Required check pending"], updatedBy: "job-supervisor" },
+        fieldPatches: { blockers: ["Required check pending"] },
+        fieldPatchSources: { blockers: { kind: "ci-check", id: "lint" } },
+        fieldPatchHistory: [{ updatedBy: "job-supervisor", fields: ["blockers"] }]
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchRunWorkpads("http://omega.local", { attemptId: "attempt_1" }, fetchImpl)).resolves.toHaveLength(1);
+    await expect(
+      patchRunWorkpad("http://omega.local", "attempt_1:workpad", {
+        updatedBy: "job-supervisor",
+        reason: "CI gate changed",
+        source: { kind: "ci-check", id: "lint" },
+        workpad: { blockers: ["Required check pending"] }
+      }, fetchImpl)
+    ).resolves.toMatchObject({ workpad: { updatedBy: "job-supervisor" }, fieldPatchHistory: [{ updatedBy: "job-supervisor" }] });
+  });
+
+  it("queries runtime logs with cursor search and export filters", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/runtime-logs/export")) {
+        expect(url).toContain("format=csv");
+        expect(url).toContain("requirementId=req_1");
+        return Promise.resolve(new Response("createdAt,level,eventType\n2026-05-01T00:00:00Z,ERROR,devflow.failed\n", { status: 200 }));
+      }
+      expect(url).toContain("/runtime-logs?");
+      expect(url).toContain("page=1");
+      expect(url).toContain("requirementId=req_1");
+      expect(url).toContain("q=merge");
+      return Promise.resolve(jsonResponse({
+        items: [{ id: "log_1", level: "ERROR", eventType: "devflow.failed", message: "merge failed", requirementId: "req_1", createdAt: "2026-05-01T00:00:00Z" }],
+        limit: 1,
+        nextCursor: "cursor_2",
+        hasMore: true
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchRuntimeLogPage("http://omega.local", { requirementId: "req_1", q: "merge", limit: 1 }, fetchImpl)).resolves.toMatchObject({
+      items: [{ id: "log_1", requirementId: "req_1" }],
+      nextCursor: "cursor_2",
+      hasMore: true
+    });
+    await expect(exportRuntimeLogs("http://omega.local", { requirementId: "req_1", format: "csv" }, fetchImpl)).resolves.toContain("devflow.failed");
+  });
+
+  it("reads repository audit records and proof previews", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "http://omega.local/repository-targets?projectId=project_omega") {
+        return Promise.resolve(jsonResponse([{ id: "repo_1", projectId: "project_omega", kind: "github", owner: "acme", repo: "demo" }]));
+      }
+      if (url === "http://omega.local/handoff-bundles?attemptId=attempt_1") {
+        return Promise.resolve(jsonResponse([{ id: "handoff_1", attemptId: "attempt_1", summary: { pullRequest: "https://github.com/acme/demo/pull/1" } }]));
+      }
+      if (url === "http://omega.local/operation-queue?status=running") {
+        return Promise.resolve(jsonResponse([{ id: "queue:operation_1", operationId: "operation_1", status: "running", queue: { prompt: "Run delivery" } }]));
+      }
+      if (url === "http://omega.local/proof-records/proof_1/preview") {
+        return Promise.resolve(jsonResponse({ available: true, proof: { id: "proof_1", label: "handoff" }, fileName: "handoff-bundle.json", previewType: "json", content: "{\"changedFiles\":[]}" }));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchRepositoryTargets("http://omega.local", { projectId: "project_omega" }, fetchImpl)).resolves.toMatchObject([
+      { id: "repo_1", kind: "github", repo: "demo" }
+    ]);
+    await expect(fetchHandoffBundles("http://omega.local", { attemptId: "attempt_1" }, fetchImpl)).resolves.toMatchObject([
+      { id: "handoff_1", summary: { pullRequest: "https://github.com/acme/demo/pull/1" } }
+    ]);
+    await expect(fetchOperationQueue("http://omega.local", { status: "running" }, fetchImpl)).resolves.toMatchObject([
+      { id: "queue:operation_1", operationId: "operation_1", status: "running" }
+    ]);
+    await expect(fetchProofPreview("http://omega.local", "proof_1", fetchImpl)).resolves.toMatchObject({
+      available: true,
+      fileName: "handoff-bundle.json",
+      previewType: "json"
+    });
+  });
+
   it("loads control-plane summaries and configuration", async () => {
     const fetchImpl = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
@@ -85,6 +199,32 @@ describe("omegaControlApiClient", () => {
         fetchImpl
       )
     ).resolves.toMatchObject({ model: "qwen-plus" });
+  });
+
+  it("manages first-class workflow templates", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!init) {
+        expect(url).toBe("http://omega.local/workflow-templates?projectId=project_omega&repositoryTargetId=repo_1");
+        return Promise.resolve(jsonResponse([{ id: "workflow_template_project_omega", templateId: "devflow-pr", validation: { status: "passed" } }]));
+      }
+      if (url.endsWith("/workflow-templates/validate")) {
+        expect(init.method).toBe("POST");
+        return Promise.resolve(jsonResponse({ validation: { status: "passed" }, template: { id: "devflow-pr", stages: [] } }));
+      }
+      if (url.endsWith("/workflow-templates/devflow-pr/restore-default")) {
+        expect(init.method).toBe("POST");
+        return Promise.resolve(jsonResponse({ id: "workflow_template_project_omega", templateId: "devflow-pr", source: "restored-default" }));
+      }
+      expect(url).toBe("http://omega.local/workflow-templates/devflow-pr");
+      expect(init.method).toBe("PUT");
+      return Promise.resolve(jsonResponse({ id: "workflow_template_project_omega", templateId: "devflow-pr", version: 2 }));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchWorkflowTemplates("http://omega.local", { projectId: "project_omega", repositoryTargetId: "repo_1" }, fetchImpl)).resolves.toHaveLength(1);
+    await expect(validateWorkflowTemplate("http://omega.local", { templateId: "devflow-pr", markdown: "---\nid: devflow-pr\n---" }, fetchImpl)).resolves.toMatchObject({ validation: { status: "passed" } });
+    await expect(updateWorkflowTemplate("http://omega.local", "devflow-pr", { projectId: "project_omega", markdown: "---\nid: devflow-pr\n---" }, fetchImpl)).resolves.toMatchObject({ version: 2 });
+    await expect(restoreWorkflowTemplateDefault("http://omega.local", "devflow-pr", { projectId: "project_omega" }, fetchImpl)).resolves.toMatchObject({ source: "restored-default" });
   });
 
   it("sends Feishu notifications through the local service", async () => {
@@ -446,5 +586,159 @@ describe("omegaControlApiClient", () => {
     await expect(
       requestCheckpointChanges("http://omega.local", "pipeline_item_1:intake", "Needs clearer acceptance criteria", fetchImpl)
     ).resolves.toMatchObject({ status: "rejected" });
+  });
+
+  it("binds Feishu config and runs provider preflight", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/feishu/config") && !init) {
+        return Promise.resolve(jsonResponse({
+          mode: "chat",
+          chatId: "",
+          assigneeLabel: "",
+          webhookSecretConfigured: false,
+          reviewTokenConfigured: false,
+          createDoc: false,
+          taskBridgeEnabled: false,
+          larkCliAvailable: true,
+          larkCliVersion: "1.0.23"
+        }));
+      }
+      if (url.endsWith("/feishu/config") && init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          mode: "task",
+          chatId: "oc_test",
+          assigneeId: "ou_test",
+          assigneeLabel: "Reviewer",
+          webhookSecret: "webhook-secret",
+          reviewToken: "review-token"
+        });
+        return Promise.resolve(jsonResponse({
+          mode: "task",
+          chatId: "oc_test",
+          assigneeId: "ou_test",
+          assigneeLabel: "Reviewer",
+          webhookSecretConfigured: true,
+          webhookSecretMasked: "********",
+          reviewTokenConfigured: true,
+          reviewTokenMasked: "********",
+          createDoc: true,
+          taskBridgeEnabled: true,
+          larkCliAvailable: true,
+          larkCliVersion: "1.0.23"
+        }));
+      }
+      if (url.endsWith("/feishu/config/test")) {
+        expect(init?.method).toBe("POST");
+        return Promise.resolve(jsonResponse({ provider: "feishu", status: "ready", tool: "lark-cli" }));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchFeishuConfig("http://omega.local", fetchImpl)).resolves.toMatchObject({ larkCliAvailable: true });
+    await expect(
+      updateFeishuConfig(
+        "http://omega.local",
+        {
+          mode: "task",
+          chatId: "oc_test",
+          assigneeId: "ou_test",
+          assigneeLabel: "Reviewer",
+          webhookSecret: "webhook-secret",
+          reviewToken: "review-token",
+          createDoc: true,
+          taskBridgeEnabled: true
+        },
+        fetchImpl
+      )
+    ).resolves.toMatchObject({ webhookSecretConfigured: true, reviewTokenConfigured: true });
+    await expect(testFeishuConfig("http://omega.local", fetchImpl)).resolves.toMatchObject({ status: "ready" });
+  });
+
+  it("searches Feishu reviewers through the local service", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://omega.local/feishu/users/search");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({ query: "王审核", limit: 10 });
+      return Promise.resolve(jsonResponse({
+        status: "ready",
+        users: [{ openId: "ou_reviewer", name: "王审核", email: "reviewer@example.test" }]
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(searchFeishuUsers("http://omega.local", "王审核", fetchImpl)).resolves.toMatchObject({
+      users: [{ openId: "ou_reviewer", name: "王审核" }]
+    });
+  });
+
+  it("runs Agent runner preflight before selecting a runtime account", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://omega.local/agent-runner/preflight");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        agentId: "coding",
+        runner: "trae-agent",
+        model: "doubao:ep-test-001"
+      });
+      return Promise.resolve(jsonResponse({
+        agentId: "coding",
+        runner: "trae-agent",
+        model: "doubao:ep-test-001",
+        effectiveModel: "doubao:ep-test-001",
+        status: "ready",
+        credentialConfigured: true,
+        message: "Runner command and local account preflight passed."
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(
+      testAgentRunner(
+        "http://omega.local",
+        { agentId: "coding", label: "Coding", runner: "trae-agent", model: "doubao:ep-test-001" },
+        fetchImpl
+      )
+    ).resolves.toMatchObject({ status: "ready", credentialConfigured: true });
+  });
+
+  it("imports an Agent Profile template through the local control plane", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://omega.local/agent-profile/import-template");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        projectId: "project_omega",
+        repositoryTargetId: "repo_1",
+        source: "repository"
+      });
+      return Promise.resolve(jsonResponse({
+        profile: {
+          projectId: "project_omega",
+          repositoryTargetId: "repo_1",
+          workflowTemplate: "devflow-pr",
+          workflowMarkdown: "workflow: devflow-pr",
+          stagePolicy: "Coding: repository only",
+          skillAllowlist: "browser-use",
+          mcpAllowlist: "github",
+          codexPolicy: "workspace-write",
+          claudePolicy: "",
+          agentProfiles: []
+        },
+        summary: {
+          source: "repository",
+          basePath: "/repo/.omega",
+          files: [{ name: "workflow", path: "/repo/.omega/workflow.md" }]
+        }
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(
+      importProjectAgentProfileTemplate(
+        "http://omega.local",
+        { projectId: "project_omega", repositoryTargetId: "repo_1", source: "repository" },
+        fetchImpl
+      )
+    ).resolves.toMatchObject({
+      profile: { repositoryTargetId: "repo_1" },
+      summary: { files: [{ name: "workflow" }] }
+    });
   });
 });

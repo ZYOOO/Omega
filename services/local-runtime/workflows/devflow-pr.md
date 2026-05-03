@@ -52,6 +52,175 @@ stages:
     agents: [delivery]
     humanGate: false
     outputArtifacts: [handoff-bundle, proof-records]
+states:
+  - id: todo
+    title: Todo intake
+    agentId: requirement
+    agents: [requirement]
+    outputArtifacts: [structured-requirement, acceptance-criteria, dispatch-plan]
+    actions:
+      - id: capture_requirement
+        type: write_requirement_artifact
+        agent: requirement
+        prompt: requirement
+        outputArtifacts: [structured-requirement, acceptance-criteria]
+    transitions:
+      passed: in_progress
+  - id: in_progress
+    title: Implementation and PR
+    agentId: coding
+    agents: [architect, coding, testing]
+    inputArtifacts: [structured-requirement, acceptance-criteria, repository-target]
+    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report, pull-request]
+    actions:
+      - id: classify_task
+        type: classify_task
+        agent: master
+        outputArtifacts: [task-classification]
+      - id: architecture_handoff
+        type: run_agent
+        agent: architect
+        prompt: architect
+        outputArtifacts: [technical-plan]
+      - id: implement_change
+        type: run_agent
+        agent: coding
+        prompt: coding
+        requiresDiff: true
+        outputArtifacts: [code-diff, changed-files, implementation-notes]
+      - id: validate_repository
+        type: run_validation
+        agent: testing
+        prompt: testing
+        outputArtifacts: [test-report]
+      - id: publish_pull_request
+        type: ensure_pr
+        agent: delivery
+        outputArtifacts: [pull-request]
+    transitions:
+      passed: code_review_round_1
+      failed: rework
+  - id: code_review_round_1
+    title: Code Review Round 1
+    agentId: review
+    agents: [review]
+    inputArtifacts: [code-diff, changed-files, test-report]
+    outputArtifacts: [review-report, blocking-risks, merge-recommendation]
+    actions:
+      - id: review_round_1
+        type: run_review
+        agent: review
+        prompt: review
+        diffSource: local_diff
+        outputArtifacts: [review-report]
+        verdicts:
+          approved: code_review_round_2
+          changes_requested: rework
+          needs_human_info: human_review
+  - id: code_review_round_2
+    title: Code Review Round 2
+    agentId: review
+    agents: [review]
+    inputArtifacts: [pull-request, test-report, review-report]
+    outputArtifacts: [review-report, blocking-risks, merge-recommendation]
+    actions:
+      - id: review_round_2
+        type: run_review
+        agent: review
+        prompt: review
+        diffSource: pr_diff
+        outputArtifacts: [review-report]
+        verdicts:
+          approved: human_review
+          changes_requested: rework
+          needs_human_info: human_review
+  - id: rework
+    title: Rework
+    agentId: coding
+    agents: [coding, testing]
+    inputArtifacts: [review-report, human-decision, check-log, code-diff]
+    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report]
+    actions:
+      - id: build_rework_checklist
+        type: build_rework_checklist
+        agent: master
+        outputArtifacts: [rework-checklist]
+      - id: apply_rework
+        type: run_agent
+        agent: coding
+        prompt: rework
+        requiresDiff: true
+        outputArtifacts: [code-diff, changed-files, implementation-notes]
+      - id: validate_rework
+        type: run_validation
+        agent: testing
+        prompt: testing
+        outputArtifacts: [test-report]
+      - id: update_pull_request
+        type: ensure_pr
+        agent: delivery
+        outputArtifacts: [pull-request]
+    transitions:
+      passed: code_review_round_1
+      failed: human_review
+  - id: human_review
+    title: Human Review
+    agentId: delivery
+    agents: [human, review, delivery]
+    humanGate: true
+    inputArtifacts: [pull-request, review-report, test-report, run-report]
+    outputArtifacts: [human-decision, review-notes]
+    actions:
+      - id: wait_human_decision
+        type: human_gate
+        agent: human
+        outputArtifacts: [human-decision]
+    transitions:
+      approved: merging
+      changes_requested: rework
+  - id: merging
+    title: Merging
+    agentId: delivery
+    agents: [delivery]
+    inputArtifacts: [human-decision, pull-request]
+    outputArtifacts: [pull-request, delivery-summary, rollback-plan]
+    actions:
+      - id: refresh_pr_status
+        type: refresh_pr_status
+        agent: delivery
+        outputArtifacts: [check-status, branch-sync-status]
+      - id: merge_pull_request
+        type: merge_pr
+        agent: delivery
+        outputArtifacts: [merge-proof]
+    transitions:
+      passed: done
+      failed: rework
+  - id: done
+    title: Done
+    agentId: delivery
+    agents: [delivery]
+    inputArtifacts: [merge-proof, run-report, proof-records]
+    outputArtifacts: [handoff-bundle, proof-records]
+    actions:
+      - id: finalize_handoff
+        type: write_handoff
+        agent: delivery
+        outputArtifacts: [handoff-bundle, proof-records]
+taskClasses:
+  - id: simple
+    title: Narrow change
+    workpadMode: compact
+    planningMode: direct
+    validationMode: focused
+    maxChangedFiles: 2
+    signals: [docs-only, copy-only, single-purpose]
+  - id: complex
+    title: Cross-cutting change
+    workpadMode: full
+    planningMode: explicit
+    validationMode: broad
+    signals: [multi-layer, behavior-change, data-model, unclear-scope]
 reviewRounds:
   - stageId: code_review_round_1
     artifact: code-review-round-1.md

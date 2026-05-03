@@ -60,6 +60,7 @@ createdAt
 
 - checkout 优先恢复上一轮 delivery branch，本地缺失时优先从 `origin/{branch}` 恢复。
 - coding runner 以 `rework` role 在同一 repo checkout 上修改。
+- rework prompt 优先消费 `reworkChecklist.prompt`，因此人工反馈、Review Agent 输出、失败原因和 PR/check 推荐动作会作为同一份执行清单进入 Agent。
 - commit / push 继续使用同一 branch 和 PR。
 - proof 写入 `rework-assessment.md`、`human-rework-summary.md`、`git-diff-human-rework.patch`、`test-report-human-rework.md`。
 - 二次 review prompt 同时看到人工意见和本轮增量 diff。
@@ -77,6 +78,7 @@ Work Item 详情页的 Run Workpad 会优先展示 Rework Assessment 摘要：
 - 标题显示 Fast rework / Replan then rework / Needs human info。
 - 展开后显示评估理由、人工原始反馈和 checklist。
 - Review Feedback / Retry Reason 继续保留 review agent、PR checks、human request changes 和失败原因的合并视图。
+- Rework Checklist 作为新的结构化执行输入进入 Workpad；展开后可以看到来源、主因和下一轮要处理的 checklist。
 
 ## 验证
 

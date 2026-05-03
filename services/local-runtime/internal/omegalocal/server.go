@@ -32,6 +32,8 @@ type Server struct {
 	watcherCancel  context.CancelFunc
 	jobMu          sync.Mutex
 	attemptCancels map[string]context.CancelFunc
+	previewMu      sync.Mutex
+	previewRuntime map[string]*previewRuntimeSession
 }
 
 type GitHubOAuthConfig struct {
@@ -42,6 +44,7 @@ type GitHubOAuthConfig struct {
 }
 
 func NewServer(databasePath, workspaceRoot, openAPIPath string) *Server {
+	ensureCommonLocalToolPaths()
 	return &Server{
 		Repo:          NewSQLiteRepository(databasePath),
 		WorkspaceRoot: workspaceRoot,
@@ -54,191 +57,37 @@ func NewServer(databasePath, workspaceRoot, openAPIPath string) *Server {
 		},
 		HTTPClient:     http.DefaultClient,
 		attemptCancels: map[string]context.CancelFunc{},
+		previewRuntime: map[string]*previewRuntimeSession{},
 	}
 }
 
-func (server *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", server.route)
-	return cors(mux)
-}
-
-func (server *Server) route(response http.ResponseWriter, request *http.Request) {
-	if request.Method == http.MethodOptions {
-		response.WriteHeader(http.StatusNoContent)
+func ensureCommonLocalToolPaths() {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
 		return
 	}
-
-	path := request.URL.Path
-	requestID := fmt.Sprintf("req_%d", time.Now().UnixNano())
-	startedAt := time.Now()
-	logger := &loggingResponseWriter{ResponseWriter: response}
-	response = logger
-	response.Header().Set("x-omega-request-id", requestID)
-	defer func() {
-		status := logger.status
-		if status == 0 {
-			status = http.StatusOK
+	current := os.Getenv("PATH")
+	parts := strings.Split(current, string(os.PathListSeparator))
+	seen := map[string]bool{}
+	for _, part := range parts {
+		seen[part] = true
+	}
+	candidates := []string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".npm-global", "bin"),
+		filepath.Join(home, ".bun", "bin"),
+	}
+	prefix := []string{}
+	for _, candidate := range candidates {
+		if seen[candidate] {
+			continue
 		}
-		level := runtimeLogLevelForStatus(status, request.Method)
-		server.logRuntime(context.Background(), level, "api.request", fmt.Sprintf("%s %s -> %d", request.Method, path, status), map[string]any{
-			"requestId":  requestID,
-			"method":     request.Method,
-			"path":       path,
-			"status":     status,
-			"bytes":      logger.bytes,
-			"durationMs": time.Since(startedAt).Milliseconds(),
-		})
-	}()
-	switch {
-	case request.Method == http.MethodGet && path == "/health":
-		writeJSON(response, http.StatusOK, map[string]any{"ok": true, "implementation": "go", "persistence": "sqlite", "databasePath": server.Repo.Path})
-	case request.Method == http.MethodGet && path == "/openapi.yaml":
-		server.openAPI(response)
-	case request.Method == http.MethodGet && path == "/workspace":
-		server.getWorkspace(response, request)
-	case request.Method == http.MethodPut && path == "/workspace":
-		server.putWorkspace(response, request)
-	case request.Method == http.MethodGet && path == "/requirements":
-		server.listTable(response, request, "requirements")
-	case request.Method == http.MethodGet && path == "/events":
-		server.listTable(response, request, "missionEvents")
-	case request.Method == http.MethodGet && path == "/pipelines":
-		server.listTable(response, request, "pipelines")
-	case request.Method == http.MethodGet && path == "/attempts":
-		server.listTable(response, request, "attempts")
-	case request.Method == http.MethodGet && strings.HasPrefix(path, "/attempts/") && strings.HasSuffix(path, "/timeline"):
-		server.attemptTimeline(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/attempts/") && strings.HasSuffix(path, "/retry"):
-		server.retryAttempt(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/attempts/") && strings.HasSuffix(path, "/cancel"):
-		server.cancelAttempt(response, request)
-	case request.Method == http.MethodGet && path == "/checkpoints":
-		server.listTable(response, request, "checkpoints")
-	case request.Method == http.MethodGet && path == "/missions":
-		server.listTable(response, request, "missions")
-	case request.Method == http.MethodGet && path == "/operations":
-		server.listTable(response, request, "operations")
-	case request.Method == http.MethodGet && path == "/proof-records":
-		server.listTable(response, request, "proofRecords")
-	case request.Method == http.MethodGet && path == "/run-workpads":
-		server.listTable(response, request, "runWorkpads")
-	case request.Method == http.MethodGet && path == "/execution-locks":
-		server.listExecutionLocks(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/execution-locks/") && strings.HasSuffix(path, "/release"):
-		server.releaseExecutionLock(response, request)
-	case request.Method == http.MethodPost && path == "/workspaces/cleanup":
-		server.cleanupWorkspaces(response, request)
-	case request.Method == http.MethodPost && path == "/job-supervisor/tick":
-		server.jobSupervisorTick(response, request)
-	case request.Method == http.MethodGet && path == "/migrations":
-		server.listMigrations(response, request)
-	case request.Method == http.MethodGet && path == "/pipeline-templates":
-		writeJSON(response, http.StatusOK, pipelineTemplates())
-	case request.Method == http.MethodGet && path == "/workflow-templates":
-		writeJSON(response, http.StatusOK, pipelineTemplates())
-	case request.Method == http.MethodPost && path == "/pipelines/from-template":
-		server.createPipelineFromTemplate(response, request)
-	case request.Method == http.MethodGet && path == "/llm-providers":
-		writeJSON(response, http.StatusOK, llmProviders())
-	case request.Method == http.MethodGet && path == "/llm-provider-selection":
-		server.getProviderSelection(response, request)
-	case request.Method == http.MethodPut && path == "/llm-provider-selection":
-		server.putProviderSelection(response, request)
-	case request.Method == http.MethodGet && path == "/agent-definitions":
-		server.listAgentDefinitions(response, request)
-	case request.Method == http.MethodGet && path == "/agent-profile":
-		server.getAgentProfile(response, request)
-	case request.Method == http.MethodPut && path == "/agent-profile":
-		server.putAgentProfile(response, request)
-	case request.Method == http.MethodGet && path == "/observability":
-		server.observability(response, request)
-	case request.Method == http.MethodGet && path == "/runtime-logs":
-		server.runtimeLogs(response, request)
-	case request.Method == http.MethodGet && path == "/local-capabilities":
-		server.localCapabilities(response, request)
-	case request.Method == http.MethodGet && path == "/local-workspace-root":
-		server.getLocalWorkspaceRoot(response, request)
-	case request.Method == http.MethodPut && path == "/local-workspace-root":
-		server.putLocalWorkspaceRoot(response, request)
-	case request.Method == http.MethodPost && path == "/page-pilot/apply":
-		server.pagePilotApply(response, request)
-	case request.Method == http.MethodPost && path == "/page-pilot/deliver":
-		server.pagePilotDeliver(response, request)
-	case request.Method == http.MethodGet && path == "/page-pilot/runs":
-		server.listPagePilotRuns(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/page-pilot/runs/") && strings.HasSuffix(path, "/discard"):
-		server.discardPagePilotRun(response, request)
-	case request.Method == http.MethodGet && path == "/github/status":
-		server.githubStatus(response, request)
-	case request.Method == http.MethodGet && path == "/github/oauth/config":
-		server.githubOAuthConfig(response, request)
-	case request.Method == http.MethodPut && path == "/github/oauth/config":
-		server.putGitHubOAuthConfig(response, request)
-	case request.Method == http.MethodPost && path == "/github/oauth/start":
-		server.githubOAuthStart(response, request)
-	case request.Method == http.MethodPost && path == "/github/cli-login/start":
-		server.githubCliLoginStart(response, request)
-	case request.Method == http.MethodGet && path == "/auth/github/callback":
-		server.githubOAuthCallback(response, request)
-	case request.Method == http.MethodGet && path == "/github/repositories":
-		server.githubRepositories(response, request)
-	case request.Method == http.MethodPost && path == "/github/repo-info":
-		server.githubRepoInfo(response, request)
-	case request.Method == http.MethodPost && path == "/github/bind-repository-target":
-		server.githubBindRepositoryTarget(response, request)
-	case request.Method == http.MethodDelete && strings.HasPrefix(path, "/github/repository-targets/"):
-		server.githubDeleteRepositoryTarget(response, request)
-	case request.Method == http.MethodPost && path == "/github/import-issues":
-		server.githubImportIssues(response, request)
-	case request.Method == http.MethodPost && path == "/github/create-pr":
-		server.githubCreatePR(response, request)
-	case request.Method == http.MethodPost && path == "/github/pr-status":
-		server.githubPRStatus(response, request)
-	case request.Method == http.MethodPost && path == "/feishu/notify":
-		server.feishuNotify(response, request)
-	case request.Method == http.MethodPost && path == "/requirements/decompose":
-		server.decomposeRequirement(response, request)
-	case request.Method == http.MethodPost && path == "/orchestrator/tick":
-		server.orchestratorTick(response, request)
-	case request.Method == http.MethodGet && path == "/orchestrator/watchers":
-		server.listOrchestratorWatchers(response, request)
-	case request.Method == http.MethodPut && strings.HasPrefix(path, "/orchestrator/watchers/"):
-		server.putOrchestratorWatcher(response, request)
-	case request.Method == http.MethodPost && path == "/work-items":
-		server.createWorkItem(response, request)
-	case request.Method == http.MethodDelete && strings.HasPrefix(path, "/work-items/"):
-		server.deleteWorkItem(response, request)
-	case request.Method == http.MethodPatch && strings.HasPrefix(path, "/work-items/"):
-		server.patchWorkItem(response, request)
-	case request.Method == http.MethodPost && path == "/pipelines/from-work-item":
-		server.createPipeline(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/pipelines/") && strings.HasSuffix(path, "/run-devflow-cycle"):
-		server.runDevFlowCycle(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/pipelines/") && strings.HasSuffix(path, "/start"):
-		server.startPipeline(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/pipelines/") && strings.HasSuffix(path, "/run-current-stage"):
-		server.runCurrentPipelineStage(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/pipelines/") && strings.HasSuffix(path, "/complete-stage"):
-		server.completePipelineStage(response, request)
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/pipelines/") && strings.HasSuffix(path, "/pause"):
-		server.setPipelineStatus(response, request, "paused")
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/pipelines/") && strings.HasSuffix(path, "/resume"):
-		server.setPipelineStatus(response, request, "running")
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/pipelines/") && strings.HasSuffix(path, "/terminate"):
-		server.setPipelineStatus(response, request, "terminated")
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/checkpoints/") && strings.HasSuffix(path, "/approve"):
-		server.decideCheckpoint(response, request, "approved")
-	case request.Method == http.MethodPost && strings.HasPrefix(path, "/checkpoints/") && strings.HasSuffix(path, "/request-changes"):
-		server.decideCheckpoint(response, request, "rejected")
-	case request.Method == http.MethodPost && path == "/missions/from-work-item":
-		server.createMission(response, request)
-	case request.Method == http.MethodPost && path == "/operations/run":
-		server.runOperation(response, request, true)
-	case request.Method == http.MethodPost && path == "/run-operation":
-		server.runOperation(response, request, false)
-	default:
-		writeJSON(response, http.StatusNotFound, map[string]any{"error": "not found"})
+		if info, statErr := os.Stat(candidate); statErr == nil && info.IsDir() {
+			prefix = append(prefix, candidate)
+		}
+	}
+	if len(prefix) > 0 {
+		_ = os.Setenv("PATH", strings.Join(append(prefix, current), string(os.PathListSeparator)))
 	}
 }
 
@@ -257,7 +106,7 @@ func (server *Server) observability(response http.ResponseWriter, request *http.
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	summary := observabilitySummary(*database)
+	summary := observabilitySummaryWithOptions(*database, observabilityOptionsFromQuery(request.URL.Query()))
 	if logs, logErr := server.Repo.ListRuntimeLogs(request.Context(), map[string]string{}, 50); logErr == nil {
 		mapValue(summary["counts"])["runtimeLogs"] = len(logs)
 	}
@@ -265,6 +114,71 @@ func (server *Server) observability(response http.ResponseWriter, request *http.
 		summary["recentErrors"] = errors
 	}
 	writeJSON(response, http.StatusOK, summary)
+}
+
+func (server *Server) createProject(response http.ResponseWriter, request *http.Request) {
+	var payload struct {
+		ID          string   `json:"id"`
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Team        string   `json:"team"`
+		Labels      []string `json:"labels"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
+	name := strings.TrimSpace(payload.Name)
+	if name == "" {
+		writeError(response, http.StatusBadRequest, fmt.Errorf("project name is required"))
+		return
+	}
+	database, err := mustLoad(server, request.Context())
+	if err != nil {
+		writeError(response, http.StatusNotFound, err)
+		return
+	}
+	projectID := strings.TrimSpace(payload.ID)
+	if projectID == "" {
+		projectID = "project_" + slugForID(name)
+	}
+	if findByID(database.Tables.Projects, projectID) >= 0 {
+		writeError(response, http.StatusConflict, fmt.Errorf("project %s already exists", projectID))
+		return
+	}
+	timestamp := nowISO()
+	labels := make([]any, 0, len(payload.Labels))
+	for _, label := range payload.Labels {
+		if trimmed := strings.TrimSpace(label); trimmed != "" {
+			labels = append(labels, trimmed)
+		}
+	}
+	project := map[string]any{
+		"id":                projectID,
+		"name":              name,
+		"description":       strings.TrimSpace(payload.Description),
+		"team":              stringOr(payload.Team, name),
+		"status":            "Active",
+		"labels":            labels,
+		"repositoryTargets": []any{},
+		"createdAt":         timestamp,
+		"updatedAt":         timestamp,
+	}
+	database.Tables.Projects = append(database.Tables.Projects, project)
+	database.Tables.MissionControlStates = append(database.Tables.MissionControlStates, map[string]any{
+		"runId":       "run_" + projectID,
+		"projectId":   projectID,
+		"workItems":   []any{},
+		"events":      []any{},
+		"syncIntents": []any{},
+		"updatedAt":   timestamp,
+	})
+	touch(&database)
+	if err := server.Repo.Save(request.Context(), database); err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, database)
 }
 
 func (server *Server) localCapabilities(response http.ResponseWriter, request *http.Request) {
@@ -888,22 +802,36 @@ func (server *Server) mutatePipeline(response http.ResponseWriter, request *http
 
 func (server *Server) decideCheckpoint(response http.ResponseWriter, request *http.Request, status string) {
 	checkpointID := pathID(request.URL.Path)
-	server.logInfo(request.Context(), "checkpoint.decision.requested", "Checkpoint decision requested.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
-	database, err := mustLoad(server, request.Context())
-	if err != nil {
-		server.logError(request.Context(), "checkpoint.decision.load_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
-		writeError(response, http.StatusNotFound, err)
-		return
-	}
-	server.reconcileAttemptIntegrityInDatabase(request.Context(), &database)
-	index := findByID(database.Tables.Checkpoints, checkpointID)
-	if index < 0 {
-		server.logError(request.Context(), "checkpoint.decision.not_found", "Checkpoint not found.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
-		writeJSON(response, http.StatusNotFound, map[string]any{"error": "checkpoint not found"})
-		return
-	}
 	var payload map[string]any
 	_ = json.NewDecoder(request.Body).Decode(&payload)
+	checkpoint, httpStatus, err := server.applyCheckpointDecision(request.Context(), checkpointID, status, payload)
+	if err != nil {
+		if httpStatus >= 500 {
+			writeError(response, httpStatus, err)
+		} else {
+			writeJSON(response, httpStatus, map[string]any{"error": err.Error()})
+		}
+		return
+	}
+	writeJSON(response, http.StatusOK, checkpoint)
+}
+
+func (server *Server) applyCheckpointDecision(ctx context.Context, checkpointID string, status string, payload map[string]any) (map[string]any, int, error) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	server.logInfo(ctx, "checkpoint.decision.requested", "Checkpoint decision requested.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+	database, err := mustLoad(server, ctx)
+	if err != nil {
+		server.logError(ctx, "checkpoint.decision.load_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+		return nil, http.StatusNotFound, err
+	}
+	server.reconcileAttemptIntegrityInDatabase(ctx, &database)
+	index := findByID(database.Tables.Checkpoints, checkpointID)
+	if index < 0 {
+		server.logError(ctx, "checkpoint.decision.not_found", "Checkpoint not found.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+		return nil, http.StatusNotFound, fmt.Errorf("checkpoint not found")
+	}
 	checkpoint := cloneMap(database.Tables.Checkpoints[index])
 	checkpoint["status"] = status
 	asyncApprovedDelivery := false
@@ -919,9 +847,8 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 			markApprovedDevFlowDeliveryQueued(&database, checkpoint)
 		} else {
 			if err := server.completeApprovedDevFlowCheckpoint(&database, checkpoint, reviewer); err != nil {
-				server.logError(request.Context(), "checkpoint.approve.failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
-				writeError(response, http.StatusInternalServerError, err)
-				return
+				server.logError(ctx, "checkpoint.approve.failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
+				return nil, http.StatusInternalServerError, err
 			}
 		}
 	} else {
@@ -932,11 +859,11 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 			var pipeline map[string]any
 			var reworkAttempt map[string]any
 			var prepareErr error
-			database, pipeline, reworkAttempt, prepareErr = server.prepareDevFlowHumanRequestedRework(request.Context(), database, checkpoint, reason)
+			database, pipeline, reworkAttempt, prepareErr = server.prepareDevFlowHumanRequestedRework(ctx, database, checkpoint, reason)
 			if prepareErr != nil {
 				checkpoint["reworkStatus"] = "failed"
 				checkpoint["reworkError"] = prepareErr.Error()
-				server.logError(request.Context(), "checkpoint.rework.prepare_failed", prepareErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
+				server.logError(ctx, "checkpoint.rework.prepare_failed", prepareErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
 			} else if text(reworkAttempt, "status") == "waiting-human" {
 				checkpoint["reworkStatus"] = "waiting-human"
 				checkpoint["reworkAttemptId"] = text(reworkAttempt, "id")
@@ -944,7 +871,7 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 			} else {
 				item := findWorkItem(database, text(pipeline, "workItemId"))
 				target := findRepositoryTarget(database, text(item, "repositoryTargetId"))
-				lock, lockErr := claimDevFlowWorkspaceLock(request.Context(), server, item, target, pipeline, reworkAttempt)
+				lock, lockErr := claimDevFlowWorkspaceLock(ctx, server, item, target, pipeline, reworkAttempt)
 				if lockErr != nil {
 					database, _ = failAttemptRecord(database, text(reworkAttempt, "id"), pipeline, lockErr.Error(), map[string]any{
 						"failureStageId":        "todo",
@@ -955,7 +882,7 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 					checkpoint["reworkStatus"] = "failed"
 					checkpoint["reworkAttemptId"] = text(reworkAttempt, "id")
 					checkpoint["reworkError"] = lockErr.Error()
-					server.logError(request.Context(), "checkpoint.rework.lock_failed", lockErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(pipeline, "id"), "attemptId": text(reworkAttempt, "id")})
+					server.logError(ctx, "checkpoint.rework.lock_failed", lockErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(pipeline, "id"), "attemptId": text(reworkAttempt, "id")})
 				} else {
 					reworkLock = lock
 					reworkPipelineID = text(pipeline, "id")
@@ -969,7 +896,7 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 	checkpoint["updatedAt"] = nowISO()
 	database.Tables.Checkpoints[index] = checkpoint
 	touch(&database)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.Save(ctx, database); err != nil {
 		if reworkLock != nil {
 			nextLock := cloneMap(reworkLock)
 			nextLock["status"] = "released"
@@ -978,11 +905,10 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 			nextLock["updatedAt"] = nowISO()
 			_ = saveExecutionLock(context.Background(), server, nextLock)
 		}
-		server.logError(request.Context(), "checkpoint.decision.save_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
-		writeError(response, http.StatusInternalServerError, err)
-		return
+		server.logError(ctx, "checkpoint.decision.save_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
+		return nil, http.StatusInternalServerError, err
 	}
-	server.logInfo(request.Context(), "checkpoint.decision.saved", "Checkpoint decision saved.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId"), "status": status})
+	server.logInfo(ctx, "checkpoint.decision.saved", "Checkpoint decision saved.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId"), "status": status})
 	if asyncApprovedDelivery {
 		reviewer := stringOr(payload["reviewer"], "human")
 		server.completeApprovedDevFlowCheckpointInBackground(text(checkpoint, "id"), reviewer)
@@ -990,7 +916,7 @@ func (server *Server) decideCheckpoint(response http.ResponseWriter, request *ht
 	if reworkAttemptID != "" {
 		server.startDevFlowCycleJob(reworkPipelineID, reworkAttemptID, false, false, reworkLock)
 	}
-	writeJSON(response, http.StatusOK, checkpoint)
+	return checkpoint, http.StatusOK, nil
 }
 
 func (server *Server) createMission(response http.ResponseWriter, request *http.Request) {
@@ -1281,6 +1207,7 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 	targetRepo := strings.TrimSpace(text(mission, "target"))
 	if targetRepo == "" || targetRepo == "No target" {
 		prompt := text(operation, "prompt") + "\n\n" + agentPolicyBlock(profile, agentID)
+		model, env := server.runnerCredentialModelAndEnv(context.Background(), resolvedRunnerID, stringOr(agent.Model, "gpt-5.4-mini"))
 		turn := agentRunner.RunTurn(context.Background(), AgentTurnRequest{
 			Role:       agentID,
 			StageID:    text(operation, "stageId"),
@@ -1289,7 +1216,8 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 			Prompt:     prompt,
 			OutputPath: filepath.Join(proofDir, resolvedRunnerID+"-last-message.txt"),
 			Sandbox:    "workspace-write",
-			Model:      stringOr(agent.Model, "gpt-5.4-mini"),
+			Model:      model,
+			Env:        env,
 		})
 		return demoCodeRunResult{stdout: text(turn.Process, "stdout"), stderr: text(turn.Process, "stderr"), runnerProcess: turn.Process}, turn.Error
 	}
@@ -1309,6 +1237,7 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 	_, _ = runCommand(repoWorkspace, "git", "config", "user.name", "Omega Codex Runner")
 
 	prompt := fmt.Sprintf("%s\n\nRepository target: %s\nCreate the requested code change in this repository. Leave generated proof in %s.\n\n%s", text(operation, "prompt"), targetRepo, proofDir, agentPolicyBlock(profile, agentID))
+	model, env := server.runnerCredentialModelAndEnv(context.Background(), resolvedRunnerID, stringOr(agent.Model, "gpt-5.4-mini"))
 	turn := agentRunner.RunTurn(context.Background(), AgentTurnRequest{
 		Role:       agentID,
 		StageID:    text(operation, "stageId"),
@@ -1317,7 +1246,8 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 		Prompt:     prompt,
 		OutputPath: filepath.Join(proofDir, resolvedRunnerID+"-last-message.txt"),
 		Sandbox:    "workspace-write",
-		Model:      stringOr(agent.Model, "gpt-5.4-mini"),
+		Model:      model,
+		Env:        env,
 	})
 	process := turn.Process
 	stdout := text(process, "stdout")
@@ -1623,6 +1553,7 @@ type SupervisedCommandEvent struct {
 type SupervisedCommandOptions struct {
 	HeartbeatInterval time.Duration
 	OnEvent           func(SupervisedCommandEvent)
+	Env               map[string]string
 }
 
 type supervisedStreamWriter struct {
@@ -1642,6 +1573,18 @@ func (writer supervisedStreamWriter) Write(chunk []byte) (int, error) {
 	return len(chunk), nil
 }
 
+func envMapToList(values map[string]string) []string {
+	items := make([]string, 0, len(values))
+	for key, value := range values {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		items = append(items, key+"="+value)
+	}
+	return items
+}
+
 func runSupervisedCommandContextWithOptions(ctx context.Context, options SupervisedCommandOptions, dir string, stdin string, name string, args ...string) (map[string]any, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1649,6 +1592,9 @@ func runSupervisedCommandContextWithOptions(ctx context.Context, options Supervi
 	started := time.Now()
 	command := exec.CommandContext(ctx, name, args...)
 	command.Dir = dir
+	if len(options.Env) > 0 {
+		command.Env = append(os.Environ(), envMapToList(options.Env)...)
+	}
 	if stdin != "" {
 		command.Stdin = strings.NewReader(stdin)
 	}
@@ -2133,6 +2079,7 @@ func (server *Server) githubRepositories(response http.ResponseWriter, request *
 
 func (server *Server) githubBindRepositoryTarget(response http.ResponseWriter, request *http.Request) {
 	var payload struct {
+		ProjectID     string `json:"projectId"`
 		Owner         string `json:"owner"`
 		Repo          string `json:"repo"`
 		NameWithOwner string `json:"nameWithOwner"`
@@ -2156,7 +2103,11 @@ func (server *Server) githubBindRepositoryTarget(response http.ResponseWriter, r
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
-	upsertGitHubRepositoryTarget(&database, repo, payload.DefaultBranch, payload.URL)
+	if payload.ProjectID != "" && findByID(database.Tables.Projects, payload.ProjectID) < 0 {
+		writeError(response, http.StatusNotFound, fmt.Errorf("project %s not found", payload.ProjectID))
+		return
+	}
+	upsertGitHubRepositoryTargetForProject(&database, payload.ProjectID, repo, payload.DefaultBranch, payload.URL)
 	touch(&database)
 	if err := server.Repo.Save(request.Context(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
@@ -2421,8 +2372,11 @@ func markApprovedDevFlowDeliveryQueued(database *WorkspaceDatabase, checkpoint m
 			continue
 		}
 		next := cloneMap(pipeline)
+		approvalRoute := workflowActionRouteFromPipeline(next, "human_review", "human", "passed")
+		mergeStageID := stringOr(approvalRoute.NextStageID, "merging")
 		run := mapValue(next["run"])
 		appendRunEvent(run, "gate.approved", "Human review approved. Delivery merge is running in the background.", "human_review", "human")
+		appendRunEvent(run, "action.routed", "Human review approval routed by workflow action handler.", "human_review", "human")
 		stages := arrayMaps(run["stages"])
 		for _, stage := range stages {
 			switch text(stage, "id") {
@@ -2430,7 +2384,7 @@ func markApprovedDevFlowDeliveryQueued(database *WorkspaceDatabase, checkpoint m
 				stage["status"] = "passed"
 				stage["approvedBy"] = "human"
 				stage["completedAt"] = nowISO()
-			case "merging":
+			case mergeStageID:
 				if text(stage, "status") == "ready" || text(stage, "status") == "waiting" {
 					stage["status"] = "running"
 					stage["startedAt"] = nowISO()
@@ -2513,30 +2467,33 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 	if err := os.MkdirAll(proofDir, 0o755); err != nil {
 		return err
 	}
-
-	humanReviewPath := filepath.Join(proofDir, "human-review.md")
-	if err := os.WriteFile(humanReviewPath, []byte(fmt.Sprintf("# Human Review\n\n- Reviewer: %s\n- Decision: approved\n- Pull request: %s\n- Approved at: %s\n", reviewer, prURL, nowISO())), 0o644); err != nil {
+	item := findWorkItem(*database, text(pipeline, "workItemId"))
+	template := findPipelineTemplate(text(pipeline, "templateId"))
+	deliveryHandler := newApprovedDevFlowDeliveryActionHandler(approvedDevFlowDeliveryActionHandler{
+		server:        server,
+		database:      database,
+		pipeline:      pipeline,
+		attempt:       attempt,
+		item:          item,
+		workspace:     workspace,
+		repoWorkspace: repoWorkspace,
+		proofDir:      proofDir,
+		prURL:         prURL,
+		reviewer:      reviewer,
+	})
+	if err := runDevFlowContractState(template, "human_review", []devFlowContractActionStep{{ID: "wait_human_decision", Type: "human_gate", Agent: "human", Run: deliveryHandler.recordHumanDecision}}); err != nil {
 		return err
 	}
-	if err := server.mergeApprovedDevFlowPullRequest(repoWorkspace, prURL, text(attempt, "branchName"), text(pipeline, "id"), text(attempt, "id")); err != nil {
-		server.logError(context.Background(), "github.pr.merge_failed", err.Error(), map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
-		return fmt.Errorf("merge pull request after human approval: %w", err)
-	}
-	server.logInfo(context.Background(), "github.pr.merged", "Pull request merged after human approval.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "pullRequestUrl": prURL})
-	mergePath := filepath.Join(proofDir, "merge.md")
-	if err := os.WriteFile(mergePath, []byte(fmt.Sprintf("# Merge\n\nMerged after human approval: %s\n", prURL)), 0o644); err != nil {
+	if err := runDevFlowContractState(template, "merging", []devFlowContractActionStep{
+		{ID: "refresh_pr_status", Type: "refresh_pr_status", Agent: "delivery", Run: deliveryHandler.refreshPullRequestStatus},
+		{ID: "merge_pull_request", Type: "merge_pr", Agent: "delivery", Run: deliveryHandler.mergePullRequest},
+	}); err != nil {
 		return err
 	}
-	handoffPath := filepath.Join(proofDir, "handoff-bundle.json")
-	if raw, err := os.ReadFile(handoffPath); err == nil {
-		var handoff map[string]any
-		if json.Unmarshal(raw, &handoff) == nil {
-			handoff["merged"] = true
-			handoff["humanGate"] = "approved"
-			handoff["approvedBy"] = reviewer
-			handoff["approvedAt"] = nowISO()
-			_ = writeJSONFile(handoffPath, handoff)
-		}
+	mergeRoute := workflowActionRouteFromPipeline(pipeline, "merging", "delivery", "passed")
+	doneStageID := stringOr(mergeRoute.NextStageID, "done")
+	if err := runDevFlowContractState(template, doneStageID, []devFlowContractActionStep{{ID: "finalize_handoff", Type: "write_handoff", Agent: "delivery", Run: deliveryHandler.writeHandoff}}); err != nil {
+		return err
 	}
 
 	run := mapValue(pipeline["run"])
@@ -2547,29 +2504,51 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 			stage["status"] = "passed"
 			stage["approvedBy"] = reviewer
 			stage["completedAt"] = nowISO()
-			stage["evidence"] = []string{humanReviewPath}
+			stage["evidence"] = []string{deliveryHandler.humanReviewProofPath()}
 		case "merging":
 			stage["status"] = "passed"
 			stage["completedAt"] = nowISO()
-			stage["evidence"] = []string{mergePath}
-		case "done":
+			stage["evidence"] = []string{deliveryHandler.mergeProofPath()}
+		case doneStageID:
 			stage["status"] = "passed"
 			stage["completedAt"] = nowISO()
-			stage["evidence"] = []string{handoffPath}
+			stage["evidence"] = []string{deliveryHandler.handoffProofPath()}
 		}
 	}
 	run["stages"] = stages
 	appendRunEvent(run, "gate.approved", fmt.Sprintf("Human review approved by %s.", reviewer), "human_review", "human")
+	appendRunEvent(run, "action.executed", "Merge action completed through workflow action handler.", "merging", "delivery")
 	appendRunEvent(run, "devflow.cycle.completed", "DevFlow PR cycle completed after human approval.", "done", "delivery")
 	pipeline["run"] = run
 	pipeline["status"] = "done"
 	pipeline["updatedAt"] = nowISO()
 	database.Tables.Pipelines[pipelineIndex] = pipeline
-	if item := findWorkItem(*database, text(pipeline, "workItemId")); item != nil {
+	if item != nil {
 		*database = updateWorkItem(*database, text(item, "id"), map[string]any{"status": "Done"})
 	}
 
 	proofFiles, _ := collectFiles(proofDir)
+	githubOutboundSync := []map[string]any{}
+	if item != nil {
+		report := server.syncGitHubIssueOutbound(context.Background(), githubOutboundSyncInput{
+			RepositoryPath: repoWorkspace,
+			Repository:     repositoryFromPullRequestURL(prURL),
+			WorkItem:       item,
+			Pipeline:       pipeline,
+			Attempt:        attempt,
+			Event:          "delivery.completed",
+			Status:         "done",
+			StageID:        "done",
+			Summary:        "Pull request merged after human approval.",
+			PullRequestURL: prURL,
+			BranchName:     text(attempt, "branchName"),
+		})
+		if text(report, "state") != "skipped" {
+			githubOutboundSync = append(githubOutboundSync, report)
+			_ = writeJSONFile(filepath.Join(proofDir, "github-outbound-sync-delivery-completed.json"), report)
+			proofFiles, _ = collectFiles(proofDir)
+		}
+	}
 	result := map[string]any{
 		"status":         "done",
 		"workspacePath":  workspace,
@@ -2577,16 +2556,19 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 		"pullRequestUrl": prURL,
 		"proofFiles":     proofFiles,
 	}
+	if len(githubOutboundSync) > 0 {
+		result["githubOutboundSync"] = githubOutboundSync
+	}
 	nextDatabase, _ := completeAttemptRecord(*database, text(attempt, "id"), pipeline, result)
 	*database = nextDatabase
 	upsertRunWorkpad(database, text(attempt, "id"))
 	for _, operation := range []map[string]any{
-		{"id": fmt.Sprintf("%s:agent:human_review:human", text(pipeline, "id")), "missionId": fmt.Sprintf("mission_%s_agent_workflow", text(pipeline, "id")), "stageId": "human_review", "agentId": "human", "status": "passed", "prompt": "Human approved delivery checkpoint.", "requiredProof": []any{"human-decision"}, "summary": "Human review approved.", "createdAt": nowISO(), "updatedAt": nowISO()},
-		{"id": fmt.Sprintf("%s:agent:merging:delivery", text(pipeline, "id")), "missionId": fmt.Sprintf("mission_%s_agent_workflow", text(pipeline, "id")), "stageId": "merging", "agentId": "delivery", "status": "passed", "prompt": "Merge approved pull request.", "requiredProof": []any{"pull-request"}, "summary": "Pull request merged after human approval.", "createdAt": nowISO(), "updatedAt": nowISO()},
+		{"id": fmt.Sprintf("%s:agent:human_review:human", text(pipeline, "id")), "missionId": fmt.Sprintf("mission_%s_agent_workflow", text(pipeline, "id")), "stageId": "human_review", "agentId": "human", "status": "passed", "prompt": "Human approved delivery checkpoint.", "requiredProof": []any{"human-decision"}, "summary": "Human review approved.", "actionRoute": workflowActionRouteMap(workflowActionRouteFromPipeline(pipeline, "human_review", "human", "passed")), "createdAt": nowISO(), "updatedAt": nowISO()},
+		{"id": fmt.Sprintf("%s:agent:merging:delivery", text(pipeline, "id")), "missionId": fmt.Sprintf("mission_%s_agent_workflow", text(pipeline, "id")), "stageId": "merging", "agentId": "delivery", "status": "passed", "prompt": "Merge approved pull request.", "requiredProof": []any{"pull-request"}, "summary": "Pull request merged after human approval.", "actionRoute": workflowActionRouteMap(mergeRoute), "createdAt": nowISO(), "updatedAt": nowISO()},
 	} {
 		database.Tables.Operations = appendOrReplace(database.Tables.Operations, operation)
 	}
-	for index, proof := range []string{humanReviewPath, mergePath, handoffPath} {
+	for index, proof := range []string{deliveryHandler.humanReviewProofPath(), deliveryHandler.mergeProofPath(), deliveryHandler.handoffProofPath()} {
 		database.Tables.ProofRecords = appendOrReplace(database.Tables.ProofRecords, map[string]any{
 			"id":          fmt.Sprintf("%s:human-delivery-proof:%d", text(pipeline, "id"), index+1),
 			"operationId": fmt.Sprintf("%s:agent:human_review:human", text(pipeline, "id")),
@@ -2970,6 +2952,15 @@ func repositoryTargetID(repo string) string {
 	return "repo_" + safeSegment(strings.ReplaceAll(repo, "/", "_"))
 }
 
+func slugForID(value string) string {
+	slug := safeSegment(strings.ToLower(strings.TrimSpace(value)))
+	slug = strings.Trim(slug, "_-.")
+	if slug == "" {
+		return "untitled"
+	}
+	return slug
+}
+
 func findRepositoryTarget(database WorkspaceDatabase, targetID string) map[string]any {
 	for _, project := range database.Tables.Projects {
 		for _, target := range arrayMaps(project["repositoryTargets"]) {
@@ -3066,6 +3057,10 @@ func (server *Server) resolveMissionRepositoryTarget(ctx context.Context, missio
 }
 
 func upsertGitHubRepositoryTarget(database *WorkspaceDatabase, repo string, defaultBranch string, repositoryURL string) {
+	upsertGitHubRepositoryTargetForProject(database, "", repo, defaultBranch, repositoryURL)
+}
+
+func upsertGitHubRepositoryTargetForProject(database *WorkspaceDatabase, projectID string, repo string, defaultBranch string, repositoryURL string) {
 	if len(database.Tables.Projects) == 0 {
 		database.Tables.Projects = append(database.Tables.Projects, map[string]any{
 			"id":                "project_omega",
@@ -3078,6 +3073,13 @@ func upsertGitHubRepositoryTarget(database *WorkspaceDatabase, repo string, defa
 			"createdAt":         nowISO(),
 			"updatedAt":         nowISO(),
 		})
+	}
+	projectIndex := 0
+	if projectID != "" {
+		projectIndex = findByID(database.Tables.Projects, projectID)
+		if projectIndex < 0 {
+			projectIndex = 0
+		}
 	}
 	parts := strings.SplitN(repo, "/", 2)
 	owner := repo
@@ -3100,7 +3102,7 @@ func upsertGitHubRepositoryTarget(database *WorkspaceDatabase, repo string, defa
 		"defaultBranch": defaultBranch,
 		"url":           repositoryURL,
 	}
-	project := cloneMap(database.Tables.Projects[0])
+	project := cloneMap(database.Tables.Projects[projectIndex])
 	targets := arrayMaps(project["repositoryTargets"])
 	for _, candidate := range targets {
 		if text(candidate, "id") == text(target, "id") {
@@ -3117,7 +3119,7 @@ func upsertGitHubRepositoryTarget(database *WorkspaceDatabase, repo string, defa
 		project["defaultRepositoryTargetId"] = target["id"]
 	}
 	project["updatedAt"] = nowISO()
-	database.Tables.Projects[0] = project
+	database.Tables.Projects[projectIndex] = project
 }
 
 func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (WorkspaceDatabase, bool) {

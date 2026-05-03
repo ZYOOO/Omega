@@ -171,6 +171,94 @@ paths:
       responses:
         '200':
           description: Proof records returned
+  /proof-records/{id}/preview:
+    get:
+      summary: Preview proof record content
+      description: >
+        读取 proof record 指向的本地文本型证据内容，返回文件名、类型、大小、
+        是否截断和预览文本。当前基础版支持 JSON、Markdown、diff 和普通文本，
+        二进制截图与大文件分页继续作为后续增强。
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Proof preview returned
+        '404':
+          description: Proof record not found
+  /repository-targets:
+    get:
+      summary: List repository target audit records
+      description: >
+        返回从 Project repository target 镜像物化出来的可查询记录。旧 Project
+        snapshot 仍保留为兼容来源；该接口用于 repository-first 查询和审计。
+      parameters:
+        - in: query
+          name: projectId
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Repository target records returned
+  /handoff-bundles:
+    get:
+      summary: List handoff bundle audit records
+      description: >
+        返回从真实 proof / Attempt / Operation 抽取的一等 handoff bundle 记录，
+        包含 bundle JSON、summary、changed files 和 PR 摘要。
+      parameters:
+        - in: query
+          name: attemptId
+          schema:
+            type: string
+        - in: query
+          name: pipelineId
+          schema:
+            type: string
+        - in: query
+          name: workItemId
+          schema:
+            type: string
+        - in: query
+          name: repositoryTargetId
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Handoff bundle records returned
+  /operation-queue:
+    get:
+      summary: List operation queue audit records
+      description: >
+        返回从 Operation 物化的长运行队列视图，包含 status、priority、stage、
+        agent、lock、attemptCount 和 queue payload。当前基础版是只读审计视图。
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+        - in: query
+          name: attemptId
+          schema:
+            type: string
+        - in: query
+          name: pipelineId
+          schema:
+            type: string
+        - in: query
+          name: workItemId
+          schema:
+            type: string
+        - in: query
+          name: repositoryTargetId
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Operation queue records returned
   /run-workpads:
     get:
       summary: List Run Workpad records
@@ -203,14 +291,55 @@ paths:
       responses:
         '200':
           description: Run Workpad records returned
+  /run-workpads/{id}:
+    patch:
+      summary: Patch selected Run Workpad fields
+      description: >
+        对 Run Workpad 做字段级 patch，不替换 runtime 派生出的整份记录。
+        patch 会存入 fieldPatches，并在后续 runtime 刷新后重新叠加。
+        允许字段包括 plan、acceptanceCriteria、validation、notes、blockers、pr、
+        reviewFeedback、retryReason、reworkChecklist、reworkAssessment 和 updatedBy。
+        每次 patch 会记录 fieldPatchSources 和 fieldPatchHistory，方便后续 UI
+        与 Agent 解释哪个字段由谁、在何时、基于哪个运行时来源更新。
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                updatedBy:
+                  type: string
+                  enum: [operator, agent, job-supervisor, human-review, review-agent, delivery-agent, test]
+                reason:
+                  type: string
+                source:
+                  type: object
+                workpad:
+                  type: object
+      responses:
+        '200':
+          description: Patched Run Workpad record returned
+        '400':
+          description: Invalid patch payload
+        '404':
+          description: Run Workpad record not found
   /runtime-logs:
     get:
       summary: List append-only runtime logs
       description: >
         Returns structured runtime log records from the local SQLite log stream. Supports
         filters for level, eventType, entityType/entityId, projectId, repositoryTargetId,
-        workItemId, pipelineId, attemptId, stageId, agentId, requestId, createdAfter,
-        createdBefore, and limit.
+        requirementId, workItemId, pipelineId, attemptId, stageId, agentId, requestId,
+        createdAfter, createdBefore, full-text q/search, and limit. By default this
+        remains backward compatible and returns an array. Use page=1 or cursor to return
+        a cursor page object.
       parameters:
         - in: query
           name: level
@@ -235,6 +364,10 @@ paths:
             type: string
         - in: query
           name: repositoryTargetId
+          schema:
+            type: string
+        - in: query
+          name: requirementId
           schema:
             type: string
         - in: query
@@ -272,6 +405,20 @@ paths:
             type: string
             format: date-time
         - in: query
+          name: q
+          schema:
+            type: string
+          description: Full-text search across event type, message, level and details JSON.
+        - in: query
+          name: cursor
+          schema:
+            type: string
+        - in: query
+          name: page
+          schema:
+            type: string
+            enum: ["1"]
+        - in: query
           name: limit
           schema:
             type: integer
@@ -280,6 +427,33 @@ paths:
       responses:
         '200':
           description: Runtime log records returned
+  /runtime-logs/export:
+    get:
+      summary: Export runtime logs
+      description: Exports the same filtered runtime log query as JSONL or CSV.
+      parameters:
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [jsonl, csv]
+            default: jsonl
+        - in: query
+          name: requirementId
+          schema:
+            type: string
+        - in: query
+          name: q
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 5000
+      responses:
+        '200':
+          description: Runtime logs exported
   /migrations:
     get:
       summary: List applied local database migrations
@@ -393,6 +567,62 @@ paths:
       responses:
         '200':
           description: Workflow templates returned
+  /workflow-templates/validate:
+    post:
+      summary: Validate workflow template markdown
+      description: Parses workflow markdown and returns validation errors without saving.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                templateId:
+                  type: string
+                workflowMarkdown:
+                  type: string
+      responses:
+        '200':
+          description: Validation result returned
+  /workflow-templates/{templateId}:
+    put:
+      summary: Save workflow template override
+      description: Saves a Project or Repository Workspace scoped workflow template record after validation.
+      parameters:
+        - name: templateId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workflow template saved
+  /workflow-templates/{templateId}/restore-default:
+    post:
+      summary: Restore default workflow template
+      description: Removes the matching Project or Repository Workspace scoped override and returns the default template.
+      parameters:
+        - name: templateId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workflow template restored
   /pipelines/from-template:
     post:
       summary: Create a pipeline from a work item and template
@@ -428,6 +658,48 @@ paths:
       responses:
         '200':
           description: Provider selection persisted
+  /runner-credentials:
+    get:
+      summary: List local runner account credentials
+      description: >
+        Returns runner account metadata for opencode and Trae Agent. API keys are never
+        returned; callers only receive `secretConfigured` and an optional masked marker.
+      responses:
+        '200':
+          description: Runner credential metadata returned
+    put:
+      summary: Save local runner account credential
+      description: >
+        Stores provider/model/base URL metadata and encrypts the submitted API key before
+        writing it to local SQLite. The local runtime decrypts the key only when launching
+        the matching runner process and injects it as environment variables.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: string
+                runner:
+                  type: string
+                  enum: [opencode, trae-agent]
+                provider:
+                  type: string
+                label:
+                  type: string
+                model:
+                  type: string
+                baseUrl:
+                  type: string
+                apiKey:
+                  type: string
+                secret:
+                  type: string
+      responses:
+        '200':
+          description: Runner credential metadata returned
   /agent-definitions:
     get:
       summary: List stage agent definitions and IO contracts
@@ -465,7 +737,7 @@ paths:
   /local-capabilities:
     get:
       summary: Inspect locally available execution tools
-      description: Reports whether local commands such as codex, opencode, claude, git, gh, and lark-cli are installed and runnable.
+      description: Reports whether local commands such as codex, opencode, trae-cli, claude, git, gh, and lark-cli are installed and runnable.
       responses:
         '200':
           description: Local capability list returned
@@ -586,7 +858,9 @@ paths:
       description: >
         Preserves the original counts/status/attention summary and adds dashboard data
         for attempt success rate, failure reasons, slow stages, active runs, pending
-        human review queue, and recommended operator actions.
+        human review queue, stage average duration, runner usage, checkpoint wait time,
+        pull request created/merged/open counts, daily trends, and recommended operator
+        actions.
       responses:
         '200':
           description: Observability summary and dashboard data returned
@@ -737,6 +1011,9 @@ paths:
                     - local-proof
                     - demo-code
                     - codex
+                    - opencode
+                    - trae-agent
+                    - claude-code
       responses:
         '200':
           description: Runner result returned
@@ -763,6 +1040,9 @@ paths:
                     - local-proof
                     - demo-code
                     - codex
+                    - opencode
+                    - trae-agent
+                    - claude-code
       responses:
         '200':
           description: Runner result returned
@@ -861,6 +1141,9 @@ paths:
                     - local-proof
                     - demo-code
                     - codex
+                    - opencode
+                    - trae-agent
+                    - claude-code
       responses:
         '200':
           description: Pipeline and operation result returned
@@ -1162,3 +1445,123 @@ paths:
           description: Notification sent
         '503':
           description: lark-cli missing or failed
+  /feishu/review-request:
+    post:
+      summary: 为 checkpoint 发送飞书 Human Review 请求
+      description: 从 checkpoint、work item、requirement、attempt、Run Workpad 和 Review Packet 生成审核包。配置 webhook 时发送飞书机器人卡片；传入 chatId 时使用 lark-cli 发送卡片；mode 为 task 时创建飞书审核任务。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - checkpointId
+              properties:
+                checkpointId:
+                  type: string
+                chatId:
+                  type: string
+                mode:
+                  type: string
+                  enum: [card, task, task-bridge]
+                assigneeId:
+                  type: string
+                tasklistId:
+                  type: string
+                followerId:
+                  type: string
+                due:
+                  type: string
+      responses:
+        '200':
+          description: 审核通知或任务已发送，并记录到 checkpoint
+        '202':
+          description: 飞书配置缺失；已记录 card/doc preview 供人工配置
+        '404':
+          description: Checkpoint 不存在
+        '503':
+          description: 飞书发送失败
+  /feishu/review-task/sync:
+    post:
+      summary: 将飞书 Task 审核状态同步回 checkpoint
+      description: 使用 lark-cli 读取已绑定的飞书任务。任务完成后，Omega 会执行与本地 Human Review UI 相同的 approved checkpoint 决策。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                checkpointId:
+                  type: string
+                  description: 可选 checkpoint id。缺省时扫描 pending 的飞书 Task 审核 checkpoint。
+      responses:
+        '200':
+          description: Task 审核同步完成
+        '404':
+          description: Checkpoint 或本地数据库不存在
+  /feishu/review-task/comment:
+    post:
+      summary: 将飞书 Task 审核评论写入 checkpoint
+      description: 接收本地桥转发的任务评论。明确修改意见会变成 request-changes；问题类评论会记录为 need-info，不直接拒绝 checkpoint。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                checkpointId:
+                  type: string
+                taskGuid:
+                  type: string
+                taskId:
+                  type: string
+                comment:
+                  type: string
+                reviewer:
+                  type: string
+                eventId:
+                  type: string
+      responses:
+        '200':
+          description: 评论已分类并写入或执行决策
+        '404':
+          description: 绑定的 checkpoint 不存在
+  /feishu/review-callback:
+    post:
+      summary: Apply a Feishu Human Review decision to a checkpoint
+      description: Applies approve or request-changes through the same checkpoint decision path used by Omega Web.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - checkpointId
+                - action
+              properties:
+                checkpointId:
+                  type: string
+                action:
+                  type: string
+                  enum: [approve, request_changes]
+                reviewer:
+                  type: string
+                reason:
+                  type: string
+                token:
+                  type: string
+                asyncDelivery:
+                  type: boolean
+      responses:
+        '200':
+          description: Checkpoint decision applied
+        '400':
+          description: Unsupported action or missing checkpoint id
+        '401':
+          description: Invalid callback token
+        '404':
+          description: Checkpoint not found

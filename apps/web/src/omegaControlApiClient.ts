@@ -1,3 +1,5 @@
+import type { MissionControlRunnerPreset } from "./missionControlApiClient";
+
 export interface ObservabilitySummary {
   counts: {
     workItems: number;
@@ -19,6 +21,25 @@ export interface ObservabilitySummary {
     blocked: number;
   };
   recentErrors?: RuntimeLogRecordInfo[];
+  dashboard?: {
+    generatedAt?: string;
+    attempts?: Record<string, unknown>;
+    failureReasons?: Array<Record<string, unknown>>;
+    slowStages?: Array<Record<string, unknown>>;
+    stageAverageDurations?: Array<Record<string, unknown>>;
+    runnerUsage?: Array<Record<string, unknown>>;
+    checkpointWaitTimes?: Record<string, unknown>;
+    pullRequests?: Record<string, unknown>;
+    trends?: Array<Record<string, unknown>>;
+    window?: Record<string, unknown>;
+    groupBy?: string;
+    groups?: Array<Record<string, unknown>>;
+    recentFailures?: Array<Record<string, unknown>>;
+    slowStageDrilldown?: Array<Record<string, unknown>>;
+    waitingHumanQueue?: Array<Record<string, unknown>>;
+    activeRuns?: Array<Record<string, unknown>>;
+    recommendedActions?: Array<Record<string, unknown>>;
+  };
 }
 
 export interface RuntimeLogRecordInfo {
@@ -30,6 +51,7 @@ export interface RuntimeLogRecordInfo {
   entityId?: string;
   projectId?: string;
   repositoryTargetId?: string;
+  requirementId?: string;
   workItemId?: string;
   pipelineId?: string;
   attemptId?: string;
@@ -38,6 +60,13 @@ export interface RuntimeLogRecordInfo {
   requestId?: string;
   details?: Record<string, unknown>;
   createdAt: string;
+}
+
+export interface RuntimeLogPageInfo {
+  items: RuntimeLogRecordInfo[];
+  limit: number;
+  nextCursor?: string;
+  hasMore: boolean;
 }
 
 export interface LlmProviderInfo {
@@ -55,6 +84,111 @@ export interface LlmProviderSelection {
   reasoningEffort: string;
 }
 
+export interface RunnerCredentialInfo {
+  id: string;
+  runner: string;
+  provider: string;
+  label: string;
+  model: string;
+  baseUrl: string;
+  secretConfigured: boolean;
+  secretMasked?: string;
+  updatedAt?: string;
+}
+
+export interface RunnerCredentialUpdate {
+  id?: string;
+  runner: string;
+  provider: string;
+  label?: string;
+  model?: string;
+  baseUrl?: string;
+  secret?: string;
+  apiKey?: string;
+}
+
+export interface FeishuConfigInfo {
+  mode: string;
+  chatId: string;
+  assigneeId: string;
+  assigneeLabel?: string;
+  tasklistId: string;
+  followerId: string;
+  due: string;
+  webhookUrl: string;
+  webhookSecretConfigured: boolean;
+  webhookSecretMasked?: string;
+  reviewTokenConfigured: boolean;
+  reviewTokenMasked?: string;
+  createDoc: boolean;
+  docFolderToken: string;
+  taskBridgeEnabled: boolean;
+  larkCliAvailable: boolean;
+  larkCliVersion?: string;
+  updatedAt?: string;
+}
+
+export interface FeishuConfigUpdate {
+  mode: string;
+  chatId?: string;
+  assigneeId?: string;
+  assigneeLabel?: string;
+  tasklistId?: string;
+  followerId?: string;
+  due?: string;
+  webhookUrl?: string;
+  webhookSecret?: string;
+  reviewToken?: string;
+  createDoc?: boolean;
+  docFolderToken?: string;
+  taskBridgeEnabled?: boolean;
+}
+
+export interface ProviderPreflightResult {
+  provider?: string;
+  status: string;
+  tool?: string;
+  path?: string;
+  message?: string;
+  raw?: string;
+}
+
+export interface FeishuUserCandidate {
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+  name?: string;
+  email?: string;
+  mobile?: string;
+  avatarUrl?: string;
+  source?: string;
+}
+
+export interface FeishuUserSearchResult {
+  status: string;
+  query?: string;
+  message?: string;
+  error?: string;
+  users: FeishuUserCandidate[];
+}
+
+export interface AgentRunnerPreflightResult {
+  agentId: string;
+  label?: string;
+  runner: string;
+  model?: string;
+  effectiveModel?: string;
+  command?: string;
+  path?: string;
+  status: string;
+  message?: string;
+  credentialConfigured?: boolean;
+  credentialProvider?: string;
+  credentialModel?: string;
+  stdout?: string;
+  stderr?: string;
+}
+
 export interface PipelineTemplateInfo {
   id: string;
   name: string;
@@ -65,6 +199,35 @@ export interface PipelineTemplateInfo {
     agentId: string;
     humanGate: boolean;
   }>;
+}
+
+export interface WorkflowTemplateRecordInfo {
+  id: string;
+  templateId: string;
+  name?: string;
+  description?: string;
+  source?: string;
+  scope?: string;
+  projectId?: string;
+  repositoryTargetId?: string;
+  version?: number;
+  markdown?: string;
+  workflowMarkdown?: string;
+  validation?: {
+    status?: string;
+    errors?: string[];
+    warnings?: string[];
+  };
+  default?: boolean;
+}
+
+export interface WorkflowTemplateValidationInfo {
+  template?: PipelineTemplateInfo;
+  validation: {
+    status?: string;
+    errors?: string[];
+    warnings?: string[];
+  };
 }
 
 export interface AgentDefinitionInfo {
@@ -103,6 +266,15 @@ export interface ProjectAgentProfileInfo {
   agentProfiles: AgentProfileDraftInfo[];
   source?: string;
   updatedAt?: string;
+}
+
+export interface AgentProfileImportResult {
+  profile: ProjectAgentProfileInfo;
+  summary: {
+    source?: string;
+    basePath?: string;
+    files?: Array<{ name?: string; path?: string }>;
+  };
 }
 
 export interface LocalCapabilityInfo {
@@ -242,6 +414,21 @@ export interface GitHubPullRequestStatusResult {
     sourceUrl?: string;
     status?: string;
   }>;
+  reviewFeedback?: Array<{
+    kind?: string;
+    label?: string;
+    message?: string;
+    createdAt?: string;
+    url?: string;
+  }>;
+  checkLogFeedback?: Array<{
+    kind?: string;
+    label?: string;
+    message?: string;
+    state?: string;
+    runId?: string;
+    url?: string;
+  }>;
 }
 
 export interface RequirementDecompositionInput {
@@ -338,6 +525,10 @@ export interface AttemptRecordInfo {
   failureDetail?: string;
   failureReviewFeedback?: string;
   humanChangeRequest?: string;
+  pullRequestFeedback?: Array<Record<string, unknown>>;
+  checkLogFeedback?: Array<Record<string, unknown>>;
+  reviewPacket?: Record<string, unknown>;
+  reworkChecklist?: Record<string, unknown>;
   reworkAssessment?: Record<string, unknown>;
   stdoutSummary?: string;
   stderrSummary?: string;
@@ -377,12 +568,24 @@ export interface RunWorkpadRecordInfo {
     blockers?: string[];
     pr?: Record<string, unknown>;
     reviewFeedback?: string[];
+    reviewPacket?: Record<string, unknown>;
     retryReason?: string;
+    reworkChecklist?: Record<string, unknown>;
     reworkAssessment?: Record<string, unknown>;
     updatedBy?: string;
   };
+  fieldPatches?: Record<string, unknown>;
+  fieldPatchSources?: Record<string, unknown>;
+  fieldPatchHistory?: Array<Record<string, unknown>>;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface PatchRunWorkpadInput {
+  workpad: Partial<RunWorkpadRecordInfo["workpad"]>;
+  updatedBy?: string;
+  reason?: string;
+  source?: Record<string, unknown>;
 }
 
 export interface ProofRecordInfo {
@@ -394,6 +597,65 @@ export interface ProofRecordInfo {
   sourceUrl?: string;
   status?: string;
   createdAt?: string;
+}
+
+export interface ProofPreviewInfo {
+  proof: ProofRecordInfo;
+  available: boolean;
+  sourcePath?: string;
+  fileName?: string;
+  extension?: string;
+  sizeBytes?: number;
+  content?: string;
+  truncated?: boolean;
+  previewType?: "json" | "markdown" | "diff" | "text" | string;
+  error?: string;
+}
+
+export interface RepositoryTargetRecordInfo {
+  id: string;
+  projectId?: string;
+  kind: string;
+  label?: string;
+  owner?: string;
+  repo?: string;
+  path?: string;
+  url?: string;
+  defaultBranch?: string;
+  [key: string]: unknown;
+}
+
+export interface HandoffBundleInfo {
+  id: string;
+  attemptId?: string;
+  pipelineId?: string;
+  workItemId?: string;
+  repositoryTargetId?: string;
+  sourcePath?: string;
+  bundle?: Record<string, unknown>;
+  summary?: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface OperationQueueItemInfo {
+  id: string;
+  operationId: string;
+  pipelineId?: string;
+  attemptId?: string;
+  workItemId?: string;
+  repositoryTargetId?: string;
+  stageId?: string;
+  agentId?: string;
+  status: string;
+  priority?: number;
+  notBefore?: string;
+  lockedBy?: string;
+  lockExpiresAt?: string;
+  attemptCount?: number;
+  queue?: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface RequirementRecordInfo {
@@ -531,6 +793,27 @@ export interface AttemptTimelineInfo {
   generatedAt: string;
 }
 
+export interface AttemptActionPlanInfo {
+  attemptId: string;
+  pipelineId?: string;
+  workItemId?: string;
+  templateId?: string;
+  workflowId?: string;
+  executionMode?: string;
+  attemptStatus?: string;
+  pipelineStatus?: string;
+  currentState?: Record<string, unknown>;
+  currentAction?: Record<string, unknown> | null;
+  actions?: Array<Record<string, unknown>>;
+  transitions?: Array<Record<string, unknown>>;
+  states?: Array<Record<string, unknown>>;
+  taskClasses?: unknown;
+  hooks?: unknown;
+  retry?: Record<string, unknown>;
+  source?: string;
+  contractActionCount?: number;
+}
+
 export interface PagePilotSelectionContext {
   elementKind: "button" | "title" | "card-copy" | "other" | string;
   stableSelector: string;
@@ -546,11 +829,13 @@ export interface PagePilotSelectionContext {
 }
 
 export interface PagePilotApplyInput {
+  runId?: string;
   projectId?: string;
   repositoryTargetId: string;
   instruction: string;
   selection: PagePilotSelectionContext;
   runner?: string;
+  previewRuntimeProfile?: Record<string, unknown>;
 }
 
 export interface PagePilotApplyResult {
@@ -578,6 +863,21 @@ export interface PagePilotApplyResult {
     touchedFiles: string[];
   };
   runnerProcess?: RunnerProcessInfo;
+  previewRuntimeProfile?: Record<string, unknown>;
+  sourceLocator?: Record<string, unknown>;
+  primaryTarget?: Record<string, unknown>;
+  submittedAnnotations?: Array<Record<string, unknown>>;
+  processEvents?: Array<Record<string, unknown>>;
+  conversationBatch?: Record<string, unknown>;
+  roundNumber?: number;
+  prPreview?: {
+    title?: string;
+    body?: string;
+    changedFiles?: string[];
+    lineDiffSummary?: string;
+  };
+  visualProof?: Record<string, unknown>;
+  sourceMappingReport?: Record<string, unknown>;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -590,6 +890,7 @@ export interface PagePilotDeliverInput {
   selection: PagePilotSelectionContext;
   branchName?: string;
   draft?: boolean;
+  previewRuntimeProfile?: Record<string, unknown>;
 }
 
 export interface PagePilotDeliverResult {
@@ -604,7 +905,41 @@ export interface PagePilotDeliverResult {
   changedFiles: string[];
   diffSummary?: string;
   lineDiffSummary?: string;
+  prPreview?: {
+    title?: string;
+    body?: string;
+    changedFiles?: string[];
+    lineDiffSummary?: string;
+  };
+  visualProof?: Record<string, unknown>;
+  previewRuntimeProfile?: Record<string, unknown>;
+  sourceMappingReport?: Record<string, unknown>;
   updatedAt?: string;
+}
+
+export interface PagePilotPreviewRuntimeInput {
+  projectId?: string;
+  repositoryTargetId: string;
+  previewUrl?: string;
+  intent?: string;
+  devCommand?: string;
+}
+
+export interface PagePilotPreviewRuntimeResult {
+  ok: boolean;
+  status: string;
+  agentId?: string;
+  stageId?: string;
+  repositoryTargetId?: string;
+  repositoryPath?: string;
+  previewUrl?: string;
+  profile?: Record<string, unknown>;
+  plan?: Record<string, unknown>;
+  health?: Record<string, unknown>;
+  pid?: number;
+  stdoutTail?: string[];
+  stderrTail?: string[];
+  error?: string;
 }
 
 export type PagePilotRunInfo = PagePilotApplyResult & Partial<PagePilotDeliverResult> & {
@@ -673,14 +1008,23 @@ async function apiErrorMessage(response: Response, prefix: string): Promise<stri
 
 export async function fetchObservability(
   apiUrl: string,
+  filtersOrFetch: { windowDays?: number; groupBy?: string; limit?: number; from?: string; to?: string } | typeof fetch = {},
   fetchImpl: typeof fetch = fetch
 ): Promise<ObservabilitySummary> {
-  return fetchJson<ObservabilitySummary>(apiUrl, "/observability", fetchImpl);
+  const filters = typeof filtersOrFetch === "function" ? {} : filtersOrFetch;
+  const effectiveFetch = typeof filtersOrFetch === "function" ? filtersOrFetch : fetchImpl;
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<ObservabilitySummary>(apiUrl, `/observability${suffix}`, effectiveFetch);
 }
 
 export async function fetchRuntimeLogs(
   apiUrl: string,
-  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; createdAfter?: string; createdBefore?: string } = {},
+  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; createdAfter?: string; createdBefore?: string; q?: string; search?: string } = {},
   fetchImpl: typeof fetch = fetch
 ): Promise<RuntimeLogRecordInfo[]> {
   const params = new URLSearchParams();
@@ -690,6 +1034,38 @@ export async function fetchRuntimeLogs(
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return fetchJson<RuntimeLogRecordInfo[]>(apiUrl, `/runtime-logs${suffix}`, fetchImpl);
+}
+
+export async function fetchRuntimeLogPage(
+  apiUrl: string,
+  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; pageSize?: number; cursor?: string; createdAfter?: string; createdBefore?: string; q?: string; search?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<RuntimeLogPageInfo> {
+  const params = new URLSearchParams();
+  params.set("page", "1");
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  return fetchJson<RuntimeLogPageInfo>(apiUrl, `/runtime-logs?${params.toString()}`, fetchImpl);
+}
+
+export async function exportRuntimeLogs(
+  apiUrl: string,
+  filters: Partial<RuntimeLogRecordInfo> & { limit?: number; format?: "jsonl" | "csv"; createdAfter?: string; createdBefore?: string; q?: string; search?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<string> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/runtime-logs/export${suffix}`);
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, "Omega control API failed: /runtime-logs/export"));
+  }
+  return response.text();
 }
 
 export async function fetchLlmProviders(
@@ -722,11 +1098,148 @@ export async function updateLlmProviderSelection(
   return response.json() as Promise<LlmProviderSelection>;
 }
 
+export async function fetchRunnerCredentials(
+  apiUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<RunnerCredentialInfo[]> {
+  return fetchJson<RunnerCredentialInfo[]>(apiUrl, "/runner-credentials", fetchImpl);
+}
+
+export async function updateRunnerCredential(
+  apiUrl: string,
+  credential: RunnerCredentialUpdate,
+  fetchImpl: typeof fetch = fetch
+): Promise<RunnerCredentialInfo> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/runner-credentials`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(credential)
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, "Omega control API failed: /runner-credentials"));
+  }
+  return response.json() as Promise<RunnerCredentialInfo>;
+}
+
+export async function fetchFeishuConfig(
+  apiUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<FeishuConfigInfo> {
+  return fetchJson<FeishuConfigInfo>(apiUrl, "/feishu/config", fetchImpl);
+}
+
+export async function updateFeishuConfig(
+  apiUrl: string,
+  config: FeishuConfigUpdate,
+  fetchImpl: typeof fetch = fetch
+): Promise<FeishuConfigInfo> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/feishu/config`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(config)
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, "Omega control API failed: /feishu/config"));
+  }
+  return response.json() as Promise<FeishuConfigInfo>;
+}
+
+export async function testFeishuConfig(
+  apiUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<ProviderPreflightResult> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/feishu/config/test`, { method: "POST" });
+  const result = await response.json().catch(() => ({ status: "failed", message: `HTTP ${response.status}` })) as ProviderPreflightResult;
+  if (!response.ok && response.status >= 500) {
+    throw new Error(result.message ?? "Feishu preflight failed.");
+  }
+  return result;
+}
+
+export async function searchFeishuUsers(
+  apiUrl: string,
+  query: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<FeishuUserSearchResult> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/feishu/users/search`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ query, limit: 10 })
+  });
+  const result = await response.json().catch(() => ({ status: "failed", users: [], message: `HTTP ${response.status}` })) as FeishuUserSearchResult;
+  if (!response.ok && response.status >= 500) {
+    throw new Error(result.message ?? result.error ?? "Feishu reviewer search failed.");
+  }
+  return result;
+}
+
+export async function testAgentRunner(
+  apiUrl: string,
+  input: { agentId: string; label?: string; runner: string; model?: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<AgentRunnerPreflightResult> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/agent-runner/preflight`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  const result = await response.json().catch(() => ({
+    agentId: input.agentId,
+    label: input.label,
+    runner: input.runner,
+    model: input.model,
+    status: "failed",
+    message: `HTTP ${response.status}`
+  })) as AgentRunnerPreflightResult;
+  return result;
+}
+
 export async function fetchPipelineTemplates(
   apiUrl: string,
   fetchImpl: typeof fetch = fetch
 ): Promise<PipelineTemplateInfo[]> {
   return fetchJson<PipelineTemplateInfo[]>(apiUrl, "/pipeline-templates", fetchImpl);
+}
+
+export async function fetchWorkflowTemplates(
+  apiUrl: string,
+  scope: { projectId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkflowTemplateRecordInfo[]> {
+  const search = new URLSearchParams();
+  if (scope.projectId) search.set("projectId", scope.projectId);
+  if (scope.repositoryTargetId) search.set("repositoryTargetId", scope.repositoryTargetId);
+  const suffix = search.toString() ? `?${search.toString()}` : "";
+  return fetchJson<WorkflowTemplateRecordInfo[]>(apiUrl, `/workflow-templates${suffix}`, fetchImpl);
+}
+
+export async function validateWorkflowTemplate(
+  apiUrl: string,
+  payload: { templateId?: string; markdown: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkflowTemplateValidationInfo> {
+  return postJson<WorkflowTemplateValidationInfo>(apiUrl, "/workflow-templates/validate", payload, fetchImpl);
+}
+
+export async function updateWorkflowTemplate(
+  apiUrl: string,
+  templateId: string,
+  payload: { projectId?: string; repositoryTargetId?: string; templateId?: string; markdown: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkflowTemplateRecordInfo> {
+  return putJson<WorkflowTemplateRecordInfo>(apiUrl, `/workflow-templates/${encodeURIComponent(templateId)}`, payload, fetchImpl);
+}
+
+export async function restoreWorkflowTemplateDefault(
+  apiUrl: string,
+  templateId: string,
+  scope: { projectId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkflowTemplateRecordInfo> {
+  return postJson<WorkflowTemplateRecordInfo>(apiUrl, `/workflow-templates/${encodeURIComponent(templateId)}/restore-default`, {
+    ...scope,
+    templateId
+  }, fetchImpl);
 }
 
 export async function fetchAgentDefinitions(
@@ -754,6 +1267,14 @@ export async function updateProjectAgentProfile(
   fetchImpl: typeof fetch = fetch
 ): Promise<ProjectAgentProfileInfo> {
   return putJson<ProjectAgentProfileInfo>(apiUrl, "/agent-profile", profile, fetchImpl);
+}
+
+export async function importProjectAgentProfileTemplate(
+  apiUrl: string,
+  input: { projectId?: string; repositoryTargetId?: string; source?: "fixtures" | "repository" | "path"; basePath?: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<AgentProfileImportResult> {
+  return postJson<AgentProfileImportResult>(apiUrl, "/agent-profile/import-template", input, fetchImpl);
 }
 
 export async function fetchLocalCapabilities(
@@ -901,6 +1422,14 @@ export async function fetchAttemptTimeline(
   return fetchJson<AttemptTimelineInfo>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/timeline`, fetchImpl);
 }
 
+export async function fetchAttemptActionPlan(
+  apiUrl: string,
+  attemptId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<AttemptActionPlanInfo> {
+  return fetchJson<AttemptActionPlanInfo>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/action-plan`, fetchImpl);
+}
+
 export async function fetchRunWorkpads(
   apiUrl: string,
   filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string; status?: string } = {},
@@ -913,6 +1442,24 @@ export async function fetchRunWorkpads(
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return fetchJson<RunWorkpadRecordInfo[]>(apiUrl, `/run-workpads${suffix}`, fetchImpl);
+}
+
+export async function patchRunWorkpad(
+  apiUrl: string,
+  runWorkpadId: string,
+  input: PatchRunWorkpadInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<RunWorkpadRecordInfo> {
+  const path = `/run-workpads/${encodeURIComponent(runWorkpadId)}`;
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}${path}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) {
+    throw new Error(await apiErrorMessage(response, `Omega control API failed: ${path}`));
+  }
+  return response.json() as Promise<RunWorkpadRecordInfo>;
 }
 
 export async function cancelAttempt(
@@ -938,6 +1485,51 @@ export async function fetchProofRecords(
   fetchImpl: typeof fetch = fetch
 ): Promise<ProofRecordInfo[]> {
   return fetchJson<ProofRecordInfo[]>(apiUrl, "/proof-records", fetchImpl);
+}
+
+export async function fetchProofPreview(
+  apiUrl: string,
+  proofId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<ProofPreviewInfo> {
+  return fetchJson<ProofPreviewInfo>(apiUrl, `/proof-records/${encodeURIComponent(proofId)}/preview`, fetchImpl);
+}
+
+export async function fetchRepositoryTargets(
+  apiUrl: string,
+  filters: { projectId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<RepositoryTargetRecordInfo[]> {
+  const params = new URLSearchParams();
+  if (filters.projectId) params.set("projectId", filters.projectId);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<RepositoryTargetRecordInfo[]>(apiUrl, `/repository-targets${suffix}`, fetchImpl);
+}
+
+export async function fetchHandoffBundles(
+  apiUrl: string,
+  filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<HandoffBundleInfo[]> {
+  const params = new URLSearchParams();
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) params.set(key, value);
+  });
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<HandoffBundleInfo[]>(apiUrl, `/handoff-bundles${suffix}`, fetchImpl);
+}
+
+export async function fetchOperationQueue(
+  apiUrl: string,
+  filters: { status?: string; attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string } = {},
+  fetchImpl: typeof fetch = fetch
+): Promise<OperationQueueItemInfo[]> {
+  const params = new URLSearchParams();
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) params.set(key, value);
+  });
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<OperationQueueItemInfo[]>(apiUrl, `/operation-queue${suffix}`, fetchImpl);
 }
 
 export async function fetchRequirements(
@@ -996,7 +1588,7 @@ export async function startPipeline(
 export async function runCurrentPipelineStage(
   apiUrl: string,
   pipelineId: string,
-  runner: "local-proof" | "demo-code" | "codex" = "local-proof",
+  runner: MissionControlRunnerPreset = "local-proof",
   fetchImpl: typeof fetch = fetch
 ): Promise<RunCurrentStageResult> {
   return postJson<RunCurrentStageResult>(apiUrl, `/pipelines/${pipelineId}/run-current-stage`, { runner }, fetchImpl);
@@ -1044,6 +1636,30 @@ export async function discardPagePilotRun(
   fetchImpl: typeof fetch = fetch
 ): Promise<PagePilotRunInfo> {
   return postJson<PagePilotRunInfo>(apiUrl, `/page-pilot/runs/${encodeURIComponent(runId)}/discard`, {}, fetchImpl);
+}
+
+export async function resolvePagePilotPreviewRuntime(
+  apiUrl: string,
+  input: PagePilotPreviewRuntimeInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotPreviewRuntimeResult> {
+  return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/resolve", input, fetchImpl);
+}
+
+export async function startPagePilotPreviewRuntime(
+  apiUrl: string,
+  input: PagePilotPreviewRuntimeInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotPreviewRuntimeResult> {
+  return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/start", input, fetchImpl);
+}
+
+export async function restartPagePilotPreviewRuntime(
+  apiUrl: string,
+  input: PagePilotPreviewRuntimeInput,
+  fetchImpl: typeof fetch = fetch
+): Promise<PagePilotPreviewRuntimeResult> {
+  return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/restart", input, fetchImpl);
 }
 
 export interface OrchestratorTickInput {

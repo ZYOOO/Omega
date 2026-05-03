@@ -24,6 +24,7 @@ type WorkspaceTables struct {
 	Operations           []map[string]any `json:"operations"`
 	ProofRecords         []map[string]any `json:"proofRecords"`
 	RunWorkpads          []map[string]any `json:"runWorkpads"`
+	WorkflowTemplates    []map[string]any `json:"workflowTemplates"`
 }
 
 type RuntimeLogRecord struct {
@@ -35,6 +36,7 @@ type RuntimeLogRecord struct {
 	EntityID           string         `json:"entityId,omitempty"`
 	ProjectID          string         `json:"projectId,omitempty"`
 	RepositoryTargetID string         `json:"repositoryTargetId,omitempty"`
+	RequirementID      string         `json:"requirementId,omitempty"`
 	WorkItemID         string         `json:"workItemId,omitempty"`
 	PipelineID         string         `json:"pipelineId,omitempty"`
 	AttemptID          string         `json:"attemptId,omitempty"`
@@ -43,6 +45,13 @@ type RuntimeLogRecord struct {
 	RequestID          string         `json:"requestId,omitempty"`
 	Details            map[string]any `json:"details,omitempty"`
 	CreatedAt          string         `json:"createdAt"`
+}
+
+type RuntimeLogPage struct {
+	Items      []RuntimeLogRecord `json:"items"`
+	Limit      int                `json:"limit"`
+	NextCursor string             `json:"nextCursor,omitempty"`
+	HasMore    bool               `json:"hasMore"`
 }
 
 type AttemptTimelineItem struct {

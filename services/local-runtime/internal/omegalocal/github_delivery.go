@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -152,6 +153,8 @@ func (server *Server) githubPRStatus(response http.ResponseWriter, request *http
 		repositoryPath = filepath.Join(strings.TrimSpace(payload.WorkspacePath), "repo")
 	}
 	branchSync := githubBranchSyncStatus(request.Context(), repositoryPath, text(pr, "baseRefName"), text(pr, "headRefName"))
+	reviewFeedback := githubPullRequestFeedback(request.Context(), repositoryPath, selector, repo)
+	checkLogFeedback := githubPullRequestCheckLogFeedback(request.Context(), repositoryPath, selector, repo, checks)
 	actions := githubDeliveryRecommendedActions(pr, checkSummary, branchSync)
 	result := cloneMap(pr)
 	result["checks"] = checks
@@ -159,8 +162,341 @@ func (server *Server) githubPRStatus(response http.ResponseWriter, request *http
 	result["deliveryGate"] = deliveryGate
 	result["proofRecords"] = proofs
 	result["branchSync"] = branchSync
+	result["reviewFeedback"] = reviewFeedback
+	result["checkLogFeedback"] = checkLogFeedback
 	result["recommendedActions"] = actions
 	writeJSON(response, http.StatusOK, result)
+}
+
+func githubPullRequestFeedback(ctx context.Context, repositoryPath string, selector string, repo string) []map[string]any {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return nil
+	}
+	args := []string{"pr", "view", selector, "--json", "comments,reviews"}
+	if strings.TrimSpace(repo) != "" {
+		args = append(args, "--repo", strings.TrimSpace(repo))
+	}
+	command := exec.CommandContext(ctx, "gh", args...)
+	if strings.TrimSpace(repositoryPath) != "" {
+		command.Dir = strings.TrimSpace(repositoryPath)
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	var pr map[string]any
+	if err := json.Unmarshal(output, &pr); err != nil {
+		return nil
+	}
+	feedback := githubPullRequestFeedbackFromView(pr)
+	feedback = append(feedback, githubPullRequestReviewThreadFeedback(ctx, repositoryPath, selector, repo)...)
+	return feedback
+}
+
+func githubPullRequestChecks(ctx context.Context, repositoryPath string, selector string, repo string) ([]map[string]any, string) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return nil, ""
+	}
+	args := []string{"pr", "checks", selector, "--json", "name,state,link"}
+	if strings.TrimSpace(repo) != "" {
+		args = append(args, "--repo", strings.TrimSpace(repo))
+	}
+	command := exec.CommandContext(ctx, "gh", args...)
+	if strings.TrimSpace(repositoryPath) != "" {
+		command.Dir = strings.TrimSpace(repositoryPath)
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, strings.TrimSpace(string(output))
+	}
+	var checks []map[string]any
+	if err := json.Unmarshal(output, &checks); err != nil {
+		return nil, strings.TrimSpace(string(output))
+	}
+	return checks, strings.TrimSpace(string(output))
+}
+
+func githubPullRequestFeedbackFromView(pr map[string]any) []map[string]any {
+	feedback := []map[string]any{}
+	add := func(kind string, label string, message string, createdAt string, url string) {
+		message = strings.TrimSpace(message)
+		if message == "" {
+			return
+		}
+		entry := map[string]any{
+			"kind":    kind,
+			"label":   stringOr(label, kind),
+			"message": truncateForProof(message, 1800),
+		}
+		if strings.TrimSpace(createdAt) != "" {
+			entry["createdAt"] = strings.TrimSpace(createdAt)
+		}
+		if strings.TrimSpace(url) != "" {
+			entry["url"] = strings.TrimSpace(url)
+		}
+		feedback = append(feedback, entry)
+	}
+	for _, comment := range arrayMaps(pr["comments"]) {
+		author := text(mapValue(comment["author"]), "login")
+		add("pr-comment", stringOr(author, "PR comment"), text(comment, "body"), text(comment, "createdAt"), text(comment, "url"))
+	}
+	for _, review := range arrayMaps(pr["reviews"]) {
+		author := text(mapValue(review["author"]), "login")
+		state := strings.TrimSpace(text(review, "state"))
+		label := strings.TrimSpace(strings.Join(compactStringList([]string{state, author}), " by "))
+		if label == "" {
+			label = "PR review"
+		}
+		message := strings.TrimSpace(text(review, "body"))
+		if message == "" && state != "" && state != "APPROVED" {
+			message = "Review state: " + state
+		}
+		add("pr-review", label, message, text(review, "submittedAt"), text(review, "url"))
+	}
+	return feedback
+}
+
+func githubPullRequestReviewThreadFeedback(ctx context.Context, repositoryPath string, selector string, repo string) []map[string]any {
+	owner, name, number := githubPullRequestIdentity(selector, repo)
+	if owner == "" || name == "" || number <= 0 {
+		return nil
+	}
+	query := `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 50) {
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          startLine
+          originalStartLine
+          comments(first: 20) {
+            nodes {
+              author { login }
+              body
+              createdAt
+              url
+              path
+              line
+              originalLine
+              diffHunk
+            }
+          }
+        }
+      }
+    }
+  }
+}`
+	args := []string{"api", "graphql", "-f", "owner=" + owner, "-f", "name=" + name, "-F", fmt.Sprintf("number=%d", number), "-f", "query=" + query}
+	command := exec.CommandContext(ctx, "gh", args...)
+	if strings.TrimSpace(repositoryPath) != "" {
+		command.Dir = strings.TrimSpace(repositoryPath)
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(output, &payload); err != nil {
+		return nil
+	}
+	return githubPullRequestReviewThreadFeedbackFromGraphQL(payload)
+}
+
+func githubPullRequestReviewThreadFeedbackFromGraphQL(payload map[string]any) []map[string]any {
+	data := mapValue(payload["data"])
+	repository := mapValue(data["repository"])
+	pullRequest := mapValue(repository["pullRequest"])
+	nodes := arrayMaps(mapValue(pullRequest["reviewThreads"])["nodes"])
+	feedback := []map[string]any{}
+	for _, thread := range nodes {
+		comments := arrayMaps(mapValue(thread["comments"])["nodes"])
+		comment := map[string]any{}
+		if len(comments) > 0 {
+			comment = comments[len(comments)-1]
+		}
+		resolved := boolValue(thread["isResolved"])
+		state := "unresolved"
+		if resolved {
+			state = "resolved"
+		}
+		path := firstNonEmpty(text(comment, "path"), text(thread, "path"))
+		line := firstNonEmpty(nonZeroIntString(comment["line"]), nonZeroIntString(thread["line"]), nonZeroIntString(comment["originalLine"]), nonZeroIntString(thread["originalLine"]))
+		author := text(mapValue(comment["author"]), "login")
+		label := strings.TrimSpace(state + " thread")
+		if path != "" {
+			label += " " + path
+			if line != "" {
+				label += ":" + line
+			}
+		}
+		if author != "" {
+			label += " by " + author
+		}
+		message := strings.TrimSpace(text(comment, "body"))
+		if message == "" {
+			message = "Review thread is " + state + "."
+		}
+		entry := map[string]any{
+			"kind":     "pr-review-thread",
+			"label":    label,
+			"message":  truncateForProof(message, 1800),
+			"state":    state,
+			"resolved": resolved,
+		}
+		for key, value := range map[string]string{
+			"createdAt":    text(comment, "createdAt"),
+			"url":          text(comment, "url"),
+			"sourceUrl":    text(comment, "url"),
+			"path":         path,
+			"line":         line,
+			"originalLine": firstNonEmpty(nonZeroIntString(comment["originalLine"]), nonZeroIntString(thread["originalLine"])),
+			"diffHunk":     text(comment, "diffHunk"),
+		} {
+			value = strings.TrimSpace(value)
+			if value == "" || value == "0" {
+				continue
+			}
+			entry[key] = value
+		}
+		feedback = append(feedback, entry)
+	}
+	return feedback
+}
+
+func nonZeroIntString(value any) string {
+	if number := intValue(value); number > 0 {
+		return fmt.Sprint(number)
+	}
+	return ""
+}
+
+func githubPullRequestIdentity(selector string, repo string) (string, string, int) {
+	repo = strings.TrimSpace(repo)
+	selector = strings.TrimSpace(selector)
+	owner := ""
+	name := ""
+	if repo != "" {
+		parts := strings.Split(repo, "/")
+		if len(parts) == 2 {
+			owner = strings.TrimSpace(parts[0])
+			name = strings.TrimSpace(parts[1])
+		}
+	}
+	if match := regexp.MustCompile(`github\.com/([^/]+)/([^/]+)/pull/([0-9]+)`).FindStringSubmatch(selector); len(match) == 4 {
+		owner = match[1]
+		name = strings.TrimSuffix(match[2], ".git")
+		return owner, name, intValueFromString(match[3])
+	}
+	if match := regexp.MustCompile(`^#?([0-9]+)$`).FindStringSubmatch(selector); len(match) == 2 {
+		return owner, name, intValueFromString(match[1])
+	}
+	return owner, name, 0
+}
+
+func githubPullRequestFeedbackPrompt(feedback []map[string]any) string {
+	lines := []string{}
+	for _, entry := range feedback {
+		message := strings.TrimSpace(text(entry, "message"))
+		if message == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- [%s] %s: %s", text(entry, "kind"), text(entry, "label"), message))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func githubPullRequestCheckLogFeedback(ctx context.Context, repositoryPath string, selector string, repo string, checks []map[string]any) []map[string]any {
+	if checks == nil && strings.TrimSpace(selector) != "" {
+		args := []string{"pr", "checks", selector, "--json", "name,state,link"}
+		if strings.TrimSpace(repo) != "" {
+			args = append(args, "--repo", strings.TrimSpace(repo))
+		}
+		command := exec.CommandContext(ctx, "gh", args...)
+		if strings.TrimSpace(repositoryPath) != "" {
+			command.Dir = strings.TrimSpace(repositoryPath)
+		}
+		output, err := command.CombinedOutput()
+		if err == nil {
+			_ = json.Unmarshal(output, &checks)
+		}
+	}
+	feedback := []map[string]any{}
+	seenRuns := map[string]bool{}
+	for _, check := range checks {
+		state := strings.ToLower(strings.TrimSpace(text(check, "state")))
+		if !containsAny(state, []string{"failure", "failed", "error", "cancelled", "canceled", "timed_out", "action_required"}) {
+			continue
+		}
+		runID := githubActionsRunID(text(check, "link"))
+		if runID == "" || seenRuns[runID] {
+			continue
+		}
+		seenRuns[runID] = true
+		logOutput := githubRunLog(ctx, repositoryPath, repo, runID, true)
+		if strings.TrimSpace(logOutput) == "" {
+			logOutput = githubRunLog(ctx, repositoryPath, repo, runID, false)
+		}
+		if strings.TrimSpace(logOutput) == "" {
+			continue
+		}
+		feedback = append(feedback, map[string]any{
+			"kind":      "ci-check-log",
+			"label":     stringOr(text(check, "name"), "check "+runID),
+			"message":   truncateForProof(logOutput, 2200),
+			"state":     text(check, "state"),
+			"runId":     runID,
+			"url":       text(check, "link"),
+			"sourceUrl": githubCheckLogSourceURL(text(check, "link")),
+			"logMode":   "failed-first",
+		})
+	}
+	return feedback
+}
+
+func githubCheckLogSourceURL(link string) string {
+	link = strings.TrimSpace(link)
+	if link == "" {
+		return ""
+	}
+	if strings.Contains(link, "?") {
+		return link + "&check_suite_focus=true"
+	}
+	return link + "?check_suite_focus=true"
+}
+
+func githubActionsRunID(link string) string {
+	match := regexp.MustCompile(`/actions/runs/([0-9]+)`).FindStringSubmatch(strings.TrimSpace(link))
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
+}
+
+func githubRunLog(ctx context.Context, repositoryPath string, repo string, runID string, failedOnly bool) string {
+	args := []string{"run", "view", runID}
+	if failedOnly {
+		args = append(args, "--log-failed")
+	} else {
+		args = append(args, "--log")
+	}
+	if strings.TrimSpace(repo) != "" {
+		args = append(args, "--repo", strings.TrimSpace(repo))
+	}
+	command := exec.CommandContext(ctx, "gh", args...)
+	if strings.TrimSpace(repositoryPath) != "" {
+		command.Dir = strings.TrimSpace(repositoryPath)
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func githubDeliveryGate(pr map[string]any, checks []map[string]any) string {

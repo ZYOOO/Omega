@@ -2,8 +2,11 @@ package omegalocal
 
 import (
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +37,66 @@ func (writer *loggingResponseWriter) Write(data []byte) (int, error) {
 func (server *Server) runtimeLogs(response http.ResponseWriter, request *http.Request) {
 	query := request.URL.Query()
 	limit, _ := strconv.Atoi(query.Get("limit"))
+	filters := runtimeLogFiltersFromQuery(query)
+	pageMode := query.Get("page") == "1" || query.Get("cursor") != "" || query.Get("pageSize") != ""
+	if pageSize, _ := strconv.Atoi(query.Get("pageSize")); pageSize > 0 {
+		limit = pageSize
+	}
+	if pageMode {
+		page, err := server.Repo.ListRuntimeLogsPage(request.Context(), filters, limit)
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(response, http.StatusOK, page)
+		return
+	}
+	logs, err := server.Repo.ListRuntimeLogs(request.Context(), filters, limit)
+	if err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, logs)
+}
+
+func (server *Server) runtimeLogsExport(response http.ResponseWriter, request *http.Request) {
+	query := request.URL.Query()
+	limit, _ := strconv.Atoi(query.Get("limit"))
+	if limit <= 0 {
+		limit = 5000
+	}
+	filters := runtimeLogFiltersFromQuery(query)
+	filters["export"] = "1"
+	logs, err := server.Repo.ListRuntimeLogs(request.Context(), filters, limit)
+	if err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	format := strings.ToLower(stringOr(query.Get("format"), "jsonl"))
+	if format != "csv" && format != "jsonl" {
+		format = "jsonl"
+	}
+	filename := "omega-runtime-logs." + format
+	response.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	switch format {
+	case "csv":
+		response.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		writer := csv.NewWriter(response)
+		_ = writer.Write([]string{"createdAt", "level", "eventType", "message", "projectId", "repositoryTargetId", "requirementId", "workItemId", "pipelineId", "attemptId", "stageId", "agentId", "requestId"})
+		for _, log := range logs {
+			_ = writer.Write([]string{log.CreatedAt, log.Level, log.EventType, log.Message, log.ProjectID, log.RepositoryTargetID, log.RequirementID, log.WorkItemID, log.PipelineID, log.AttemptID, log.StageID, log.AgentID, log.RequestID})
+		}
+		writer.Flush()
+	default:
+		response.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+		encoder := json.NewEncoder(response)
+		for _, log := range logs {
+			_ = encoder.Encode(log)
+		}
+	}
+}
+
+func runtimeLogFiltersFromQuery(query url.Values) map[string]string {
 	filters := map[string]string{
 		"level":              strings.ToUpper(query.Get("level")),
 		"eventType":          query.Get("eventType"),
@@ -41,6 +104,7 @@ func (server *Server) runtimeLogs(response http.ResponseWriter, request *http.Re
 		"entityId":           query.Get("entityId"),
 		"projectId":          query.Get("projectId"),
 		"repositoryTargetId": query.Get("repositoryTargetId"),
+		"requirementId":      query.Get("requirementId"),
 		"workItemId":         query.Get("workItemId"),
 		"pipelineId":         query.Get("pipelineId"),
 		"attemptId":          query.Get("attemptId"),
@@ -49,13 +113,10 @@ func (server *Server) runtimeLogs(response http.ResponseWriter, request *http.Re
 		"requestId":          query.Get("requestId"),
 		"createdAfter":       stringOr(query.Get("createdAfter"), query.Get("from")),
 		"createdBefore":      stringOr(query.Get("createdBefore"), query.Get("to")),
+		"cursor":             query.Get("cursor"),
+		"query":              stringOr(query.Get("q"), query.Get("search")),
 	}
-	logs, err := server.Repo.ListRuntimeLogs(request.Context(), filters, limit)
-	if err != nil {
-		writeError(response, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(response, http.StatusOK, logs)
+	return filters
 }
 
 func (server *Server) logInfo(ctx context.Context, eventType string, message string, fields map[string]any) {
@@ -90,6 +151,7 @@ func (server *Server) logRuntime(ctx context.Context, level string, eventType st
 		EntityID:           text(fields, "entityId"),
 		ProjectID:          text(fields, "projectId"),
 		RepositoryTargetID: text(fields, "repositoryTargetId"),
+		RequirementID:      text(fields, "requirementId"),
 		WorkItemID:         text(fields, "workItemId"),
 		PipelineID:         text(fields, "pipelineId"),
 		AttemptID:          text(fields, "attemptId"),

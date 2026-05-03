@@ -1,6 +1,6 @@
 import type { Mission, PipelineRun, WorkItem, WorkspaceDatabase, WorkspaceSession } from "./core";
 import { databaseFromWorkspaceSession, workspaceSessionFromDatabase } from "./core";
-import type { RunOperationViaMissionControlApiResponse } from "./missionControlApiClient";
+import type { MissionControlRunnerPreset, RunOperationViaMissionControlApiResponse } from "./missionControlApiClient";
 
 export async function fetchWorkspaceSession(
   apiUrl: string,
@@ -50,6 +50,30 @@ export async function createWorkItemViaApi(
 
   if (!response.ok) {
     throw new Error(`Create work item API failed: ${response.status}`);
+  }
+
+  return workspaceSessionFromDatabase(run, await response.json() as WorkspaceDatabase);
+}
+
+export async function createProjectViaApi(
+  apiUrl: string,
+  run: PipelineRun,
+  input: {
+    name: string;
+    description?: string;
+    team?: string;
+    labels?: string[];
+  },
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkspaceSession> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/projects`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Create project API failed: ${response.status}`);
   }
 
   return workspaceSessionFromDatabase(run, await response.json() as WorkspaceDatabase);
@@ -125,6 +149,7 @@ export async function bindGitHubRepositoryTargetViaApi(
   apiUrl: string,
   run: PipelineRun,
   input: {
+    projectId?: string;
     owner: string;
     repo: string;
     nameWithOwner?: string;
@@ -167,7 +192,7 @@ export async function runOperationViaWorkspaceApi(
   apiUrl: string,
   mission: Mission,
   operationId: string,
-  runner: "local-proof" | "demo-code" | "codex",
+  runner: MissionControlRunnerPreset,
   fetchImpl: typeof fetch = fetch
 ): Promise<RunOperationViaMissionControlApiResponse> {
   const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/operations/run`, {

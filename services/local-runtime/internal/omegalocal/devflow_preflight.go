@@ -2,8 +2,10 @@ package omegalocal
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -73,6 +75,9 @@ func (server *Server) preflightDevFlowRun(ctx context.Context, database Workspac
 			result.add("github-cli", "failed", "gh is required for GitHub PR delivery.")
 		} else {
 			result.add("github-cli", "passed", "gh is available.")
+			for _, check := range githubDeliveryContractPreflight(ctx, target) {
+				result.add(check.ID, check.Status, check.Message)
+			}
 		}
 	}
 
@@ -119,4 +124,57 @@ func (server *Server) preflightDevFlowRun(ctx context.Context, database Workspac
 		result.Status = "failed"
 	}
 	return result
+}
+
+func githubDeliveryContractPreflight(ctx context.Context, target map[string]any) []DevFlowPreflightCheck {
+	owner := strings.TrimSpace(text(target, "owner"))
+	repo := strings.TrimSpace(text(target, "repo"))
+	if owner == "" || repo == "" {
+		return []DevFlowPreflightCheck{{
+			ID:      "github-repository",
+			Status:  "failed",
+			Message: "GitHub repository target must include owner and repo.",
+		}}
+	}
+	repoSlug := owner + "/" + repo
+	checks := []DevFlowPreflightCheck{}
+	add := func(id string, status string, message string) {
+		checks = append(checks, DevFlowPreflightCheck{ID: id, Status: status, Message: message})
+	}
+	if output, err := exec.CommandContext(ctx, "gh", "auth", "status").CombinedOutput(); err != nil {
+		add("github-auth", "failed", "gh auth status failed: "+truncateForProof(string(output), 600))
+		return checks
+	}
+	add("github-auth", "passed", "gh is authenticated.")
+
+	viewOutput, err := exec.CommandContext(ctx, "gh", "repo", "view", repoSlug, "--json", "nameWithOwner,viewerPermission,defaultBranchRef").CombinedOutput()
+	if err != nil {
+		add("github-repository", "failed", "gh repo view failed: "+truncateForProof(string(viewOutput), 600))
+		return checks
+	}
+	var view map[string]any
+	if err := json.Unmarshal(viewOutput, &view); err != nil {
+		add("github-repository", "failed", "gh repo view returned invalid JSON: "+err.Error())
+		return checks
+	}
+	add("github-repository", "passed", stringOr(text(view, "nameWithOwner"), repoSlug))
+	permission := strings.ToUpper(strings.TrimSpace(text(view, "viewerPermission")))
+	switch permission {
+	case "ADMIN", "MAINTAIN", "WRITE":
+		add("github-branch-permission", "passed", "viewerPermission="+permission+" can push delivery branches.")
+		add("github-pr-create-permission", "passed", "viewerPermission="+permission+" can create pull requests.")
+	default:
+		if permission == "" {
+			permission = "UNKNOWN"
+		}
+		add("github-branch-permission", "failed", "GitHub viewerPermission="+permission+" cannot be trusted for delivery branch push.")
+		add("github-pr-create-permission", "failed", "GitHub viewerPermission="+permission+" cannot be trusted for PR creation.")
+	}
+	listOutput, err := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", repoSlug, "--limit", "1", "--json", "number").CombinedOutput()
+	if err != nil {
+		add("github-checks-read-permission", "failed", "gh pr list/checks capability failed: "+truncateForProof(string(listOutput), 600))
+	} else {
+		add("github-checks-read-permission", "passed", "PR and checks metadata are readable.")
+	}
+	return checks
 }
