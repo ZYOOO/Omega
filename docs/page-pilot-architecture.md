@@ -137,7 +137,7 @@ Electron dev shell 能力：
 - `omega-preload.cjs` 暴露 `omegaDesktop.openPreview`、`omegaDesktop.reloadPreview` 和 `omegaDesktop.resolvePreviewTarget`。
 - `omega-preview:open` 会把当前 Electron 已启动/复用的 Go local runtime base URL 注入给 `pilot-preload.cjs`；direct pilot 调用 `/page-pilot/apply`、`/page-pilot/deliver` 和 discard 时使用这条现有服务链路。
 - Omega 首页提供 Page Pilot CTA，`#page-pilot` 可直接进入功能二页面。
-- Page Pilot 页面必须先选择 Repository Workspace；Work Item 详情页的 `Open in Page Pilot` 会使用该 item 的 `repositoryTargetId` 作为目标 repo。
+- Page Pilot 页面必须先选择 Repository Workspace；只有 Page Pilot 物化出来的 Work Item 详情页展示 `Open in Page Pilot`，并使用该 item 的 `repositoryTargetId` 作为目标 repo。
 - Page Pilot preview source 支持三类入口：
   - Repository source：按所选 Repository Workspace 准备隔离预览工作区或显式 local path。
   - Dev server by Agent：Preview Runtime Agent 读取所选 repo，生成启动 profile，启动 dev server，通过 health check 后打开预览。

@@ -32,6 +32,7 @@ type Server struct {
 	watcherCancel  context.CancelFunc
 	jobMu          sync.Mutex
 	attemptCancels map[string]context.CancelFunc
+	checkpointMu   sync.Mutex
 	previewMu      sync.Mutex
 	previewRuntime map[string]*previewRuntimeSession
 }
@@ -236,6 +237,19 @@ func (server *Server) openAPI(response http.ResponseWriter) {
 }
 
 func (server *Server) getWorkspace(response http.ResponseWriter, request *http.Request) {
+	if request.URL.Query().Get("scope") == "session" {
+		database, err := server.Repo.LoadWorkspaceSession(request.Context())
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(response, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+			return
+		}
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(response, http.StatusOK, database)
+		return
+	}
 	database, err := server.Repo.Load(request.Context())
 	if errors.Is(err, sql.ErrNoRows) {
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "workspace not found"})
@@ -269,6 +283,63 @@ func (server *Server) putWorkspace(response http.ResponseWriter, request *http.R
 }
 
 func (server *Server) listTable(response http.ResponseWriter, request *http.Request, table string) {
+	filters := tableListFilters(request.URL.Query())
+	switch table {
+	case "pipelines":
+		records, err := server.Repo.ListPipelines(request.Context(), filters)
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(response, http.StatusOK, records)
+		return
+	case "attempts":
+		records, err := server.Repo.ListAttempts(request.Context(), filters)
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(response, http.StatusOK, records)
+		return
+	case "operations":
+		if len(filters) > 0 {
+			records, err := server.Repo.ListOperations(request.Context(), filters)
+			if err != nil {
+				writeError(response, http.StatusInternalServerError, err)
+				return
+			}
+			writeJSON(response, http.StatusOK, records)
+			return
+		}
+	case "proofRecords":
+		if len(filters) > 0 {
+			records, err := server.Repo.ListProofRecords(request.Context(), filters)
+			if err != nil {
+				writeError(response, http.StatusInternalServerError, err)
+				return
+			}
+			writeJSON(response, http.StatusOK, records)
+			return
+		}
+	case "checkpoints":
+		if len(filters) > 0 && filters["reconcile"] == "" {
+			records, err := server.Repo.ListCheckpoints(request.Context(), filters)
+			if err != nil {
+				writeError(response, http.StatusInternalServerError, err)
+				return
+			}
+			writeJSON(response, http.StatusOK, records)
+			return
+		}
+	case "runWorkpads":
+		records, err := server.Repo.ListRunWorkpads(request.Context(), filters)
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(response, http.StatusOK, records)
+		return
+	}
 	database, err := server.Repo.Load(request.Context())
 	if errors.Is(err, sql.ErrNoRows) {
 		writeJSON(response, http.StatusOK, []map[string]any{})
@@ -820,19 +891,37 @@ func (server *Server) applyCheckpointDecision(ctx context.Context, checkpointID 
 	if payload == nil {
 		payload = map[string]any{}
 	}
-	server.logInfo(ctx, "checkpoint.decision.requested", "Checkpoint decision requested.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+	server.checkpointMu.Lock()
+	defer server.checkpointMu.Unlock()
+	server.logRuntimeDiagnosticFile("DEBUG", "checkpoint.decision.requested", "Checkpoint decision requested.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
 	database, err := mustLoad(server, ctx)
 	if err != nil {
 		server.logError(ctx, "checkpoint.decision.load_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
 		return nil, http.StatusNotFound, err
 	}
-	server.reconcileAttemptIntegrityInDatabase(ctx, &database)
 	index := findByID(database.Tables.Checkpoints, checkpointID)
 	if index < 0 {
-		server.logError(ctx, "checkpoint.decision.not_found", "Checkpoint not found.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
-		return nil, http.StatusNotFound, fmt.Errorf("checkpoint not found")
+		server.reconcileAttemptIntegrityInDatabase(ctx, &database)
+		index = findByID(database.Tables.Checkpoints, checkpointID)
+		if index < 0 {
+			server.logError(ctx, "checkpoint.decision.not_found", "Checkpoint not found.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+			return nil, http.StatusNotFound, fmt.Errorf("checkpoint not found")
+		}
 	}
 	checkpoint := cloneMap(database.Tables.Checkpoints[index])
+	if checkpointDecisionFinal(text(checkpoint, "status")) {
+		server.logInfo(ctx, "checkpoint.decision.noop", "Checkpoint decision already finalized.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId"), "status": text(checkpoint, "status")})
+		return checkpoint, http.StatusOK, nil
+	}
+	if status == "approved" && text(checkpoint, "stageId") == "human_review" && attemptIndexForCheckpoint(database, checkpoint) < 0 {
+		server.reconcileAttemptIntegrityInDatabase(ctx, &database)
+		index = findByID(database.Tables.Checkpoints, checkpointID)
+		if index < 0 {
+			server.logError(ctx, "checkpoint.decision.not_found_after_reconcile", "Checkpoint disappeared during decision reconciliation.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
+			return nil, http.StatusNotFound, fmt.Errorf("checkpoint not found")
+		}
+		checkpoint = cloneMap(database.Tables.Checkpoints[index])
+	}
 	checkpoint["status"] = status
 	asyncApprovedDelivery := false
 	var reworkLock map[string]any
@@ -917,6 +1006,15 @@ func (server *Server) applyCheckpointDecision(ctx context.Context, checkpointID 
 		server.startDevFlowCycleJob(reworkPipelineID, reworkAttemptID, false, false, reworkLock)
 	}
 	return checkpoint, http.StatusOK, nil
+}
+
+func checkpointDecisionFinal(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "approved", "rejected", "done", "passed":
+		return true
+	default:
+		return false
+	}
 }
 
 func (server *Server) createMission(response http.ResponseWriter, request *http.Request) {
@@ -2830,6 +2928,9 @@ func pipelineStatusFromRun(run map[string]any) string {
 	stages := arrayMaps(run["stages"])
 	allPassed := true
 	for _, stage := range stages {
+		if text(stage, "status") == "failed" || text(stage, "status") == "blocked" || text(stage, "status") == "stalled" {
+			return "failed"
+		}
 		if text(stage, "status") == "needs-human" {
 			return "waiting-human"
 		}
@@ -2863,13 +2964,22 @@ func findWorkItem(database WorkspaceDatabase, itemID string) map[string]any {
 
 func appendOrReplace(records []map[string]any, record map[string]any) []map[string]any {
 	id := text(record, "id")
+	output := []map[string]any{}
+	replaced := false
 	for index, candidate := range records {
 		if text(candidate, "id") == id {
-			records[index] = record
-			return records
+			if !replaced {
+				output = append(output, record)
+				replaced = true
+			}
+			continue
 		}
+		output = append(output, records[index])
 	}
-	return append(records, record)
+	if replaced {
+		return output
+	}
+	return append(output, record)
 }
 
 func findByID(records []map[string]any, id string) int {

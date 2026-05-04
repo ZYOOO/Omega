@@ -174,9 +174,10 @@ lark-cli contact +get-user --as user --format json
 
 飞书按钮直连回调需要额外入口：
 
-- 如果卡片里的 `Approve` / `Request changes` 要由飞书云端直接调用 `POST /feishu/review-callback`，就需要配置飞书可访问的 `OMEGA_PUBLIC_API_URL`。
+- 如果卡片里的 `Approve` / `Request changes` 要由飞书云端直接调用 `POST /feishu/review-callback`，就需要在飞书开放平台启用卡片回传交互 / 订阅 `card.action.trigger`，把 Card Request URL 配置到飞书可访问的 Omega runtime，并设置 `OMEGA_PUBLIC_API_URL`。
+- 只有在确认飞书 Card Request URL 已经配置并能访问 Omega 后，才设置 `OMEGA_FEISHU_CARD_CALLBACK_ENABLED=true` 或 `OMEGA_FEISHU_INTERACTIVE_CALLBACK_ENABLED=true`。否则 Omega 不会渲染会失败的 `Approve` / `Request changes` 按钮，避免飞书客户端报 `200340`。
 - 如果不暴露公网，可以保留卡片通知和 `Open review`，审核人回到 Omega Web 操作；这条路径和飞书消息同步同级，但按钮不直接改 checkpoint。
-- Task 审核模式不依赖按钮回调。完成飞书任务后，本机调用 `/feishu/review-task/sync` 即可把审核通过同步回 Omega。
+- Task 审核模式不依赖按钮回调。完成飞书任务后，本机调用 `/feishu/review-task/sync` 即可把审核通过同步回 Omega。没有显式路由但 `lark-cli` 能解析当前用户时，Omega 会优先创建绑定当前用户的飞书 Task，而不是发送不可点击的个人卡片按钮。
 - 任务评论可以由本地事件桥或手动脚本转发到 `/feishu/review-task/comment`。这一步同样只调用本机 `127.0.0.1` runtime，不要求公网。
 - 如果在页面开启 `Enable local task bridge sync`，或设置 `OMEGA_FEISHU_TASK_BRIDGE_ENABLED=true`，JobSupervisor 会在 tick 中顺带运行 Task bridge；也可以手动调用 `/feishu/review-task/bridge/tick` 做 dry-run 检查。
 
@@ -189,7 +190,7 @@ lark-cli contact +get-user --as user --format json
 - 飞书任务评论里的问题 / 缺少信息不会直接拒绝，只会写入 checkpoint `feishuReview.lastComment`，供操作者补充上下文。
 - 飞书 callback 建议配置 `OMEGA_FEISHU_REVIEW_TOKEN`，避免未经授权的外部请求直接修改 checkpoint。
 - 每次发送结果会写入 checkpoint 的 `feishuReview` 字段，包含 `status`、`provider`、`tool`、`format`、message/card preview 等信息。
-- 没有显式路由但 `lark-cli` 已登录时，会使用当前用户直投 fallback；该路径不要求公网。
+- 没有显式路由但 `lark-cli` 已登录时，会使用当前用户 Task fallback；该路径不要求公网，完成任务后由 Task bridge 或手动 sync 写回 Omega。
 
 ## Task 审核使用方法
 
@@ -227,7 +228,7 @@ curl -X POST http://127.0.0.1:3888/feishu/review-task/comment \
 自动化测试：
 
 ```bash
-go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding|TestFeishuReviewTaskSyncApprovesCompletedTask|TestFeishuReviewTaskCommentRequestsChanges|TestFeishuReviewTaskCommentNeedInfoRecordsOnly|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestUsesLarkCLIInteractiveCard|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestFeishuNotifyUsesLocalLarkCLI'
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding|TestFeishuReviewTaskSyncApprovesCompletedTask|TestFeishuReviewTaskCommentRequestsChanges|TestFeishuReviewTaskCommentNeedInfoRecordsOnly|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestUsesLarkCLIInteractiveCard|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestFeishuReviewCallbackAcceptsCardActionPayload|TestFeishuNotifyUsesLocalLarkCLI'
 ```
 
 需要人工验证：
@@ -235,7 +236,7 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewReque
 - 配置真实飞书机器人 webhook 后，触发一个 DevFlow Human Review。
 - 飞书群收到卡片，内容包含 Work Item、需求摘要、PR 和风险。
 - 点击卡片中的本地 review 链接能打开 Omega 对应 Work Item。
-- 配置公网 callback 或后续本地事件桥后，飞书侧 Approve 能让 Omega checkpoint 进入 approved，并继续 merging。
-- 配置公网 callback 或后续本地事件桥后，飞书侧 Request changes 能让 Omega checkpoint 进入 rejected，并生成 rework attempt / checklist。
+- 配置公网 Card Request URL 并设置 `OMEGA_FEISHU_CARD_CALLBACK_ENABLED=true` 后，飞书侧 Approve 能让 Omega checkpoint 进入 approved，并继续 merging。
+- 配置公网 Card Request URL 并设置 `OMEGA_FEISHU_CARD_CALLBACK_ENABLED=true` 后，飞书侧 Request changes 能让 Omega checkpoint 进入 rejected，并生成 rework attempt / checklist。
 - Task 模式下完成任务后调用 `/feishu/review-task/sync`，Omega checkpoint 应进入 approved。
 - Task 模式下写明确修改评论后调用 `/feishu/review-task/comment`，Omega checkpoint 应进入 rejected，并进入 rework。

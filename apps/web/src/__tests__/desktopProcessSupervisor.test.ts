@@ -1,5 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -14,7 +15,8 @@ const {
   envFlag,
   selectPreviewRefreshStrategy,
   resolveRepositoryPreviewTarget,
-  resolveRepositoryWorktree
+  resolveRepositoryWorktree,
+  startRepositoryPreviewRuntime
 } = require("../../../../apps/desktop/src/process-supervisor.cjs") as {
   buildPreviewRuntimePlan: (input: { env: Record<string, string | undefined> }) => {
     enabled: boolean;
@@ -55,6 +57,17 @@ const {
     previewUrl?: string;
   }>;
   resolveRepositoryWorktree: (target: Record<string, unknown>, env: Record<string, string | undefined>) => Promise<string>;
+  startRepositoryPreviewRuntime: (
+    target: Record<string, unknown>,
+    options: { repositoryTargetId?: string; previewUrl?: string; intent?: string },
+    env: Record<string, string | undefined>,
+  ) => Promise<{
+    ok: boolean;
+    status?: string;
+    repoPath?: string;
+    previewUrl?: string;
+    profile?: { source?: string; workingDirectory?: string; previewUrl?: string; intent?: string };
+  }>;
 };
 
 describe("desktop process supervisor", () => {
@@ -197,6 +210,66 @@ describe("desktop process supervisor", () => {
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not invent a preview URL when repository source only prepares a worktree", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "omega-preview-workspaces-"));
+    const repo = path.join(root, "ZYOOO_TestRepo");
+    try {
+      mkdirSync(repo, { recursive: true });
+      execFileSync("git", ["init"], { cwd: repo });
+      execFileSync("git", ["remote", "add", "origin", "git@github.com:ZYOOO/TestRepo.git"], { cwd: repo });
+      writeFileSync(path.join(repo, "package.json"), JSON.stringify({ scripts: { dev: "vite" } }));
+
+      const preview = await resolveRepositoryPreviewTarget(
+        { id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" },
+        { OMEGA_PAGE_PILOT_WORKSPACE_ROOT: root },
+      );
+      expect(preview).toMatchObject({
+        ok: true,
+        repoPath: repo,
+        htmlFile: "",
+        hasPackageJson: true,
+        previewUrl: "",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("connects to an explicit running preview URL without preparing a GitHub worktree first", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end("<main>External preview</main>");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    try {
+      const previewUrl = `http://127.0.0.1:${port}/`;
+      const result = await startRepositoryPreviewRuntime(
+        { id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" },
+        { repositoryTargetId: "repo_test", previewUrl, intent: "/dashboard" },
+        { OMEGA_PAGE_PILOT_WORKSPACE_ROOT: path.join(tmpdir(), "omega-preview-workspaces-missing") },
+      );
+
+      expect(result).toMatchObject({
+        ok: true,
+        status: "external",
+        repoPath: "",
+        previewUrl,
+        profile: {
+          source: "external-url",
+          workingDirectory: "",
+          previewUrl,
+          intent: "/dashboard",
+        },
+      });
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
     }
   });
 });

@@ -4,6 +4,13 @@ export type PrimaryNav = "Projects" | "Views" | "Issues" | "Page Pilot" | "Setti
 export type UiTheme = "light" | "dark";
 
 type ConnectionStatusMap = Record<ProviderId, { status: string }>;
+export type AgentAccessSidebarItem = {
+  id: string;
+  label: string;
+  value: string;
+  status: "ready" | "partial" | "setup";
+  targetTab: "agents" | "runtime";
+};
 
 type WorkspaceChromeProps = {
   activeNav: PrimaryNav;
@@ -20,6 +27,8 @@ type WorkspaceChromeProps = {
   activeRepositoryWorkspaceTargetId: string;
   workspaceSectionOpen: boolean;
   connectionsSectionOpen: boolean;
+  agentAccessSectionOpen: boolean;
+  agentAccessItems: AgentAccessSidebarItem[];
   visibleConnectionProviders: ConnectionProvider[];
   selectedProviderId: ProviderId;
   connections: ConnectionStatusMap;
@@ -32,9 +41,11 @@ type WorkspaceChromeProps = {
   onToggleTheme: () => void;
   onToggleWorkspaceSection: (open: boolean) => void;
   onToggleConnectionsSection: (open: boolean) => void;
+  onToggleAgentAccessSection: (open: boolean) => void;
   onSelectWorkspace: (target: RepositoryTarget, targetItems: WorkItem[]) => void;
   onConfigureWorkspace: (target: RepositoryTarget) => void;
   onProviderClick: (provider: ConnectionProvider) => void;
+  onAgentAccessClick: (item: AgentAccessSidebarItem) => void;
   onNewRequirement: () => void;
 };
 
@@ -63,6 +74,8 @@ export function WorkspaceChrome({
   activeRepositoryWorkspaceTargetId,
   workspaceSectionOpen,
   connectionsSectionOpen,
+  agentAccessSectionOpen,
+  agentAccessItems,
   visibleConnectionProviders,
   selectedProviderId,
   connections,
@@ -75,9 +88,11 @@ export function WorkspaceChrome({
   onToggleTheme,
   onToggleWorkspaceSection,
   onToggleConnectionsSection,
+  onToggleAgentAccessSection,
   onSelectWorkspace,
   onConfigureWorkspace,
   onProviderClick,
+  onAgentAccessClick,
   onNewRequirement
 }: WorkspaceChromeProps) {
   return (
@@ -159,6 +174,32 @@ export function WorkspaceChrome({
                 <span className={connections[provider.id].status === "connected" ? "dot online" : "dot"} />
                 <span>{provider.name}</span>
                 <small>{connections[provider.id].status === "connected" ? "on" : "off"}</small>
+              </button>
+            ))}
+          </div>
+        </details>
+
+        <details
+          className="sidebar-section agent-access-section"
+          open={agentAccessSectionOpen}
+          onToggle={(event) => onToggleAgentAccessSection(event.currentTarget.open)}
+        >
+          <summary>
+            <span className="section-label">Agents</span>
+          </summary>
+          <div className="connection-stack agent-access-stack">
+            {agentAccessItems.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className="connection-row agent-access-row"
+                aria-label={`${item.label}: ${item.value}`}
+                onClick={() => onAgentAccessClick(item)}
+                title={`${item.label}: ${item.value}`}
+              >
+                <span className={item.status === "ready" ? "dot online" : item.status === "partial" ? "dot warning" : "dot"} />
+                <span>{item.label}</span>
+                <small>{item.value}</small>
               </button>
             ))}
           </div>

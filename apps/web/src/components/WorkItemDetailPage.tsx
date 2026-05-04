@@ -11,6 +11,7 @@ import type {
   OperationRecordInfo,
   PatchRunWorkpadInput,
   PipelineRecordInfo,
+  ProofPreviewInfo,
   ProofRecordInfo,
   RequirementRecordInfo,
   RunWorkpadRecordInfo
@@ -140,9 +141,23 @@ export interface WorkItemDetailPageProps extends DetailHelpers {
   workItems: WorkItem[];
   onOpenPagePilot: () => void;
   onApproveCheckpoint: (checkpointId: string) => void;
+  onFetchProofPreview?: (proofId: string) => Promise<ProofPreviewInfo>;
   onPatchRunWorkpad?: (runWorkpadId: string, input: PatchRunWorkpadInput) => Promise<void>;
   onRequestCheckpointChanges: (checkpointId: string, note?: string) => void;
   onRetryAttempt: (attemptId: string) => void;
+}
+
+function visibleExternalReference(value?: string): string {
+  const raw = value?.trim() ?? "";
+  if (!raw) return "";
+  if (/^(?:page-pilot:)?item_(?:manual|page_pilot)_/i.test(raw)) return "";
+  if (/^req_item_manual_/i.test(raw)) return "";
+  if (/^pipeline_item_(?:manual|page_pilot)_/i.test(raw)) return "";
+  return raw;
+}
+
+function isPagePilotWorkItem(item: WorkItem): boolean {
+  return item.source === "page_pilot" || item.labels.includes("page-pilot") || item.sourceExternalRef?.startsWith("page-pilot:") === true;
 }
 
 export function WorkItemDetailPage({
@@ -170,6 +185,7 @@ export function WorkItemDetailPage({
   workItems,
   onOpenPagePilot,
   onApproveCheckpoint,
+  onFetchProofPreview,
   onPatchRunWorkpad,
   onRequestCheckpointChanges,
   onRetryAttempt
@@ -183,9 +199,22 @@ export function WorkItemDetailPage({
     () => latestRunWorkpadForDetail({ attempt, pipeline, runWorkpads, workItem }),
     [attempt, pipeline, runWorkpads, workItem]
   );
-  const checkpoint = pipeline
-    ? checkpoints.find((candidate) => candidate.pipelineId === pipeline.id && candidate.status === "pending")
-    : undefined;
+  const humanReviewCheckpoints = useMemo(() => {
+    if (!pipeline) return [];
+    return checkpoints
+      .filter((candidate) => {
+        if (candidate.pipelineId !== pipeline.id) return false;
+        if (!isHumanReviewCheckpoint(candidate)) return false;
+        if (attempt?.id && candidate.attemptId && candidate.attemptId !== attempt.id) return false;
+        return true;
+      })
+      .sort((left, right) => checkpointTime(right) - checkpointTime(left));
+  }, [attempt?.id, checkpoints, pipeline]);
+  const checkpoint = humanReviewCheckpoints[0];
+  const checkpointActionable =
+    checkpoint?.status === "pending" &&
+    (attempt ? attempt.status === "waiting-human" && attempt.currentStageId === "human_review" : true) &&
+    (pipeline ? pipeline.status === "waiting-human" : true);
   const detailOperations = useMemo(
     () => operationsForWorkItem({ attempt, operations, pipeline, workItem }),
     [attempt, operations, pipeline, workItem]
@@ -234,6 +263,7 @@ export function WorkItemDetailPage({
       buildRunWorkpadSections({
         attempt,
         checkpoint,
+        checkpointActionable,
         operations: detailOperations,
         pipeline,
         proofCards,
@@ -243,12 +273,15 @@ export function WorkItemDetailPage({
         runWorkpad,
         workItem
       }),
-    [attempt, checkpoint, detailOperations, pipeline, proofCards, pullRequestStatus, requirement, reviewEvents, runWorkpad, workItem]
+    [attempt, checkpoint, checkpointActionable, detailOperations, pipeline, proofCards, pullRequestStatus, requirement, reviewEvents, runWorkpad, workItem]
   );
   const timelineItems =
     attemptTimeline && attempt?.id && attemptTimeline.attempt?.id === attempt.id
       ? attemptTimeline.items ?? []
       : [];
+  const workItemExternalRef = visibleExternalReference(workItem.sourceExternalRef);
+  const requirementExternalRef = visibleExternalReference(requirement?.sourceExternalRef);
+  const canOpenPagePilot = isPagePilotWorkItem(workItem);
 
   return (
     <section className="issue-detail-view work-item-detail-page" aria-label="Work item detail">
@@ -267,15 +300,17 @@ export function WorkItemDetailPage({
           <div className="issue-detail-meta">
             <span>{workItem.key}</span>
             <span>{sourceLabel(workItem)}</span>
-            {workItem.sourceExternalRef ? <span>{workItem.sourceExternalRef}</span> : null}
+            {workItemExternalRef ? <span>{workItemExternalRef}</span> : null}
             {repositoryLabel ? <span>{repositoryLabel}</span> : null}
             <span>{agentShortLabel(workItem.assignee)}</span>
           </div>
-          <div className="issue-detail-actions">
-            <button type="button" onClick={onOpenPagePilot} disabled={!workItem.repositoryTargetId}>
-              Open in Page Pilot
-            </button>
-          </div>
+          {canOpenPagePilot ? (
+            <div className="issue-detail-actions">
+              <button type="button" onClick={onOpenPagePilot} disabled={!workItem.repositoryTargetId}>
+                Open in Page Pilot
+              </button>
+            </div>
+          ) : null}
         </header>
 
         <section className="issue-detail-section detail-flow-priority">
@@ -300,7 +335,7 @@ export function WorkItemDetailPage({
               <strong>{requirement?.title ?? workItem.title}</strong>
             </div>
             <div className="requirement-source-meta">
-              {requirement?.sourceExternalRef ? <span>{requirement.sourceExternalRef}</span> : null}
+              {requirementExternalRef ? <span>{requirementExternalRef}</span> : null}
               {requirement?.status ? <span>{requirement.status}</span> : null}
               <span>{siblingItems.length || 1} item{(siblingItems.length || 1) === 1 ? "" : "s"}</span>
             </div>
@@ -322,6 +357,7 @@ export function WorkItemDetailPage({
             attempt={attempt}
             attemptStatusLabel={attemptStatusLabel}
             checkpoint={checkpoint}
+            checkpointActionable={checkpointActionable}
             displayText={displayText}
             failedStages={failedStages}
             failureOperations={failureOperations}
@@ -329,6 +365,7 @@ export function WorkItemDetailPage({
             humanReviewArtifacts={humanReviewArtifacts}
             humanReviewEvents={reviewEvents}
             onApproveCheckpoint={onApproveCheckpoint}
+            onFetchProofPreview={onFetchProofPreview}
             onRequestCheckpointChanges={onRequestCheckpointChanges}
             onRetryAttempt={onRetryAttempt}
             operationStatusLabel={operationStatusLabel}
@@ -352,7 +389,7 @@ export function WorkItemDetailPage({
 
         <section className="issue-detail-section">
           <h3>Artifacts</h3>
-          <ArtifactGrid proofs={proofCards} />
+          <ArtifactGrid onFetchProofPreview={onFetchProofPreview} proofs={proofCards} />
         </section>
 
         <section className="issue-detail-section">
@@ -384,6 +421,7 @@ function RunWorkpad({
   sections: WorkpadSection[];
 }) {
   const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(true);
   const [editorOpen, setEditorOpen] = useState(false);
   const [selectedField, setSelectedField] = useState<WorkpadEditableField>("notes");
   const [draftValue, setDraftValue] = useState("");
@@ -436,6 +474,9 @@ function RunWorkpad({
         </div>
         <div className="run-workpad-actions">
           <small>{workpadSignalSummary(sections)}</small>
+          <button type="button" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>
+            {expanded ? "Collapse" : "Expand"}
+          </button>
           {canEdit ? (
             <button
               type="button"
@@ -449,20 +490,22 @@ function RunWorkpad({
           ) : null}
         </div>
       </header>
-      <div className="run-workpad-grid">
-        {sections.map((section) => (
-          <button
-            key={section.id}
-            type="button"
-            className={section.tone ? `workpad-card workpad-${section.tone}` : "workpad-card"}
-            onClick={() => setActiveSectionId(section.id)}
-          >
-            <span>{section.label}</span>
-            <strong>{section.title}</strong>
-            <p>{section.preview}</p>
-          </button>
-        ))}
-      </div>
+      {expanded ? (
+        <div className="run-workpad-grid">
+          {sections.map((section) => (
+            <button
+              key={section.id}
+              type="button"
+              className={section.tone ? `workpad-card workpad-${section.tone}` : "workpad-card"}
+              onClick={() => setActiveSectionId(section.id)}
+            >
+              <span>{section.label}</span>
+              <strong>{section.title}</strong>
+              <p>{section.preview}</p>
+            </button>
+          ))}
+        </div>
+      ) : null}
       {activeSection ? (
         <section className="detail-popover-backdrop" role="presentation" onClick={() => setActiveSectionId(null)}>
           <article
@@ -614,8 +657,9 @@ function DeliveryFlowGrid({
   actionPlan?: AttemptActionPlanInfo | null;
   pipeline?: PipelineRecordInfo;
 }) {
+  const pipelineStages = pipeline?.run?.stages ?? [];
   const planStates = actionPlan?.states?.length ? actionPlan.states : [];
-  const stages = planStates.length ? planStates : pipeline?.run?.stages ?? [];
+  const stages = pipelineStages.length ? pipelineStages : planStates;
   if (!stages.length) {
     return <p className="muted-copy">Delivery stages will appear after a pipeline is created.</p>;
   }
@@ -626,12 +670,13 @@ function DeliveryFlowGrid({
         const agent = recordString(stageRecord, "agent") || recordString(stageRecord, "agentId");
         const agentIds = Array.isArray(stageRecord.agentIds) ? stageRecord.agentIds.map(String) : agent ? [agent] : [];
         const status = recordString(stageRecord, "status");
+        const participantLabel = stageParticipantLabel(stageRecord, agentIds, agentShortLabel);
         return (
           <article key={recordString(stageRecord, "id") || String(index)} className={pipelineStageClassName(status)}>
             <span>{index + 1}</span>
             <div>
               <strong>{recordString(stageRecord, "title") || recordString(stageRecord, "id")}</strong>
-              <small>{agentIds.length ? agentIds.map(agentShortLabel).join(" + ") : "Agent pending"}</small>
+              {participantLabel ? <small>{participantLabel}</small> : null}
             </div>
             <em>{pipelineStageLabel(status)}</em>
           </article>
@@ -639,6 +684,18 @@ function DeliveryFlowGrid({
       })}
     </div>
   );
+}
+
+function stageParticipantLabel(stage: Record<string, unknown>, agentIds: string[], agentShortLabel: (agentId: string) => string): string {
+  if (agentIds.length) return agentIds.map(agentShortLabel).join(" + ");
+  const raw = `${recordString(stage, "id")} ${recordString(stage, "title")}`.toLowerCase();
+  if (/todo|intake|requirement/.test(raw)) return "Requirement";
+  if (/implementation|architect|coding|test/.test(raw)) return "Architecture + Code + Test";
+  if (/code_review|review round|review/.test(raw)) return "Review";
+  if (/rework/.test(raw)) return "Code + Test";
+  if (/human/.test(raw)) return "Human Review";
+  if (/merg|deliver|done|ship/.test(raw)) return "Delivery";
+  return "Workflow stage";
 }
 
 function ReworkReturnSignal({
@@ -690,6 +747,7 @@ function ReworkReturnSignal({
 function buildRunWorkpadSections({
   attempt,
   checkpoint,
+  checkpointActionable,
   operations,
   pipeline,
   proofCards,
@@ -701,6 +759,7 @@ function buildRunWorkpadSections({
 }: {
   attempt?: AttemptRecordInfo;
   checkpoint?: CheckpointRecordInfo;
+  checkpointActionable?: boolean;
   operations: OperationRecordInfo[];
   pipeline?: PipelineRecordInfo;
   proofCards: DetailProofCard[];
@@ -715,10 +774,13 @@ function buildRunWorkpadSections({
   const validationOps = operations.filter((operation) => /test|check|validation/i.test(`${operation.stageId ?? ""} ${operation.agentId ?? ""} ${operation.summary ?? ""}`));
   const reviewOps = operations.filter((operation) => /review|rework/i.test(`${operation.stageId ?? ""} ${operation.agentId ?? ""} ${operation.summary ?? ""}`));
   const recordedBlockers = asStringArray(workpad?.blockers).filter((blocker) => {
-    if (checkpoint?.status === "pending" && /human review|人工|审批/i.test(blocker)) return false;
+    if (checkpointActionable && /human review|人工|审批/i.test(blocker)) return false;
     return true;
   });
-  const checkpointBlocker = checkpoint && checkpoint.status !== "pending" ? `${checkpoint.title}: ${checkpoint.summary}` : "";
+  const checkpointBlocker =
+    checkpoint && checkpoint.status === "rejected"
+      ? `${checkpoint.title}: ${checkpoint.summary}`
+      : "";
   const blockers = recordedBlockers.length ? recordedBlockers : [
     attempt?.failureReason,
     attempt?.errorMessage,
@@ -1121,6 +1183,16 @@ function recordString(value: unknown, key: string): string {
   return typeof raw === "string" ? raw : "";
 }
 
+function isHumanReviewCheckpoint(checkpoint: CheckpointRecordInfo): boolean {
+  return /human[_-]?review|human review|人工|审批/i.test(`${checkpoint.stageId} ${checkpoint.title} ${checkpoint.summary}`);
+}
+
+function checkpointTime(checkpoint: CheckpointRecordInfo): number {
+  const raw = checkpoint.updatedAt || checkpoint.createdAt || "";
+  const parsed = raw ? Date.parse(raw) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function recordBool(value: unknown, key: string): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   return (value as Record<string, unknown>)[key] === true;
@@ -1223,6 +1295,11 @@ function proofCardsForWorkItem({
 }): DetailProofCard[] {
   const cards: DetailProofCard[] = [];
   const seen = new Set<string>();
+  const proofRecordBySource = new Map<string, ProofRecordInfo>();
+  for (const record of proofRecords) {
+    if (record.sourcePath) proofRecordBySource.set(record.sourcePath, record);
+    if (record.sourceUrl) proofRecordBySource.set(record.sourceUrl, record);
+  }
   const addCard = (input: Omit<DetailProofCard, "id" | "kind"> & { id?: string; kind?: string }) => {
     const label = input.label || (input.path ? fileNameFromPath(input.path) : input.url ?? "proof");
     const key = input.path || input.url || `${input.stage ?? ""}:${label}`;
@@ -1242,8 +1319,17 @@ function proofCardsForWorkItem({
   const stageSnapshots = attempt?.stages?.length ? attempt.stages : pipeline?.run?.stages ?? [];
   for (const stage of stageSnapshots) {
     const evidence = "evidence" in stage && Array.isArray(stage.evidence) ? stage.evidence : [];
-    for (const proof of evidence) {
-      addCard({ label: fileNameFromPath(proof), path: proof, stage: stage.title ?? stage.id });
+    const outputArtifacts = "outputArtifacts" in stage && Array.isArray(stage.outputArtifacts) ? stage.outputArtifacts : [];
+    for (const proof of [...evidence, ...outputArtifacts]) {
+      const record = proofRecordBySource.get(proof);
+      if (!record && !isPreviewableProofReference(proof)) continue;
+      addCard({
+        id: record?.id,
+        label: record?.value || record?.label || fileNameFromPath(proof),
+        path: record?.sourcePath ?? proof,
+        url: record?.sourceUrl,
+        stage: stage.title ?? stage.id
+      });
     }
   }
 
@@ -1264,6 +1350,14 @@ function proofCardsForWorkItem({
     });
   }
   return cards;
+}
+
+function isPreviewableProofReference(value: string): boolean {
+  if (!value.trim()) return false;
+  if (/^https?:\/\//i.test(value)) return true;
+  if (value.startsWith("/") || value.startsWith("~") || value.startsWith(".")) return true;
+  if (value.includes("/") || value.includes("\\")) return true;
+  return /\.[a-z0-9]{2,8}$/i.test(value);
 }
 
 function reviewEventsForWorkItem(attempt?: AttemptRecordInfo, pipeline?: PipelineRecordInfo): DetailReviewEventCard[] {

@@ -32,6 +32,7 @@ describe("WorkItemDetailPage", () => {
       stageId: "coding",
       target: "ZYOOO/TestRepo",
       source: "manual" as const,
+      sourceExternalRef: "item_manual_21",
       requirementId: "req_21",
       repositoryTargetId: "repo_test",
       acceptanceCriteria: ["展示用户姓名", "展示账号状态"],
@@ -48,6 +49,7 @@ describe("WorkItemDetailPage", () => {
           projectId: "project_omega",
           repositoryTargetId: "repo_test",
           source: "manual",
+          sourceExternalRef: "req_item_manual_21",
           title: "添加用户详情页面",
           rawText: "# 添加用户详情页面\n\n".repeat(30),
           acceptanceCriteria: ["展示用户姓名"],
@@ -102,11 +104,11 @@ describe("WorkItemDetailPage", () => {
           id: "pipeline_21",
           workItemId: "item_manual_21",
           runId: "run_1",
-          status: "running",
+          status: "waiting-human",
           run: {
             stages: [
-              { id: "implementation", title: "Implementation and PR", status: "running", agentIds: ["coding", "testing"] },
-              { id: "human_review", title: "Human Review", status: "waiting-human", agentIds: ["review"] }
+              { id: "implementation", title: "Implementation and PR", status: "passed", agentIds: ["coding", "testing"] },
+              { id: "human_review", title: "Human Review", status: "needs-human", agentIds: ["review"] }
             ],
             events: [{ type: "checkpoint.rejected", message: "Add loading feedback before merge." }]
           }
@@ -148,6 +150,12 @@ describe("WorkItemDetailPage", () => {
     );
 
     expect(screen.getByLabelText("Run workpad")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open in Page Pilot" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
+    expect(screen.queryByRole("button", { name: /Review packet/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(screen.queryByText("item_manual_21")).not.toBeInTheDocument();
+    expect(screen.queryByText("req_item_manual_21")).not.toBeInTheDocument();
     expect(screen.getByText("Rework checklist")).toBeInTheDocument();
     expect(screen.getByText("Review packet")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Review packet/i }));
@@ -166,7 +174,8 @@ describe("WorkItemDetailPage", () => {
     expect(screen.getByText("Required check changed state.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(container.querySelector(".requirement-source-scroll")).toBeTruthy();
-    expect(container.querySelector(".detail-stage-grid .stage-running")).toBeTruthy();
+    expect(container.querySelectorAll(".detail-stage-grid .stage-needs-human")).toHaveLength(1);
+    expect(container.querySelectorAll(".detail-stage-grid .stage-running")).toHaveLength(0);
     expect(screen.getByText("Agent operations")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /implementation.*coding/i }));
     expect(screen.getByText("Prompt")).toBeInTheDocument();
@@ -261,6 +270,258 @@ describe("WorkItemDetailPage", () => {
     expect(screen.queryByText("Rework checklist")).not.toBeInTheDocument();
     expect(screen.getByText("No active blockers")).toBeInTheDocument();
     expect(screen.getByText("No retry needed")).toBeInTheDocument();
+  });
+
+  it("renders delivery flow from the canonical backend pipeline snapshot instead of action plan states", () => {
+    const workItem: WorkItem = {
+      id: "item_manual_32",
+      key: "OMG-32",
+      title: "新增加一个静夜思在md文档中",
+      description: "Need a markdown update.",
+      status: "Human Review" as const,
+      priority: "High" as const,
+      assignee: "coding",
+      labels: [],
+      team: "Omega",
+      stageId: "review",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: [],
+      blockedByItemIds: []
+    };
+
+    const { container } = render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[]}
+        pipeline={{
+          id: "pipeline_32",
+          workItemId: "item_manual_32",
+          runId: "run_32",
+          status: "waiting-human",
+          run: {
+            stages: [
+              { id: "todo", title: "Todo intake", status: "passed", agentIds: ["requirement"] },
+              { id: "in_progress", title: "Implementation and PR", status: "passed", agentIds: ["architect", "coding", "testing"] },
+              { id: "code_review_round_1", title: "Code Review Round 1", status: "passed", agentIds: ["review"] },
+              { id: "code_review_round_2", title: "Code Review Round 2", status: "passed", agentIds: ["review"] },
+              { id: "rework", title: "Rework", status: "waiting", agentIds: ["coding", "testing"] },
+              { id: "human_review", title: "Human Review", status: "needs-human", agentIds: ["human"] },
+              { id: "merging", title: "Merging", status: "waiting", agentIds: ["delivery"] },
+              { id: "done", title: "Done", status: "waiting", agentIds: ["delivery"] }
+            ]
+          }
+        }}
+        attemptActionPlan={{
+          attemptId: "attempt_32",
+          pipelineId: "pipeline_32",
+          states: [
+            { id: "todo", title: "Todo intake", status: "passed" },
+            { id: "in_progress", title: "Implementation and PR", status: "running" },
+            { id: "human_review", title: "Human Review", status: "needs-human" },
+            { id: "done", title: "Done", status: "needs-human" }
+          ]
+        }}
+        attempts={[{
+          id: "attempt_32",
+          itemId: "item_manual_32",
+          pipelineId: "pipeline_32",
+          status: "waiting-human",
+          currentStageId: "human_review"
+        }]}
+        checkpoints={[{
+          id: "pipeline_32:human_review",
+          pipelineId: "pipeline_32",
+          attemptId: "attempt_32",
+          stageId: "human_review",
+          status: "pending",
+          title: "Human review",
+          summary: "Waiting for approval."
+        }]}
+        operations={[]}
+        proofRecords={[]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    expect(container.querySelectorAll(".detail-stage-grid .stage-needs-human")).toHaveLength(1);
+    expect(container.querySelectorAll(".detail-stage-grid .stage-running")).toHaveLength(0);
+  });
+
+  it("hides human approval actions after the current human review checkpoint is approved", () => {
+    const workItem: WorkItem = {
+      id: "item_manual_30",
+      key: "OMG-30",
+      title: "新增客户健康度工作台页面",
+      description: "Need final approval.",
+      status: "Done" as const,
+      priority: "High" as const,
+      assignee: "coding",
+      labels: [],
+      team: "Omega",
+      stageId: "delivery",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: [],
+      blockedByItemIds: []
+    };
+
+    render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[]}
+        pipeline={{
+          id: "pipeline_30",
+          workItemId: "item_manual_30",
+          runId: "run_30",
+          status: "done",
+          run: {
+            stages: [
+              { id: "human_review", title: "Human Review", status: "passed", agentIds: ["human"] },
+              { id: "done", title: "Done", status: "passed", agentIds: ["delivery"] }
+            ],
+            events: [
+              { type: "gate.approved", message: "Human review approved by human." },
+              { type: "devflow.cycle.completed", message: "DevFlow PR cycle completed after human approval." }
+            ]
+          }
+        }}
+        attempts={[{
+          id: "attempt_30",
+          itemId: "item_manual_30",
+          pipelineId: "pipeline_30",
+          status: "done",
+          currentStageId: "done",
+          pullRequestUrl: "https://github.com/ZYOOO/TestRepo/pull/40"
+        }]}
+        checkpoints={[{
+          id: "pipeline_30:human_review",
+          pipelineId: "pipeline_30",
+          attemptId: "attempt_30",
+          stageId: "human_review",
+          status: "approved",
+          title: "Human Review",
+          summary: "Human Review is approved.",
+          decisionNote: "approved by human",
+          updatedAt: "2026-05-04T01:00:00Z"
+        }]}
+        operations={[]}
+        proofRecords={[]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    expect(screen.queryByRole("button", { name: "Approve delivery" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Request changes" })).not.toBeInTheDocument();
+    expect(screen.getByText("Human review approved")).toBeInTheDocument();
+    expect(screen.getByText("approved by human")).toBeInTheDocument();
+  });
+
+  it("opens proof artifact previews from the artifact grid", async () => {
+    const workItem: WorkItem = {
+      id: "item_manual_preview",
+      key: "OMG-preview",
+      title: "查看审核产物",
+      description: "Need artifact preview.",
+      status: "In Review" as const,
+      priority: "Medium" as const,
+      assignee: "review",
+      labels: [],
+      team: "Omega",
+      stageId: "review",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: [],
+      blockedByItemIds: []
+    };
+    const onFetchProofPreview = vi.fn().mockResolvedValue({
+      available: true,
+      proof: { id: "proof_preview", label: "code-review-round-1" },
+      sourcePath: "/tmp/proof/code-review-round-1.md",
+      previewType: "markdown",
+      content: "# Review\n\nNo blocking findings."
+    });
+
+    render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[]}
+        pipeline={{
+          id: "pipeline_preview",
+          workItemId: "item_manual_preview",
+          runId: "run_preview",
+          status: "waiting-human",
+          run: {
+            stages: [{
+              id: "human_review",
+              title: "Human Review",
+              status: "waiting-human",
+              agentIds: ["review"],
+              outputArtifacts: ["/tmp/proof/code-review-round-1.md", "rollback-plan"]
+            }]
+          }
+        }}
+        attempts={[]}
+        checkpoints={[]}
+        operations={[{
+          id: "pipeline_preview:agent:human_review:review",
+          stageId: "human_review",
+          agentId: "review",
+          status: "passed",
+          prompt: "Review",
+          summary: "Review complete."
+        }]}
+        proofRecords={[{
+          id: "proof_preview",
+          operationId: "pipeline_preview:agent:human_review:review",
+          label: "code-review-round-1",
+          value: "code-review-round-1.md",
+          sourcePath: "/tmp/proof/code-review-round-1.md"
+        }]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onFetchProofPreview={onFetchProofPreview}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /code-review-round-1\.md/i }));
+
+    await waitFor(() => expect(onFetchProofPreview).toHaveBeenCalledWith("proof_preview"));
+    expect(screen.getByRole("dialog", { name: /code-review-round-1\.md preview/i })).toBeInTheDocument();
+    expect(screen.getByText(/No blocking findings/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /rollback-plan/i })).not.toBeInTheDocument();
   });
 
   it("round-trips work item detail hash routes", () => {

@@ -2,7 +2,101 @@
 
 本文记录当前 v0Beta 已完成的关键工程节点，方便后续整理仓库和演示材料。
 
+## 2026-05-04
+
+### DevFlow Delivery flow 单一活动阶段收敛
+
+完成：
+
+- 修复 Work Item 详情页 Delivery flow 同时高亮 Implementation、Human Review、Done 的状态混乱问题。
+- 收敛 DevFlow 状态权威：`pipeline.run.stages` 表示当前运行态，`attempt.currentStageId` 表示当前执行点，`attemptActionPlan.states` 只表示 workflow contract，不再驱动主流程 UI。
+- 后端对 `devflow-pr` pipeline 和 latest attempt stages 做 canonicalization；`markDevFlowStageProgress` 在写入新的 current stage 时同步清理同一 pipeline 的旧活动态。
+- 终态 pipeline 不再参与 current-stage 反推，避免已完成、失败、取消、超时状态被旧 stage snapshot 覆盖成 running。
+- 前端详情页只展示 backend canonical `pipeline.run.stages`，不再根据 checkpoint/currentStageId 自行重算 Delivery flow。
+- 补充 Go 和 React 回归测试，锁定 OMG-32 这类 Human Review 恢复场景。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestNormalizeDevFlowPipelineStageStatusesKeepsSingleActiveStage|TestMarkDevFlowStageProgressCanonicalizesCurrentStage' -count=1
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testNamePattern "canonical backend pipeline snapshot" --testTimeout=30000
+npm run lint
+git diff --check
+```
+
+### Projects 页面主题与概要区收敛
+
+完成：
+
+- 修复 Projects 页面按钮没有完整适配 light / dark 的问题：`Project config`、disabled `Create project`、disabled `Create workspace` 不再显示黑色默认按钮。
+- 将 Project summary 的三项统计从右侧高卡片改为紧凑胶囊指标，降低视觉重量。
+- 移除 Projects 页中冗余的阶段标签条，避免 `Requirements / Repository Workspace / Agent Pipeline / Human Review / Delivery` 和实际 Work Item 流程展示重复。
+- 手测 light / dark 两个主题，确认按钮、输入框、统计和卡片背景都跟随主题。
+
+验证：
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=20000
+npm run lint
+```
+
+### Workboard New Requirement 描述区视觉收敛
+
+完成：
+
+- New Requirement composer 的 Write / Preview 切换改为紧凑 segmented control，去掉 light mode 下突兀的深色竖向分隔线。
+- Description textarea 与 Preview 面板改成独立圆角内容区，避免 tab 和内容边框拼接造成视觉噪声。
+- Preview 面板补充 light / dark mode 专用 Markdown 颜色，标题、列表、正文和空状态更清晰。
+
+验证：
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=20000
+npm run lint
+```
+
 ## 2026-05-03
+
+### Feishu 连接状态与 Page Pilot 侧栏交互修复
+
+完成：
+
+- Feishu Connections 展示改为消费运行时 effective state：`lark-cli` 当前用户 fallback、显式 chat/task/webhook/reviewer 路由任一 ready 时，左侧显示 `on`，不再被旧 session 的 `off` 误导。
+- Feishu Provider 面板补充 route 说明，当前用户 fallback 会显示 `current-user fallback via lark-cli`，让个人机器人审核链路和显式群/任务/webhook 路由边界更清楚。
+- Page Pilot 模式点击左侧 Connections provider 会切到 Settings 并打开 Provider access，不再尝试打开被 Page Pilot 隐藏的 inspector。
+- Page Pilot launcher 不再常驻右下角 `AI` 浮球；该浮球只在 Web fallback 的内嵌 iframe 预览打开后显示，Electron direct pilot 的 AI 操作继续留在目标页面内。
+- 补充 operator view 回归：从 `#page-pilot` session 进入时 Feishu 显示 `on`，点击 Feishu 后能进入 Settings 并看到测试连接入口。
+
+验证：
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=20000
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+```
+
+### Page Pilot Repository source 打开链路修复
+
+完成：
+
+- 修复 Page Pilot 默认 `Repository source` 对 package.json 项目只准备 worktree、却直接打开默认 preview URL 的问题。
+- Electron `resolveRepositoryPreviewTarget` 不再在没有显式配置时返回默认 `127.0.0.1` 预览地址，避免 Page Pilot 打开未启动或错误的目标页面。
+- Page Pilot 启动器会根据 repo 形态选择真实路径：package.json 项目优先自动启动 Preview Runtime Agent 后再打开 Electron direct pilot；只有纯静态 `index.html` 仓库才走 file preview。
+- `Dev server by Agent` 支持完整 URL 输入：完整 URL 会拆成 Preview Runtime 目标 URL 和打开路径，避免卡在错误端口的启动 / health check。
+- Electron Preview Runtime 对已运行的显式 preview URL 增加 external-url fast path，不再先准备 GitHub isolated worktree；同时修复路径 query/hash 合成。
+- `HTML file` 模式在输入框为空时会从当前 Repository Workspace 自动寻找根目录 `index.html`，恢复旧版“选 workspace 后直接打开”的使用感。
+- 打开流程增加 busy state 和超时反馈，避免页面长时间停在 starting。
+- `HTML file` 模式会忽略残留 HTTP URL，并从当前 workspace 自动解析 `index.html`；Electron 打开失败后会关闭 BrowserView，避免失败 webview 覆盖 Workboard。
+- 补充 package.json repository source 单测和 process supervisor 边界测试，覆盖“不要伪造 previewUrl”。
+- 同步回归 Work Item 30 相关链路：proof-backed Human Review recovery、current-user Feishu fallback、详情页 active attempt 刷新相关 targeted tests 通过。
+
+验证：
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=15000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+npm run lint
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilot|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget|TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestJobSupervisorRecoversOrphanedHumanReviewAttempt|TestJobSupervisorRecoversProofBackedHumanReviewAttempt|TestFeishuAutoReviewFallsBackToCurrentLarkUser|TestJobSupervisorDoesNotOverwriteFreshWaitingHumanAttempt'
+```
 
 ### 飞书审核人搜索与绑定
 
@@ -1921,3 +2015,518 @@ npm run build
 go test ./services/local-runtime/internal/omegalocal
 npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
 ```
+
+## 2026-05-03 继续：Page Pilot Web fallback 与预览进程恢复
+
+### 本轮目标
+
+用户在 Electron 中遇到 `ERR_EMPTY_RESPONSE`，并指出 HTML file 模式会退回 Work items、页面像卡住。按要求启动 Web 版手测后，复现出三个串联问题：hash route 被 session 覆盖、旧 3009 Python 静态服务只返回 empty response、历史 repository target 缺少 id。
+
+### 变更内容
+
+- Page Pilot Web 版在没有 Electron bridge 时不再直接报错，而是通过 local runtime API 启动选定 Repository Workspace，并以内嵌 iframe + `PagePilotOverlay` 打开。
+- Vite `/page-pilot-target` 默认代理改为 `http://127.0.0.1:3009`，Web fallback 会把 3009 预览映射为同源 `/page-pilot-target/...`。
+- App session 恢复阶段改为调用 `initialActiveNav(session.activeNav)`，让 `#page-pilot` 和 Work Item detail hash 优先生效。
+- Go Preview Runtime 启动前如果发现当前 preview URL health check 失败，会清理 cwd 等于目标 workspace 的陈旧监听进程，再启动新的 runtime。
+- Page Pilot 对旧 session 中缺失 `repositoryTarget.id` 的 GitHub target 派生 `repo_owner_repo`，避免 UI 显示已选仓库但执行链路拿不到 id。
+
+### 本机手测
+
+- 启动 `OMEGA_PAGE_PILOT_TARGET_URL=http://127.0.0.1:3009 npm run dev -- --host 127.0.0.1 --port 5174`。
+- 访问 `http://127.0.0.1:5174/#page-pilot`，等待 workspace 加载后仍停留在 Page Pilot。
+- 点击 `Open page editor` 后，坏掉的旧 3009 进程被清理，新 `python3 -m http.server` 返回 `200 OK`，页面出现 iframe。
+- 打开 `AI` 浮层后，`Select`、Apply/Confirm/Discard 状态和近期 runs 能正常显示。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=15000
+npm run build -- --mode development
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotPreviewRuntimeStartPersistsGoProfile|TestPagePilot|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget|TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget'
+```
+
+## 2026-05-03 继续：Electron Page Pilot 目标页状态校验
+
+### 本轮目标
+
+截图显示 `python3 -m http.server` 的 404 错误页浮在 Omega 左上角，同时 Page Pilot 启动器仍显示 `Target page opened...`。这说明 Electron direct pilot 把 HTTP 错误页当成了成功目标页。
+
+### 变更内容
+
+- `omega-preview:open` 改为先创建未挂载 BrowserView，后台加载并校验目标 URL。
+- 主 frame `did-fail-load` 直接返回错误；`did-navigate` 捕获的 HTTP status `>=400` 也返回错误。
+- 只有目标页校验成功后才 `setBrowserView` 并布局，避免错误页短暂或长期覆盖 Omega 主界面。
+- 启动时自动恢复 preview 也复用该校验，失败时关闭 preview view 并保留主窗口。
+
+### 验证
+
+```bash
+node --check apps/desktop/src/main.cjs
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=15000
+```
+
+## 2026-05-04：主导航 hash route 与 session 恢复收敛
+
+### 本轮目标
+
+排查用户反馈的刷新、进入应用、Project 页面或 Work Item 详情页偶发跳回 Work items 问题，确认是否由页面加载完成后的自动切换引起。
+
+### 变更内容
+
+- 将 Projects、Views、Settings 纳入显式 hash route，并统一通过 `activeNavFromHash` / `primaryNavHash` 做主导航映射。
+- workspace session 加载完成后不再盲目恢复保存的 `activeNav`；当前 URL hash 优先生效。
+- 侧边栏导航、Project config、Provider access、Settings 的 Open work items、Page Pilot exit 等入口都会同步 hash，避免状态和 URL 分叉。
+- Work Item 详情 hash 保持一等路由，刷新后继续进入详情而不是列表。
+
+### 本机手测
+
+- 浏览器访问 `http://127.0.0.1:5173/#projects`，等待 workspace 加载并刷新，页面仍为 Projects。
+- 浏览器打开 `OMG-30` 详情 `#/work-items/item_manual_30` 后刷新，仍显示 Work item detail。
+- 浏览器访问并刷新 `#page-pilot`，仍显示 Page Pilot。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=20000
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：New requirement 按钮交互态修正
+
+### 本轮目标
+
+修复 `New requirement` 在 hover / active 后出现黑色外圈的问题，让按钮状态和 light / dark UI 都保持一致。
+
+### 变更内容
+
+- 保留 `.topbar-create` 原来的透明容器 + `::before` conic 光边结构。
+- hover / focus-visible / active 状态只显式覆盖 `background: transparent`、`border-color` 和 `outline`，避免透明边缘吃到全局 button hover 的深色背景。
+- 保持原有 light / dark mode 的填充、光边和动效，不改变按钮整体观感。
+
+### 验证
+
+```bash
+npm run lint
+git diff --check
+```
+
+本机浏览器点击并 hover `New requirement`，未再出现黑色外圈。
+
+## 2026-05-04 继续：Dark sidebar controls 与 Connections provider 收敛
+
+### 本轮目标
+
+修复 dark mode 下 Workspaces / Connections 折叠按钮过亮的问题，并澄清左侧 Connections 中 `Google on` 的误导性状态。
+
+### 变更内容
+
+- dark theme 的 `.sidebar-section summary::after` 改为深色按钮样式，hover / focus 只轻微提亮。
+- 左侧 Connections 主列表隐藏 Google，仅展示当前产品真实使用的 GitHub / Feishu / CI。
+- 保留 Google provider 定义以兼容旧 workspace session 和未来身份能力，但不再作为当前工作台连接状态展示。
+- 更新 sidebar GitHub provider 测试定位，避免隐藏 Google 后 provider panel 默认落到 GitHub 时产生文本歧义。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=20000
+npm run lint
+git diff --check
+```
+
+本机浏览器 dark mode 验证：折叠按钮和 sidebar 色板协调，Connections 中不再出现 Google。
+
+## 2026-05-04 继续：Requirement composer 创建闭环与 dark UI 收敛
+
+### 本轮目标
+
+修复用户反馈的 `New requirement` 表单 dark mode 可读性、右侧提示卡冗余、workspace 名称截断，以及点击 `Create` 后长时间停在 `Creating...` 的问题。
+
+### 变更内容
+
+- `createItem()` 在 API 创建成功后立即用返回 session 更新 Projects / Requirements / Work Items / Mission State，并清理创建表单；`refreshControlPlane()` 改为后台异步刷新，避免慢观测性接口阻塞用户操作闭环。
+- 新增回归测试，模拟 `/observability` 永不返回，验证 requirement 创建仍会结束 `Creating...` 并显示新 work item。
+- 移除 inline requirement composer 的右侧说明卡，避免和 workspace lock status 重复。
+- dark mode 下提高 title / description label 可读性，并让 `New requirement` 保持原蓝青渐变填充。
+- 收紧 sidebar workspace row / config button 间距，优先给仓库名留空间。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "finishes requirement creation|shows Feishu|keeps the hash-routed Projects" --testTimeout=30000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
+npm run lint
+git diff --check
+```
+
+本机浏览器验证：`http://127.0.0.1:5173/#workboard` dark mode 下打开 `New requirement`，workspace 名称可完整显示，表单标签可读，右侧说明卡消失，按钮保持原渐变样式。
+
+## 2026-05-04 继续：Delivery flow 截断与 Feishu approve 路由收敛
+
+### 本轮目标
+
+修复 Work Item 详情页 `Delivery flow` 状态文字只露半截的问题，并解释 / 修复飞书 Human Review 卡片在个人机器人场景点击 `Approve` 报 `200340` 的问题。
+
+### 变更内容
+
+- `detail-stage-grid` 的状态 `<em>` 从标题内容列中拆出，改为卡片底部整行展示，保留 ellipsis 但不再裁切文字高度。
+- `feishu/review-callback` 支持飞书 card action 的嵌套 payload：`event.action.value`、`event.operator.open_id`、`event.token`，并兼容 callback URL challenge。
+- 新增显式开关 `OMEGA_FEISHU_CARD_CALLBACK_ENABLED=true` / `OMEGA_FEISHU_INTERACTIVE_CALLBACK_ENABLED=true`。未启用时卡片不再渲染 `Approve` / `Request changes` 交互按钮，避免用户点击后遇到飞书 `200340`。
+- `lark-cli` 当前用户 fallback 在无卡片 callback 时优先创建绑定当前用户的飞书 Task，完成任务后通过 Task bridge 或 `/feishu/review-task/sync` 同步为 Omega Human Review approve。
+- 如果 Task 创建失败，会退回发送无交互按钮的卡片通知，并记录 `taskReviewError`，避免审核通知完全丢失。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewFallsBackToCurrentLarkUser|TestFeishuReviewRequestUsesLarkCLIInteractiveCard|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestFeishuReviewCallbackAcceptsCardActionPayload|TestFeishuReviewTaskSyncApprovesCompletedTask'
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=20000
+```
+
+本机浏览器验证：`http://127.0.0.1:5173/#/work-items/item_manual_30` 的 Delivery flow 状态行完整显示。
+
+## 2026-05-04 继续：Human Review actionability 与 dark artifacts 可读性
+
+### 本轮目标
+
+修复 Human Review approve 后详情页仍展示可点击审核按钮的问题，并提升 Work Item 详情页 Artifacts proof 卡片在 dark mode 下的可读性。
+
+### 变更内容
+
+- Work Item 详情页不再使用 pipeline 下任意 pending checkpoint 作为 Human Review 操作入口；改为筛选当前 pipeline / current attempt 的 `human_review` checkpoint，并选择最新记录。
+- 新增 `checkpointActionable` 判断：只有 checkpoint pending、attempt waiting-human/currentStage human_review、pipeline waiting-human 同时成立，才渲染 `Approve delivery` / `Request changes`。
+- 非 actionable checkpoint 渲染只读决策摘要，例如 `Human review approved` 和 decision note，避免 approve 后继续出现可操作按钮。
+- Run Workpad blocker 逻辑同步收紧：pending Human Review 不作为 blocker；rejected checkpoint 才作为需要处理的 blocker。
+- JobSupervisor integrity reconcile 增加 completed Human Review decision 回填：当历史数据里 pipeline/attempt 已 done 且 run events 有 `gate.approved`，但 checkpoint 仍 pending 时，`/checkpoints` 会自动修正为 approved。
+- dark mode 下补充 `.proof-card` / `.proof-card-copy` 的 label、meta、path 颜色，修复 Artifacts 区域文字过暗。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestListCheckpointsReconcilesCompletedHumanReviewDecision|TestApproveDevFlowCheckpointCanContinueDeliveryAsync|TestFeishuReviewTaskSyncApprovesCompletedTask|TestFeishuReviewCallbackAcceptsCardActionPayload'
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=20000
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：Work Item artifacts preview 入口
+
+### 本轮目标
+
+把 Work Item 详情页的 Human Review proof 和 Artifacts 从“路径展示”改成真实可查看的证据入口。
+
+### 变更内容
+
+- `WorkItemDetailPage` 接入 `fetchProofPreview`，并传给 Current Attempt / Artifacts 区域。
+- `Changed` / `Validation` proof 条目改为可点击 artifact button，直接打开 proof preview modal。
+- Artifacts grid 改成整卡点击预览，卡片主标题显示短文件名，stage/kind/path 摘要保留为辅助信息。
+- 新增 proof preview modal：展示完整 source path、preview content、不可用错误和 truncated 提示。
+- 新增回归测试：点击 artifact card 会调用 `/proof-records/:id/preview` 对应 fetch，并展示预览内容。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=20000
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：Artifact preview runtime 路由修复
+
+### 本轮目标
+
+修复 artifact preview modal 把前端 HTML 当 JSON 解析的问题，并保证 stage evidence 点击时使用真实 proof record id。
+
+### 变更内容
+
+- 非 dev Web 默认 Mission Control API 改为 `http://127.0.0.1:3888`，覆盖 Electron/static 场景下缺少 `VITE_MISSION_CONTROL_API_URL` 的 preview 请求。
+- `omegaControlApiClient` 对成功状态但非 JSON 的响应给出清晰错误，方便识别请求是否落到 SPA fallback。
+- `proofCardsForWorkItem` 会按 `sourcePath` / `sourceUrl` 匹配 proof record；stage evidence 与 proof record 指向同一文件时，保留真实 proof id，避免用文件路径调用 preview endpoint。
+- Go runtime 的 proof preview endpoint 增加本地路径兜底：历史 run 中只有 evidence path、没有 proof record id 的 artifact 也能打开真实文件内容。
+- 增加回归测试覆盖非 JSON 响应和 stage evidence/proof record 去重后的 preview id。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=20000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=20000
+go test ./services/local-runtime/internal/omegalocal -run TestRepositoryAuditTablesAndProofPreview
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：Artifact preview 符号输出过滤
+
+### 本轮目标
+
+修复 `rollback-plan` 这类 workflow output slot 被误当成 proof record 打开后报 404 的问题。
+
+### 变更内容
+
+- Work Item artifact 聚合区分真实 proof evidence 和 workflow 符号输出。
+- 只有匹配 proof record、URL、本地路径或带扩展名的文件引用才进入 preview card。
+- `rollback-plan` 等纯符号 output artifact 不再显示为可点击 preview，避免把流程契约字段误导成真实证据文件。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=20000
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：Feishu reviewer controls 视觉适配
+
+### 本轮目标
+
+修复 Feishu Provider Access 中 reviewer 搜索按钮样式不适配的问题。
+
+### 变更内容
+
+- Reviewer input 独占一行，避免和操作按钮互相挤压。
+- `Search` / `Use current user` 使用同宽局部按钮样式。
+- 补齐 light / dark mode 的按钮背景、边框、文字和交互态。
+
+### 验证
+
+```bash
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：Workboard Human Review / Blocked 分组收敛
+
+### 本轮目标
+
+让 Workboard 中需要注意的 Human Review 和 Blocked 队列更容易被看到。
+
+### 变更内容
+
+- 新增 `Human Review` 展示状态，pipeline `waiting-human` 会进入独立分组。
+- 调整 Workboard 状态顺序，`Blocked` 放到 `Done` 前面。
+- `Blocked` 改为黄色/琥珀色状态点和 pill，避免和 Done / Ready 的灰色弱提示混淆。
+- `Human Review` 使用独立紫色状态点和 pill。
+- 补充 workboard 分组顺序回归测试。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/core/__tests__/workboard.test.ts apps/web/src/core/__tests__/workItemProjection.test.ts --testTimeout=20000
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：Workboard Page Pilot item 展示收敛
+
+### 本轮目标
+
+降低 Workboard 列表元信息噪音，并让 Page Pilot 物化 Work Item 更容易识别。
+
+### 变更内容
+
+- 隐藏 `item_manual_*`、`page-pilot:item_*` 等内部 id 元信息。
+- 新增 `page_pilot` Work Item source，Page Pilot item 使用 `Page Pilot #N` 标签。
+- Page Pilot pipeline 的 `Delivery` 阶段在 Workboard 进度中显示为 `Confirm / PR`。
+- 保持 Page Pilot item 在 Workboard 主列表中展示，作为统一追踪入口；Page Pilot 专页继续承担运行启动和 recent runs 管理。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "marks not-started work clearly" --testTimeout=30000
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：内部 Work Item 引用展示过滤
+
+### 本轮目标
+
+让 `item_manual_*` 等内部关联 id 只留在数据层，不再出现在 Workboard 详情、项目摘要和 Inspector 的普通展示文案中。
+
+### 变更内容
+
+- Work Item 详情页过滤内部 `sourceExternalRef` 和 requirement external ref。
+- Workboard 列表元信息移除 requirement id 展示，避免 `Req item_manual_*` 这类内部关联占用行空间。
+- Project workspace 的 Work items 摘要只显示真实外部引用或语义化 Work Item key。
+- Workboard Inspector 的 Requirement block 同步过滤内部 requirement ref。
+- 补充详情页回归测试，覆盖 `item_manual_*` / `req_item_manual_*` 不出现在可见文本里。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "marks not-started work clearly" --testTimeout=30000
+```
+
+## 2026-05-04 继续：侧边栏 Agent 本地绑定状态
+
+### 本轮目标
+
+把 Agent runner / model / profile / account 的本机级绑定状态露出到全局侧边栏，避免用户误以为这些能力只属于当前 workspace。
+
+### 变更内容
+
+- 左侧 sidebar 新增 `Agents` 区块，展示当前本机 runner、model、profile readiness 和账号绑定摘要。
+- Agent 状态点击后进入 Settings / Workspace Agent Studio；后续每个 stage 的 runner 分配仍保留在 workspace 级 Agent Studio 中处理。
+- Agent 状态沿用 light / dark sidebar 样式，避免新增独立浮层或把本地配置混入 Workspaces 卡片。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "renders Go control-plane observability" --testTimeout=30000
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：Work Item 详情页信息架构收敛
+
+### 本轮目标
+
+降低 Work Item 详情页重复信息和跨功能入口噪音，保持 DevFlow 与 Page Pilot 的主路径边界清楚。
+
+### 变更内容
+
+- `Open in Page Pilot` 仅在 Page Pilot 物化出来的 Work Item 详情页显示，普通 Requirement / DevFlow item 不再展示该入口。
+- Delivery Flow / Current Attempt 去重：Current Attempt 中的 stage/action plan 细节改为默认折叠，保留 Run Timeline、Human Review 和 PR 状态作为主要信息。
+- Run Workpad 增加 Collapse / Expand 控制，便于审核时收起执行摘要。
+- `Agent pending` fallback 改为按 stage 显示可理解的角色标签；`Ship` 文案改为 `Delivery`。
+- 详情页深链刷新时，如果 workspace 还在加载，先展示 detail loading state，不再短暂回落到 Work items 列表。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "marks not-started work clearly" --testTimeout=30000
+```
+
+## 2026-05-04 继续：DevFlow 单一活动阶段修复
+
+### 本轮目标
+
+修复 Work Item 详情页中 Delivery flow 同时显示多个活动阶段的问题，让 UI 只展示 pipeline 的 canonical runtime snapshot。
+
+### 变更内容
+
+- Go runtime 在 workspace load/normalize 时对 `devflow-pr` pipeline 做 stage canonicalization。
+- canonical current stage 优先来自 pending checkpoint，其次来自 latest attempt，再回退到 run stages 中的 active status。
+- 当前阶段前的线性阶段修正为 passed，当前阶段后的 stale active status 修正为 waiting；未执行的可选 `rework` 保持 waiting。
+- `pipelineStatusFromRun` 增加 failed / blocked / stalled 映射，避免 failed stage 被误算成 running。
+- Work Item 详情页 Delivery flow 改为优先使用 `pipeline.run.stages`，避免把 action plan states 当成主流程状态。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run TestNormalizeDevFlowPipelineStageStatusesKeepsSingleActiveStage -count=1
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testNamePattern "canonical pipeline snapshot" --testTimeout=30000
+npm run lint
+git diff --check
+```
+
+## 2026-05-04 继续：Feishu Human Review 无公网回调默认路由
+
+### 本轮目标
+
+避免没有公网 Card Request URL 时，飞书仍发送看起来可点击但无法回写 Omega 的卡片按钮。
+
+### 变更内容
+
+- 只有同时配置 `OMEGA_FEISHU_CARD_CALLBACK_ENABLED=true` 和 `OMEGA_PUBLIC_API_URL` 时，Feishu review card 才包含 `Approve` / `Request changes` 回调按钮。
+- 没有公网回调时，如果可解析当前 `lark-cli` 用户，会优先创建 Feishu Task 审核；否则 chat 路由发送文本 fallback，不再发送不可回调的交互按钮。
+- 文档和测试同步区分“公网卡片回调”和“本机 Task 审核”两条路径。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewRequestUsesLarkCLITextWhenCardCallbackUnavailable|TestFeishuAutoReviewFallsBackToCurrentLarkUser|TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding|TestFeishuReviewRequestSendsInteractiveWebhookCard' -count=1
+```
+
+## 2026-05-04 继续：执行状态读取性能收敛
+
+### 本轮目标
+
+降低 Workboard、Work Item detail 和 live execution polling 对 SQLite snapshot 与大体积 operation/proof 历史的压力，避免用户刷新、切换页面或打开详情时被全量执行历史拖慢。
+
+### 变更内容
+
+- 新增 SQLite 表级读取快路径：pipelines / attempts / checkpoints / operations / proof records 可按查询参数直接读取规范化表。
+- 表接口支持 `limit`、`status`、`pipelineId`、`workItemId` 等过滤；未过滤 `/operations` 保留完整 snapshot 行为，兼容 runnerProcess 历史详情。
+- 前端控制面刷新改成首屏限量拉取 recent operations / proof records 与 pending checkpoints。
+- Work Item 详情页按当前 pipeline/work item 补拉 scoped execution records；轮询路径不再反复拉完整 artifacts。
+- API client 对带 query 的新接口保留 404 fallback，兼容测试 mock 或旧 runtime。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestListOperationsSupportsFilteredFastPath|TestRunOperationPersistsRunnerProcessResult|Test.*Checkpoint|Test.*Pipeline|Test.*Operation' -count=1
+go test ./services/local-runtime/internal/omegalocal -count=1
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=30000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
+npm run lint
+```
+
+## 2026-05-04 继续：runtime log 噪音治理
+
+### 本轮目标
+
+解释并修复 `runtime_logs` 在少量 Work Item 下膨胀到 65 万条的问题，避免访问日志和周期轮询日志淹没真实执行事件。
+
+### 变更内容
+
+- `api.request` 持久化策略改为默认只记录失败请求和 mutating 请求；成功 GET / HEAD / OPTIONS 不再进入 `runtime_logs`。
+- 增加 `OMEGA_RUNTIME_LOG_DEBUG_API=true` 开发开关，用于需要排查 API 访问链路时临时恢复成功 GET 记录。
+- 被数据库跳过的成功读请求写入 `.omega/logs/omega-runtime-diagnostics.YYYY-MM-DD.jsonl`；`/health` 不写库也不写文件。
+- JobSupervisor interval tick 只在产生操作者可见变化时写数据库；无变化 tick 写入 daily diagnostic file。
+- 远端 PR check poll 只在 failed / missing required checks 时写数据库 `job_supervisor.remote_signals.blocked`；正常 poll 写入 daily diagnostic file。
+- diagnostic file 写入时清理 24 小时以前的旧 `omega-runtime-diagnostics.*.jsonl`。
+- SQLite migration 启动时 compact 历史噪音日志，保留最近少量 tail 供排查。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestAPIRequestRuntimeLogPolicySkipsSuccessfulReads|TestDiagnosticRuntimeLogsUseDailyFilesAndOneDayRetention|TestSQLiteCompactsNoisyRuntimeLogs|TestRuntimeLogsAPIListsAndFiltersRecords|TestSQLiteMigrations|TestMigrationsAndPipelineTemplates' -count=1
+```
+
+## 2026-05-04 继续：Human Review approve 幂等与 stale snapshot 防护
+
+### 本轮目标
+
+修复 OMG-32 approve 后仍显示 Approve、重复点击触发多次 merge/outbound sync，以及 JobSupervisor 旧 snapshot 覆盖人工审核结果的问题。
+
+### 变更内容
+
+- Checkpoint decision 加服务端互斥，避免同一进程内重复 approve 并发推进同一个 gate。
+- 已终态 checkpoint 再次收到同类 decision 时直接返回现有结果，不重复执行 delivery continuation。
+- 正常 checkpoint decision 跳过完整 integrity recovery，只有 checkpoint 缺失时才尝试恢复扫描。
+- Workspace 保存时去重同 id checkpoint，终态优先于 pending，防止旧 duplicate pending 覆盖 approved。
+- `appendOrReplace` 删除后续 duplicate id，避免 upsert 逻辑继续制造同 id 多条记录。
+- JobSupervisor 保存前检查 workspace snapshot 是否已被其他链路更新；如果已变化，本轮 tick 跳过保存并写 diagnostic file，避免轮询覆盖人工审核或 delivery 状态。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestCheckpointDecisionDeduplicatesDuplicateCheckpointIDs|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestFeishuReviewTaskBridgeApprovesCheckpoint' -count=1
+```
+
+## 2026-05-04 继续：Workspace session 轻量化与 auto-run settling 复核
+
+### 本轮目标
+
+拆掉 UI live polling 对完整 `/workspace` snapshot 的依赖，降低 Electron / Web 打开后对 Go runtime 的 CPU 和内存压力；同时复核此前 `DevFlow auto-run settling` 测试失败是否代表状态机混乱。
+
+### 变更内容
+
+- Web `fetchWorkspaceSession` 改为读取 `/workspace?scope=session`，会话恢复只消费项目、需求、Work Item、连接、UI preference 等产品状态。
+- Go runtime `GET /workspace?scope=session` 改为从 SQLite 规范化表组装 session read model，不再反序列化完整 `workspace_snapshots.database_json` 后裁剪。
+- `work_items` 增加 `record_json`，保存完整 Work Item 记录；session 视图可保留 `source` / `repositoryTargetId` / Page Pilot 元信息，同时继续只返回 UI 会话所需表。
+- `/run-workpads` 列表读取切换到 SQLite `run_workpads` 规范化表，避免通过 snapshot fallback 拉取整库。
+- Human Review approve 继续保持正常路径快速；只有 legacy checkpoint 缺失 attempt 时才触发 integrity recovery，恢复旧数据可审批能力。
+- 复跑 `TestOrchestratorTickCanClaimAndRunDevFlowCycle` 单次和 5 次计数均通过；此前失败判定为异步 job settling 在高负载下被放大的超时，而不是稳定的多 active stage 状态机错误。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -count=1
+curl -fsS -o /tmp/omega-workspace-session.json -w 'session HTTP=%{http_code} BYTES=%{size_download} TOTAL=%{time_total}\n' 'http://127.0.0.1:3888/workspace?scope=session'
+curl -fsS -o /tmp/omega-workspace-full.json -w 'full HTTP=%{http_code} BYTES=%{size_download} TOTAL=%{time_total}\n' 'http://127.0.0.1:3888/workspace'
+```
+
+本地实测 session 约 464KB / 0.26s，full workspace 约 14.7MB / 0.45s；session scope 测试会破坏 full snapshot JSON，防止后续回退到完整镜像反序列化。

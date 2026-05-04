@@ -35,6 +35,18 @@ var sqliteMigrations = []sqliteMigration{
 	{Version: "20260502_002", Name: "repository_audit_tables", Up: func(ctx context.Context, repo *SQLiteRepository) error {
 		return repo.initializeBaselineSchema(ctx)
 	}},
+	{Version: "20260504_001", Name: "compact_noisy_runtime_logs", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		return repo.compactNoisyRuntimeLogs(ctx)
+	}},
+	{Version: "20260504_002", Name: "work_items_full_record_json", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		return repo.ensureWorkItemRecordJSON(ctx)
+	}},
 }
 
 func (repo *SQLiteRepository) applyPendingSQLiteMigrations(ctx context.Context) error {

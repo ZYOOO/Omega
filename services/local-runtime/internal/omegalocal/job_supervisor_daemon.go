@@ -70,17 +70,49 @@ func (server *Server) runJobSupervisorTick(ctx context.Context, config JobSuperv
 		server.logError(ctx, "job_supervisor.tick.failed", err.Error(), map[string]any{"trigger": trigger})
 		return
 	}
-	server.logDebug(ctx, "job_supervisor.tick.completed", "JobSupervisor tick completed.", map[string]any{
-		"trigger":            trigger,
-		"changed":            intValue(summary["changed"]),
-		"stalledAttempts":    intValue(summary["stalledAttempts"]),
-		"pendingCheckpoints": intValue(summary["pendingCheckpoints"]),
-		"runnableItems":      intValue(summary["runnableItems"]),
-		"acceptedReadyRuns":  intValue(summary["acceptedReadyRuns"]),
-		"retryableAttempts":  intValue(summary["retryableAttempts"]),
-		"acceptedRetries":    intValue(summary["acceptedRetryAttempts"]),
-		"cleanedWorkspaces":  intValue(summary["cleanedWorkspaces"]),
-		"workflowContracts":  intValue(summary["workflowContractPipelines"]),
-		"workflowMissing":    intValue(summary["workflowContractMissing"]),
-	})
+	if shouldPersistJobSupervisorTickLog(trigger, summary) {
+		server.logInfo(ctx, "job_supervisor.tick.completed", "JobSupervisor tick completed with operator-visible changes.", map[string]any{
+			"trigger":             trigger,
+			"changed":             intValue(summary["changed"]),
+			"stalledAttempts":     intValue(summary["stalledAttempts"]),
+			"pendingCheckpoints":  intValue(summary["pendingCheckpoints"]),
+			"runnableItems":       intValue(summary["runnableItems"]),
+			"acceptedReadyRuns":   intValue(summary["acceptedReadyRuns"]),
+			"retryableAttempts":   intValue(summary["retryableAttempts"]),
+			"acceptedRetries":     intValue(summary["acceptedRetryAttempts"]),
+			"cleanedWorkspaces":   intValue(summary["cleanedWorkspaces"]),
+			"blockedRemoteChecks": intValue(summary["blockedRemoteChecks"]),
+			"workflowContracts":   intValue(summary["workflowContractPipelines"]),
+			"workflowMissing":     intValue(summary["workflowContractMissing"]),
+		})
+	} else {
+		server.logRuntimeDiagnosticFile("DEBUG", "job_supervisor.tick.completed", "JobSupervisor interval tick completed without operator-visible changes.", map[string]any{
+			"trigger":            trigger,
+			"changed":            intValue(summary["changed"]),
+			"pendingCheckpoints": intValue(summary["pendingCheckpoints"]),
+			"runnableItems":      intValue(summary["runnableItems"]),
+			"retryableAttempts":  intValue(summary["retryableAttempts"]),
+			"workflowContracts":  intValue(summary["workflowContractPipelines"]),
+		})
+	}
+}
+
+func shouldPersistJobSupervisorTickLog(trigger string, summary map[string]any) bool {
+	if trigger != "interval" {
+		return true
+	}
+	for _, key := range []string{
+		"stalledAttempts",
+		"acceptedReadyRuns",
+		"acceptedRetryAttempts",
+		"cleanedWorkspaces",
+		"blockedRemoteChecks",
+		"workflowContractMissing",
+		"manualRecoveryRequired",
+	} {
+		if intValue(summary[key]) > 0 {
+			return true
+		}
+	}
+	return false
 }

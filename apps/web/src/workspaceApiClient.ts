@@ -7,7 +7,7 @@ export async function fetchWorkspaceSession(
   run: PipelineRun,
   fetchImpl: typeof fetch = fetch
 ): Promise<WorkspaceSession | undefined> {
-  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/workspace`);
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/workspace?scope=session`);
   if (response.status === 404) {
     return undefined;
   }

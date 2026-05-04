@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -31,15 +32,26 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		if status == 0 {
 			status = http.StatusOK
 		}
-		level := runtimeLogLevelForStatus(status, request.Method)
-		server.logRuntime(context.Background(), level, "api.request", fmt.Sprintf("%s %s -> %d", request.Method, path, status), map[string]any{
-			"requestId":  requestID,
-			"method":     request.Method,
-			"path":       path,
-			"status":     status,
-			"bytes":      logger.bytes,
-			"durationMs": time.Since(startedAt).Milliseconds(),
-		})
+		if shouldPersistAPIRequestLog(request.Method, path, status) {
+			level := runtimeLogLevelForStatus(status, request.Method)
+			server.logRuntime(context.Background(), level, "api.request", fmt.Sprintf("%s %s -> %d", request.Method, path, status), map[string]any{
+				"requestId":  requestID,
+				"method":     request.Method,
+				"path":       path,
+				"status":     status,
+				"bytes":      logger.bytes,
+				"durationMs": time.Since(startedAt).Milliseconds(),
+			})
+		} else if shouldWriteAPIRequestDiagnosticLog(request.Method, path, status) {
+			server.logRuntimeDiagnosticFile("DEBUG", "api.request", fmt.Sprintf("%s %s -> %d", request.Method, path, status), map[string]any{
+				"requestId":  requestID,
+				"method":     request.Method,
+				"path":       path,
+				"status":     status,
+				"bytes":      logger.bytes,
+				"durationMs": time.Since(startedAt).Milliseconds(),
+			})
+		}
 	}()
 	switch {
 	case request.Method == http.MethodGet && path == "/health":
@@ -244,5 +256,24 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.runOperation(response, request, false)
 	default:
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "not found"})
+	}
+}
+
+func shouldWriteAPIRequestDiagnosticLog(method string, path string, status int) bool {
+	return status < 400 && path != "/health"
+}
+
+func shouldPersistAPIRequestLog(method string, path string, status int) bool {
+	if status >= 400 {
+		return true
+	}
+	if strings.EqualFold(os.Getenv("OMEGA_RUNTIME_LOG_DEBUG_API"), "true") {
+		return path != "/health"
+	}
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
 	}
 }

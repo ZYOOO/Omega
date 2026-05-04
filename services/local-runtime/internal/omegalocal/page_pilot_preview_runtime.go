@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -148,6 +149,7 @@ func (server *Server) startPagePilotPreviewRuntime(ctx context.Context, payload 
 		_ = server.persistPagePilotPreviewRuntime(ctx, payload.RepositoryTargetID, resolved)
 		return resolved, nil
 	}
+	stopStalePagePilotPreviewListeners(plan)
 	if strings.TrimSpace(plan.Command) == "" {
 		resolved["ok"] = false
 		resolved["status"] = "failed"
@@ -389,6 +391,61 @@ func (server *Server) stopPagePilotPreviewRuntimeSession(key string) {
 	}
 	_ = session.command.Process.Kill()
 	delete(server.previewRuntime, key)
+}
+
+func stopStalePagePilotPreviewListeners(plan pagePilotPreviewRuntimePlan) {
+	port := pagePilotPreviewPort(plan.PreviewURL)
+	if port == "" || plan.RepoPath == "" || !isPagePilotLocalPreviewURL(plan.PreviewURL) {
+		return
+	}
+	output, err := exec.Command("lsof", "-nP", "-tiTCP:"+port, "-sTCP:LISTEN").Output()
+	if err != nil {
+		return
+	}
+	for _, rawPID := range strings.Fields(string(output)) {
+		pid, err := strconv.Atoi(strings.TrimSpace(rawPID))
+		if err != nil || pid <= 0 || !pagePilotPreviewProcessOwnsWorkspace(pid, plan.RepoPath) {
+			continue
+		}
+		if process, err := os.FindProcess(pid); err == nil {
+			_ = process.Kill()
+		}
+	}
+}
+
+func isPagePilotLocalPreviewURL(rawURL string) bool {
+	request, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil || request.URL == nil {
+		return false
+	}
+	host := request.URL.Hostname()
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+func pagePilotPreviewProcessOwnsWorkspace(pid int, repoPath string) bool {
+	output, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
+	if err != nil {
+		return false
+	}
+	cwd := ""
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(line, "n") {
+			cwd = strings.TrimPrefix(line, "n")
+			break
+		}
+	}
+	if cwd == "" {
+		return false
+	}
+	workspace, err := filepath.EvalSymlinks(repoPath)
+	if err != nil {
+		workspace = filepath.Clean(repoPath)
+	}
+	processCwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		processCwd = filepath.Clean(cwd)
+	}
+	return processCwd == workspace
 }
 
 func pagePilotPreviewRuntimeKey(repositoryTargetID string) string {

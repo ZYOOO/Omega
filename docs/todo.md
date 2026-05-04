@@ -447,6 +447,11 @@ Item
 ## 产品 / 体验缺口
 
 - [x] 增加项目创建与 repository target 配置基础版：新增 `POST /projects` 和 Projects 页面创建入口，`github/bind-repository-target` 支持按 `projectId` 绑定；前端绑定仓库时携带当前 Project，后续继续补多项目切换和更完整 onboarding UI。
+- [x] 收敛 New requirement 创建体验：创建成功不再等待慢控制面刷新，dark mode composer 标签可读，移除重复说明卡并收紧 workspace 卡片间距。
+- [x] 收敛 Workboard / detail 刷新性能：首屏和轮询不再全量拉取 operations/proof records，后端列表接口支持 SQLite 规范化表过滤读取。
+- [x] runtime logs 噪音治理第一版：成功 GET 访问日志不再默认落库，JobSupervisor interval tick / remote poll 去噪；被跳过的高频诊断日志写入 `.omega/logs` daily JSONL 并保留约 1 天，通过 SQLite migration compact 历史 `api.request` / tick / poll 日志。
+- [x] Workspace session 轻量化：UI 会话恢复改走 `/workspace?scope=session`，不再在 live polling 中传输 missions / operations / proof records 等执行重表；后端 session read model 从 SQLite 规范化表组装，不再反序列化完整 snapshot；`/run-workpads` 切换到 SQLite 规范化表读取。
+- [ ] 继续治理历史数据体积：为 stdout / stderr / runner details 等真实执行日志增加按天或按数量的长期 retention，避免 `.omega/omega.db` 长期膨胀。
 - [ ] 增加由服务端数据驱动的 activity / event timeline 页面
 - [x] 增加 Operator 视图基础版（队列 / waiting-human / proof / runtime model / checkpoint）
 - [ ] 增强 Operator 视图（失败队列 / 重试 / token 耗时 / runner cost）
@@ -463,6 +468,7 @@ Item
 - [ ] 增加本地 App sync loop 在线状态和远端同步状态展示
   - 2026-05-02 计划：依赖 shared sync API 和远端授权模型，暂不进入本轮实现。
 - [x] 增加飞书通知状态展示（runner message 基础版）
+- [x] 主导航 hash route 收敛：Projects / Views / Settings / Page Pilot / Work Item detail 刷新后不再被 workspace session 恢复覆盖回 Work items。
 
 ## 赛题追踪
 
@@ -493,10 +499,20 @@ Item
 - [x] Git 集成基础版：隔离 clone、创建本地 branch、commit、生成 diff/summary proof
 - [x] GitHub PR 集成基础版：推送 branch、创建 PR、读取 checks、合并 PR
 
+## Feishu / Provider access
+
+- [x] Feishu Connections 状态区分运行时可用路由和旧 session 持久状态：`lark-cli` 当前用户 fallback、chat/task/webhook/reviewer route ready 时显示 `on`。
+- [x] Page Pilot 页面点击 Feishu / provider 连接行时跳转 Settings 打开 Provider access，避免隐藏 inspector 导致无响应。
+- [x] Connections 主列表移除暂未产品化的 Google identity 占位，只展示 GitHub / Feishu / CI，避免默认 `on` 误导。
+- [x] Feishu Human Review approve 路由收敛：未配置 Card Request URL 时不再发送会报 `200340` 的卡片按钮，当前用户 fallback 改走可同步的 Task 审核。
+- [x] Sidebar Agent Access：左侧 sidebar 展示本机级 runner / model / profile / account 绑定状态，点击进入 Agent Studio；workspace 级 stage 分配继续保留在 Agent Studio 内。
+
 ## Page Pilot 产品化
 
 - [x] Page Pilot 入口接入 Workboard / Work Item，并支持选择明确 Repository Workspace。
 - [x] Electron Open preview 增加真实 IPC 结果反馈和失败日志，避免端口未启动时表现为无响应。
+- [x] Page Pilot Web fallback 恢复：无 Electron bridge 时通过 Go Preview Runtime API 启动所选 workspace，并用 `/page-pilot-target` 同源 iframe 打开 3009 预览。
+- [x] Page Pilot Preview Runtime 会清理同 workspace 的陈旧 3009 监听进程，避免旧 `ERR_EMPTY_RESPONSE` server 阻塞新预览。
 - [x] Page Pilot GitHub target 使用 Omega 管理的隔离 preview workspace；不再扫描用户本机默认目录猜测 worktree。
 - [x] Electron 基础版 Preview Runtime Agent/Profile：Dev server 模式会读取所选 repo、生成 profile、启动 dev server、health check 通过后打开 direct pilot。
 - [x] Electron 基础版 Preview Runtime reload supervisor：目标页 Reload / apply 后刷新会按 profile 做 health check、HMR 等待或 dev server restart。

@@ -72,6 +72,7 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 	if err != nil {
 		return nil, err
 	}
+	loadedSavedAt := database.SavedAt
 	summary := server.reconcileAttemptIntegrityInDatabase(ctx, &database)
 	mergeSupervisorSummary(summary, server.scanWorkflowContracts(ctx, &database))
 	mergeSupervisorSummary(summary, server.scanRemoteAttemptSignals(ctx, &database, options))
@@ -89,6 +90,11 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 	mergeSupervisorSummary(summary, server.scanRecoverableAttempts(ctx, &database, options, &jobs))
 	mergeSupervisorSummary(summary, server.scanWorkspaceCleanup(ctx, &database, workspaceCleanupOptions{AutoCleanupWorkspaces: options.AutoCleanupWorkspaces, WorkspaceRetentionSeconds: options.WorkspaceRetentionSeconds, Limit: options.Limit}))
 	if intValue(summary["changed"]) > 0 {
+		if currentSavedAt, err := server.Repo.WorkspaceSavedAt(ctx); err == nil && currentSavedAt != "" && loadedSavedAt != "" && currentSavedAt != loadedSavedAt {
+			summary["saveSkippedStaleSnapshot"] = 1
+			server.logRuntimeDiagnosticFile("DEBUG", "job_supervisor.save.skipped_stale_snapshot", "JobSupervisor skipped saving because the workspace changed during this tick.", map[string]any{"loadedSavedAt": loadedSavedAt, "currentSavedAt": currentSavedAt, "changed": intValue(summary["changed"])})
+			return summary, nil
+		}
 		if err := server.Repo.Save(ctx, database); err != nil {
 			return nil, err
 		}
@@ -166,13 +172,15 @@ func (server *Server) scanRemoteAttemptSignals(ctx context.Context, database *Wo
 				}
 				if intValue(checkSummary["failed"]) > 0 || intValue(checkSummary["missingRequired"]) > 0 {
 					summary["blockedRemoteChecks"] = intValue(summary["blockedRemoteChecks"]) + 1
+					server.logInfo(ctx, "job_supervisor.remote_signals.blocked", "Remote pull request checks require attention.", map[string]any{"attemptId": text(nextAttempt, "id"), "pipelineId": text(nextAttempt, "pipelineId"), "pullRequestUrl": prURL, "checkSummary": checkSummary})
+				} else {
+					server.logRuntimeDiagnosticFile("DEBUG", "job_supervisor.remote_signals.polled", "Remote pull request checks polled by JobSupervisor.", map[string]any{"attemptId": text(nextAttempt, "id"), "pipelineId": text(nextAttempt, "pipelineId"), "pullRequestUrl": prURL, "checkSummary": checkSummary})
 				}
 				summary["remoteSignalObservations"] = append(arrayMaps(summary["remoteSignalObservations"]), map[string]any{
 					"attemptId":    text(nextAttempt, "id"),
 					"pipelineId":   text(nextAttempt, "pipelineId"),
 					"checkSummary": checkSummary,
 				})
-				server.logInfo(ctx, "job_supervisor.remote_signals.polled", "Remote pull request checks polled by JobSupervisor.", map[string]any{"attemptId": text(nextAttempt, "id"), "pipelineId": text(nextAttempt, "pipelineId"), "pullRequestUrl": prURL, "checkSummary": checkSummary})
 				changed = true
 			}
 		}
@@ -470,18 +478,19 @@ func supervisorRetryPolicyForAttempt(database WorkspaceDatabase, attempt map[str
 
 func (server *Server) reconcileAttemptIntegrityInDatabase(ctx context.Context, database *WorkspaceDatabase) map[string]any {
 	summary := map[string]any{
-		"status":                   "ok",
-		"changed":                  0,
-		"linkedCheckpoints":        0,
-		"backfilledAttempts":       0,
-		"checkedCheckpoints":       0,
-		"pendingCheckpoints":       0,
-		"unresolvedGateLinks":      0,
-		"checkedAttempts":          0,
-		"stalledAttempts":          0,
-		"recoveredHumanGates":      0,
-		"recoveredProofHumanGates": 0,
-		"feishuReviewPipelines":    []any{},
+		"status":                        "ok",
+		"changed":                       0,
+		"linkedCheckpoints":             0,
+		"backfilledAttempts":            0,
+		"checkedCheckpoints":            0,
+		"pendingCheckpoints":            0,
+		"reconciledCheckpointDecisions": 0,
+		"unresolvedGateLinks":           0,
+		"checkedAttempts":               0,
+		"stalledAttempts":               0,
+		"recoveredHumanGates":           0,
+		"recoveredProofHumanGates":      0,
+		"feishuReviewPipelines":         []any{},
 	}
 	if database == nil {
 		return summary
@@ -519,6 +528,21 @@ func (server *Server) reconcileAttemptIntegrityInDatabase(ctx context.Context, d
 			summary["unresolvedGateLinks"] = intValue(summary["unresolvedGateLinks"]) + 1
 			continue
 		}
+		if status, note := reconciledHumanReviewCheckpointDecision(database.Tables.Attempts[attemptIndex], pipeline); status != "" {
+			nextCheckpoint := cloneMap(checkpoint)
+			nextCheckpoint["status"] = status
+			if text(nextCheckpoint, "decisionNote") == "" && note != "" {
+				nextCheckpoint["decisionNote"] = note
+			}
+			if nextAttemptID := text(database.Tables.Attempts[attemptIndex], "id"); nextAttemptID != "" {
+				nextCheckpoint["attemptId"] = nextAttemptID
+			}
+			nextCheckpoint["updatedAt"] = nowISO()
+			database.Tables.Checkpoints[index] = nextCheckpoint
+			summary["reconciledCheckpointDecisions"] = intValue(summary["reconciledCheckpointDecisions"]) + 1
+			summary["changed"] = intValue(summary["changed"]) + 1
+			continue
+		}
 		if server.recoverOrphanedHumanReviewAttempt(ctx, database, pipelineIndex, attemptIndex, checkpoint) {
 			summary["recoveredHumanGates"] = intValue(summary["recoveredHumanGates"]) + 1
 			summary["feishuReviewPipelines"] = append(arrayValues(summary["feishuReviewPipelines"]), pipelineID)
@@ -545,6 +569,34 @@ func (server *Server) reconcileAttemptIntegrityInDatabase(ctx context.Context, d
 		}
 	}
 	return summary
+}
+
+func reconciledHumanReviewCheckpointDecision(attempt map[string]any, pipeline map[string]any) (string, string) {
+	if text(attempt, "status") == "done" && text(pipeline, "status") == "done" && pipelineHasRunEvent(pipeline, "gate.approved") {
+		return "approved", latestPipelineEventMessage(pipeline, "gate.approved", "approved by human")
+	}
+	if pipelineHasRunEvent(pipeline, "gate.rejected") {
+		return "rejected", latestPipelineEventMessage(pipeline, "gate.rejected", "changes requested")
+	}
+	return "", ""
+}
+
+func pipelineHasRunEvent(pipeline map[string]any, eventType string) bool {
+	return latestPipelineEventMessage(pipeline, eventType, "") != ""
+}
+
+func latestPipelineEventMessage(pipeline map[string]any, eventType string, fallback string) string {
+	events := arrayMaps(mapValue(pipeline["run"])["events"])
+	for index := len(events) - 1; index >= 0; index-- {
+		if text(events[index], "type") != eventType {
+			continue
+		}
+		if message := text(events[index], "message"); message != "" {
+			return message
+		}
+		return fallback
+	}
+	return ""
 }
 
 func (server *Server) recoverOrphanedHumanReviewAttempt(ctx context.Context, database *WorkspaceDatabase, pipelineIndex int, attemptIndex int, checkpoint map[string]any) bool {

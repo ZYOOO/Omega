@@ -141,10 +141,147 @@ func normalizePipelineExecutionMetadata(database WorkspaceDatabase) WorkspaceDat
 			run["requirement"] = normalizedRun["requirement"]
 		}
 		next["run"] = run
+		next = normalizeDevFlowPipelineStageStatuses(database, next)
 		next["updatedAt"] = stringOr(text(next, "updatedAt"), timestamp)
 		database.Tables.Pipelines[index] = next
 	}
+	database = normalizeDevFlowAttemptStageStatuses(database)
 	return database
+}
+
+func normalizeDevFlowPipelineStageStatuses(database WorkspaceDatabase, pipeline map[string]any) map[string]any {
+	if !isDevFlowPRTemplate(text(pipeline, "templateId")) {
+		return pipeline
+	}
+	if status := text(pipeline, "status"); status == "done" || status == "completed" || status == "failed" || status == "blocked" || status == "stalled" || status == "canceled" || status == "cancelled" || status == "terminated" {
+		return pipeline
+	}
+	run := mapValue(pipeline["run"])
+	stages := arrayMaps(run["stages"])
+	if len(stages) == 0 {
+		return pipeline
+	}
+	currentStageID := canonicalDevFlowCurrentStageID(database, pipeline, stages)
+	if currentStageID == "" {
+		return pipeline
+	}
+	currentIndex := -1
+	for index, stage := range stages {
+		if text(stage, "id") == currentStageID {
+			currentIndex = index
+			break
+		}
+	}
+	if currentIndex < 0 {
+		return pipeline
+	}
+	for index, stage := range stages {
+		status := text(stage, "status")
+		if index == currentIndex {
+			if text(pipeline, "status") == "waiting-human" || status == "needs-human" || status == "waiting-human" {
+				stage["status"] = "needs-human"
+			} else if status == "ready" {
+				stage["status"] = "running"
+			}
+			continue
+		}
+		if index < currentIndex {
+			if text(stage, "id") == "rework" && status != "passed" && status != "failed" {
+				stage["status"] = "waiting"
+				continue
+			}
+			if devFlowStageStatusIsActive(status) || status == "waiting" {
+				stage["status"] = "passed"
+			}
+			continue
+		}
+		if devFlowStageStatusIsActive(status) {
+			stage["status"] = "waiting"
+		}
+	}
+	run["stages"] = stages
+	pipeline["run"] = run
+	pipeline["status"] = pipelineStatusFromRun(run)
+	return pipeline
+}
+
+func normalizeDevFlowAttemptStageStatuses(database WorkspaceDatabase) WorkspaceDatabase {
+	pipelinesByID := map[string]map[string]any{}
+	for _, pipeline := range database.Tables.Pipelines {
+		if isDevFlowPRTemplate(text(pipeline, "templateId")) {
+			pipelinesByID[text(pipeline, "id")] = pipeline
+		}
+	}
+	for index, attempt := range database.Tables.Attempts {
+		pipeline := pipelinesByID[text(attempt, "pipelineId")]
+		if pipeline == nil || len(arrayMaps(attempt["stages"])) == 0 {
+			continue
+		}
+		pipelineView := cloneMap(pipeline)
+		run := cloneMap(mapValue(pipelineView["run"]))
+		run["stages"] = attempt["stages"]
+		pipelineView["run"] = run
+		pipelineView["status"] = text(attempt, "status")
+		normalized := normalizeDevFlowPipelineStageStatuses(database, pipelineView)
+		normalizedRun := mapValue(normalized["run"])
+		next := cloneMap(attempt)
+		next["stages"] = normalizedRun["stages"]
+		database.Tables.Attempts[index] = next
+	}
+	return database
+}
+
+func canonicalDevFlowCurrentStageID(database WorkspaceDatabase, pipeline map[string]any, stages []map[string]any) string {
+	pipelineID := text(pipeline, "id")
+	for _, checkpoint := range database.Tables.Checkpoints {
+		if text(checkpoint, "pipelineId") == pipelineID && text(checkpoint, "status") == "pending" && text(checkpoint, "stageId") != "" {
+			return text(checkpoint, "stageId")
+		}
+	}
+	if attemptIndex := latestAttemptIndexForPipeline(database, pipelineID); attemptIndex >= 0 {
+		stageID := text(database.Tables.Attempts[attemptIndex], "currentStageId")
+		if stageID != "" && stageIDExists(stages, stageID) {
+			return stageID
+		}
+	}
+	for _, wanted := range []string{"failed", "stalled", "blocked", "needs-human", "waiting-human", "running", "ready"} {
+		for _, stage := range stages {
+			if text(stage, "status") == wanted {
+				return text(stage, "id")
+			}
+		}
+	}
+	return ""
+}
+
+func stageIDExists(stages []map[string]any, stageID string) bool {
+	for _, stage := range stages {
+		if text(stage, "id") == stageID {
+			return true
+		}
+	}
+	return false
+}
+
+func devFlowStageStatusIsActive(status string) bool {
+	if devFlowStageStatusCanBeCurrent(status) {
+		return true
+	}
+	switch status {
+	case "failed", "stalled", "blocked":
+		return true
+	default:
+		return false
+	}
+}
+
+func devFlowStageStatusCanBeCurrent(status string) bool {
+	switch status {
+	case "running", "ready", "needs-human", "waiting-human", "review":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyWorkflowTemplateToPipeline(pipeline map[string]any, template PipelineTemplate) map[string]any {

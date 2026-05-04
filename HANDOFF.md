@@ -1,59 +1,75 @@
 # Omega Handoff
 
-更新时间：2026-05-03（Asia/Shanghai）
+更新时间：2026-05-04（Asia/Shanghai）
 
-本文是 Omega 当前阶段的交接说明。接手同事应先读本文，再按文末的验证路径启动服务和做手动测试。
+本文是 Omega 当前阶段的交接说明。接手同事应先读本文，再读 README 和核心 docs，最后按文末验证路径启动服务、回归 DevFlow / Page Pilot / Feishu。
 
 ## 1. 当前一句话
 
-Omega 是一个 local-first 的 AI DevFlow 产品：用户在桌面 App / Web UI 中输入 Requirement，系统将其转成 Work Item，锁定明确 Repository Workspace，在隔离 workspace 中按可配置 workflow 编排 Agent，产出代码修改、branch、commit、PR、review、human gate、proof，并把过程沉淀为可审计的 Run Workpad。
+Omega 是一个 local-first 的 AI DevFlow 产品：用户在桌面 App / Web UI 中输入 Requirement，系统将其转成 Work Item，锁定明确 Repository Workspace，在隔离 workspace 中按 workflow contract 编排 Agent，产出代码修改、branch、commit、PR、review、human gate、proof，并把过程沉淀为可审计的 Run Workpad。
 
-当前重点已经从“能不能生成代码”进入到“能不能稳定、可恢复、可审计、可配置地交付”。
+当前重点已经从“能不能生成代码”进入到“能不能稳定、可恢复、可审计、可配置、可解释地交付”。最近一轮主要围绕 Page Pilot 可用性、Human Review/Feishu 审核、Work Item 状态一致性、UI 可读性和 runtime 性能治理。
 
-## 2. 两条主线状态
+## 2. 当前主线状态
 
-### 功能一：DevFlow / Workboard
+### DevFlow / Workboard
 
 已具备本地闭环：
 
-- React SPA / Electron 壳可打开 Workboard、Settings、Work Item 详情。
-- Requirement 创建后会绑定明确 Repository Workspace，不能误写其他仓库。
-- Go local runtime 负责 SQLite、workflow 编排、runner、workspace、GitHub 出站、Human Review gate、proof。
-- Workflow 已由 contract state runner 驱动，默认 DevFlow contract 可在 Workspace Agent Studio 中查看和编辑。
-- 通用 action executor 已接管默认链路的主要阶段，包括 review / rework / human review / merging / delivery。
-- Run Workpad 已是一等视图：Plan、Acceptance Criteria、Validation、Review Packet、Blockers、Retry Reason、Notes、PR 等字段会被持续更新。
-- JobSupervisor 已支持 heartbeat、stall detection、retry、cancel、timeout、workspace cleanup、worker host lease、checkpoint 恢复和 proof-backed Human Review recovery。
+- React SPA / Electron 壳可打开 Projects、Workboard、Page Pilot、Settings、Work Item 详情。
+- Requirement 创建后会绑定明确 Repository Workspace，Agent 执行不能误写其他仓库。
+- Go local runtime 负责 SQLite、workflow 编排、runner、workspace、GitHub 出站、Human Review gate、proof、Feishu 通知。
+- 默认 DevFlow 已由 workflow contract state runner 驱动，主要阶段通过 action executor 执行。
+- Run Workpad 是一等视图：Plan、Acceptance Criteria、Validation、Review Packet、Blockers、Retry Reason、Notes、PR 等字段会被持续更新。
+- JobSupervisor 支持 heartbeat、stall detection、retry、cancel、timeout、workspace cleanup、worker host lease、checkpoint 恢复和 proof-backed Human Review recovery。
 - Human Review 进入等待后会生成 checkpoint、review packet、PR 信息和 proof；Approve 后进入 Merging，Request changes 会归并 feedback 并进入 Rework。
-- Feishu 已支持通过 `lark-cli` 给当前登录用户发送 review / failure 通知；如果显式配置 chat/task 路由，也可走对应路由。
-- Work Item 详情页对 active attempt 的 action plan / timeline 做轮询刷新，避免必须手动刷新才能看到阶段推进。
-- GitHub 侧支持真实 branch / commit / PR / merge；CI/checks、PR comments、review feedback 已有基础采集和 rework checklist 聚合。
+- Feishu 支持 `lark-cli` 当前用户 fallback，也支持显式 chat/task/webhook 路由；review/failure 通知会走真实路由，不再只停留在 UI 绑定状态。
+- Work Item 详情页优先消费后端 canonical pipeline / action plan，减少前端自行推断状态。
 
-最近重点修复：
+最近修复重点：
 
-- Work Item 30 两次失败排查：
-  - 第一次失败来自目标 repo 的 `git diff --check`，目标文件存在 trailing whitespace。
-  - 第二次失败发生在 proof / review 已完成、PR 已创建后，worker orphan 标记早于 checkpoint 恢复，导致 UI 看到 stalled。
-  - 已新增 proof-backed Human Review recovery：JobSupervisor 可从 `.omega/proof/human-review-request.md`、`handoff-bundle.json`、`attempt-review-packet.json` 恢复 checkpoint、PR、workspace、review packet，并重新发送 Feishu review 通知。
-- Feishu 测试消息成功但 workflow 不发送的问题：已补 review/failure 自动发送路径和当前 `lark-cli` 用户 fallback。
-- Work Item 详情页进度不会自动刷新的问题：已补 active attempt 轮询。
+- 修复 Delivery flow 同时显示多个活动阶段的问题。后端把 `pipeline.run.stages` 作为当前运行态权威，读写链路都做 canonicalization，避免 Implementation / Human Review / Done 同时高亮。
+- 修复 Human Review approve 后仍显示 Approve、响应慢的问题。checkpoint 决策加入互斥、idempotency、duplicate checkpoint 去重和 stale supervisor snapshot 保存保护。
+- 修复 Feishu approve/task bridge、callback 与本地 checkpoint 决策路径不一致的问题。Feishu 审核统一走 shared checkpoint decision path。
+- 修复 Work Item 列表状态分组和展示噪音：Human Review 独立分组，Blocked 变为黄色且前置，Page Pilot item 使用 Page Pilot 编号，UI 不再显示 `item_manual_*` 这类内部 id。
+- Work Item 详情页的 proof artifacts 支持点击预览，Markdown/patch/text 走本地 runtime preview，不再把 HTML 404 当 JSON 解析。
 
-### 功能二：Page Pilot
+### Page Pilot
 
-已具备 Electron direct pilot MVP：
+已具备 Electron direct pilot + Web fallback 的真实链路：
 
-- 在 Electron 内打开目标项目页面。
-- 注入 Page Pilot 悬浮控件，支持隐藏、展开、圈选真实 DOM 元素。
+- Electron 内可打开目标项目页面，注入 Page Pilot 悬浮控件，圈选真实 DOM。
 - 圈选会采集 selector、DOM context、style snapshot、source context、用户批注。
-- 提交给 Go runtime 的 Page Pilot Agent 链路后，在目标 repo 或 isolated workspace 中修改代码。
-- 修改后刷新预览，用户可 Confirm / Discard。
-- Confirm 后会物化 `source=page_pilot` 的 Requirement / Work Item / Pipeline，并记录 proof / diff / linkage。
-- Preview Runtime Agent 已有基础：可按 repo 推断/启动 dev server profile，减少固定端口假设。
+- Page Pilot Agent 在目标 repo 或 isolated workspace 中修改代码，修改后刷新预览。
+- 用户可 Confirm / Discard；Confirm 后物化 `source=page_pilot` 的 Requirement / Work Item / Pipeline，并记录 proof / diff / linkage。
+- Preview Runtime Agent 可按 repo 推断/启动 dev server profile；`HTML file` 模式可从当前 Repository Workspace 自动寻找根目录 `index.html`。
 
-仍需重点手动测：
+最近修复重点：
 
-- Electron 内 Page Pilot 打开真实 repo preview 的稳定性。
-- isolated-devflow mode 下确认后回写目标仓库的边界。
-- 多批选区、多轮对话、source mapping 覆盖率。
+- `Repository source` 不再伪造默认 preview URL；package.json 项目会启动 Preview Runtime Agent，纯静态项目才打开 `index.html`。
+- `Dev server by Agent` 支持完整 URL path/query/hash；已有可访问 URL 会按 external-url 接入，不再强制 clone / prepare。
+- Electron `openPreview` 对主 frame HTTP 404 / load fail 做校验，失败时销毁 BrowserView，避免错误页盖住 Omega 主界面。
+- Web 模式恢复 iframe + overlay fallback，适合不用 Electron 时调试。
+- Page Pilot 页面移除无意义 AI 浮动按钮，连接/设置入口回到主侧边栏与 Settings。
+- Page Pilot recent runs、status、preview source、light/dark UI 已做基础收敛。
+
+### Runtime / 性能
+
+最近修复重点：
+
+- `runtime_logs` 去噪：成功 GET/HEAD/OPTIONS 不再默认落库；高频诊断写 `.omega/logs/omega-runtime-diagnostics.YYYY-MM-DD.jsonl`，保留约 1 天。
+- migration compact 旧的 `api.request` / supervisor tick / remote poll 噪音日志，避免几十万 rows 拖慢 UI。
+- UI 会话恢复改走 `GET /workspace?scope=session`。
+- 后端 session read model 现在从 SQLite 规范化表组装，不再反序列化完整 `workspace_snapshots.database_json` 后裁剪。
+- `work_items.record_json` 保存完整 Work Item 业务记录，session 视图可保留 `source`、`repositoryTargetId`、Page Pilot 元信息。
+- `/run-workpads`、`/pipelines`、`/attempts`、带 filter 的 `/operations` / `/proof-records` / `/checkpoints` 已有规范化表读取路径，减少 full snapshot fallback。
+
+本地实测当前库：
+
+```text
+/workspace?scope=session 约 464KB / 0.26s
+/workspace              约 14.7MB / 0.45s
+```
 
 ## 3. 主要目录
 
@@ -62,10 +78,11 @@ Omega 是一个 local-first 的 AI DevFlow 产品：用户在桌面 App / Web UI
 ```text
 apps/web/src/App.tsx
 apps/web/src/components/WorkItemDetailPage.tsx
-apps/web/src/components/WorkspaceAgentStudio.tsx
+apps/web/src/components/WorkItemDetailPanels.tsx
 apps/web/src/components/PagePilotPreview.tsx
+apps/web/src/components/WorkspaceChrome.tsx
 apps/web/src/omegaControlApiClient.ts
-apps/web/src/missionControlWrites.ts
+apps/web/src/workspaceApiClient.ts
 apps/web/src/styles.css
 ```
 
@@ -73,6 +90,7 @@ apps/web/src/styles.css
 
 ```text
 apps/desktop/src/main.cjs
+apps/desktop/src/process-supervisor.cjs
 apps/desktop/src/pilot-preload.cjs
 ```
 
@@ -83,14 +101,13 @@ services/local-runtime/cmd/omega-local-runtime/main.go
 services/local-runtime/internal/omegalocal/server.go
 services/local-runtime/internal/omegalocal/server_routes.go
 services/local-runtime/internal/omegalocal/devflow_cycle.go
-services/local-runtime/internal/omegalocal/devflow_delivery_actions.go
-services/local-runtime/internal/omegalocal/devflow_rework_actions.go
 services/local-runtime/internal/omegalocal/job_supervisor.go
-services/local-runtime/internal/omegalocal/feishu.go
 services/local-runtime/internal/omegalocal/feishu_review.go
-services/local-runtime/internal/omegalocal/feishu_config.go
-services/local-runtime/internal/omegalocal/runner_preflight.go
+services/local-runtime/internal/omegalocal/page_pilot_preview_runtime.go
+services/local-runtime/internal/omegalocal/pipeline_records.go
+services/local-runtime/internal/omegalocal/runtime_logs.go
 services/local-runtime/internal/omegalocal/sqlite.go
+services/local-runtime/internal/omegalocal/sqlite_table_reads.go
 services/local-runtime/internal/omegalocal/sqlite_migrations.go
 services/local-runtime/workflows/devflow-pr.md
 ```
@@ -109,12 +126,13 @@ docs/bug-log.md
 docs/feishu-review-chain.md
 docs/feishu-bot-permissions.md
 docs/manual-testing-needed.md
-docs/workflow-contract-executor-plan.md
+docs/page-pilot-architecture.md
+docs/new-colleague-handoff-prompt.md
 ```
 
 ## 4. 启动方式
 
-推荐在开发阶段使用三个进程：
+开发期推荐三个进程：
 
 ```bash
 npm install
@@ -131,7 +149,14 @@ Web UI:           http://127.0.0.1:5173
 Electron:         Omega AI Delivery Engine
 ```
 
-如果端口被占用，先用 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 查进程，不要直接删除 `.omega` 或 workspace 数据。
+如果端口被占用，先查进程：
+
+```bash
+lsof -nP -iTCP:3888 -sTCP:LISTEN
+lsof -nP -iTCP:5173 -sTCP:LISTEN
+```
+
+不要直接删除 `.omega` 或 workspace 数据。当前 `.omega/omega.db` 是真实本地状态，里面有 Work Item、Pipeline、Page Pilot run、proof record 和 Feishu config。
 
 ## 5. 常用验证
 
@@ -139,23 +164,25 @@ Electron:         Omega AI Delivery Engine
 
 ```bash
 npm run lint
-npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=30000
 npm run build
 ```
 
 Go：
 
 ```bash
-go test ./services/local-runtime/internal/omegalocal
+go test ./services/local-runtime/internal/omegalocal -count=1
 ```
 
-本轮新增/重点验证：
+本轮重点验证：
 
 ```bash
-go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorRecoversOrphanedHumanReviewAttempt|TestJobSupervisorRecoversProofBackedHumanReviewAttempt|TestFeishuAutoReviewFallsBackToCurrentLarkUser'
+go test ./services/local-runtime/internal/omegalocal -run 'TestWorkspaceSessionScopeOmitsExecutionHeavyTables|TestNormalizeDevFlowPipelineStageStatusesKeepsSingleActiveStage|TestCheckpointDecisionDeduplicatesDuplicateCheckpointIDs|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestFeishuReviewTaskBridgeApprovesCheckpoint' -count=1
+npm test -- --run apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/__tests__/omegaControlApiClient.test.ts
 ```
 
-说明：完整 Go 测试中仍可能出现长运行异步测试超时，需要继续拆分为更稳定的接口级测试；不要把单次 async timeout 直接等同于功能链路失败，要结合 runtime logs、attempt events 和 proof 判断。
+说明：完整 Go 测试里曾出现长运行 async settling 超时；最近复核更像高负载放大的观察窗口问题，不是稳定状态机错误。遇到失败时先看 runtime logs、attempt events、pipeline snapshot、proof 和 JobSupervisor tick，不要只看 UI。
 
 ## 6. Feishu 当前接入方式
 
@@ -164,7 +191,8 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorReco
 - App ID / App Secret 用于拿 tenant token。
 - `lark-cli` 登录用户可作为默认 review/failure 接收人。
 - 如果配置了 chat id / task assignee / webhook，则优先走显式路由。
-- 如果未配置显式路由，但 `lark-cli` 可以解析当前用户，review/failure 会 fallback 到当前用户私聊。
+- 如果未配置显式路由，但 `lark-cli` 可以解析当前用户，review/failure fallback 到当前用户私聊。
+- 侧边栏 Connections 的 Feishu `on` 表示至少有一条可用投递路由，不代表所有 chat/task/webhook 都已配置。
 
 常见排查：
 
@@ -181,44 +209,39 @@ docs/feishu-bot-permissions.md
 docs/feishu-review-chain.md
 ```
 
-## 7. Workspace / Repo 目录原则
+## 7. Workspace / Repo 原则
 
-面向用户的目录划分建议：
-
-- 应用安装目录：存放 Omega 自己的 app、runtime、全局 DB、日志。
-- Omega workspace root：默认 `~/Omega/workspaces`，存放每个 Work Item / Page Pilot 的隔离执行 workspace。
-- Repository target：用户真实项目仓库，必须明确绑定。
-- `.omega`：每个 workspace 和必要 repo target 内都可以有项目级配置、proof、runtime metadata。
-
-原则：
-
-- Work Item / Agent 执行必须锁定 Repository Workspace。
-- 默认可以提供 `.omega` 配置，不要求用户一开始手写配置。
-- 对真实 repo 的写入应通过隔离 workspace、branch、commit、PR 形成审计链路。
+- Work Item / Agent 执行必须锁定明确 Repository Workspace。
+- 对真实 repo 的写入应通过隔离 workspace、branch、commit、PR、review、proof 形成审计链路。
+- Page Pilot 不允许只做假 UI；圈选、源码定位、代码修改、热更新、diff、PR、review、proof 都要尽量落到真实数据。
+- `HTML file` 可以从当前 Repository Workspace 自动解析，但不能跨 repo 猜路径。
+- App UI 修改要同时看 light / dark。
+- 新功能更新 feature implementation log / development log / todo；修 bug 更新 bug log。
 
 ## 8. 当前已知风险
 
-- `App.tsx` 已拆出一批组件和写入 API，但仍偏大，Workboard list/detail、Inspector、Settings 还应继续拆。
-- `server.go` 已拆出 routes / action handler / migration 等文件，但仍有旧兼容逻辑，需要继续收敛。
-- Workflow contract 已可驱动默认链路，但复杂自定义 workflow 的 UI 校验、版本化和回滚还不够完整。
-- Feishu 当前可发送 review/failure，但双向审核同步仍以本地 sync / task bridge 为主，长连接事件桥还需要更多真实账号场景测试。
-- Page Pilot 已接回旧版可用体验，但 isolated-devflow 和 preview runtime 的自动识别还需要更多真实项目覆盖。
-- 完整 Go 测试存在少数长运行异步用例超时，需要继续拆成更确定的单元测试和接口测试。
+- `App.tsx` 和 `server.go` 已继续拆出模块，但仍偏大；新增能力优先落到组件/模块，不要继续把逻辑堆回去。
+- full snapshot 仍作为兼容层存在；热路径应继续迁到规范化 SQLite read model。
+- `.omega/omega.db` 已经过日志去噪，但 stdout/stderr/runner details 等长期 retention 还需继续治理。
+- Feishu 双向审批已可走当前用户 fallback / task bridge，但公网 callback、task、chat 多路由需要更多真实账号场景测试。
+- Page Pilot isolated-devflow mode 已能跑基础链路，但多项目、多框架、复杂 source mapping 仍需真实手测。
+- Work Item 详情页已减少前端推断，但后续还应继续让 UI 直接消费 action plan / canonical pipeline。
 
 ## 9. 下一步优先级
 
 P0：
 
-- 用 Work Item 30 验证 proof-backed Human Review recovery：运行 JobSupervisor tick 后应恢复 checkpoint，并发送 Feishu review 通知。
-- 完成 Work Item 详情页 action plan 消费收敛，减少 UI 自己推断状态。
-- 把 Feishu review/failure 真实链路加入手动测试文档。
-- 继续稳定 full Go test 中的长运行 async 用例。
+- 用 OMG-32 / 新 Work Item 复测 Human Review approve：Feishu 点 Approve 后 UI 应快速进入 Merging/Done，不再保留可点击 Approve。
+- 继续观察 `/workspace?scope=session`、`/run-workpads`、`/pipelines` 等热路径响应体积，避免 live polling 回退到 full snapshot。
+- Page Pilot isolated-devflow mode 完整手测：隔离修改、Confirm、PR、Discard、proof。
+- 把 Workboard list/detail、Inspector、Settings/Agent Studio 继续拆组件。
 
 P1：
 
-- Page Pilot isolated-devflow mode 完整回归：隔离修改、确认回写、discard 清理、PR 摘要。
+- Runtime 继续拆 `server.go` 残留 handler 和 DevFlow action handler。
+- 为 runtime stdout / stderr / runner details 增加按天或按数量 retention。
 - Workspace Agent Studio 的 workflow / prompt / agent / skills 配置继续产品化，补导入模板和校验。
-- Observability dashboard 继续做趋势、慢阶段、最近失败、runner 使用和 checkpoint 等待时长。
+- Observability dashboard 增强趋势、慢阶段、最近失败、runner 使用、checkpoint 等待时长。
 
 P2：
 
@@ -230,11 +253,12 @@ P2：
 
 接手后不要先大改 UI。建议顺序：
 
-1. 阅读本文和 `docs/latest-architecture.md`。
+1. 阅读本文、README、`docs/latest-architecture.md`、`docs/current-product-design.md`、`docs/development-plan.md`、`docs/todo.md`。
 2. 启动 runtime / web / desktop。
-3. 对 `ZYOOO/TestRepo` 跑一次 Requirement 到 Human Review。
-4. 对 Work Item 30 跑一次 `job-supervisor/tick`，确认 checkpoint recovery 和 Feishu 通知。
-5. 再决定是否继续拆前端或补 Go runtime 模块化。
+3. 在 `ZYOOO/TestRepo` 跑一个 Requirement 到 Human Review，确认 repo target、workspace、branch、PR、proof 都是真实的。
+4. 在 Feishu 私聊里 Approve 一个 Human Review，确认 Omega UI、checkpoint、pipeline、attempt 同步变化。
+5. 用 Page Pilot 打开同一 repo，分别测 Dev server by Agent 和 HTML file。
+6. 再决定继续拆前端、补 Go runtime 模块化，还是强化 Page Pilot source mapping。
 
 判断功能是否真的完成时，不要只看 UI 的 Done：
 

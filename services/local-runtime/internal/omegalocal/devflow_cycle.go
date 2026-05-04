@@ -373,10 +373,12 @@ func markDevFlowStageProgress(pipeline map[string]any, stageID string, status st
 	run := mapValue(next["run"])
 	stages := arrayMaps(run["stages"])
 	timestamp := nowISO()
-	for _, stage := range stages {
+	currentIndex := -1
+	for index, stage := range stages {
 		if text(stage, "id") != stageID {
 			continue
 		}
+		currentIndex = index
 		stage["status"] = status
 		stage["updatedAt"] = timestamp
 		if status == "running" && text(stage, "startedAt") == "" {
@@ -387,6 +389,33 @@ func markDevFlowStageProgress(pipeline map[string]any, stageID string, status st
 		}
 		if note != "" {
 			stage["notes"] = note
+		}
+	}
+	if currentIndex >= 0 && devFlowStageStatusCanBeCurrent(status) {
+		for index, stage := range stages {
+			if index == currentIndex {
+				continue
+			}
+			stageStatus := text(stage, "status")
+			stageID := text(stage, "id")
+			if index < currentIndex {
+				if stageID == "rework" && stageStatus != "passed" && stageStatus != "failed" {
+					stage["status"] = "waiting"
+					continue
+				}
+				if stageStatus != "failed" && stageStatus != "blocked" && stageStatus != "stalled" {
+					stage["status"] = "passed"
+					if text(stage, "completedAt") == "" {
+						stage["completedAt"] = timestamp
+					}
+				}
+				continue
+			}
+			if stageStatus != "failed" && stageStatus != "blocked" && stageStatus != "stalled" {
+				stage["status"] = "waiting"
+				delete(stage, "startedAt")
+				delete(stage, "completedAt")
+			}
 		}
 	}
 	run["stages"] = stages

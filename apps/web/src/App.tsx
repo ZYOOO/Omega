@@ -22,7 +22,7 @@ import { ObservabilityDashboard } from "./components/ObservabilityDashboard";
 import { PortalHome } from "./components/PortalHome";
 import { ProjectSurface } from "./components/ProjectSurface";
 import { RequirementComposer } from "./components/RequirementComposer";
-import { WorkspaceChrome, type PrimaryNav, type UiTheme } from "./components/WorkspaceChrome";
+import { WorkspaceChrome, type AgentAccessSidebarItem, type PrimaryNav, type UiTheme } from "./components/WorkspaceChrome";
 import { WorkspaceAgentStudio } from "./components/WorkspaceAgentStudio";
 import { WorkItemDetailPage } from "./components/WorkItemDetailPage";
 import { missionControlUnavailableMessage, requireMissionControlApi } from "./missionControlWrites";
@@ -54,6 +54,7 @@ import {
   fetchPipelines,
   fetchPipelineTemplates,
   fetchPagePilotRuns,
+  fetchProofPreview,
   fetchProofRecords,
   fetchProjectAgentProfile,
   fetchRequirements,
@@ -125,7 +126,7 @@ import {
   runOperationViaWorkspaceApi,
   saveWorkspaceSessionViaApi
 } from "./workspaceApiClient";
-import type { ConnectionProvider, ProjectRecord, ProviderId, WorkItem, WorkItemPriority, WorkItemStatus, WorkboardViewSort } from "./core";
+import type { ConnectionProvider, ConnectionState, ProjectRecord, ProviderId, WorkItem, WorkItemPriority, WorkItemStatus, WorkboardViewSort } from "./core";
 import "./styles.css";
 
 type InspectorPanel = "properties" | "provider";
@@ -188,19 +189,59 @@ function InfoIcon() {
   );
 }
 
+const RECENT_OPERATION_LIMIT = 40;
+const RECENT_PROOF_RECORD_LIMIT = 80;
+const DETAIL_OPERATION_LIMIT = 240;
+const DETAIL_PROOF_RECORD_LIMIT = 320;
+
+function mergeExecutionRecords<T extends { id: string; createdAt?: string; updatedAt?: string }>(
+  current: T[],
+  next: T[],
+  limit: number
+): T[] {
+  const byId = new Map<string, T>();
+  for (const record of current) byId.set(record.id, record);
+  for (const record of next) byId.set(record.id, record);
+  return [...byId.values()]
+    .sort((left, right) => (right.updatedAt ?? right.createdAt ?? "").localeCompare(left.updatedAt ?? left.createdAt ?? ""))
+    .slice(0, limit);
+}
+
 function initialAppSurface(): AppSurface {
   if (typeof window === "undefined") return "home";
   if (window.location.hash === "#home") return "home";
   if (window.location.hash === "#workboard") return "workboard";
+  if (window.location.hash === "#projects") return "workboard";
+  if (window.location.hash === "#views") return "workboard";
   if (window.location.hash === "#page-pilot") return "workboard";
+  if (window.location.hash === "#settings") return "workboard";
   if (isWorkItemDetailHash(window.location.hash)) return "workboard";
   return import.meta.env.MODE === "test" ? "workboard" : "home";
 }
 
+function activeNavFromHash(hash: string): PrimaryNav | undefined {
+  if (isWorkItemDetailHash(hash)) return "Issues";
+  if (hash === "#workboard") return "Issues";
+  if (hash === "#projects") return "Projects";
+  if (hash === "#views") return "Views";
+  if (hash === "#page-pilot") return "Page Pilot";
+  if (hash === "#settings") return "Settings";
+  return undefined;
+}
+
 function initialActiveNav(savedNav: PrimaryNav): PrimaryNav {
-  if (typeof window !== "undefined" && isWorkItemDetailHash(window.location.hash)) return "Issues";
-  if (typeof window !== "undefined" && window.location.hash === "#page-pilot") return "Page Pilot";
+  if (typeof window !== "undefined") {
+    return activeNavFromHash(window.location.hash) ?? savedNav;
+  }
   return savedNav;
+}
+
+function primaryNavHash(nav: PrimaryNav): string {
+  if (nav === "Projects") return "#projects";
+  if (nav === "Views") return "#views";
+  if (nav === "Page Pilot") return "#page-pilot";
+  if (nav === "Settings") return "#settings";
+  return "#workboard";
 }
 
 function initialWorkItemDetailId(): string {
@@ -383,7 +424,7 @@ const providerClientIds: Partial<Record<ProviderId, string>> = {
   google: import.meta.env.VITE_GOOGLE_CLIENT_ID
 };
 
-const missionControlApiUrl = import.meta.env.VITE_MISSION_CONTROL_API_URL || (import.meta.env.DEV ? "/api" : "");
+const missionControlApiUrl = import.meta.env.VITE_MISSION_CONTROL_API_URL || (import.meta.env.DEV ? "/api" : "http://127.0.0.1:3888");
 
 const defaultGitHubOAuthConfig: GitHubOAuthConfigInfo = {
   configured: false,
@@ -411,8 +452,39 @@ const defaultFeishuConfig: FeishuConfigInfo = {
   larkCliAvailable: false
 };
 
+function configText(value?: string): string {
+  return (value ?? "").trim();
+}
+
+function feishuReviewRouteReady(config: Partial<FeishuConfigInfo>): boolean {
+  return Boolean(
+    config.larkCliAvailable ||
+    configText(config.chatId) ||
+    configText(config.assigneeId) ||
+    configText(config.tasklistId) ||
+    configText(config.webhookUrl)
+  );
+}
+
+function feishuConnectionIdentity(config: Partial<FeishuConfigInfo>): string {
+  if (configText(config.assigneeLabel)) return configText(config.assigneeLabel);
+  if (configText(config.assigneeId)) return "task-reviewer";
+  if (configText(config.chatId)) return "chat-route";
+  if (configText(config.webhookUrl)) return "webhook";
+  if (config.larkCliAvailable) return "lark-cli current-user";
+  return config.mode || "configured";
+}
+
+function feishuConnectionDetail(config: Partial<FeishuConfigInfo>): string {
+  if (configText(config.assigneeLabel) || configText(config.assigneeId)) return "task reviewer route";
+  if (configText(config.chatId)) return "chat route";
+  if (configText(config.webhookUrl)) return "webhook route";
+  if (config.larkCliAvailable) return "current-user fallback via lark-cli";
+  return "binding required";
+}
+
 const visibleConnectionProviders = connectionProviders.filter((provider) =>
-  ["github", "feishu", "google", "ci"].includes(provider.id)
+  ["github", "feishu", "ci"].includes(provider.id)
 );
 
 function agentShortLabel(agentId: string): string {
@@ -422,8 +494,10 @@ function agentShortLabel(agentId: string): string {
     architect: "Arch",
     coding: "Code",
     testing: "Test",
-    review: "Rev",
-    delivery: "Ship"
+    human: "Human",
+    review: "Review",
+    delivery: "Delivery",
+    "page-pilot": "Page Pilot"
   };
   return labels[agentId] ?? agentId.slice(0, 4);
 }
@@ -444,6 +518,7 @@ function pipelineStageLabel(status: string): string {
     waiting: "Waiting",
     running: "Running",
     "needs-human": "Review",
+    "waiting-human": "Review",
     passed: "Done",
     "changes-requested": "Changes requested",
     failed: "Failed",
@@ -472,6 +547,7 @@ function attemptStatusLabel(status: string): string {
 function sourceLabel(item: WorkItem): string {
   if (item.source === "github_issue") return "GitHub";
   if (item.source === "feishu_message") return "Feishu";
+  if (item.source === "page_pilot" || isPagePilotWorkItem(item)) return "Page Pilot";
   if (item.source === "ai_generated") return "AI";
   return "Omega";
 }
@@ -479,15 +555,36 @@ function sourceLabel(item: WorkItem): string {
 function issueNumberFromReference(item: WorkItem): string {
   const sourceNumber = item.sourceExternalRef?.match(/#(\d+)$/)?.[1];
   if (sourceNumber) return sourceNumber;
-  return item.key.match(/(?:GH|OMG)-(\d+)$/)?.[1] ?? "";
+  const keyNumber = item.key.match(/(?:GH|OMG|PP)-(\d+)$/)?.[1];
+  if (keyNumber) return keyNumber;
+  return item.id.match(/(?:item_manual_|item_page_pilot_)(\d+)$/)?.[1] ?? "";
 }
 
 function workItemDisplayLabel(item: WorkItem): string {
   const number = issueNumberFromReference(item);
+  if (item.source === "page_pilot" || isPagePilotWorkItem(item)) return number ? `Page Pilot #${number}` : "Page Pilot";
   if (item.source === "github_issue") return number ? `GitHub #${number}` : "GitHub issue";
   if (item.source === "feishu_message") return number ? `Feishu item ${number}` : "Feishu item";
   if (item.source === "ai_generated") return number ? `AI item ${number}` : "AI item";
   return number ? `Work item ${number}` : "Work item";
+}
+
+function visibleExternalReference(value?: string): string {
+  const raw = value?.trim() ?? "";
+  if (!raw) return "";
+  if (/^(?:page-pilot:)?item_(?:manual|page_pilot)_/i.test(raw)) return "";
+  if (/^req_item_manual_/i.test(raw)) return "";
+  if (/^pipeline_item_(?:manual|page_pilot)_/i.test(raw)) return "";
+  return raw;
+}
+
+function workItemMetaParts(item: WorkItem, repositoryLabel: string): string[] {
+  const parts = [
+    visibleExternalReference(item.sourceExternalRef),
+    repositoryLabel,
+    isPagePilotWorkItem(item) ? "Page Pilot" : agentShortLabel(item.assignee)
+  ].filter(Boolean);
+  return Array.from(new Set(parts));
 }
 
 function displayText(value: string): string {
@@ -507,8 +604,8 @@ function isPagePilotWorkItem(item: WorkItem): boolean {
 }
 
 function runtimeStatusForWorkItem(item: WorkItem, pipeline?: PipelineRecordInfo): WorkItemStatus {
+  if (pipeline?.status === "waiting-human") return "Human Review";
   if (!isPagePilotWorkItem(item)) return item.status;
-  if (pipeline?.status === "waiting-human") return "In Review";
   if (pipeline?.status === "discarded" || pipeline?.status === "failed") return "Blocked";
   if (pipeline?.status === "delivered" || pipeline?.status === "done") return "Done";
   return item.status;
@@ -559,12 +656,18 @@ function summarizePipelineProgress(
       : Math.max(8, Math.round(((passedCount + (currentStage.status === "running" ? 0.55 : 0.25)) / stages.length) * 100));
   const agentIds = currentStage.agentIds ?? (currentStage.agentId ? [currentStage.agentId] : []);
 
+  const rawLabel = currentStage.title ?? currentStage.id;
+  const label =
+    isPagePilotWorkItem(item) && /delivery/i.test(rawLabel)
+      ? "Confirm / PR"
+      : rawLabel;
+
   return {
     label: currentStage.status === "passed" || currentStage.status === "done"
       ? agentIds.length
         ? agentIds.map(agentShortLabel).join(" + ")
         : "Complete"
-      : currentStage.title ?? currentStage.id,
+      : label,
     percent,
     status: currentStage.status
   };
@@ -870,6 +973,7 @@ function App() {
   const [workspaceFolderPickerMessage, setWorkspaceFolderPickerMessage] = useState("");
   const [workspaceSectionOpen, setWorkspaceSectionOpen] = useState(true);
   const [connectionsSectionOpen, setConnectionsSectionOpen] = useState(true);
+  const [agentAccessSectionOpen, setAgentAccessSectionOpen] = useState(true);
 
   useEffect(() => {
     function syncDetailRoute() {
@@ -888,7 +992,16 @@ function App() {
         setInspectorOpen(false);
         return;
       }
-      if (window.location.hash === "#workboard" || window.location.hash === "#home") {
+      const routedNav = activeNavFromHash(window.location.hash);
+      if (routedNav) {
+        setAppSurface("workboard");
+        setActiveNav(routedNav);
+        setActiveWorkItemDetailId("");
+        setInspectorOpen(false);
+        return;
+      }
+      if (window.location.hash === "#home") {
+        setAppSurface("home");
         setActiveWorkItemDetailId("");
       }
     }
@@ -976,6 +1089,7 @@ function App() {
   const activeWorkItemDetail = activeNav === "Issues"
     ? displayWorkItems.find((item) => item.id === activeWorkItemDetailId)
     : undefined;
+  const activeDetailRoutePending = activeNav === "Issues" && activeWorkItemDetailId !== "" && !activeWorkItemDetail;
   const selectedRequirement = selectedWorkItem?.requirementId
     ? requirements.find((requirement) => requirement.id === selectedWorkItem.requirementId)
     : undefined;
@@ -1046,6 +1160,29 @@ function App() {
   const activeDetailCompleted = activeWorkItemDetail
     ? isCompletedWork(activeWorkItemDetail, activeDetailPipeline)
     : false;
+  useEffect(() => {
+    if (!missionControlApiUrl || !activeWorkItemDetail || !activeDetailPipeline) return;
+    let cancelled = false;
+    const filters = {
+      pipelineId: activeDetailPipeline.id,
+      workItemId: activeWorkItemDetail.id
+    };
+    const loadScopedExecutionRecords = async () => {
+      const [scopedOperations, scopedProofRecords, scopedCheckpoints] = await Promise.all([
+        fetchOperations(missionControlApiUrl, { ...filters, limit: DETAIL_OPERATION_LIMIT }).catch(() => []),
+        fetchProofRecords(missionControlApiUrl, { ...filters, limit: DETAIL_PROOF_RECORD_LIMIT }).catch(() => []),
+        fetchCheckpoints(missionControlApiUrl, { pipelineId: activeDetailPipeline.id }).catch(() => [])
+      ]);
+      if (cancelled) return;
+      setOperations((current) => mergeExecutionRecords(current, scopedOperations, RECENT_OPERATION_LIMIT + DETAIL_OPERATION_LIMIT));
+      setProofRecords((current) => mergeExecutionRecords(current, scopedProofRecords, RECENT_PROOF_RECORD_LIMIT + DETAIL_PROOF_RECORD_LIMIT));
+      setCheckpoints((current) => mergeExecutionRecords(current, scopedCheckpoints, 300));
+    };
+    void loadScopedExecutionRecords();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeDetailPipeline?.id, activeWorkItemDetail?.id, missionControlApiUrl]);
   useEffect(() => {
     if (!missionControlApiUrl || !activeDetailAttempt?.id) {
       setActiveAttemptActionPlan(null);
@@ -1208,10 +1345,10 @@ function App() {
       fetchRequirements(missionControlApiUrl).catch(() => []),
       fetchPipelines(missionControlApiUrl),
       fetchAttempts(missionControlApiUrl).catch(() => []),
-      fetchProofRecords(missionControlApiUrl).catch(() => []),
+      fetchProofRecords(missionControlApiUrl, { limit: RECENT_PROOF_RECORD_LIMIT }).catch(() => []),
       fetchRunWorkpads(missionControlApiUrl).catch(() => []),
-      fetchCheckpoints(missionControlApiUrl),
-      fetchOperations(missionControlApiUrl).catch(() => []),
+      fetchCheckpoints(missionControlApiUrl, { status: "pending", limit: 100 }),
+      fetchOperations(missionControlApiUrl, { limit: RECENT_OPERATION_LIMIT }).catch(() => []),
       fetchRuntimeLogs(missionControlApiUrl, { limit: 80 }).catch(() => []),
       fetchRunnerCredentials(missionControlApiUrl).catch(() => []),
       fetchExecutionLocks(missionControlApiUrl).catch(() => []),
@@ -1230,10 +1367,10 @@ function App() {
     setRequirements(nextRequirements);
     setPipelines(nextPipelines);
     setAttempts(nextAttempts);
-    setProofRecords(nextProofRecords);
+    setProofRecords((current) => mergeExecutionRecords(current, nextProofRecords, RECENT_PROOF_RECORD_LIMIT + DETAIL_PROOF_RECORD_LIMIT));
     setRunWorkpads(nextRunWorkpads);
-    setCheckpoints(nextCheckpoints);
-    setOperations(nextOperations);
+    setCheckpoints((current) => mergeExecutionRecords(current, nextCheckpoints, 300));
+    setOperations((current) => mergeExecutionRecords(current, nextOperations, RECENT_OPERATION_LIMIT + DETAIL_OPERATION_LIMIT));
     setRuntimeLogs(nextRuntimeLogs);
     setRunnerCredentials(nextRunnerCredentials);
     setExecutionLocks(nextExecutionLocks);
@@ -1262,15 +1399,9 @@ function App() {
     if (nextGitHubStatus?.authenticated) {
       setConnections((current) => grantProviderConnection(current, "github", nextGitHubStatus.account ?? "gh-cli"));
     }
-    if (
-      nextFeishuConfig.larkCliAvailable ||
-      nextFeishuConfig.chatId ||
-      nextFeishuConfig.assigneeId ||
-      nextFeishuConfig.tasklistId ||
-      nextFeishuConfig.webhookUrl
-    ) {
+    if (feishuReviewRouteReady(nextFeishuConfig)) {
       setConnections((current) =>
-        grantProviderConnection(current, "feishu", nextFeishuConfig.larkCliAvailable ? "lark-cli" : nextFeishuConfig.mode || "configured")
+        grantProviderConnection(current, "feishu", feishuConnectionIdentity(nextFeishuConfig))
       );
     }
     setGitHubOAuthDraft((currentDraft) => ({
@@ -1348,7 +1479,7 @@ function App() {
       fetchPipelines(missionControlApiUrl),
       fetchAttempts(missionControlApiUrl).catch(() => []),
       fetchRunWorkpads(missionControlApiUrl).catch(() => []),
-      fetchCheckpoints(missionControlApiUrl)
+      fetchCheckpoints(missionControlApiUrl, { status: "pending", limit: 100 })
     ]);
     if (session) {
       setProjects(session.projects);
@@ -1360,14 +1491,17 @@ function App() {
     setPipelines(nextPipelines);
     setAttempts(nextAttempts);
     setRunWorkpads(nextRunWorkpads);
-    setCheckpoints(nextCheckpoints);
+    setCheckpoints((current) => mergeExecutionRecords(current, nextCheckpoints, 300));
     if (options.includeArtifacts) {
+      const artifactFilters = activeWorkItemDetail && activeDetailPipeline
+        ? { pipelineId: activeDetailPipeline.id, workItemId: activeWorkItemDetail.id }
+        : {};
       const [nextOperations, nextProofRecords] = await Promise.all([
-        fetchOperations(missionControlApiUrl).catch(() => []),
-        fetchProofRecords(missionControlApiUrl).catch(() => [])
+        fetchOperations(missionControlApiUrl, { ...artifactFilters, limit: activeDetailPipeline ? DETAIL_OPERATION_LIMIT : RECENT_OPERATION_LIMIT }).catch(() => []),
+        fetchProofRecords(missionControlApiUrl, { ...artifactFilters, limit: activeDetailPipeline ? DETAIL_PROOF_RECORD_LIMIT : RECENT_PROOF_RECORD_LIMIT }).catch(() => [])
       ]);
-      setOperations(nextOperations);
-      setProofRecords(nextProofRecords);
+      setOperations((current) => mergeExecutionRecords(current, nextOperations, RECENT_OPERATION_LIMIT + DETAIL_OPERATION_LIMIT));
+      setProofRecords((current) => mergeExecutionRecords(current, nextProofRecords, RECENT_PROOF_RECORD_LIMIT + DETAIL_PROOF_RECORD_LIMIT));
     }
   }
 
@@ -1420,7 +1554,7 @@ function App() {
           setWorkItems(session.workItems);
           setMissionState(session.missionState);
           setConnections(session.connections);
-          setActiveNav(session.activeNav);
+          setActiveNav(initialActiveNav(session.activeNav));
           setSelectedProviderId(session.selectedProviderId);
           setSelectedWorkItemId(session.selectedWorkItemId);
           setInspectorOpen(false);
@@ -1536,9 +1670,6 @@ function App() {
       setRequirements(session.requirements);
       setWorkItems(session.workItems);
       setMissionState(session.missionState);
-      await refreshControlPlane().catch((error) => {
-        console.warn("Control plane refresh after work item create failed", error);
-      });
 
       setSelectedWorkItemId(item.id);
       setShowInlineCreate(false);
@@ -1549,6 +1680,10 @@ function App() {
       setCreateDescriptionMode("write");
       setRunnerMessage(`Created requirement ${title}.`);
       setActiveNav("Issues");
+      window.history.replaceState(null, "", "#workboard");
+      void refreshControlPlane().catch((error) => {
+        console.warn("Control plane refresh after work item create failed", error);
+      });
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "Create work item failed.");
     } finally {
@@ -1845,6 +1980,9 @@ function App() {
   }
 
   function handleProviderRowClick(provider: ConnectionProvider) {
+    setActiveNav("Settings");
+    setActiveWorkItemDetailId("");
+    window.history.replaceState(null, "", "#settings");
     openProviderAccess(provider.id);
   }
 
@@ -2001,6 +2139,7 @@ function App() {
     if (selectedRepositoryBound) {
       setActiveRepositoryWorkspaceTargetId(selectedRepositoryTargetId);
       setActiveNav("Issues");
+      window.history.replaceState(null, "", "#workboard");
       setRunnerMessage(`${selectedRepositoryNameWithOwner} workspace is open.`);
       return;
     }
@@ -2020,6 +2159,7 @@ function App() {
       setConnections(session.connections);
       setActiveRepositoryWorkspaceTargetId(selectedRepositoryTargetId);
       setActiveNav("Issues");
+      window.history.replaceState(null, "", "#workboard");
       setRunnerMessage(`${selectedRepositoryNameWithOwner} workspace was created under ${session.projects[0]?.name ?? "the current project"}.`);
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "GitHub repository workspace creation failed.");
@@ -2046,9 +2186,9 @@ function App() {
       if (activeRepositoryWorkspaceTargetId === targetId) {
         setActiveRepositoryWorkspaceTargetId("");
         setActiveWorkItemDetailId("");
-        window.history.replaceState(null, "", "#workboard");
         setSelectedWorkItemId(session.workItems[0]?.id ?? "");
         setActiveNav("Projects");
+        window.history.replaceState(null, "", "#projects");
         setRunnerMessage(`${label} was removed from Omega.`);
       } else {
         setRunnerMessage("");
@@ -2082,7 +2222,9 @@ function App() {
       setConnections(session.connections);
       setSelectedWorkItemId(syncedItems[0]?.id ?? session.workItems[0]?.id ?? "");
       setActiveRepositoryWorkspaceTargetId(repositoryTargetId);
+      setActiveWorkItemDetailId("");
       setActiveNav("Issues");
+      window.history.replaceState(null, "", "#workboard");
       const importedCount = Math.max(syncedItems.length - beforeCount, 0);
       const message =
         importedCount > 0
@@ -2182,7 +2324,7 @@ function App() {
       setFeishuReviewTokenDraft("");
       setFeishuWebhookSecretVisible(false);
       setFeishuReviewTokenVisible(false);
-      setConnections((current) => grantProviderConnection(current, "feishu", saved.mode || "configured"));
+      setConnections((current) => grantProviderConnection(current, "feishu", feishuConnectionIdentity(saved)));
       setProviderFeedback("Feishu review channel saved. Human Review can now use this binding.");
     } catch (error) {
       setProviderFeedback(error instanceof Error ? error.message : "Feishu config save failed.");
@@ -2199,6 +2341,9 @@ function App() {
           ? result.message ?? "Feishu binding is ready."
           : result.message ?? "Feishu binding needs attention."
       );
+      if (result.status === "ready") {
+        setConnections((current) => grantProviderConnection(current, "feishu", feishuConnectionIdentity(feishuConfig)));
+      }
     } catch (error) {
       setProviderFeedback(error instanceof Error ? error.message : "Feishu preflight failed.");
     } finally {
@@ -2331,8 +2476,69 @@ function App() {
     .join(" ");
   const selectedProvider =
     visibleConnectionProviders.find((provider) => provider.id === selectedProviderId) ?? visibleConnectionProviders[0];
+  const effectiveConnections = useMemo<ConnectionState>(() => {
+    if (!feishuReviewRouteReady(feishuConfig)) return connections;
+    return grantProviderConnection(connections, "feishu", feishuConnectionIdentity(feishuConfig));
+  }, [connections, feishuConfig]);
+  const agentAccessItems = useMemo<AgentAccessSidebarItem[]>(() => {
+    const selectedRunner = runnerOptionFor(agentConfigDraft.runner);
+    const selectedRunnerReady = capabilityAvailable(localCapabilities, selectedRunner?.capabilityId);
+    const readyProfiles = agentConfigDraft.agentProfiles.filter((profile) => {
+      const option = runnerOptionFor(profile.runner);
+      return option ? capabilityAvailable(localCapabilities, option.capabilityId) : false;
+    }).length;
+    const totalProfiles = agentConfigDraft.agentProfiles.length;
+    const savedAccounts = runnerCredentials.filter((credential) => credential.secretConfigured).length;
+    const selectedRunnerUsesLocalCliAuth = agentConfigDraft.runner === "codex" || agentConfigDraft.runner === "claude-code";
+    const accountsReady = savedAccounts > 0 || (selectedRunnerUsesLocalCliAuth && selectedRunnerReady);
+    const selectedModel = agentConfigDraft.agentProfiles.find((profile) => profile.id === selectedAgentProfileId)?.model || llmSelection.model;
+    return [
+      {
+        id: "runner",
+        label: "Runner",
+        value: selectedRunner?.label ?? agentConfigDraft.runner,
+        status: selectedRunnerReady ? "ready" : "setup",
+        targetTab: "agents"
+      },
+      {
+        id: "model",
+        label: "Model",
+        value: selectedModel || "not set",
+        status: selectedModel ? "ready" : "setup",
+        targetTab: "agents"
+      },
+      {
+        id: "profiles",
+        label: "Profiles",
+        value: `${readyProfiles}/${totalProfiles || 0}`,
+        status: totalProfiles > 0 && readyProfiles === totalProfiles ? "ready" : readyProfiles > 0 ? "partial" : "setup",
+        targetTab: "agents"
+      },
+      {
+        id: "accounts",
+        label: "Accounts",
+        value: savedAccounts > 0 ? `${savedAccounts} saved` : accountsReady ? "local auth" : "setup",
+        status: accountsReady ? "ready" : "setup",
+        targetTab: "runtime"
+      }
+    ];
+  }, [agentConfigDraft, llmSelection.model, localCapabilities, runnerCredentials, selectedAgentProfileId]);
+
+  function openAgentAccess(targetTab: AgentConfigTab = "agents") {
+    setAppSurface("workboard");
+    setActiveNav("Settings");
+    setActiveWorkItemDetailId("");
+    setAgentConfigOpen(true);
+    setAgentConfigTab(targetTab);
+    if (targetTab === "runtime") setRuntimeConfigTab("omega");
+    window.history.replaceState(null, "", "#settings");
+    clearWorkspaceMessages();
+  }
+
   function openWorkboard() {
     setAppSurface("workboard");
+    setActiveNav("Issues");
+    setActiveWorkItemDetailId("");
     window.history.replaceState(null, "", "#workboard");
   }
 
@@ -2375,6 +2581,7 @@ function App() {
 
   function openHome() {
     setAppSurface("home");
+    setActiveWorkItemDetailId("");
     window.history.replaceState(null, "", "#home");
   }
 
@@ -2580,9 +2787,11 @@ function App() {
         activeRepositoryWorkspaceTargetId={activeRepositoryWorkspaceTargetId}
         workspaceSectionOpen={workspaceSectionOpen}
         connectionsSectionOpen={connectionsSectionOpen}
+        agentAccessSectionOpen={agentAccessSectionOpen}
+        agentAccessItems={agentAccessItems}
         visibleConnectionProviders={visibleConnectionProviders}
         selectedProviderId={selectedProviderId}
-        connections={connections}
+        connections={effectiveConnections}
         onBackToWorkItems={() => {
           setActiveWorkItemDetailId("");
           setInspectorOpen(false);
@@ -2591,20 +2800,16 @@ function App() {
         onHome={openHome}
         onNavigate={(item) => {
           setActiveNav(item);
+          setActiveWorkItemDetailId("");
           clearWorkspaceMessages();
           if (item === "Projects") {
             setActiveRepositoryWorkspaceTargetId("");
-            setActiveWorkItemDetailId("");
-            window.history.replaceState(null, "", "#workboard");
           }
-          if (item === "Views" || item === "Page Pilot") {
-            if (item === "Page Pilot" && !activeRepositoryWorkspaceTargetId) {
-              const fallbackTargetId = primaryProject?.defaultRepositoryTargetId ?? (repositoryTargets.length === 1 ? repositoryTargets[0].id : "");
-              if (fallbackTargetId) setActiveRepositoryWorkspaceTargetId(fallbackTargetId);
-            }
-            setActiveWorkItemDetailId("");
-            window.history.replaceState(null, "", item === "Page Pilot" ? "#page-pilot" : "#workboard");
+          if (item === "Page Pilot" && !activeRepositoryWorkspaceTargetId) {
+            const fallbackTargetId = primaryProject?.defaultRepositoryTargetId ?? (repositoryTargets.length === 1 ? repositoryTargets[0].id : "");
+            if (fallbackTargetId) setActiveRepositoryWorkspaceTargetId(fallbackTargetId);
           }
+          window.history.replaceState(null, "", primaryNavHash(item));
         }}
         onRunDetail={() => {
           if (activeWorkItemDetail) {
@@ -2615,6 +2820,7 @@ function App() {
         onToggleTheme={toggleUiTheme}
         onToggleWorkspaceSection={setWorkspaceSectionOpen}
         onToggleConnectionsSection={setConnectionsSectionOpen}
+        onToggleAgentAccessSection={setAgentAccessSectionOpen}
         onSelectWorkspace={(target, targetItems) => {
           setActiveRepositoryWorkspaceTargetId(target.id);
           setSelectedWorkItemId(targetItems[0]?.id ?? "");
@@ -2628,10 +2834,11 @@ function App() {
           setActiveWorkItemDetailId("");
           setActiveNav("Settings");
           setAgentConfigOpen(true);
-          window.history.replaceState(null, "", "#workboard");
+          window.history.replaceState(null, "", "#settings");
           clearWorkspaceMessages();
         }}
         onProviderClick={handleProviderRowClick}
+        onAgentAccessClick={(item) => openAgentAccess(item.targetTab)}
         onNewRequirement={() => {
           setShowInlineCreate((current) => !current);
           setCreateComposerExpanded(true);
@@ -2663,15 +2870,21 @@ function App() {
             filteredGitHubRepositories={filteredGitHubRepositories}
             githubRepoInfo={githubRepoInfo}
             onOpenProjectConfig={() => {
+              setActiveWorkItemDetailId("");
               setActiveNav("Settings");
               setAgentConfigOpen(true);
+              window.history.replaceState(null, "", "#settings");
             }}
             onSyncActiveRepository={() => {
               if (activeRepositoryWorkspace?.kind === "github") {
                 void importGitHubIssues(activeRepositoryWorkspace.owner, activeRepositoryWorkspace.repo);
               }
             }}
-            onOpenWorkItems={() => setActiveNav("Issues")}
+            onOpenWorkItems={() => {
+              setActiveWorkItemDetailId("");
+              setActiveNav("Issues");
+              window.history.replaceState(null, "", "#workboard");
+            }}
             onNewProjectNameChange={setNewProjectName}
             onNewProjectDescriptionChange={setNewProjectDescription}
             onCreateProject={() => void createProject()}
@@ -3092,7 +3305,14 @@ function App() {
                   <h2>{activeRepositoryWorkspaceLabel || primaryProject?.name || "Omega Project"}</h2>
                 </div>
                 {activeRepositoryWorkspace ? (
-                  <button type="button" onClick={() => setActiveNav("Issues")}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveWorkItemDetailId("");
+                      setActiveNav("Issues");
+                      window.history.replaceState(null, "", "#workboard");
+                    }}
+                  >
                     Open work items
                   </button>
                 ) : null}
@@ -3292,6 +3512,7 @@ function App() {
             repositoryTargetId={pagePilotRepositoryTarget?.id}
             repositoryLabel={pagePilotRepositoryLabel}
             apiAvailable={Boolean(missionControlApiUrl)}
+            apiUrl={missionControlApiUrl}
             onReloadApp={() => void reloadDesktopApp()}
             onSelectRepositoryTarget={(targetId) => {
               setActiveRepositoryWorkspaceTargetId(targetId);
@@ -3301,7 +3522,11 @@ function App() {
             onDeliver={deliverPagePilotConfirmedChange}
             onDiscard={discardPagePilotPendingChange}
             onFetchRuns={loadPagePilotRuns}
-            onExit={() => setActiveNav("Issues")}
+            onExit={() => {
+              setActiveWorkItemDetailId("");
+              setActiveNav("Issues");
+              window.history.replaceState(null, "", "#workboard");
+            }}
           />
         ) : null}
 
@@ -3333,10 +3558,23 @@ function App() {
                 workItemStatusLabel={workItemStatusLabel}
                 onOpenPagePilot={() => openPagePilotForRepository(activeWorkItemDetail.repositoryTargetId)}
                 onApproveCheckpoint={(checkpointId) => void approvePendingCheckpoint(checkpointId)}
+                onFetchProofPreview={(proofId) => fetchProofPreview(missionControlApiUrl, proofId)}
                 onPatchRunWorkpad={updateRunWorkpadPatch}
                 onRequestCheckpointChanges={(checkpointId, note) => void rejectPendingCheckpoint(checkpointId, note)}
                 onRetryAttempt={(attemptId) => void retryWorkItemAttempt(attemptId)}
               />
+            ) : activeDetailRoutePending ? (
+              <section className="issue-detail-view work-item-detail-page" aria-label="Work item detail loading">
+                <article className="issue-detail-document detail-loading-card">
+                  <span className="section-label">Work item</span>
+                  <h2>{workspaceLoaded ? "Work item not found" : "Loading work item..."}</h2>
+                  <p className="muted-copy">
+                    {workspaceLoaded
+                      ? "This detail route does not match a loaded work item."
+                      : "Omega is loading the workspace before opening the detail view."}
+                  </p>
+                </article>
+              </section>
             ) : (
             <>
             {showInlineCreate ? (
@@ -3391,7 +3629,7 @@ function App() {
               <label>
                 <span>Status</span>
                 <select value={statusFilter} onChange={(event) => setStatusFilter(event.currentTarget.value as "All" | WorkItemStatus)}>
-                  {["All", "Planning", "Ready", "In Review", "Backlog", "Done", "Blocked"].map((status) => (
+                  {["All", "Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Done"].map((status) => (
                     <option key={status} value={status}>
                       {status === "All" ? "All" : workItemStatusLabel(status as WorkItemStatus)}
                     </option>
@@ -3460,7 +3698,7 @@ function App() {
                             </span>
                             <strong>{item.title}</strong>
                           </div>
-                          <small>{item.sourceExternalRef ?? item.target}</small>
+                          <small>{visibleExternalReference(item.sourceExternalRef) || item.target}</small>
                           <span className={`status-pill ${statusClassName(item.status)}`}>
                             {workItemStatusLabel(item.status)}
                           </span>
@@ -3527,6 +3765,7 @@ function App() {
                             : repositoryTarget?.path ?? activeRepositoryWorkspaceLabel;
                         const itemPipeline = pipelinesByWorkItemId.get(item.id);
                         const pipelineStages = itemPipeline?.run?.stages ?? [];
+                        const metaParts = workItemMetaParts(item, repositoryLabel);
                         const itemPendingCheckpoint = itemPipeline
                           ? checkpoints.find((checkpoint) =>
                               checkpoint.pipelineId === itemPipeline.id && checkpoint.status === "pending"
@@ -3534,7 +3773,8 @@ function App() {
                           : undefined;
                         const completed = isCompletedWork(item, itemPipeline);
                         const failed = isFailedWork(item, itemPipeline);
-                        const runDisabled = completed || runningWorkItemId === item.id || item.status === "Planning" || item.status === "In Review";
+                        const runDisabled =
+                          completed || runningWorkItemId === item.id || item.status === "Planning" || item.status === "In Review" || item.status === "Human Review";
                         const progress = summarizePipelineProgress(item, pipelineStages, runningWorkItemId === item.id);
                         const hasProgress = pipelineStages.length > 0 || item.status === "Planning" || runningWorkItemId === item.id;
                         const deleteAllowed = canDeleteWorkItem(item);
@@ -3574,10 +3814,9 @@ function App() {
                                 <strong>{item.title}</strong>
                               </div>
                               <div className="issue-meta-line">
-                                {item.sourceExternalRef ? <span>{item.sourceExternalRef}</span> : null}
-                                {item.requirementId ? <span>Req {item.requirementId.replace(/^req_/, "")}</span> : null}
-                                {repositoryLabel ? <span>{repositoryLabel}</span> : null}
-                                <span>{agentShortLabel(item.assignee)}</span>
+                                {metaParts.map((part) => (
+                                  <span key={part}>{part}</span>
+                                ))}
                               </div>
                             </div>
                             <div className="issue-progress-slot">
@@ -3619,7 +3858,7 @@ function App() {
                                 >
                                   Retry
                                 </button>
-                              ) : !completed && !hasProgress && item.status !== "Planning" && item.status !== "In Review" ? (
+                              ) : !completed && !hasProgress && item.status !== "Planning" && item.status !== "In Review" && item.status !== "Human Review" ? (
                                 <button
                                   className="run-inline"
                                   disabled={runDisabled}
@@ -3687,7 +3926,7 @@ function App() {
                     }
                   }}
                 >
-                  {["Planning", "Ready", "In Review", "Backlog", "Done", "Blocked"].map((status) => (
+                  {["Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Done"].map((status) => (
                     <option key={status} value={status}>
                       {workItemStatusLabel(status as WorkItemStatus)}
                     </option>
@@ -3732,7 +3971,9 @@ function App() {
             <div className="property-copy">
               <span>Requirement</span>
               <p>{selectedRequirement?.title ?? selectedWorkItem.title}</p>
-              {selectedRequirement?.sourceExternalRef ? <small>{selectedRequirement.sourceExternalRef}</small> : null}
+              {visibleExternalReference(selectedRequirement?.sourceExternalRef) ? (
+                <small>{visibleExternalReference(selectedRequirement?.sourceExternalRef)}</small>
+              ) : null}
             </div>
             <div className="property-copy">
               <span>Item description</span>
@@ -3764,10 +4005,12 @@ function App() {
                   <h2>{provider.name}</h2>
                   <p>{provider.description}</p>
                   <div className="provider-status">
-                    <span className={connections[provider.id].status === "connected" ? "dot online" : "dot"} />
-                    <span>{connections[provider.id].status}</span>
+                    <span className={effectiveConnections[provider.id].status === "connected" ? "dot online" : "dot"} />
+                    <span>{effectiveConnections[provider.id].status}</span>
                     <small>
-                      {canUseLocalGitHubOAuth(provider)
+                      {provider.id === "feishu"
+                        ? feishuConnectionDetail(feishuConfig)
+                        : canUseLocalGitHubOAuth(provider)
                         ? githubOAuthConfig.configured
                           ? `oauth ready (${githubOAuthConfig.source})`
                           : "oauth setup"
@@ -4062,7 +4305,7 @@ function App() {
                           : "Connect"}
                       </button>
                       <button
-                        disabled={connections[provider.id].status !== "connected"}
+                        disabled={effectiveConnections[provider.id].status !== "connected"}
                         onClick={() => disconnectProvider(provider.id)}
                       >
                         Disconnect

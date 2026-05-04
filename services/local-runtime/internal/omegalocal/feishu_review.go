@@ -51,19 +51,35 @@ func (server *Server) feishuReviewCallback(response http.ResponseWriter, request
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
+	if challenge := strings.TrimSpace(text(payload, "challenge")); challenge != "" {
+		writeJSON(response, http.StatusOK, map[string]any{"challenge": challenge})
+		return
+	}
 	if !feishuReviewTokenAllowed(request, payload) {
 		writeJSON(response, http.StatusUnauthorized, map[string]any{"error": "invalid Feishu review token"})
 		return
 	}
-	checkpointID := strings.TrimSpace(stringOr(payload["checkpointId"], text(mapValue(payload["value"]), "checkpointId")))
-	action := strings.ToLower(strings.TrimSpace(stringOr(payload["action"], text(mapValue(payload["value"]), "action"))))
-	reviewer := stringOr(payload["reviewer"], stringOr(payload["operator"], "feishu-reviewer"))
+	value := feishuReviewCallbackValue(payload)
+	event := mapValue(payload["event"])
+	operator := firstNonEmpty(
+		text(mapValue(event["operator"]), "open_id"),
+		text(mapValue(event["operator"]), "user_id"),
+		text(mapValue(payload["operator"]), "open_id"),
+		stringOr(payload["operator"], ""),
+	)
+	checkpointID := strings.TrimSpace(stringOr(payload["checkpointId"], text(value, "checkpointId")))
+	action := strings.ToLower(strings.TrimSpace(stringOr(payload["action"], text(value, "action"))))
+	reviewer := stringOr(payload["reviewer"], stringOr(operator, "feishu-reviewer"))
 	reason := stringOr(payload["reason"], stringOr(payload["comment"], "changes requested from Feishu"))
 	if checkpointID == "" {
 		writeJSON(response, http.StatusBadRequest, map[string]any{"error": "checkpointId is required"})
 		return
 	}
-	decisionPayload := map[string]any{"reviewer": reviewer, "reason": reason, "asyncDelivery": boolValueDefault(payload["asyncDelivery"], true)}
+	asyncDeliveryValue := payload["asyncDelivery"]
+	if asyncDeliveryValue == nil {
+		asyncDeliveryValue = value["asyncDelivery"]
+	}
+	decisionPayload := map[string]any{"reviewer": reviewer, "reason": reason, "asyncDelivery": boolValueDefault(asyncDeliveryValue, true)}
 	switch action {
 	case "approve", "approved":
 		checkpoint, status, err := server.applyCheckpointDecision(request.Context(), checkpointID, "approved", decisionPayload)
@@ -84,6 +100,24 @@ func (server *Server) feishuReviewCallback(response http.ResponseWriter, request
 	}
 }
 
+func feishuReviewCallbackValue(payload map[string]any) map[string]any {
+	if value := mapValue(payload["value"]); len(value) > 0 {
+		return value
+	}
+	event := mapValue(payload["event"])
+	action := mapValue(event["action"])
+	if value := mapValue(action["value"]); len(value) > 0 {
+		return value
+	}
+	if value := mapValue(payload["action"]); len(value) > 0 {
+		if nested := mapValue(value["value"]); len(nested) > 0 {
+			return nested
+		}
+		return value
+	}
+	return map[string]any{}
+}
+
 func feishuReviewTokenAllowed(request *http.Request, payload map[string]any) bool {
 	expected := strings.TrimSpace(os.Getenv("OMEGA_FEISHU_REVIEW_TOKEN"))
 	if expected == "" {
@@ -94,6 +128,8 @@ func feishuReviewTokenAllowed(request *http.Request, payload map[string]any) boo
 		request.URL.Query().Get("token"),
 		stringOr(payload["token"], ""),
 		text(mapValue(payload["value"]), "token"),
+		text(feishuReviewCallbackValue(payload), "token"),
+		text(mapValue(payload["event"]), "token"),
 	}
 	for _, candidate := range candidates {
 		if hmac.Equal([]byte(strings.TrimSpace(candidate)), []byte(expected)) {
@@ -271,6 +307,9 @@ func (server *Server) mergeFeishuReviewOptions(ctx context.Context, options feis
 	if strings.TrimSpace(options.DocFolderToken) == "" {
 		options.DocFolderToken = config.DocFolderToken
 	}
+	if strings.TrimSpace(options.DirectUserID) == "" && !feishuReviewTaskModeEnabled(options) && !feishuCardCallbackReady() {
+		options.DirectUserID = server.currentFeishuUserID(ctx)
+	}
 	if strings.TrimSpace(options.DirectUserID) == "" && strings.TrimSpace(options.ChatID) == "" && strings.TrimSpace(options.WebhookURL) == "" && !feishuReviewTaskModeEnabled(options) {
 		options.DirectUserID = server.currentFeishuUserID(ctx)
 	}
@@ -330,6 +369,7 @@ func feishuReviewPacketFromRecords(database WorkspaceDatabase, checkpoint map[st
 func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
 	card := buildFeishuReviewCardWithOptions(packet, options)
 	docMarkdown := buildFeishuReviewDocMarkdown(packet)
+	callbackReady := feishuCardCallbackReady()
 	webhook := strings.TrimSpace(options.WebhookURL)
 	if webhook == "" {
 		webhook = strings.TrimSpace(os.Getenv("OMEGA_FEISHU_WEBHOOK_URL"))
@@ -344,6 +384,25 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 		}
 		return result, err
 	}
+	if !callbackReady {
+		directUserID := strings.TrimSpace(options.DirectUserID)
+		if directUserID != "" {
+			taskOptions := options
+			taskOptions.AssigneeID = firstNonEmpty(taskOptions.AssigneeID, directUserID)
+			result, err := sendFeishuReviewTask(ctx, packet, taskOptions)
+			if result != nil {
+				result["route"] = "direct-user"
+				result["fallback"] = "current-user-task"
+				result["docPreview"] = truncateForProof(docMarkdown, 1200)
+				if !feishuReviewTaskBridgeEnabled() {
+					result["syncHint"] = "Complete the Feishu task, then run /feishu/review-task/sync or enable OMEGA_FEISHU_TASK_BRIDGE_ENABLED=true."
+				}
+			}
+			if err == nil && result != nil {
+				return result, nil
+			}
+		}
+	}
 	if webhook != "" {
 		result, err := sendFeishuWebhookInteractiveCardWithSecret(ctx, webhook, options.WebhookSecret, card)
 		result["docMode"] = "card-summary"
@@ -352,6 +411,16 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 	}
 	chatID := strings.TrimSpace(options.ChatID)
 	if chatID != "" {
+		if !callbackReady {
+			result, err := sendFeishuText(ctx, chatID, renderFeishuReviewText(packet))
+			if result != nil {
+				result["format"] = "text-fallback"
+				result["docMode"] = "text-summary"
+				result["fallback"] = "card-callback-unavailable"
+				result["syncHint"] = "No public Feishu Card Request URL is configured. Approve in Omega Web or configure Task review mode."
+			}
+			return result, err
+		}
 		result, cardErr := sendFeishuInteractiveCard(ctx, chatID, card)
 		if result != nil {
 			result["docMode"] = "card-summary"
@@ -370,6 +439,31 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 	}
 	directUserID := strings.TrimSpace(options.DirectUserID)
 	if directUserID != "" {
+		if !callbackReady {
+			taskOptions := options
+			taskOptions.AssigneeID = firstNonEmpty(taskOptions.AssigneeID, directUserID)
+			result, err := sendFeishuReviewTask(ctx, packet, taskOptions)
+			if err == nil && result != nil {
+				result["route"] = "direct-user"
+				result["fallback"] = "current-user-task"
+				result["docPreview"] = truncateForProof(docMarkdown, 1200)
+				if !feishuReviewTaskBridgeEnabled() {
+					result["syncHint"] = "Complete the Feishu task, then run /feishu/review-task/sync or enable OMEGA_FEISHU_TASK_BRIDGE_ENABLED=true."
+				}
+				return result, nil
+			}
+			result, cardErr := sendFeishuInteractiveCardToUser(ctx, directUserID, card)
+			if result != nil {
+				result["docMode"] = "card-summary"
+				result["docPreview"] = truncateForProof(docMarkdown, 1200)
+				result["fallback"] = "current-user"
+				if err != nil {
+					result["taskReviewError"] = err.Error()
+				}
+				return result, cardErr
+			}
+			return result, err
+		}
 		result, cardErr := sendFeishuInteractiveCardToUser(ctx, directUserID, card)
 		if result != nil {
 			result["docMode"] = "card-summary"
@@ -396,6 +490,20 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 		"docPreview":   truncateForProof(docMarkdown, 2000),
 		"checkpointId": text(mapValue(packet["checkpoint"]), "id"),
 	}, nil
+}
+
+func feishuCardCallbackEnabled() bool {
+	for _, key := range []string{"OMEGA_FEISHU_CARD_CALLBACK_ENABLED", "OMEGA_FEISHU_INTERACTIVE_CALLBACK_ENABLED"} {
+		value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+		if value == "1" || value == "true" || value == "yes" {
+			return true
+		}
+	}
+	return false
+}
+
+func feishuCardCallbackReady() bool {
+	return feishuCardCallbackEnabled() && strings.TrimSpace(os.Getenv("OMEGA_PUBLIC_API_URL")) != ""
 }
 
 func sendFeishuFailurePacket(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
@@ -500,16 +608,25 @@ func buildFeishuReviewCardWithOptions(packet map[string]any, options feishuRevie
 	if reviewURL != "" {
 		actions = append(actions, map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Open review"}, "type": "default", "url": reviewURL})
 	}
-	approveValue := map[string]any{"action": "approve", "checkpointId": checkpointID, "token": token}
-	requestChangesValue := map[string]any{"action": "request_changes", "checkpointId": checkpointID, "token": token}
-	actions = append(actions,
-		map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Approve"}, "type": "primary", "value": approveValue},
-		map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Request changes"}, "type": "danger", "value": requestChangesValue},
-	)
-	if callbackURL != "" {
-		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "plain_text", "content": "Interactive buttons require the Feishu callback URL to point to " + callbackURL}}})
+	if feishuCardCallbackReady() {
+		approveValue := map[string]any{"action": "approve", "checkpointId": checkpointID, "token": token}
+		requestChangesValue := map[string]any{"action": "request_changes", "checkpointId": checkpointID, "token": token}
+		actions = append(actions,
+			map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Approve"}, "type": "primary", "value": approveValue},
+			map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Request changes"}, "type": "danger", "value": requestChangesValue},
+		)
+		if callbackURL != "" {
+			elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "plain_text", "content": "Card buttons require Feishu Card Request URL to point to " + callbackURL}}})
+		}
+	} else {
+		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "plain_text", "content": "Card buttons are disabled until a public Feishu Card Request URL is configured. Omega will prefer Task review when a reviewer is available."}}})
 	}
-	elements = append(elements, map[string]any{"tag": "action", "actions": actions})
+	if len(actions) == 0 {
+		actions = append(actions, map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Open Omega"}, "type": "default", "url": firstNonEmpty(reviewURL, publicAppURL)})
+	}
+	if firstNonEmpty(reviewURL, publicAppURL) != "" {
+		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
+	}
 	return map[string]any{
 		"config": map[string]any{"wide_screen_mode": true},
 		"header": map[string]any{

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -178,7 +179,11 @@ func (server *Server) listOperationQueue(response http.ResponseWriter, request *
 }
 
 func (server *Server) proofRecordPreview(response http.ResponseWriter, request *http.Request) {
-	proofID := strings.TrimSuffix(pathID(request.URL.Path), "/preview")
+	proofID, err := proofPreviewID(request)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
 	database, err := mustLoad(server, request.Context())
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, err)
@@ -186,6 +191,16 @@ func (server *Server) proofRecordPreview(response http.ResponseWriter, request *
 	}
 	proof := findRecordByID(database.Tables.ProofRecords, proofID)
 	if len(proof) == 0 {
+		if sourcePath, ok := resolveProofPreviewPath(proofID); ok {
+			preview, previewErr := previewLocalTextFile(sourcePath, 128*1024)
+			if previewErr != nil {
+				writeJSON(response, http.StatusOK, map[string]any{"sourcePath": sourcePath, "available": false, "error": previewErr.Error()})
+				return
+			}
+			preview["proof"] = map[string]any{"id": proofID, "sourcePath": sourcePath, "label": filepath.Base(sourcePath)}
+			writeJSON(response, http.StatusOK, preview)
+			return
+		}
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "proof record not found"})
 		return
 	}
@@ -201,6 +216,30 @@ func (server *Server) proofRecordPreview(response http.ResponseWriter, request *
 	}
 	preview["proof"] = proof
 	writeJSON(response, http.StatusOK, preview)
+}
+
+func proofPreviewID(request *http.Request) (string, error) {
+	escaped := request.RequestURI
+	if queryIndex := strings.IndexByte(escaped, '?'); queryIndex >= 0 {
+		escaped = escaped[:queryIndex]
+	}
+	if strings.TrimSpace(escaped) == "" {
+		escaped = request.URL.EscapedPath()
+	}
+	escaped = strings.TrimPrefix(escaped, "/proof-records/")
+	escaped = strings.TrimSuffix(escaped, "/preview")
+	return url.PathUnescape(escaped)
+}
+
+func resolveProofPreviewPath(proofID string) (string, bool) {
+	if filepath.IsAbs(proofID) {
+		return proofID, true
+	}
+	candidate := string(os.PathSeparator) + proofID
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate, true
+	}
+	return "", false
 }
 
 func (repo *SQLiteRepository) ListRepositoryTargets(ctx context.Context, projectID string) ([]map[string]any, error) {

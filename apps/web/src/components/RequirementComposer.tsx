@@ -32,7 +32,6 @@ export function RequirementComposer({
   assignee,
   target,
   hasRepositoryWorkspace,
-  repositoryWorkspaceLabel,
   isExpanded,
   descriptionMode,
   isCreating,
@@ -120,14 +119,6 @@ export function RequirementComposer({
           </div>
         ) : null}
       </div>
-      <aside className="inline-create-note">
-        <span>Requirement to item</span>
-        <p>
-          {hasRepositoryWorkspace && repositoryWorkspaceLabel
-            ? `A requirement will be stored under ${repositoryWorkspaceLabel}, then converted into its first executable item.`
-            : "No repository workspace selected."}
-        </p>
-      </aside>
     </section>
   );
 }

@@ -4,6 +4,7 @@ const { refreshPreviewRuntime, resolveRepositoryPreviewTarget, startDesktopServi
 
 let mainWindow;
 let previewView;
+let previewViewAttached = false;
 let desktopServices;
 let previewRuntimeSession;
 
@@ -53,7 +54,14 @@ function normalizePreviewRequest(input) {
   };
 }
 
-function ensurePreviewView(config = {}) {
+function attachPreviewView() {
+  if (!mainWindow || !previewView || previewViewAttached) return;
+  mainWindow.setBrowserView(previewView);
+  previewViewAttached = true;
+  layoutPreviewView();
+}
+
+function ensurePreviewView(config = {}, options = {}) {
   if (!mainWindow) return previewView;
   if (previewView) closePreviewView();
   previewView = new BrowserView({
@@ -65,8 +73,8 @@ function ensurePreviewView(config = {}) {
       sandbox: false,
     },
   });
-  mainWindow.setBrowserView(previewView);
-  layoutPreviewView();
+  previewViewAttached = false;
+  if (options.attach !== false) attachPreviewView();
   return previewView;
 }
 
@@ -74,9 +82,50 @@ function closePreviewView() {
   if (!mainWindow || !previewView) return { ok: false, error: "preview is not open" };
   const view = previewView;
   previewView = null;
-  mainWindow.removeBrowserView(view);
+  const wasAttached = previewViewAttached;
+  previewViewAttached = false;
+  if (wasAttached) mainWindow.removeBrowserView(view);
   view.webContents.destroy();
   return { ok: true };
+}
+
+async function loadPreviewURLWithStatus(view, url) {
+  let navigationStatus = { code: 0, text: "", url };
+  const onNavigate = (_event, navigatedUrl, httpResponseCode, httpStatusText) => {
+    navigationStatus = {
+      code: Number(httpResponseCode || 0),
+      text: httpStatusText || "",
+      url: navigatedUrl || url,
+    };
+  };
+  const loadPromise = new Promise((resolve, reject) => {
+    const cleanup = () => {
+      view.webContents.removeListener("did-fail-load", onFail);
+      view.webContents.removeListener("did-navigate", onNavigate);
+    };
+    const onFail = (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (!isMainFrame) return;
+      cleanup();
+      reject(new Error(`${errorDescription} (${errorCode}) loading '${validatedURL || url}'`));
+    };
+    view.webContents.on("did-navigate", onNavigate);
+    view.webContents.on("did-fail-load", onFail);
+    view.webContents.loadURL(url).then(
+      () => {
+        cleanup();
+        resolve();
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+  await loadPromise;
+  if (navigationStatus.code >= 400) {
+    throw new Error(`HTTP ${navigationStatus.code}${navigationStatus.text ? ` ${navigationStatus.text}` : ""} loading '${navigationStatus.url}'`);
+  }
+  return navigationStatus;
 }
 
 async function createWindow() {
@@ -109,8 +158,14 @@ async function createWindow() {
 
   const previewUrl = desktopServices.preview?.url || desktopServices.preview?.plan?.previewUrl;
   if (previewUrl && ["external", "running"].includes(desktopServices.preview?.status)) {
-    const view = ensurePreviewView({ url: previewUrl, runtimeUrl: runtimeApiBase(), hostedInOmega: true });
-    await view.webContents.loadURL(previewUrl);
+    try {
+      const view = ensurePreviewView({ url: previewUrl, runtimeUrl: runtimeApiBase(), hostedInOmega: true }, { attach: false });
+      await loadPreviewURLWithStatus(view, previewUrl);
+      attachPreviewView();
+    } catch (error) {
+      console.warn(`[omega-desktop:preview] initial preview failed ${previewUrl}: ${error instanceof Error ? error.message : String(error)}`);
+      closePreviewView();
+    }
   }
 }
 
@@ -119,13 +174,15 @@ ipcMain.handle("omega-preview:open", async (_event, url) => {
   if (!request.url) return { ok: false, error: "preview url is required" };
   console.log(`[omega-desktop:preview] open ${request.url}`);
   try {
-    const view = ensurePreviewView(request.config);
-    await view.webContents.loadURL(request.url);
+    const view = ensurePreviewView(request.config, { attach: false });
+    await loadPreviewURLWithStatus(view, request.url);
+    attachPreviewView();
     console.log(`[omega-desktop:preview] opened ${request.url}`);
     return { ok: true, url: request.url };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[omega-desktop:preview] open failed ${request.url}: ${message}`);
+    closePreviewView();
     return { ok: false, url: request.url, error: message };
   }
 });

@@ -6,7 +6,8 @@ import type {
   CheckpointRecordInfo,
   GitHubPullRequestStatusResult,
   OperationRecordInfo,
-  PipelineRecordInfo
+  PipelineRecordInfo,
+  ProofPreviewInfo
 } from "../omegaControlApiClient";
 
 export interface DetailProofCard {
@@ -49,12 +50,14 @@ interface WorkItemAttemptPanelProps extends LabelHelpers {
   actionPlan?: AttemptActionPlanInfo | null;
   pipeline?: PipelineRecordInfo;
   checkpoint?: CheckpointRecordInfo;
+  checkpointActionable?: boolean;
   failedStages: FailedStageSummary[];
   failureOperations: OperationRecordInfo[];
   failureProofCards: DetailProofCard[];
   humanReviewArtifacts: DetailProofCard[];
   humanReviewEvents: DetailReviewEventCard[];
   onApproveCheckpoint: (checkpointId: string) => void;
+  onFetchProofPreview?: (proofId: string) => Promise<ProofPreviewInfo>;
   onRequestCheckpointChanges: (checkpointId: string, note?: string) => void;
   onRetryAttempt?: (attemptId: string) => void;
   pullRequestStatus?: GitHubPullRequestStatusResult | null;
@@ -67,6 +70,7 @@ export function WorkItemAttemptPanel({
   attempt,
   attemptStatusLabel,
   checkpoint,
+  checkpointActionable = false,
   displayText,
   failedStages,
   failureOperations,
@@ -74,6 +78,7 @@ export function WorkItemAttemptPanel({
   humanReviewArtifacts,
   humanReviewEvents,
   onApproveCheckpoint,
+  onFetchProofPreview,
   onRequestCheckpointChanges,
   onRetryAttempt,
   operationStatusLabel,
@@ -95,10 +100,12 @@ export function WorkItemAttemptPanel({
           </header>
           <HumanGateCard
             checkpoint={checkpoint}
+            actionable={checkpointActionable}
             displayText={displayText}
             humanReviewArtifacts={humanReviewArtifacts}
             humanReviewEvents={humanReviewEvents}
             onApproveCheckpoint={onApproveCheckpoint}
+            onFetchProofPreview={onFetchProofPreview}
             onRequestCheckpointChanges={onRequestCheckpointChanges}
           />
         </article>
@@ -133,28 +140,32 @@ export function WorkItemAttemptPanel({
         ) : null}
       </header>
 
-      <ActionPlanSummary actionPlan={actionPlan} />
-
-      <div className="attempt-stage-flow" aria-label={`Attempt ${attempt.id} stages`}>
-        {stages.map((stage) => (
-          <AttemptStageCard
-            key={`${attempt.id}-${String(stage.id)}`}
-            agentShortLabel={agentShortLabel}
-            pipelineStageClassName={pipelineStageClassName}
-            pipelineStageLabel={pipelineStageLabel}
-            stage={stage}
-          />
-        ))}
-      </div>
+      <details className="attempt-stage-details">
+        <summary>Stage details</summary>
+        <ActionPlanSummary actionPlan={actionPlan} />
+        <div className="attempt-stage-flow" aria-label={`Attempt ${attempt.id} stages`}>
+          {stages.map((stage) => (
+            <AttemptStageCard
+              key={`${attempt.id}-${String(stage.id)}`}
+              agentShortLabel={agentShortLabel}
+              pipelineStageClassName={pipelineStageClassName}
+              pipelineStageLabel={pipelineStageLabel}
+              stage={stage}
+            />
+          ))}
+        </div>
+      </details>
 
       {checkpoint ? (
         <HumanGateCard
           attempt={attempt}
           checkpoint={checkpoint}
+          actionable={checkpointActionable}
           displayText={displayText}
           humanReviewArtifacts={humanReviewArtifacts}
           humanReviewEvents={humanReviewEvents}
           onApproveCheckpoint={onApproveCheckpoint}
+          onFetchProofPreview={onFetchProofPreview}
           onRequestCheckpointChanges={onRequestCheckpointChanges}
         />
       ) : null}
@@ -309,10 +320,22 @@ function AttemptStageCard({
     <article className={pipelineStageClassName(status)}>
       <span>{pipelineStageLabel(status)}</span>
       <strong>{title}</strong>
-      <small>{agentIds.length ? agentIds.map(agentShortLabel).join(" + ") : "Agent pending"}</small>
+      <small>{stageParticipantLabel(stageRecord, agentIds, agentShortLabel)}</small>
       {artifactLabels.length ? <em>{artifactLabels.slice(0, 2).join(", ")}</em> : null}
     </article>
   );
+}
+
+function stageParticipantLabel(stage: Record<string, unknown>, agentIds: string[], agentShortLabel: (agentId: string) => string): string {
+  if (agentIds.length) return agentIds.map(agentShortLabel).join(" + ");
+  const raw = `${recordText(stage, "id")} ${recordText(stage, "title")}`.toLowerCase();
+  if (/todo|intake|requirement/.test(raw)) return "Requirement";
+  if (/implementation|architect|coding|test/.test(raw)) return "Architecture + Code + Test";
+  if (/code_review|review round|review/.test(raw)) return "Review";
+  if (/rework/.test(raw)) return "Code + Test";
+  if (/human/.test(raw)) return "Human Review";
+  if (/merg|deliver|done|ship/.test(raw)) return "Delivery";
+  return "Workflow stage";
 }
 
 function recordText(record: Record<string, unknown> | undefined | null, key: string): string {
@@ -325,25 +348,30 @@ function recordBool(record: Record<string, unknown> | undefined | null, key: str
 }
 
 interface HumanGateCardProps {
+  actionable: boolean;
   attempt?: AttemptRecordInfo;
   checkpoint: CheckpointRecordInfo;
   displayText: (value: string) => string;
   humanReviewArtifacts: DetailProofCard[];
   humanReviewEvents: DetailReviewEventCard[];
   onApproveCheckpoint: (checkpointId: string) => void;
+  onFetchProofPreview?: (proofId: string) => Promise<ProofPreviewInfo>;
   onRequestCheckpointChanges: (checkpointId: string, note?: string) => void;
 }
 
 function HumanGateCard({
+  actionable,
   attempt,
   checkpoint,
   displayText,
   humanReviewArtifacts,
   humanReviewEvents,
   onApproveCheckpoint,
+  onFetchProofPreview,
   onRequestCheckpointChanges
 }: HumanGateCardProps) {
   const [reviewNote, setReviewNote] = useState("");
+  const previewState = useProofPreviewDialog(onFetchProofPreview);
   const defaultRequestChangesNote = "Please address the review notes before delivery.";
   const changedMaterials = humanReviewArtifacts.filter((proof) =>
     /diff|implementation|change|changed|summary|handoff/i.test(`${proof.kind} ${proof.label} ${proof.path ?? ""}`)
@@ -352,6 +380,19 @@ function HumanGateCard({
     /test|check|validation|review/i.test(`${proof.kind} ${proof.label} ${proof.path ?? ""}`)
   );
   const displayMaterials = humanReviewArtifacts.slice(0, 6);
+  const decisionTitle =
+    checkpoint.status === "approved"
+      ? "Human review approved"
+      : checkpoint.status === "rejected"
+        ? "Changes requested"
+        : "Human review is no longer waiting for input";
+  const decisionSummary =
+    checkpoint.decisionNote ||
+    (checkpoint.status === "approved"
+      ? "Delivery has been approved and the workflow can continue."
+      : checkpoint.status === "rejected"
+        ? "The item was sent back for rework."
+        : "This checkpoint is not actionable for the current run.");
 
   return (
     <section className="human-gate-card human-review-thread" aria-label="Human review checkpoint">
@@ -385,7 +426,7 @@ function HumanGateCard({
             <ul className="human-review-bullets">
               {changedMaterials.slice(0, 4).map((proof) => (
                 <li key={proof.id}>
-                  <ArtifactInline proof={proof} />
+                  <ArtifactInline onOpen={previewState.open} proof={proof} />
                 </li>
               ))}
             </ul>
@@ -400,7 +441,7 @@ function HumanGateCard({
             <ul className="human-review-bullets">
               {validationMaterials.slice(0, 4).map((proof) => (
                 <li key={proof.id}>
-                  <ArtifactInline proof={proof} />
+                  <ArtifactInline onOpen={previewState.open} proof={proof} />
                 </li>
               ))}
             </ul>
@@ -423,7 +464,7 @@ function HumanGateCard({
             <h4>Artifacts</h4>
             <div className="human-review-artifacts compact">
               {displayMaterials.map((proof) => (
-                <ArtifactSummary key={proof.id} proof={proof} />
+                <ArtifactSummary key={proof.id} onOpen={previewState.open} proof={proof} />
               ))}
             </div>
           </section>
@@ -443,31 +484,39 @@ function HumanGateCard({
       </div>
 
       <div className="human-review-composer">
-        <div>
-          <textarea
-            aria-label="Human review comment"
-            value={reviewNote}
-            onChange={(event) => setReviewNote(event.currentTarget.value)}
-            placeholder="Leave a comment for the agent before approving or requesting changes..."
-          />
-          <div className="human-gate-actions">
-            <button type="button" className="primary-action" onClick={() => onApproveCheckpoint(checkpoint.id)}>
-              Approve delivery
-            </button>
-            <button
-              type="button"
-              onClick={() => onRequestCheckpointChanges(checkpoint.id, reviewNote.trim() || defaultRequestChangesNote)}
-            >
-              Request changes
-            </button>
+        {actionable ? (
+          <div>
+            <textarea
+              aria-label="Human review comment"
+              value={reviewNote}
+              onChange={(event) => setReviewNote(event.currentTarget.value)}
+              placeholder="Leave a comment for the agent before approving or requesting changes..."
+            />
+            <div className="human-gate-actions">
+              <button type="button" className="primary-action" onClick={() => onApproveCheckpoint(checkpoint.id)}>
+                Approve delivery
+              </button>
+              <button
+                type="button"
+                onClick={() => onRequestCheckpointChanges(checkpoint.id, reviewNote.trim() || defaultRequestChangesNote)}
+              >
+                Request changes
+              </button>
+            </div>
           </div>
-        </div>
+        ) : (
+          <article className={`human-review-decision checkpoint-${checkpoint.status}`}>
+            <strong>{decisionTitle}</strong>
+            <p>{decisionSummary}</p>
+          </article>
+        )}
       </div>
+      <ProofPreviewDialog state={previewState} />
     </section>
   );
 }
 
-function ArtifactInline({ proof }: { proof: DetailProofCard }) {
+function ArtifactInline({ onOpen, proof }: { onOpen: (proof: DetailProofCard) => void; proof: DetailProofCard }) {
   if (proof.url) {
     return (
       <a href={proof.url} target="_blank" rel="noreferrer">
@@ -477,10 +526,10 @@ function ArtifactInline({ proof }: { proof: DetailProofCard }) {
   }
 
   return (
-    <>
-      <span>{proof.label}</span>
-      {proof.path ? <code title={proof.path}>{compactArtifactPath(proof.path)}</code> : null}
-    </>
+    <button type="button" className="artifact-inline-button" onClick={() => onOpen(proof)} title={proof.path ?? proof.label}>
+      <span>{artifactFileName(proof)}</span>
+      {proof.stage ? <small>{proof.stage}</small> : null}
+    </button>
   );
 }
 
@@ -635,32 +684,41 @@ export function AgentTraceList({
   );
 }
 
-export function ArtifactGrid({ proofs }: { proofs: DetailProofCard[] }) {
+export function ArtifactGrid({
+  onFetchProofPreview,
+  proofs
+}: {
+  onFetchProofPreview?: (proofId: string) => Promise<ProofPreviewInfo>;
+  proofs: DetailProofCard[];
+}) {
+  const previewState = useProofPreviewDialog(onFetchProofPreview);
   if (!proofs.length) {
     return <p className="muted-copy">No artifact has been collected yet.</p>;
   }
 
   return (
-    <div className="proof-grid">
-      {proofs.map((proof) => (
-        <details key={proof.id} className="proof-card">
-          <summary>
+    <>
+      <div className="proof-grid">
+        {proofs.map((proof) => (
+          <button
+            key={proof.id}
+            type="button"
+            className="proof-card proof-card-button"
+            onClick={() => previewState.open(proof)}
+            title={proof.path ?? proof.url ?? proof.label}
+          >
             <span className="proof-kind">{proof.kind}</span>
             <div className="proof-card-copy">
-              <strong>{proof.label}</strong>
+              <strong>{artifactFileName(proof)}</strong>
               {proof.stage ? <small>{proof.stage}</small> : null}
+              {proof.path ? <code>{compactArtifactPath(proof.path)}</code> : null}
             </div>
-          </summary>
-          {proof.url ? (
-            <a href={proof.url} target="_blank" rel="noreferrer">
-              Open URL
-            </a>
-          ) : proof.path ? (
-            <code>{proof.path}</code>
-          ) : null}
-        </details>
-      ))}
-    </div>
+            <span className="proof-open-label">Preview</span>
+          </button>
+        ))}
+      </div>
+      <ProofPreviewDialog state={previewState} />
+    </>
   );
 }
 
@@ -727,22 +785,123 @@ function formatBeijingTimestamp(value?: string): string {
 }
 
 function ArtifactSummary({
+  onOpen,
   openLabel = "Open",
   proof
 }: {
+  onOpen?: (proof: DetailProofCard) => void;
   openLabel?: string;
   proof: DetailProofCard;
 }) {
+  const content = (
+    <>
+      <span>{proof.kind}</span>
+      <strong>{artifactFileName(proof)}</strong>
+      {proof.stage ? <small>{proof.stage}</small> : null}
+      {proof.path ? <code title={proof.path}>{compactArtifactPath(proof.path)}</code> : null}
+      {proof.url ? <small>{openLabel}</small> : null}
+    </>
+  );
+  if (onOpen && !proof.url) {
+    return (
+      <button type="button" className="artifact-summary-button" onClick={() => onOpen(proof)} title={proof.path ?? proof.label}>
+        {content}
+      </button>
+    );
+  }
   return (
     <article>
-      <span>{proof.kind}</span>
-      <strong>{proof.label}</strong>
-      {proof.stage ? <small>{proof.stage}</small> : null}
       {proof.url ? (
-        <a href={proof.url} target="_blank" rel="noreferrer">{openLabel}</a>
-      ) : proof.path ? (
-        <code>{proof.path}</code>
-      ) : null}
+        <a href={proof.url} target="_blank" rel="noreferrer">{content}</a>
+      ) : (
+        content
+      )}
     </article>
   );
+}
+
+function useProofPreviewDialog(onFetchProofPreview?: (proofId: string) => Promise<ProofPreviewInfo>) {
+  const [proof, setProof] = useState<DetailProofCard | null>(null);
+  const [preview, setPreview] = useState<ProofPreviewInfo | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const open = (nextProof: DetailProofCard) => {
+    if (nextProof.url) {
+      window.open(nextProof.url, "_blank", "noreferrer");
+      return;
+    }
+    setProof(nextProof);
+    setPreview(null);
+    setError("");
+    if (!onFetchProofPreview) {
+      setError("Artifact preview is not connected for this view.");
+      return;
+    }
+    setLoading(true);
+    onFetchProofPreview(nextProof.id)
+      .then((result) => {
+        setPreview(result);
+        setError(result.available === false ? result.error || "Artifact content is not available." : "");
+      })
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : "Artifact preview failed."))
+      .finally(() => setLoading(false));
+  };
+
+  return {
+    close: () => {
+      setProof(null);
+      setPreview(null);
+      setError("");
+      setLoading(false);
+    },
+    error,
+    loading,
+    open,
+    preview,
+    proof
+  };
+}
+
+function ProofPreviewDialog({ state }: { state: ReturnType<typeof useProofPreviewDialog> }) {
+  if (!state.proof) return null;
+  const sourcePath = state.preview?.sourcePath || state.proof.path || "";
+  const content = state.preview?.content ?? "";
+  return (
+    <section className="detail-popover-backdrop" role="presentation" onClick={state.close}>
+      <article
+        className="detail-popover proof-preview-popover"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${artifactFileName(state.proof)} preview`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span>{state.proof.kind}</span>
+            <strong>{artifactFileName(state.proof)}</strong>
+          </div>
+          <button type="button" onClick={state.close}>Close</button>
+        </header>
+        <div className="detail-popover-body">
+          {sourcePath ? <code className="proof-preview-path">{sourcePath}</code> : null}
+          {state.loading ? <p className="muted-copy">Loading artifact preview...</p> : null}
+          {state.error ? <p className="attempt-error">{state.error}</p> : null}
+          {!state.loading && content ? (
+            <pre className={`proof-preview-content proof-preview-${state.preview?.previewType ?? "text"}`}>
+              <code>{content}</code>
+            </pre>
+          ) : null}
+          {!state.loading && !state.error && !content ? <p className="muted-copy">No preview content captured for this artifact.</p> : null}
+          {state.preview?.truncated ? <small className="muted-copy">Preview truncated to keep the detail view responsive.</small> : null}
+        </div>
+      </article>
+    </section>
+  );
+}
+
+function artifactFileName(proof: DetailProofCard): string {
+  const raw = proof.path || proof.label;
+  const normalized = raw.replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).pop() || proof.label;
 }

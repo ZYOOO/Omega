@@ -11,8 +11,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+var diagnosticLogMu sync.Mutex
 
 type loggingResponseWriter struct {
 	http.ResponseWriter
@@ -163,6 +166,82 @@ func (server *Server) logRuntime(ctx context.Context, level string, eventType st
 	}
 	if err := server.Repo.AppendRuntimeLog(ctx, record); err != nil {
 		fmt.Printf("Omega runtime log write failed: %s\n", err)
+	}
+}
+
+func (server *Server) logRuntimeDiagnosticFile(level string, eventType string, message string, fields map[string]any) {
+	if server == nil || server.Repo == nil {
+		return
+	}
+	dir := filepath.Dir(server.Repo.Path)
+	if _, err := os.Stat(dir); err != nil {
+		return
+	}
+	fields = cloneLogFields(fields)
+	record := RuntimeLogRecord{
+		ID:                 fmt.Sprintf("diag_%d", time.Now().UnixNano()),
+		Level:              strings.ToUpper(stringOr(level, "DEBUG")),
+		EventType:          stringOr(eventType, "runtime.diagnostic"),
+		Message:            message,
+		EntityType:         text(fields, "entityType"),
+		EntityID:           text(fields, "entityId"),
+		ProjectID:          text(fields, "projectId"),
+		RepositoryTargetID: text(fields, "repositoryTargetId"),
+		RequirementID:      text(fields, "requirementId"),
+		WorkItemID:         text(fields, "workItemId"),
+		PipelineID:         text(fields, "pipelineId"),
+		AttemptID:          text(fields, "attemptId"),
+		StageID:            text(fields, "stageId"),
+		AgentID:            text(fields, "agentId"),
+		RequestID:          text(fields, "requestId"),
+		Details:            fields,
+		CreatedAt:          nowISO(),
+	}
+	if err := appendDiagnosticRuntimeLog(dir, record); err != nil {
+		fmt.Printf("Omega diagnostic log write failed: %s\n", err)
+	}
+}
+
+func appendDiagnosticRuntimeLog(root string, record RuntimeLogRecord) error {
+	diagnosticLogMu.Lock()
+	defer diagnosticLogMu.Unlock()
+	logDir := filepath.Join(root, "logs")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		return err
+	}
+	now := time.Now()
+	cleanupDiagnosticRuntimeLogs(logDir, now)
+	path := filepath.Join(logDir, "omega-runtime-diagnostics."+now.Format("2006-01-02")+".jsonl")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	encoder := json.NewEncoder(file)
+	return encoder.Encode(record)
+}
+
+func cleanupDiagnosticRuntimeLogs(logDir string, now time.Time) {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return
+	}
+	cutoff := now.Add(-24 * time.Hour)
+	today := "omega-runtime-diagnostics." + now.Format("2006-01-02") + ".jsonl"
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "omega-runtime-diagnostics.") || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		if entry.Name() == today {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(logDir, entry.Name()))
+		}
 	}
 }
 

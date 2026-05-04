@@ -2,6 +2,41 @@
 
 这个文档用于记录每个功能的落地方式。后续每完成一个功能，都按相同结构补一节：目标、入口、数据/API、运行时行为、验证、后续工作。
 
+## 2026-05-04: Sidebar Agent Access
+
+### 目标
+
+把本机级 Agent 绑定状态放到全局侧边栏，而不是只藏在某个 workspace 的配置入口中。当前 runner、model、profile readiness 和 runner account 都属于用户本地环境；后续按 stage 分配 runner 时，再进入 workspace 级 Agent Studio。
+
+### 入口
+
+- 左侧 sidebar 新增 `Agents` 折叠区。
+- `Runner` / `Model` / `Profiles` 行进入 Agent Studio 的 Agents tab。
+- `Accounts` 行进入 Agent Studio 的 Runtime tab。
+
+### 数据/API
+
+前端复用已有本地状态：
+
+- `GET /local-capabilities`
+- `GET /runner-credentials`
+- `GET /agent-profile`
+- `GET /llm-provider-selection`
+
+本次没有新增后端 API。
+
+### 运行时行为
+
+侧边栏只展示本机级可用性摘要，不改变 pipeline 运行策略。Workspace 级 stage policy、skills/MCP allowlist 和每个 stage 的 runner 分配仍通过 Workspace Agent Studio 保存。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "renders Go control-plane observability" --testTimeout=30000
+npm run lint
+git diff --check
+```
+
 ## 2026-05-02: P0 产品化补齐
 
 ### 目标
@@ -236,7 +271,7 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewReque
 
 - 首页增加 `打开 Page Pilot` / `启动 Page Pilot` 按钮。
 - 支持 `#page-pilot` 深链，Electron 或浏览器可直接打开功能二页面。
-- Work Item 详情页增加 `Open in Page Pilot`，使用当前 Work Item 的 `repositoryTargetId` 作为 Page Pilot 目标。
+- Page Pilot 物化出来的 Work Item 详情页保留 `Open in Page Pilot`，使用该 item 的 `repositoryTargetId` 作为 Page Pilot 目标；普通 Requirement / DevFlow item 不展示该入口，避免功能一、功能二主路径混淆。
 - Page Pilot 页面保留普通 App chrome，不再默认进入会隐藏导航的沉浸式空白预览状态。
 - Electron preload 暴露 `window.omegaDesktop.reloadApp()`；Page Pilot 顶部提供 `Reload app`，用于替代浏览器地址栏刷新按钮。
 - 旧尝试：`Open preview` 曾在 Omega 页面里打开 BrowserView，并用 `preview-preload.cjs` 注入最小工具条，再把圈选结果回传到 Omega 页面的 overlay。这个做法改变了已验证的 direct pilot 体验，现不作为主路径继续推进。
@@ -2633,4 +2668,28 @@ go test ./services/local-runtime/internal/omegalocal
 npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=15000
 npm run lint
 npm run build
+```
+
+## 2026-05-04: Workboard 执行记录按需读取
+
+### 功能作用
+
+让 Workboard 和 Work Item 详情页在本地数据库增长后仍保持可用：列表页面只需要当前状态和少量最近记录，详情页才需要当前 item 的 proof / operation 历史，因此执行记录读取从“全量加载”调整为“首屏限量 + 详情 scoped 补齐”。
+
+### 实现架构
+
+- Go runtime：
+  - 新增 SQLite 表级读取方法，pipelines / attempts / checkpoints / operations / proof records 支持查询参数过滤。
+  - `/operations` 未带 query 时保持旧完整记录输出，带 query 时走轻量规范化表，降低首屏和轮询响应体积。
+- Web：
+  - `refreshControlPlane` 只拉最近 operations/proof records 与 pending checkpoints。
+  - Work Item detail 根据当前 pipeline/work item 拉 scoped artifacts，并 merge 到本地状态。
+  - `refreshExecutionState` 的轮询路径只刷新 execution status，不再重复拉完整 artifacts。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -count=1
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
+npm run lint
 ```

@@ -952,7 +952,7 @@ async function fetchJson<T>(apiUrl: string, path: string, fetchImpl: typeof fetc
   if (!response.ok) {
     throw new Error(await apiErrorMessage(response, `Omega control API failed: ${path}`));
   }
-  return response.json() as Promise<T>;
+  return parseJsonResponse<T>(response, path);
 }
 
 async function postJson<T>(
@@ -969,7 +969,7 @@ async function postJson<T>(
   if (!response.ok) {
     throw new Error(await apiErrorMessage(response, `Omega control API failed: ${path}`));
   }
-  return response.json() as Promise<T>;
+  return parseJsonResponse<T>(response, path);
 }
 
 async function putJson<T>(
@@ -986,7 +986,16 @@ async function putJson<T>(
   if (!response.ok) {
     throw new Error(await apiErrorMessage(response, `Omega control API failed: ${path}`));
   }
-  return response.json() as Promise<T>;
+  return parseJsonResponse<T>(response, path);
+}
+
+async function parseJsonResponse<T>(response: Response, path: string): Promise<T> {
+  try {
+    return (await response.json()) as T;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Omega control API returned non-JSON for ${path}. Check the local runtime API route. ${detail}`);
+  }
 }
 
 async function apiErrorMessage(response: Response, prefix: string): Promise<string> {
@@ -1400,18 +1409,74 @@ export async function decomposeRequirement(
   return postJson<RequirementDecompositionResult>(apiUrl, "/requirements/decompose", input, fetchImpl);
 }
 
+type ExecutionRecordFilters = {
+  id?: string;
+  itemId?: string;
+  workItemId?: string;
+  pipelineId?: string;
+  repositoryTargetId?: string;
+  runId?: string;
+  missionId?: string;
+  stageId?: string;
+  agentId?: string;
+  operationId?: string;
+  label?: string;
+  status?: string;
+  limit?: number;
+};
+
+function tableQuerySuffix(filters: ExecutionRecordFilters = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  return params.toString() ? `?${params.toString()}` : "";
+}
+
+function normalizeTableFetchArgs(
+  filtersOrFetch?: ExecutionRecordFilters | typeof fetch,
+  fetchImpl: typeof fetch = fetch
+) {
+  if (typeof filtersOrFetch === "function") {
+    return { filters: {}, fetchImpl: filtersOrFetch };
+  }
+  return { filters: filtersOrFetch ?? {}, fetchImpl };
+}
+
+async function fetchFilteredTable<T>(
+  apiUrl: string,
+  path: string,
+  filters: ExecutionRecordFilters,
+  fetchImpl: typeof fetch
+): Promise<T> {
+  const suffix = tableQuerySuffix(filters);
+  try {
+    return await fetchJson<T>(apiUrl, `${path}${suffix}`, fetchImpl);
+  } catch (error) {
+    if (suffix && error instanceof Error && error.message.includes(" 404:")) {
+      return fetchJson<T>(apiUrl, path, fetchImpl);
+    }
+    throw error;
+  }
+}
+
 export async function fetchPipelines(
   apiUrl: string,
+  filtersOrFetch?: ExecutionRecordFilters | typeof fetch,
   fetchImpl: typeof fetch = fetch
 ): Promise<PipelineRecordInfo[]> {
-  return fetchJson<PipelineRecordInfo[]>(apiUrl, "/pipelines", fetchImpl);
+  const args = normalizeTableFetchArgs(filtersOrFetch, fetchImpl);
+  return fetchFilteredTable<PipelineRecordInfo[]>(apiUrl, "/pipelines", args.filters, args.fetchImpl);
 }
 
 export async function fetchAttempts(
   apiUrl: string,
+  filtersOrFetch?: ExecutionRecordFilters | typeof fetch,
   fetchImpl: typeof fetch = fetch
 ): Promise<AttemptRecordInfo[]> {
-  return fetchJson<AttemptRecordInfo[]>(apiUrl, "/attempts", fetchImpl);
+  const args = normalizeTableFetchArgs(filtersOrFetch, fetchImpl);
+  return fetchFilteredTable<AttemptRecordInfo[]>(apiUrl, "/attempts", args.filters, args.fetchImpl);
 }
 
 export async function fetchAttemptTimeline(
@@ -1482,9 +1547,11 @@ export async function retryAttempt(
 
 export async function fetchProofRecords(
   apiUrl: string,
+  filtersOrFetch?: ExecutionRecordFilters | typeof fetch,
   fetchImpl: typeof fetch = fetch
 ): Promise<ProofRecordInfo[]> {
-  return fetchJson<ProofRecordInfo[]>(apiUrl, "/proof-records", fetchImpl);
+  const args = normalizeTableFetchArgs(filtersOrFetch, fetchImpl);
+  return fetchFilteredTable<ProofRecordInfo[]>(apiUrl, "/proof-records", args.filters, args.fetchImpl);
 }
 
 export async function fetchProofPreview(
@@ -1541,16 +1608,20 @@ export async function fetchRequirements(
 
 export async function fetchCheckpoints(
   apiUrl: string,
+  filtersOrFetch?: ExecutionRecordFilters | typeof fetch,
   fetchImpl: typeof fetch = fetch
 ): Promise<CheckpointRecordInfo[]> {
-  return fetchJson<CheckpointRecordInfo[]>(apiUrl, "/checkpoints", fetchImpl);
+  const args = normalizeTableFetchArgs(filtersOrFetch, fetchImpl);
+  return fetchFilteredTable<CheckpointRecordInfo[]>(apiUrl, "/checkpoints", args.filters, args.fetchImpl);
 }
 
 export async function fetchOperations(
   apiUrl: string,
+  filtersOrFetch?: ExecutionRecordFilters | typeof fetch,
   fetchImpl: typeof fetch = fetch
 ): Promise<OperationRecordInfo[]> {
-  return fetchJson<OperationRecordInfo[]>(apiUrl, "/operations", fetchImpl);
+  const args = normalizeTableFetchArgs(filtersOrFetch, fetchImpl);
+  return fetchFilteredTable<OperationRecordInfo[]>(apiUrl, "/operations", args.filters, args.fetchImpl);
 }
 
 export async function fetchExecutionLocks(

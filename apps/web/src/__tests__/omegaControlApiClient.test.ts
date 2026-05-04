@@ -153,6 +153,14 @@ describe("omegaControlApiClient", () => {
     });
   });
 
+  it("reports a clear error when proof preview reaches the web app instead of the runtime", async () => {
+    const fetchImpl = vi.fn(() =>
+      Promise.resolve(new Response("<!doctype html><title>Omega</title>", { status: 200, headers: { "content-type": "text/html" } }))
+    ) as unknown as typeof fetch;
+
+    await expect(fetchProofPreview("", "proof_1", fetchImpl)).rejects.toThrow(/returned non-JSON/);
+  });
+
   it("loads control-plane summaries and configuration", async () => {
     const fetchImpl = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);

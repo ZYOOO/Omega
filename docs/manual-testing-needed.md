@@ -8,12 +8,24 @@
 
 后续 shared sync、多端协作授权、App sync loop 和代码库语义索引需要先完成产品方案与远端环境，再补单独手测清单。
 
+## 2026-05-03 Feishu 连接状态与 Page Pilot provider 入口
+
+### 需要验证
+
+- [ ] 本机 `lark-cli` 当前用户可用、但没有显式 chat/task/webhook 时，左侧 Connections 的 Feishu 应显示绿色 `on`。
+- [ ] 在 Page Pilot 页面点击 Feishu 行，应切到 Settings 并打开 Feishu Provider access 面板，而不是无响应。
+- [ ] Feishu Provider access 应显示当前可用 route，例如 `current-user fallback via lark-cli`，并保留 `Test Feishu connection` 入口。
+- [ ] Page Pilot launcher 初始页不应显示右下角 `AI` 浮球；只有 Web fallback 打开内嵌 preview iframe 后才显示该浮球。
+
 ## 2026-04-30 Page Pilot 桌面端链路
 
 ### 需要验证
 
 - Electron 启动后进入 Page Pilot，选择 Repository Workspace。
-- 使用 `Repository source` 打开目标页面，确认不是空白页，也不是嵌在 Omega 内的小预览。
+- 使用 `Repository source` 打开目标页面：package.json 项目应先由 Preview Runtime Agent 启动 dev server，再进入 Electron direct pilot；没有 package.json 的静态 `index.html` 仓库应直接进入目标页面。两种情况都要确认不是空白页，也不是嵌在 Omega 内的小预览。
+- 使用 `Dev server by Agent` 输入完整 URL，例如 `http://127.0.0.1:3009/dashboard?tab=customers#health`，应以 `3009` 作为 Preview Runtime 目标地址，并打开对应 path/query/hash 页面，不应一直停留在 starting 状态。
+- 使用 `HTML file` 且不输入路径时，应从当前 Repository Workspace 自动打开根目录 `index.html`；如果没有找到，应明确提示输入 HTML 文件路径，而不是卡住。
+- 使用 `HTML file` 时如果输入框残留 `http://...`，应忽略该 URL 并从当前 workspace 自动打开 `index.html`，不应尝试打开 HTTP URL。
 - 在目标页面内圈选至少 3 个真实 DOM 元素，提交一次包含多批注的修改。
 - Apply 后目标页面刷新，能看到代码改动结果。
 - 回到 Page Pilot 启动器后，Recent runs 能看到刚才的 run。
@@ -43,6 +55,7 @@
 
 ```bash
 npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=15000
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=15000
 npm run lint
 go test ./services/local-runtime/internal/omegalocal
 ```
@@ -53,7 +66,7 @@ go test ./services/local-runtime/internal/omegalocal
 
 - [ ] 配置 `OMEGA_FEISHU_WEBHOOK_URL`，指向真实飞书机器人 webhook。
 - [ ] 如机器人启用了签名，配置 `OMEGA_FEISHU_WEBHOOK_SECRET`。
-- [ ] 如需从飞书按钮直接回调 Omega，配置飞书可访问的 `OMEGA_PUBLIC_API_URL`；如果只发通知或通过 `Open review` 回到 Omega Web，则不需要公网。
+- [ ] 如需从飞书按钮直接回调 Omega，在飞书开放平台启用卡片回传交互 / 订阅 `card.action.trigger`，把 Card Request URL 配置到飞书可访问的 Omega runtime，并设置 `OMEGA_PUBLIC_API_URL` 与 `OMEGA_FEISHU_CARD_CALLBACK_ENABLED=true`；没有公网回调时，Omega 应优先走 Task 审核，chat 路由只发送文本 fallback，不展示不可回调的 Approve / Request changes 按钮。
 - [ ] 如需卡片打开 Omega Web，配置 `OMEGA_PUBLIC_APP_URL`。
 - [ ] 建议配置 `OMEGA_FEISHU_REVIEW_TOKEN`，并在飞书回调中带上同一个 token。
 - [ ] 如果不使用 webhook，登录 `lark-cli`，然后配置 `OMEGA_FEISHU_REVIEW_CHAT_ID`。
@@ -69,8 +82,8 @@ go test ./services/local-runtime/internal/omegalocal
 - [ ] 卡片包含 Work Item、需求摘要、PR、风险等级和 Review Packet 摘要。
 - [ ] 长需求不会把卡片撑爆；长内容以 review doc preview / 后续文档入口承载。
 - [ ] 点击 `Open review` 能打开 Omega 对应 Work Item 页面。
-- [ ] 如果配置了公网 callback，飞书侧 `Approve` 走 `/feishu/review-callback` 后，Omega checkpoint 变为 approved，并继续 merging。
-- [ ] 如果配置了公网 callback，飞书侧 `Request changes` 走 `/feishu/review-callback` 后，Omega checkpoint 变为 rejected，并生成 rework attempt / checklist。
+- [ ] 如果配置了公网 Card Request URL 并设置 `OMEGA_FEISHU_CARD_CALLBACK_ENABLED=true`，飞书侧 `Approve` 走 `/feishu/review-callback` 后，Omega checkpoint 变为 approved，并继续 merging。
+- [ ] 如果配置了公网 Card Request URL 并设置 `OMEGA_FEISHU_CARD_CALLBACK_ENABLED=true`，飞书侧 `Request changes` 走 `/feishu/review-callback` 后，Omega checkpoint 变为 rejected，并生成 rework attempt / checklist。
 - [ ] Task 模式下，Human Review 后飞书里出现一条审核任务，任务描述包含 Work Item、PR、branch、需求摘要和 review token。
 - [ ] Settings 里按姓名搜索审核人时能返回候选人；如果姓名搜索依赖的用户登录态不可用，按企业邮箱或手机号搜索能给出明确权限 / 配置错误。
 - [ ] Settings 里点击 `Use current user` 能把当前 `lark-cli auth login` 的飞书用户选为 Reviewer。
@@ -91,7 +104,7 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewReque
 ### 需要验证
 
 - [ ] 确认本机已登录 `lark-cli auth login`，Settings 里的 Feishu 测试消息能发给当前用户。
-- [ ] 不配置 chat id / task assignee / webhook，只触发一个 DevFlow 到 Human Review；当前飞书用户应收到审核通知。
+- [ ] 不配置 chat id / task assignee / webhook，只触发一个 DevFlow 到 Human Review；当前飞书用户应收到绑定自己的飞书审核任务，完成任务后可通过 Task bridge / sync 写回 approve。
 - [ ] Work Item 详情页停留在运行中的 attempt，Delivery flow / Run timeline 应在约 2.5 秒内自动更新，不需要浏览器刷新。
 - [ ] 人为制造一次 validation failure 或 stalled recovery 场景；当前飞书用户应收到失败通知。
 - [ ] 如果当前 attempt 已经因为 stale supervisor 被误标 stalled，但仍有 pending Human Review checkpoint，JobSupervisor tick 后应恢复为 `waiting-human`。
@@ -101,4 +114,44 @@ go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewReque
 ```bash
 go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget|TestFeishuAutoReviewFallsBackToCurrentLarkUser|TestJobSupervisorMarksOrphanedWorkerAttemptStalled|TestJobSupervisorDoesNotOverwriteFreshWaitingHumanAttempt|TestJobSupervisorRecoversOrphanedHumanReviewAttempt'
 npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000
+```
+
+2026-05-03 本轮代码回归补充：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorRecoversOrphanedHumanReviewAttempt|TestJobSupervisorRecoversProofBackedHumanReviewAttempt|TestFeishuAutoReviewFallsBackToCurrentLarkUser|TestJobSupervisorDoesNotOverwriteFreshWaitingHumanAttempt'
+```
+
+## 2026-05-03 Page Pilot Web / Electron 打开回归
+
+### 需要验证
+
+- [ ] Web 访问 `/#page-pilot`，等待 workspace session 加载后仍停留在 Page Pilot，不跳回 Work items。
+- [ ] 在 Web 模式点击 `Open page editor`，Repository source 能通过 Go Preview Runtime 启动当前 Repository Workspace，并在页面内显示 iframe。
+- [ ] 如果 3009 上存在同 workspace 的坏掉旧 preview server，点击后应清理并重启；`curl --noproxy '*' -I http://127.0.0.1:3009/` 应返回 `200 OK`。
+- [ ] 打开 `AI` 浮层后，`Select` 按钮可用；如果 target 不是同源代理，应显示不可 inspect 的明确提示。
+- [ ] HTML file 模式字段为空时，应解析当前 Repository Workspace，而不是沿用上次的 dev-server URL。
+- [ ] HTML file 模式字段里残留 `http://127.0.0.1:3009/` 时，应忽略这个 stale URL 并解析当前 workspace。
+- [ ] Electron 中 `Open page editor` 失败时不应留下遮挡 Workboard 的 BrowserView；重新打开后能显示明确错误或成功进入 direct pilot。
+
+### 自动化已覆盖
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=15000
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotPreviewRuntimeStartPersistsGoProfile|TestPagePilot|TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget|TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget'
+```
+
+## 2026-05-04 主导航刷新 / session 恢复回归
+
+### 需要验证
+
+- [x] Web 访问 `http://127.0.0.1:5173/#projects`，等待 workspace session 加载完成后仍停留在 Projects。
+- [x] 在 Projects 页面刷新浏览器后，URL 仍为 `#projects`，页面不跳回 Work items。
+- [x] 打开 Work Item 30 详情 `#/work-items/item_manual_30` 后刷新，仍停留在 Work item detail。
+- [x] Web 访问并刷新 `#page-pilot`，仍停留在 Page Pilot。
+
+### 自动化已覆盖
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=20000
 ```

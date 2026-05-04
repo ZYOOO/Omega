@@ -41,6 +41,21 @@ describe("workboard", () => {
     expect(groups[1].items).toHaveLength(5);
   });
 
+  it("keeps human review and blocked queues visible before done work", () => {
+    const items = updateWorkItemStatus(
+      updateWorkItemStatus(
+        updateWorkItemStatus(createWorkItems(createSampleRun()), "item_solution", "Human Review"),
+        "item_coding",
+        "Done"
+      ),
+      "item_testing",
+      "Blocked"
+    );
+    const groups = groupWorkItemsByStatus(items);
+
+    expect(groups.map((group) => group.status)).toEqual(["Ready", "Human Review", "Backlog", "Blocked", "Done"]);
+  });
+
   it("updates work item status and priority immutably", () => {
     const items = createWorkItems(createSampleRun());
     const updatedStatus = updateWorkItemStatus(items, "item_intake", "In Review");

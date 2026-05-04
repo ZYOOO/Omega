@@ -35,6 +35,15 @@ type ProjectSurfaceProps = {
   onSelectGitHubRepository: (repository: GitHubRepositoryInfo) => void;
 };
 
+function visibleExternalReference(value?: string): string {
+  const raw = value?.trim() ?? "";
+  if (!raw) return "";
+  if (/^(?:page-pilot:)?item_(?:manual|page_pilot)_/i.test(raw)) return "";
+  if (/^req_item_manual_/i.test(raw)) return "";
+  if (/^pipeline_item_(?:manual|page_pilot)_/i.test(raw)) return "";
+  return raw;
+}
+
 export function ProjectSurface({
   primaryProject,
   repositoryTargets,
@@ -103,13 +112,6 @@ export function ProjectSurface({
             <strong>{pipelines.length}</strong>
           </span>
         </div>
-        <div className="project-flow-strip" aria-label="Project delivery flow">
-          <span>Requirements</span>
-          <span>Repository Workspace</span>
-          <span>Agent Pipeline</span>
-          <span>Human Review</span>
-          <span>Delivery</span>
-        </div>
         <div className="project-create-form" aria-label="Create project">
           <label>
             <span>Project name</span>
@@ -171,7 +173,7 @@ export function ProjectSurface({
                   {activeRepositoryWorkspaceItems.slice(0, 8).map((item) => (
                     <div key={item.id}>
                       <span>{item.title}</span>
-                      <small>{item.sourceExternalRef ?? item.key}</small>
+                      <small>{visibleExternalReference(item.sourceExternalRef) || item.key}</small>
                     </div>
                   ))}
                 </div>

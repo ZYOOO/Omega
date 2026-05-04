@@ -190,12 +190,13 @@ async function resolveRepositoryPreviewTarget(target, env = process.env) {
   }
   const indexPath = path.join(repoPath, "index.html");
   const packagePath = path.join(repoPath, "package.json");
+  const configuredPreviewUrl = env.OMEGA_PREVIEW_URL || env.OMEGA_PAGE_PILOT_URL || "";
   return {
     ok: true,
     repoPath,
     htmlFile: fs.existsSync(indexPath) ? indexPath : "",
     hasPackageJson: fs.existsSync(packagePath),
-    previewUrl: env.OMEGA_PREVIEW_URL || env.OMEGA_PAGE_PILOT_URL || DEFAULT_PREVIEW_URL,
+    previewUrl: configuredPreviewUrl,
   };
 }
 
@@ -447,6 +448,56 @@ function selectPreviewRefreshStrategy(profile = {}, options = {}) {
 }
 
 async function startRepositoryPreviewRuntime(target, options = {}, env = process.env) {
+  const explicitPreviewUrl = typeof options.previewUrl === "string" ? options.previewUrl.trim() : "";
+  if (explicitPreviewUrl) {
+    const health = await httpGetStatus(explicitPreviewUrl, Number(env.OMEGA_PREVIEW_EXTERNAL_CHECK_TIMEOUT_MS || 1500));
+    if (health.ok) {
+      const repoPath = target?.kind === "local" && target.path && fs.existsSync(path.resolve(String(target.path)))
+        ? path.resolve(String(target.path))
+        : "";
+      const evidence = repoPath ? previewRuntimeEvidence(repoPath) : [];
+      const profile = {
+        agentId: PREVIEW_RUNTIME_AGENT_ID,
+        stageId: PREVIEW_RUNTIME_STAGE_ID,
+        repositoryTargetId: options.repositoryTargetId || target?.id || "",
+        workingDirectory: repoPath,
+        installCommand: "",
+        devCommand: "",
+        previewUrl: explicitPreviewUrl,
+        healthCheck: {
+          url: explicitPreviewUrl,
+          expectedStatus: 200,
+          lastStatus: health.status,
+        },
+        reloadStrategy: "hmr-wait",
+        source: "external-url",
+        evidence,
+        intent: options.intent || "",
+        responsibilities: [
+          "Connect to the explicit preview URL supplied by the operator.",
+          "Keep Page Pilot edits locked to the selected repository target.",
+          "Return an auditable profile before Electron opens the target page.",
+        ],
+        createdAt: new Date().toISOString(),
+      };
+      return {
+        ok: true,
+        agentId: PREVIEW_RUNTIME_AGENT_ID,
+        stageId: PREVIEW_RUNTIME_STAGE_ID,
+        status: "external",
+        repoPath,
+        previewUrl: explicitPreviewUrl,
+        plan: {
+          enabled: false,
+          source: "external-url",
+          repoPath,
+          previewUrl: explicitPreviewUrl,
+        },
+        profile,
+        error: "",
+      };
+    }
+  }
   const repoPath = await resolveRepositoryWorktree(target, env);
   if (!repoPath) {
     return {

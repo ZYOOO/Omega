@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS repository_targets (
 );
 CREATE INDEX IF NOT EXISTS idx_repository_targets_project ON repository_targets(project_id, kind, updated_at);
 CREATE TABLE IF NOT EXISTS requirements (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, repository_target_id TEXT, source TEXT NOT NULL, source_external_ref TEXT, title TEXT NOT NULL, raw_text TEXT NOT NULL, structured_json TEXT NOT NULL, acceptance_criteria_json TEXT NOT NULL, risks_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, key TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL, priority TEXT NOT NULL, assignee TEXT NOT NULL, labels_json TEXT NOT NULL, team TEXT NOT NULL, stage_id TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, key TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL, priority TEXT NOT NULL, assignee TEXT NOT NULL, labels_json TEXT NOT NULL, team TEXT NOT NULL, stage_id TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, record_json TEXT);
 CREATE TABLE IF NOT EXISTS mission_control_states (run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, work_items_json TEXT NOT NULL, events_json TEXT NOT NULL, sync_intents_json TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mission_events (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sync_intents (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, sequence INTEGER NOT NULL, intent_json TEXT NOT NULL);
@@ -232,6 +232,61 @@ CREATE INDEX IF NOT EXISTS idx_runtime_logs_work_item ON runtime_logs(work_item_
 `)
 }
 
+func (repo *SQLiteRepository) ensureWorkItemRecordJSON(ctx context.Context) error {
+	output, err := repo.query(ctx, `.mode json
+PRAGMA table_info(work_items);
+`)
+	if err != nil {
+		return err
+	}
+	var columns []map[string]any
+	if strings.TrimSpace(output) != "" {
+		if err := json.Unmarshal([]byte(output), &columns); err != nil {
+			return err
+		}
+	}
+	hasRecordJSON := false
+	for _, column := range columns {
+		if text(column, "name") == "record_json" {
+			hasRecordJSON = true
+			break
+		}
+	}
+	if !hasRecordJSON {
+		if err := repo.exec(ctx, "ALTER TABLE work_items ADD COLUMN record_json TEXT;"); err != nil {
+			return err
+		}
+	}
+	return repo.exec(ctx, `
+UPDATE work_items
+SET record_json = COALESCE(
+  (
+    SELECT j.value
+    FROM workspace_snapshots ws, json_each(ws.database_json, '$.tables.workItems') j
+    WHERE json_extract(j.value, '$.id') = work_items.id
+    LIMIT 1
+  ),
+  json_object(
+    'id', id,
+    'projectId', project_id,
+    'key', key,
+    'title', title,
+    'description', description,
+    'status', status,
+    'priority', priority,
+    'assignee', assignee,
+    'labels', json(labels_json),
+    'team', team,
+    'stageId', stage_id,
+    'target', target,
+    'createdAt', created_at,
+    'updatedAt', updated_at
+  )
+)
+WHERE record_json IS NULL OR TRIM(record_json) = '';
+`)
+}
+
 func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDatabase) error {
 	if err := repo.Initialize(ctx); err != nil {
 		return err
@@ -296,10 +351,12 @@ func (repo *SQLiteRepository) Save(ctx context.Context, database WorkspaceDataba
 	}
 	for _, item := range database.Tables.WorkItems {
 		sqlText = append(sqlText, fmt.Sprintf(
-			"INSERT OR REPLACE INTO work_items VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+			`INSERT OR REPLACE INTO work_items (
+  id, project_id, key, title, description, status, priority, assignee, labels_json, team, stage_id, target, created_at, updated_at, record_json
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);`,
 			q(item, "id"), q(item, "projectId"), q(item, "key"), q(item, "title"), q(item, "description"), q(item, "status"),
 			q(item, "priority"), q(item, "assignee"), jsonQ(item["labels"]), q(item, "team"), q(item, "stageId"), q(item, "target"),
-			q(item, "createdAt"), q(item, "updatedAt"),
+			q(item, "createdAt"), q(item, "updatedAt"), jsonQ(item),
 		))
 	}
 	for _, state := range database.Tables.MissionControlStates {
@@ -407,6 +464,17 @@ func (repo *SQLiteRepository) Load(ctx context.Context) (*WorkspaceDatabase, err
 	}
 	ensureTables(&database)
 	return &database, nil
+}
+
+func (repo *SQLiteRepository) WorkspaceSavedAt(ctx context.Context) (string, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return "", err
+	}
+	output, err := repo.query(ctx, "SELECT saved_at FROM workspace_snapshots WHERE id = 'default';")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output), nil
 }
 
 func (repo *SQLiteRepository) Migrations(ctx context.Context) ([]map[string]any, error) {
@@ -703,6 +771,41 @@ INSERT OR REPLACE INTO runtime_logs (
 	))
 }
 
+func (repo *SQLiteRepository) compactNoisyRuntimeLogs(ctx context.Context) error {
+	return repo.exec(ctx, `
+DELETE FROM runtime_logs
+WHERE event_type = 'api.request'
+  AND level = 'DEBUG'
+  AND id NOT IN (
+    SELECT id FROM runtime_logs
+    WHERE event_type = 'api.request'
+      AND level = 'DEBUG'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1000
+  );
+DELETE FROM runtime_logs
+WHERE event_type = 'job_supervisor.tick.completed'
+  AND level = 'DEBUG'
+  AND id NOT IN (
+    SELECT id FROM runtime_logs
+    WHERE event_type = 'job_supervisor.tick.completed'
+      AND level = 'DEBUG'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 200
+  );
+DELETE FROM runtime_logs
+WHERE event_type = 'job_supervisor.remote_signals.polled'
+  AND level = 'INFO'
+  AND id NOT IN (
+    SELECT id FROM runtime_logs
+    WHERE event_type = 'job_supervisor.remote_signals.polled'
+      AND level = 'INFO'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 200
+  );
+`)
+}
+
 func (repo *SQLiteRepository) ListRuntimeLogs(ctx context.Context, filters map[string]string, limit int) ([]RuntimeLogRecord, error) {
 	page, err := repo.ListRuntimeLogsPage(ctx, filters, limit)
 	if err != nil {
@@ -964,6 +1067,7 @@ func ensureTables(database *WorkspaceDatabase) {
 	database.Tables.WorkItems = linked.Tables.WorkItems
 	database.Tables.MissionControlStates = linked.Tables.MissionControlStates
 	database.Tables.Pipelines = linked.Tables.Pipelines
+	database.Tables.Checkpoints = dedupeCheckpointRecords(linked.Tables.Checkpoints)
 	if database.Tables.Attempts == nil {
 		database.Tables.Attempts = []map[string]any{}
 	}
@@ -972,6 +1076,56 @@ func ensureTables(database *WorkspaceDatabase) {
 	}
 	if database.Tables.WorkflowTemplates == nil {
 		database.Tables.WorkflowTemplates = []map[string]any{}
+	}
+}
+
+func dedupeCheckpointRecords(records []map[string]any) []map[string]any {
+	if len(records) <= 1 {
+		return records
+	}
+	positions := map[string]int{}
+	output := []map[string]any{}
+	for _, record := range records {
+		id := text(record, "id")
+		if id == "" {
+			output = append(output, record)
+			continue
+		}
+		if index, ok := positions[id]; ok {
+			output[index] = preferredCheckpointRecord(output[index], record)
+			continue
+		}
+		positions[id] = len(output)
+		output = append(output, record)
+	}
+	return output
+}
+
+func preferredCheckpointRecord(left map[string]any, right map[string]any) map[string]any {
+	leftRank := checkpointStatusRank(text(left, "status"))
+	rightRank := checkpointStatusRank(text(right, "status"))
+	if rightRank > leftRank {
+		return right
+	}
+	if rightRank < leftRank {
+		return left
+	}
+	if text(right, "updatedAt") > text(left, "updatedAt") {
+		return right
+	}
+	return left
+}
+
+func checkpointStatusRank(status string) int {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "approved", "rejected", "done", "passed":
+		return 3
+	case "running", "needs-human", "waiting-human":
+		return 2
+	case "pending":
+		return 1
+	default:
+		return 0
 	}
 }
 

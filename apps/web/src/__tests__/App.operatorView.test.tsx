@@ -63,7 +63,7 @@ describe("App operator view", () => {
     });
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({ error: "workspace not found" }, 404));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -96,7 +96,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({ error: "workspace not found" }, 404));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -182,6 +182,9 @@ describe("App operator view", () => {
     expect(screen.getByText("Local tools")).toBeInTheDocument();
     expect(screen.getByText("git")).toBeInTheDocument();
     expect(screen.getByText("lark-cli")).toBeInTheDocument();
+    expect(screen.getAllByText("Agents").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Runner: Codex" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Profiles:/ })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Projects/ }));
     fireEvent.click(screen.getByRole("button", { name: "Project config" }));
@@ -214,7 +217,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/workspace")) {
+      if (url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) {
         return Promise.resolve(jsonResponse({
           schemaVersion: 1,
           savedAt: new Date().toISOString(),
@@ -370,7 +373,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({
           schemaVersion: 1,
           savedAt: new Date().toISOString(),
@@ -510,7 +513,7 @@ describe("App operator view", () => {
     const now = new Date().toISOString();
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/workspace")) {
+      if (url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) {
         return Promise.resolve(jsonResponse({
           schemaVersion: 1,
           savedAt: now,
@@ -584,7 +587,9 @@ describe("App operator view", () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    fireEvent.click(await screen.findByText("GitHub"));
+    const sidebar = await screen.findByLabelText("Workspace navigation");
+    const connectionsPanel = within(sidebar).getByText("Connections").closest("details") as HTMLElement;
+    fireEvent.click(within(connectionsPanel).getByText("GitHub"));
 
     await waitFor(() => expect(screen.getByText("Provider access")).toBeInTheDocument());
     const oauthSetupSummary = screen.getByText("OAuth app setup");
@@ -600,6 +605,292 @@ describe("App operator view", () => {
     expect(openExternalUrlInNewTab).toHaveBeenCalledWith("https://github.com/login/device");
     fireEvent.click(screen.getByRole("button", { name: "Check GitHub status" }));
     await waitFor(() => expect(screen.getByText("GitHub CLI is connected as ZYOOO.")).toBeInTheDocument());
+  });
+
+  it("shows Feishu current-user fallback as connected and opens settings from Page Pilot", async () => {
+    vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
+
+    const now = new Date().toISOString();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
+        return Promise.resolve(jsonResponse({
+          schemaVersion: 1,
+          savedAt: now,
+          tables: {
+            projects: [{
+              id: "project_omega",
+              name: "Omega",
+              description: "",
+              team: "Omega",
+              status: "Active",
+              labels: [],
+              repositoryTargets: [{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }],
+              defaultRepositoryTargetId: "repo_test",
+              createdAt: now,
+              updatedAt: now
+            }],
+            workItems: [],
+            missionControlStates: [{ runId: "run_req_omega_001", projectId: "project_omega", workItems: [], events: [], syncIntents: [], updatedAt: now }],
+            missionEvents: [],
+            syncIntents: [],
+            connections: [],
+            uiPreferences: [{ id: "default", activeNav: "Page Pilot", selectedProviderId: "github", selectedWorkItemId: "", inspectorOpen: false, activeInspectorPanel: "properties", runnerPreset: "local-proof", statusFilter: "All", assigneeFilter: "All", sortDirection: "desc", collapsedGroups: [] }],
+            pipelines: [],
+            checkpoints: [],
+            missions: [],
+            operations: [],
+            proofRecords: []
+          }
+        }));
+      }
+      if (url.endsWith("/workspace") && init?.method === "PUT") {
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      if (url.endsWith("/feishu/config")) {
+        return Promise.resolve(jsonResponse({
+          mode: "chat",
+          chatId: "",
+          assigneeId: "",
+          assigneeLabel: "",
+          tasklistId: "",
+          followerId: "",
+          due: "",
+          webhookUrl: "",
+          webhookSecretConfigured: false,
+          reviewTokenConfigured: false,
+          createDoc: false,
+          docFolderToken: "",
+          taskBridgeEnabled: false,
+          larkCliAvailable: true,
+          larkCliVersion: "lark-cli version 1.0.23"
+        }));
+      }
+      if (url.includes("/observability")) {
+        return Promise.resolve(jsonResponse({
+          counts: { workItems: 0, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
+          pipelineStatus: {},
+          checkpointStatus: {},
+          operationStatus: {},
+          workItemStatus: {},
+          attention: { waitingHuman: 0, failed: 0, blocked: 0 }
+        }));
+      }
+      if (url.endsWith("/github/oauth/config")) {
+        return Promise.resolve(jsonResponse({
+          configured: false,
+          clientId: "",
+          redirectUri: "http://127.0.0.1:3888/auth/github/callback",
+          tokenUrl: "https://github.com/login/oauth/access_token",
+          secretConfigured: false,
+          source: "empty"
+        }));
+      }
+      if (url.endsWith("/github/status")) {
+        return Promise.resolve(jsonResponse({ available: true, authenticated: false }));
+      }
+      if (url.endsWith("/llm-provider-selection")) {
+        return Promise.resolve(jsonResponse({ providerId: "openai", model: "gpt-5.4-mini", reasoningEffort: "medium" }));
+      }
+      if (url.endsWith("/local-workspace-root")) {
+        return Promise.resolve(jsonResponse({ workspaceRoot: "" }));
+      }
+      if (url.endsWith("/page-pilot/runs")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith("/llm-providers") || url.endsWith("/pipeline-templates") || url.endsWith("/agent-definitions") || url.endsWith("/pipelines") || url.endsWith("/checkpoints") || url.endsWith("/local-capabilities") || url.endsWith("/requirements") || url.endsWith("/attempts") || url.endsWith("/proof-records") || url.endsWith("/run-workpads") || url.endsWith("/operations") || url.includes("/runtime-logs") || url.endsWith("/runner-credentials") || url.endsWith("/execution-locks") || url.endsWith("/orchestrator/watchers")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    vi.stubGlobal("fetch", fetchMock);
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    const feishuButton = await screen.findByRole("button", { name: /Feishu/ });
+    expect(feishuButton).toHaveTextContent("on");
+    fireEvent.click(feishuButton);
+
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    expect(await screen.findByText("current-user fallback via lark-cli")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Test Feishu connection" })).toBeInTheDocument();
+  });
+
+  it("keeps the hash-routed Projects page when the workspace session restores a different nav", async () => {
+    vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
+    window.location.hash = "#projects";
+
+    const now = new Date().toISOString();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
+        return Promise.resolve(jsonResponse({
+          schemaVersion: 1,
+          savedAt: now,
+          tables: {
+            projects: [{
+              id: "project_omega",
+              name: "Omega",
+              description: "",
+              team: "Omega",
+              status: "Active",
+              labels: [],
+              repositoryTargets: [],
+              createdAt: now,
+              updatedAt: now
+            }],
+            workItems: [],
+            missionControlStates: [{ runId: "run_req_omega_001", projectId: "project_omega", workItems: [], events: [], syncIntents: [], updatedAt: now }],
+            missionEvents: [],
+            syncIntents: [],
+            connections: [],
+            uiPreferences: [{ id: "default", activeNav: "Issues", selectedProviderId: "github", selectedWorkItemId: "", inspectorOpen: false, activeInspectorPanel: "properties", runnerPreset: "local-proof", statusFilter: "All", assigneeFilter: "All", sortDirection: "desc", collapsedGroups: [] }],
+            pipelines: [],
+            checkpoints: [],
+            missions: [],
+            operations: [],
+            proofRecords: []
+          }
+        }));
+      }
+      if (url.endsWith("/workspace") && init?.method === "PUT") {
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      if (url.endsWith("/github/repositories")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.includes("/observability")) {
+        return Promise.resolve(jsonResponse({
+          counts: { workItems: 0, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
+          pipelineStatus: {},
+          checkpointStatus: {},
+          operationStatus: {},
+          workItemStatus: {},
+          attention: { waitingHuman: 0, failed: 0, blocked: 0 }
+        }));
+      }
+      if (url.endsWith("/github/oauth/config")) {
+        return Promise.resolve(jsonResponse({
+          configured: false,
+          clientId: "",
+          redirectUri: "http://127.0.0.1:3888/auth/github/callback",
+          tokenUrl: "https://github.com/login/oauth/access_token",
+          secretConfigured: false,
+          source: "empty"
+        }));
+      }
+      if (url.endsWith("/github/status")) {
+        return Promise.resolve(jsonResponse({ available: true, authenticated: true, output: "", account: "ZYOOO", oauthConfigured: false, oauthAuthenticated: false }));
+      }
+      if (url.endsWith("/llm-provider-selection")) {
+        return Promise.resolve(jsonResponse({ providerId: "openai", model: "gpt-5.4-mini", reasoningEffort: "medium" }));
+      }
+      if (url.endsWith("/llm-providers") || url.endsWith("/pipeline-templates") || url.endsWith("/agent-definitions") || url.endsWith("/pipelines") || url.endsWith("/checkpoints") || url.endsWith("/local-capabilities")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    vi.stubGlobal("fetch", fetchMock);
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Projects" })).toBeInTheDocument();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:3888/workspace?scope=session"));
+    expect(screen.queryByRole("heading", { name: "Work items" })).not.toBeInTheDocument();
+    expect(window.location.hash).toBe("#projects");
+  });
+
+  it("finishes requirement creation before slow control-plane refresh completes", async () => {
+    vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
+
+    const now = new Date().toISOString();
+    const workspace = {
+      schemaVersion: 1,
+      savedAt: now,
+      tables: {
+        projects: [{
+          id: "project_omega",
+          name: "Omega",
+          description: "",
+          team: "Omega",
+          status: "Active",
+          labels: [],
+          repositoryTargets: [{ id: "repo_ZYOOO_TestRepo", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }],
+          defaultRepositoryTargetId: "repo_ZYOOO_TestRepo",
+          createdAt: now,
+          updatedAt: now
+        }],
+        requirements: [],
+        workItems: [],
+        missionControlStates: [{ runId: "run_req_omega_001", projectId: "project_omega", workItems: [], events: [], syncIntents: [], updatedAt: now }],
+        missionEvents: [],
+        syncIntents: [],
+        connections: [],
+        uiPreferences: [{ id: "default", activeNav: "Issues", selectedProviderId: "github", selectedWorkItemId: "", inspectorOpen: false, activeInspectorPanel: "properties", runnerPreset: "local-proof", statusFilter: "All", assigneeFilter: "All", sortDirection: "desc", collapsedGroups: [] }],
+        pipelines: [],
+        checkpoints: [],
+        missions: [],
+        operations: [],
+        proofRecords: []
+      }
+    };
+
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
+        return Promise.resolve(jsonResponse(workspace));
+      }
+      if (url.endsWith("/workspace") && init?.method === "PUT") {
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      if (url.endsWith("/work-items") && init?.method === "POST") {
+        const item = (JSON.parse(String(init.body)) as { item: Record<string, unknown> }).item;
+        return Promise.resolve(jsonResponse({
+          ...workspace,
+          tables: {
+            ...workspace.tables,
+            workItems: [{ ...item, projectId: "project_omega", createdAt: now, updatedAt: now }]
+          }
+        }));
+      }
+      if (url.includes("/observability")) {
+        return new Promise<Response>(() => undefined);
+      }
+      if (url.endsWith("/github/oauth/config")) {
+        return Promise.resolve(jsonResponse({
+          configured: false,
+          clientId: "",
+          redirectUri: "http://127.0.0.1:3888/auth/github/callback",
+          tokenUrl: "https://github.com/login/oauth/access_token",
+          secretConfigured: false,
+          source: "empty"
+        }));
+      }
+      if (url.endsWith("/github/status")) {
+        return Promise.resolve(jsonResponse({ available: true, authenticated: true, output: "", account: "ZYOOO", oauthConfigured: false, oauthAuthenticated: false }));
+      }
+      if (url.endsWith("/llm-provider-selection")) {
+        return Promise.resolve(jsonResponse({ providerId: "openai", model: "gpt-5.4-mini", reasoningEffort: "medium" }));
+      }
+      if (url.endsWith("/llm-providers") || url.endsWith("/pipeline-templates") || url.endsWith("/agent-definitions") || url.endsWith("/pipelines") || url.endsWith("/checkpoints") || url.endsWith("/local-capabilities")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    vi.stubGlobal("fetch", fetchMock);
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "New requirement" }));
+    fireEvent.change(await screen.findByPlaceholderText("Title"), { target: { value: "Quick create requirement" } });
+    fireEvent.change(screen.getByPlaceholderText("Type your description here..."), { target: { value: "Create should not wait for metrics refresh." } });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Creating..." })).not.toBeInTheDocument());
+    expect(screen.getAllByText("Quick create requirement").length).toBeGreaterThan(0);
   });
 
   it("imports GitHub issues from the Projects view", async () => {
@@ -692,7 +983,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse(emptyWorkspace));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -902,7 +1193,7 @@ describe("App operator view", () => {
     };
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse(workspace));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -1014,7 +1305,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse(workspaceSnapshot));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -1166,7 +1457,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({ error: "workspace not found" }, 404));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -1243,7 +1534,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({ error: "workspace not found" }, 404));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -1319,7 +1610,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({ error: "workspace not found" }, 404));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -1386,7 +1677,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({ error: "workspace not found" }, 404));
       }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
@@ -1530,7 +1821,7 @@ describe("App operator view", () => {
     let workspaceSnapshot: any = workspace;
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) return Promise.resolve(jsonResponse(workspaceSnapshot));
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) return Promise.resolve(jsonResponse(workspaceSnapshot));
       if (url.endsWith("/workspace") && init?.method === "PUT") return Promise.resolve(jsonResponse({ ok: true }));
       if (url.endsWith("/requirements")) return Promise.resolve(jsonResponse(workspaceSnapshot.tables.requirements));
       if (url.endsWith("/work-items/item_manual_52") && init?.method === "PATCH") {
@@ -1633,6 +1924,7 @@ describe("App operator view", () => {
             stageId: "intake",
             target: "https://github.com/ZYOOO/TestRepo",
             source: "manual",
+            requirementId: "req_item_manual_21",
             repositoryTargetId: "repo_ZYOOO_TestRepo",
             acceptanceCriteria: [],
             blockedByItemIds: [],
@@ -1696,7 +1988,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) return Promise.resolve(jsonResponse(workspace));
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) return Promise.resolve(jsonResponse(workspace));
       if (url.endsWith("/workspace") && init?.method === "PUT") return Promise.resolve(jsonResponse({ ok: true }));
       if (url.endsWith("/requirements")) return Promise.resolve(jsonResponse([]));
       if (url.endsWith("/pipelines")) {
@@ -1812,16 +2104,19 @@ describe("App operator view", () => {
 
     await screen.findAllByText("Fresh requirement");
     expect(screen.getAllByText("Not started").length).toBeGreaterThan(1);
-    expect(screen.getByLabelText(/current progress Rev \+ Ship/)).toBeInTheDocument();
-    expect(screen.getAllByText("Rev + Ship")).toHaveLength(1);
+    expect(screen.getByLabelText(/current progress Review \+ Delivery/)).toBeInTheDocument();
+    expect(screen.getAllByText("Review + Delivery")).toHaveLength(1);
     expect(screen.getByText("Page Pilot: kept for review")).toBeInTheDocument();
-    expect(screen.getByLabelText(/PP-3 current progress Delivery/)).toBeInTheDocument();
+    expect(screen.getByText("Page Pilot #3")).toBeInTheDocument();
+    expect(screen.getByLabelText(/PP-3 current progress Confirm \/ PR/)).toBeInTheDocument();
+    expect(screen.queryByText(/page-pilot:item_page_pilot_waiting/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Req item_manual_21/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Completed" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Delivered requirement"));
     expect(await screen.findByText("Current attempt")).toBeInTheDocument();
     expect(screen.getByText("devflow-pr · 1200ms")).toBeInTheDocument();
-    expect(screen.getByText("implementation-summary.md")).toBeInTheDocument();
+    expect(screen.getAllByText("implementation-summary.md").length).toBeGreaterThan(0);
     expect(screen.getByText("Attempt history")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /ZYOOO\/TestRepo 3/ }));
@@ -1896,7 +2191,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) return Promise.resolve(jsonResponse(workspace));
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) return Promise.resolve(jsonResponse(workspace));
       if (url.endsWith("/workspace") && init?.method === "PUT") return Promise.resolve(jsonResponse({ ok: true }));
       if (url.endsWith("/requirements")) return Promise.resolve(jsonResponse([]));
       if (url.endsWith("/pipelines")) {
@@ -2026,7 +2321,7 @@ describe("App operator view", () => {
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/workspace") && !init) {
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({
           schemaVersion: 1,
           tables: {

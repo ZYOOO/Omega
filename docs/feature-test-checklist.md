@@ -229,7 +229,7 @@ Retry reason：
 步骤：
 
 1. 从左侧导航进入 Page Pilot。
-2. 或从某个 Work Item 详情页点击 `Open in Page Pilot`。
+2. 或从 Page Pilot 物化出来的 Work Item 详情页点击 `Open in Page Pilot`。
 3. 选择明确 Repository Workspace。
 
 通过标准：
