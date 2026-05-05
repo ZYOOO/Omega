@@ -44,6 +44,8 @@ func main() {
 	flag.Parse()
 
 	server := omegalocal.NewServer(*databasePath, *workspaceRoot, *openAPIPath)
+	stopWatchers := server.StartOrchestratorWatchers(context.Background())
+	defer stopWatchers()
 	stopSupervisor := server.StartJobSupervisor(context.Background(), omegalocal.JobSupervisorConfig{
 		Enabled:               *jobSupervisor,
 		Interval:              *jobSupervisorInterval,

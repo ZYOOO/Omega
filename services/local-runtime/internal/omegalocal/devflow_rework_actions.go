@@ -73,6 +73,7 @@ func (handler *devFlowReworkActionHandler) contractSteps() []devFlowContractActi
 		{ID: "apply_rework", Type: "run_agent", Agent: "coding", Run: handler.apply},
 		{ID: "validate_rework", Type: "run_validation", Agent: "testing", Run: handler.validate},
 		{ID: "update_pull_request", Type: "ensure_pr", Agent: "delivery", Run: handler.updatePullRequest},
+		{ID: "collect_rework_ci_results", Type: "run_ci_checks", Agent: "testing", Run: handler.collectCI},
 	}
 }
 
@@ -139,7 +140,7 @@ Rules:
 		OutputPath:        handler.notePath,
 		Sandbox:           "workspace-write",
 		Model:             reworkModel,
-		Env:               reworkEnv,
+		Env:               mergeEnvMaps(agentCapabilityEnv(handler.profile, "coding"), reworkEnv),
 		HeartbeatInterval: handler.runnerHeartbeatInterval,
 		OnProcessEvent:    handler.server.runnerHeartbeatRecorder(text(handler.pipeline, "id"), text(handler.item, "id"), handler.attemptID, handler.stageID, "coding", handler.codingRunnerID),
 	})
@@ -226,5 +227,22 @@ func (handler *devFlowReworkActionHandler) updatePullRequest() error {
 	*handler.remoteCheckSummary = githubCheckSummaryWithRequired(*handler.remoteChecks, handler.template.Runtime.RequiredChecks)
 	*handler.pullRequestFeedback = githubPullRequestFeedback(handler.ctx, handler.repoWorkspace, handler.prURL, handler.repoSlug)
 	*handler.checkLogFeedback = githubPullRequestCheckLogFeedback(handler.ctx, handler.repoWorkspace, handler.prURL, handler.repoSlug, *handler.remoteChecks)
+	return nil
+}
+
+func (handler *devFlowReworkActionHandler) collectCI() error {
+	ciResult := collectDevFlowGitHubActionsCI(handler.ctx, handler.repoWorkspace, handler.repoSlug, handler.prURL, handler.template.Runtime.RequiredChecks, handler.proofDir, fmt.Sprintf("ci-checks-rework-%d.md", handler.cycle))
+	*handler.checksOutput = ciResult.ChecksOutput
+	*handler.remoteChecks = ciResult.RemoteChecks
+	*handler.remoteChecksRaw = ciResult.RemoteChecksRaw
+	*handler.remoteCheckSummary = ciResult.CheckSummary
+	*handler.checkLogFeedback = ciResult.CheckLogFeedback
+	artifact := ""
+	proofFiles := []string{}
+	if strings.TrimSpace(ciResult.ReportPath) != "" {
+		artifact = filepath.Base(ciResult.ReportPath)
+		proofFiles = append(proofFiles, ciResult.ReportPath)
+	}
+	handler.recordAgent(handler.stageID, "testing", "passed", "Collect GitHub Actions CI checks and failed check logs after rework.", artifact, ciResult.Summary, proofFiles, map[string]any{"runner": "github-actions", "status": ciResult.Status, "checkSummary": ciResult.CheckSummary, "checkLogFeedback": ciResult.CheckLogFeedback, "reviewCycle": handler.cycle})
 	return nil
 }

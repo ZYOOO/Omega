@@ -171,13 +171,42 @@ export async function bindGitHubRepositoryTargetViaApi(
   return workspaceSessionFromDatabase(run, await response.json() as WorkspaceDatabase);
 }
 
+export async function bindLocalRepositoryTargetViaApi(
+  apiUrl: string,
+  run: PipelineRun,
+  input: {
+    projectId?: string;
+    path: string;
+    defaultBranch?: string;
+  },
+  fetchImpl: typeof fetch = fetch
+): Promise<WorkspaceSession> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/repository-targets/local`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Local repository workspace API failed: ${response.status}`);
+  }
+
+  return workspaceSessionFromDatabase(run, await response.json() as WorkspaceDatabase);
+}
+
 export async function deleteRepositoryTargetViaApi(
   apiUrl: string,
   run: PipelineRun,
   repositoryTargetId: string,
+  options: { deleteLocalWorkspaces?: boolean } = {},
   fetchImpl: typeof fetch = fetch
 ): Promise<WorkspaceSession> {
-  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/github/repository-targets/${encodeURIComponent(repositoryTargetId)}`, {
+  const params = new URLSearchParams();
+  if (options.deleteLocalWorkspaces) {
+    params.set("deleteLocalWorkspaces", "true");
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/github/repository-targets/${encodeURIComponent(repositoryTargetId)}${suffix}`, {
     method: "DELETE"
   });
 

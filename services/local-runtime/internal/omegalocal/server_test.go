@@ -3,7 +3,9 @@ package omegalocal
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,6 +67,42 @@ func TestWorkspaceAndWorkItemAPI(t *testing.T) {
 	}
 }
 
+func TestPatchWorkItemUsesSessionTablesWhenSnapshotIsCorrupt(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	item := map[string]any{
+		"id": "item_patch_snapshot_free", "key": "OMG-31", "title": "Patch without snapshot", "description": "Use normalized tables.",
+		"status": "Ready", "priority": "High", "assignee": "requirement", "labels": []any{"manual"}, "team": "Omega", "stageId": "intake", "target": "No target",
+	}
+	response := postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("create item status = %d", response.StatusCode)
+	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+
+	patch := requestJSON(t, http.MethodPatch, api.URL+"/work-items/item_patch_snapshot_free", map[string]any{"status": "Done", "priority": "Urgent"})
+	if patch.StatusCode != http.StatusOK {
+		t.Fatalf("patch item status = %d", patch.StatusCode)
+	}
+	var database WorkspaceDatabase
+	decode(t, patch, &database)
+	itemIndex := findByID(database.Tables.WorkItems, "item_patch_snapshot_free")
+	if itemIndex < 0 || text(database.Tables.WorkItems[itemIndex], "status") != "Done" || text(database.Tables.WorkItems[itemIndex], "priority") != "Urgent" {
+		t.Fatalf("patched session item = %+v", database.Tables.WorkItems)
+	}
+	loaded, err := repo.LoadWorkspaceSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedIndex := findByID(loaded.Tables.WorkItems, "item_patch_snapshot_free")
+	if loadedIndex < 0 || text(loaded.Tables.WorkItems[loadedIndex], "status") != "Done" {
+		t.Fatalf("normalized item not patched: %+v", loaded.Tables.WorkItems)
+	}
+}
+
 func TestCreateWorkItemInitializesEmptyWorkspace(t *testing.T) {
 	api, _ := newTestAPI(t)
 
@@ -87,6 +125,37 @@ func TestCreateWorkItemInitializesEmptyWorkspace(t *testing.T) {
 	}
 	if len(database.Tables.Requirements) != 1 || database.Tables.WorkItems[0]["requirementId"] != database.Tables.Requirements[0]["id"] {
 		t.Fatalf("requirement link missing: items=%+v requirements=%+v", database.Tables.WorkItems, database.Tables.Requirements)
+	}
+}
+
+func TestCreateWorkItemUsesSessionTablesWhenSnapshotIsCorrupt(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+
+	item := map[string]any{
+		"id": "item_create_snapshot_free", "key": "OMG-32", "title": "Create without snapshot", "description": "Use session tables.",
+		"status": "Ready", "priority": "Medium", "assignee": "requirement", "labels": []any{"manual"}, "team": "Omega", "stageId": "intake", "target": "No target",
+	}
+	response := postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("create item status = %d", response.StatusCode)
+	}
+	var database WorkspaceDatabase
+	decode(t, response, &database)
+	itemIndex := findByID(database.Tables.WorkItems, "item_create_snapshot_free")
+	if itemIndex < 0 || text(database.Tables.WorkItems[itemIndex], "requirementId") == "" {
+		t.Fatalf("created item missing from session response: %+v", database.Tables.WorkItems)
+	}
+	loaded, err := repo.LoadWorkspaceSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedIndex := findByID(loaded.Tables.WorkItems, "item_create_snapshot_free")
+	if loadedIndex < 0 || text(loaded.Tables.WorkItems[loadedIndex], "requirementId") == "" || len(loaded.Tables.Requirements) == 0 {
+		t.Fatalf("normalized create missing: items=%+v requirements=%+v", loaded.Tables.WorkItems, loaded.Tables.Requirements)
 	}
 }
 
@@ -117,6 +186,40 @@ func TestDeleteNotStartedWorkItemRemovesUnsharedRequirement(t *testing.T) {
 	stateItems := arrayMaps(database.Tables.MissionControlStates[0]["workItems"])
 	if len(stateItems) != 0 {
 		t.Fatalf("mission state work item projection was not deleted: %+v", stateItems)
+	}
+}
+
+func TestDeleteWorkItemUsesSessionTablesWhenSnapshotIsCorrupt(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	item := map[string]any{
+		"id": "item_delete_snapshot_free", "key": "OMG-33", "title": "Delete without snapshot", "description": "Use session tables.",
+		"status": "Ready", "priority": "Medium", "assignee": "requirement", "labels": []any{"manual"}, "team": "Omega", "stageId": "intake", "target": "No target",
+	}
+	create := postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create item status = %d", create.StatusCode)
+	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+
+	remove := requestJSON(t, http.MethodDelete, api.URL+"/work-items/item_delete_snapshot_free", nil)
+	if remove.StatusCode != http.StatusOK {
+		t.Fatalf("delete item status = %d", remove.StatusCode)
+	}
+	loaded, err := repo.LoadWorkspaceSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findByID(loaded.Tables.WorkItems, "item_delete_snapshot_free") >= 0 {
+		t.Fatalf("normalized item was not deleted: %+v", loaded.Tables.WorkItems)
+	}
+	for _, requirement := range loaded.Tables.Requirements {
+		if strings.Contains(text(requirement, "id"), "item_delete_snapshot_free") {
+			t.Fatalf("unshared requirement was not deleted: %+v", loaded.Tables.Requirements)
+		}
 	}
 }
 
@@ -236,7 +339,7 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	if got := anySlice(stages[1]["agentIds"]); len(got) != 3 || got[0] != "architect" || got[2] != "testing" {
 		t.Fatalf("pipeline stages did not preserve workflow agents: %+v", stages[1])
 	}
-	if got := anySlice(stages[1]["outputArtifacts"]); len(got) == 0 || got[len(got)-1] != "pull-request" {
+	if got := anySlice(stages[1]["outputArtifacts"]); len(got) == 0 || got[len(got)-1] != "ci-report" {
 		t.Fatalf("pipeline stages did not preserve workflow artifacts: %+v", stages[1])
 	}
 }
@@ -879,6 +982,9 @@ func TestListCheckpointsReconcilesCompletedHumanReviewDecision(t *testing.T) {
 	if err := repo.Save(context.Background(), database); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 
 	var checkpoints []map[string]any
 	decode(t, mustGet(t, api.URL+"/checkpoints"), &checkpoints)
@@ -940,6 +1046,185 @@ func TestJobSupervisorTickMarksStalledRunningAttempt(t *testing.T) {
 	}
 }
 
+func TestJobSupervisorTickUsesNormalizedExecutionStateWhenSnapshotIsCorrupt(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	timestamp := nowISO()
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id":        "item_snapshot_free",
+		"projectId": "project_omega", "key": "OMG-snapshot-free", "title": "Recover without snapshot", "description": "Supervisor should use normalized tables.",
+		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "ZYOOO/TestRepo", "createdAt": timestamp, "updatedAt": timestamp,
+	}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	run := mapValue(pipeline["run"])
+	stages := arrayMaps(run["stages"])
+	stages[0]["status"] = "passed"
+	stages[1]["status"] = "running"
+	stages[1]["startedAt"] = timestamp
+	run["stages"] = stages
+	pipeline["run"] = run
+	pipeline["status"] = "running"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_snapshot_free"
+	attempt["lastSeenAt"] = time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	attempt["updatedAt"] = attempt["lastSeenAt"]
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+
+	response := postJSON(t, api.URL+"/job-supervisor/tick", map[string]any{"staleAfterSeconds": 60})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("supervisor status = %d", response.StatusCode)
+	}
+	var summary map[string]any
+	decode(t, response, &summary)
+	if summary["stalledAttempts"].(float64) != 1 {
+		t.Fatalf("supervisor summary = %+v", summary)
+	}
+	attempts, err := repo.ListAttempts(context.Background(), map[string]string{"id": "attempt_snapshot_free"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || text(attempts[0], "status") != "stalled" || text(attempts[0], "stalledAt") == "" || text(attempts[0], "statusReason") == "" {
+		t.Fatalf("normalized attempt not updated: %+v", attempts)
+	}
+	pipelines, err := repo.ListPipelines(context.Background(), map[string]string{"id": text(pipeline, "id")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pipelines) != 1 || text(pipelines[0], "status") != "stalled" {
+		t.Fatalf("normalized pipeline not updated: %+v", pipelines)
+	}
+}
+
+func TestRenderFeishuFailureTextIncludesReadableContext(t *testing.T) {
+	item := map[string]any{
+		"id":                 "item_42",
+		"key":                "OMG-42",
+		"title":              "Add task summary CLI",
+		"description":        "Expose task status in one command.",
+		"source":             "manual",
+		"status":             "Blocked",
+		"priority":           "High",
+		"assignee":           "coding",
+		"labels":             []any{"manual", "feishu"},
+		"target":             "ZYOOO/TestRepo",
+		"repositoryTargetId": "repo_zyooo_testrepo",
+		"requirementId":      "req_42",
+	}
+	requirement := map[string]any{
+		"id":          "req_42",
+		"title":       "Add task summary CLI",
+		"description": "The CLI should show task title, reviewer state, and latest runner state.",
+	}
+	repositoryTarget := map[string]any{
+		"id":    "repo_zyooo_testrepo",
+		"kind":  "github",
+		"owner": "ZYOOO",
+		"repo":  "TestRepo",
+	}
+	pipeline := map[string]any{
+		"id":         "pipeline_item_42",
+		"templateId": "devflow-pr",
+		"status":     "stalled",
+		"run": map[string]any{
+			"stages": []any{
+				map[string]any{"id": "todo", "title": "Requirement", "status": "passed"},
+				map[string]any{"id": "in_progress", "title": "Implementation and PR", "status": "running"},
+			},
+		},
+	}
+	attempt := map[string]any{
+		"id":             "attempt_42",
+		"status":         "stalled",
+		"runner":         "codex",
+		"currentStageId": "in_progress",
+		"lastSeenAt":     "2026-05-05T02:00:00Z",
+		"statusReason":   "No heartbeat for 7200 seconds.",
+		"branchName":     "codex/omg-42-task-summary",
+		"pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/42",
+		"workspacePath":  "/tmp/omega/workspaces/item_42",
+	}
+
+	message := renderFeishuFailureText(map[string]any{
+		"item":             item,
+		"requirement":      requirement,
+		"repositoryTarget": repositoryTarget,
+		"pipeline":         pipeline,
+		"attempt":          attempt,
+	})
+
+	for _, expected := range []string{
+		"🚨 Omega 运行需要处理",
+		"类型: Stalled attempt",
+		"工作项: OMG-42 (item_42) · Add task summary CLI",
+		"需求: Add task summary CLI",
+		"上下文: source manual · status Blocked · priority High · assignee coding · labels manual, feishu",
+		"仓库: ZYOOO/TestRepo (repo_zyooo_testrepo)",
+		"阶段: Implementation and PR (in_progress)",
+		"PR: https://github.com/ZYOOO/TestRepo/pull/42",
+		"🛠️ 建议处理",
+	} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("message missing %q:\n%s", expected, message)
+		}
+	}
+	if strings.Contains(message, "**") || strings.Contains(message, "`") {
+		t.Fatalf("plain Feishu message should not expose markdown:\n%s", message)
+	}
+	if count := strings.Count(message, "工作项:"); count != 1 {
+		t.Fatalf("expected one work item line, got %d:\n%s", count, message)
+	}
+}
+
+func TestRenderFeishuReviewTextUsesPlainFeishuText(t *testing.T) {
+	message := renderFeishuReviewText(map[string]any{
+		"item": map[string]any{
+			"id":          "item_review_1",
+			"key":         "OMG-77",
+			"title":       "Review task summary",
+			"description": "Show a concise summary for reviewers.",
+		},
+		"attempt": map[string]any{
+			"pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/77",
+			"branchName":     "codex/omg-77-review-summary",
+		},
+		"requirement": map[string]any{
+			"description": "Reviewer should understand the requirement from Feishu.",
+		},
+		"reviewPacket": map[string]any{
+			"summary": "Validation passed.",
+			"risk":    map[string]any{"level": "low"},
+		},
+	})
+
+	for _, expected := range []string{
+		"✅ Omega 人工审核",
+		"工作项: OMG-77 (item_review_1) · Review task summary",
+		"风险: low",
+		"📋 需求摘要",
+		"🧾 Review packet",
+		"🛠️ 审核动作",
+	} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("message missing %q:\n%s", expected, message)
+		}
+	}
+	if strings.Contains(message, "**") || strings.Contains(message, "`") {
+		t.Fatalf("plain Feishu review message should not expose markdown:\n%s", message)
+	}
+}
+
 func TestJobSupervisorLoopRunsMaintenanceTicks(t *testing.T) {
 	root := t.TempDir()
 	openAPI := filepath.Join(root, "openapi.yaml")
@@ -985,7 +1270,16 @@ func TestJobSupervisorLoopRunsMaintenanceTicks(t *testing.T) {
 		StaleAfter:         time.Second,
 		ReadyScanItemLimit: 1,
 	})
-	defer stop()
+	stopped := false
+	stopSupervisor := func() {
+		if stopped {
+			return
+		}
+		stop()
+		stopped = true
+		time.Sleep(50 * time.Millisecond)
+	}
+	defer stopSupervisor()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		updated, err := server.Repo.Load(context.Background())
@@ -993,6 +1287,7 @@ func TestJobSupervisorLoopRunsMaintenanceTicks(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(updated.Tables.Attempts) == 1 && updated.Tables.Attempts[0]["status"] == "stalled" {
+			stopSupervisor()
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -1066,6 +1361,53 @@ func TestCancelAttemptAPIUpdatesStateAndSignalsRunningJob(t *testing.T) {
 	}
 }
 
+func TestCancelAttemptUsesNormalizedExecutionStateWhenSnapshotIsCorrupt(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	api := httptest.NewServer(server.Handler())
+	t.Cleanup(api.Close)
+	seedWorkspace(t, server.Repo)
+	database, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id": "item_manual_cancel_snapshot_free", "projectId": "project_omega", "key": "OMG-cancel-snapshot-free", "title": "Cancel without snapshot", "description": "Cancel a running attempt.",
+		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "ZYOOO/TestRepo", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["status"] = "running"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_cancel_snapshot_free"
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	if err := server.Repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+
+	response := postJSON(t, api.URL+"/attempts/attempt_cancel_snapshot_free/cancel", map[string]any{"reason": "Operator stopped the run."})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("cancel status = %d", response.StatusCode)
+	}
+	state, err := server.Repo.LoadSupervisorExecutionState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptIndex := findByID(state.Tables.Attempts, "attempt_cancel_snapshot_free")
+	pipelineIndex := findByID(state.Tables.Pipelines, text(pipeline, "id"))
+	itemIndex := findByID(state.Tables.WorkItems, "item_manual_cancel_snapshot_free")
+	if attemptIndex < 0 || pipelineIndex < 0 || itemIndex < 0 {
+		t.Fatalf("execution records missing: %+v", state.Tables)
+	}
+	if text(state.Tables.Attempts[attemptIndex], "status") != "canceled" || text(state.Tables.Pipelines[pipelineIndex], "status") != "canceled" || text(state.Tables.WorkItems[itemIndex], "status") != "Blocked" {
+		t.Fatalf("canceled state attempt=%+v pipeline=%+v item=%+v", state.Tables.Attempts[attemptIndex], state.Tables.Pipelines[pipelineIndex], state.Tables.WorkItems[itemIndex])
+	}
+}
+
 func TestPrepareDevFlowAttemptRetryLinksAttempts(t *testing.T) {
 	root := t.TempDir()
 	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
@@ -1130,6 +1472,76 @@ func TestPrepareDevFlowAttemptRetryLinksAttempts(t *testing.T) {
 	itemAfter := findWorkItem(updated, "item_retry")
 	if text(itemAfter, "status") != "In Review" {
 		t.Fatalf("work item status = %+v", itemAfter)
+	}
+}
+
+func TestPrepareDevFlowAttemptRetryUsesNormalizedExecutionStateWhenSnapshotIsCorrupt(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	seedWorkspace(t, server.Repo)
+	repoPath := createDemoGitRepo(t)
+	ctx := context.Background()
+	profile := defaultAgentProfile("project_omega", "repo_retry_snapshot_free")
+	for index := range profile.AgentProfiles {
+		profile.AgentProfiles[index].Runner = "demo-code"
+	}
+	if err := server.Repo.SetAgentProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	database, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{"id": "repo_retry_snapshot_free", "kind": "local", "path": repoPath, "createdAt": nowISO(), "updatedAt": nowISO()}}
+	project["defaultRepositoryTargetId"] = "repo_retry_snapshot_free"
+	database.Tables.Projects[0] = project
+	item := map[string]any{
+		"id": "item_retry_snapshot_free", "projectId": "project_omega", "key": "OMG-retry-snapshot", "title": "Retry without snapshot", "description": "Retry this failed work.",
+		"status": "Blocked", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": repoPath, "repositoryTargetId": "repo_retry_snapshot_free", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_retry_snapshot_free"
+	pipeline["status"] = "failed"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	attempt["id"] = "attempt_retry_snapshot_old"
+	attempt["status"] = "failed"
+	attempt["errorMessage"] = "Coding agent produced no repository changes."
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	if err := server.Repo.Save(ctx, *database); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Repo.exec(ctx, "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := server.Repo.LoadSupervisorExecutionState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, retryAttempt, err := server.prepareDevFlowAttemptRetry(ctx, *state, "attempt_retry_snapshot_old", "Retry from normalized execution state.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Repo.SaveSupervisorExecutionState(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := server.Repo.LoadSupervisorExecutionState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldIndex := findByID(loaded.Tables.Attempts, "attempt_retry_snapshot_old")
+	retryIndex := findByID(loaded.Tables.Attempts, text(retryAttempt, "id"))
+	if oldIndex < 0 || retryIndex < 0 {
+		t.Fatalf("retry attempts missing from normalized state: %+v", loaded.Tables.Attempts)
+	}
+	if text(loaded.Tables.Attempts[oldIndex], "retryAttemptId") != text(retryAttempt, "id") || text(loaded.Tables.Attempts[retryIndex], "retryOfAttemptId") != "attempt_retry_snapshot_old" {
+		t.Fatalf("retry links not persisted: old=%+v retry=%+v", loaded.Tables.Attempts[oldIndex], loaded.Tables.Attempts[retryIndex])
+	}
+	if findByID(loaded.Tables.RunWorkpads, text(retryAttempt, "id")+":workpad") < 0 {
+		t.Fatalf("retry run workpad missing: %+v", loaded.Tables.RunWorkpads)
 	}
 }
 
@@ -1451,6 +1863,57 @@ func TestJobSupervisorTickReportsRunnableReadyWork(t *testing.T) {
 	if len(loaded.Tables.Attempts) != 0 {
 		t.Fatalf("scan without autoRunReady should not create attempts: %+v", loaded.Tables.Attempts)
 	}
+}
+
+func TestOrchestratorTickAutoRunsExistingNotStartedWorkItem(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	api := httptest.NewServer(server.Handler())
+	t.Cleanup(api.Close)
+	seedWorkspace(t, server.Repo)
+	repoPath := createDemoGitRepo(t)
+	ctx := context.Background()
+	profile := defaultAgentProfile("project_omega", "repo_orchestrator_ready")
+	for index := range profile.AgentProfiles {
+		profile.AgentProfiles[index].Runner = "demo-code"
+	}
+	if err := server.Repo.SetAgentProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	database, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := cloneMap(database.Tables.Projects[0])
+	project["repositoryTargets"] = []any{map[string]any{"id": "repo_orchestrator_ready", "kind": "local", "path": repoPath, "createdAt": nowISO(), "updatedAt": nowISO()}}
+	project["defaultRepositoryTargetId"] = "repo_orchestrator_ready"
+	database.Tables.Projects[0] = project
+	item := map[string]any{
+		"id": "item_orchestrator_ready", "projectId": "project_omega", "key": "OMG-auto", "title": "Auto run ready work", "description": "Runnable work.",
+		"status": "Ready", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "todo", "target": repoPath, "repositoryTargetId": "repo_orchestrator_ready", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	if err := server.Repo.Save(ctx, *database); err != nil {
+		t.Fatal(err)
+	}
+
+	var result map[string]any
+	decode(t, postJSON(t, api.URL+"/orchestrator/tick", map[string]any{"repositoryTargetId": "repo_orchestrator_ready", "autoRun": true, "limit": "5"}), &result)
+	if result["status"] != "accepted-ready-work" {
+		t.Fatalf("orchestrator result = %+v", result)
+	}
+	readyWork := mapValue(result["readyWork"])
+	if intValue(readyWork["acceptedReadyRuns"]) != 1 || len(arrayMaps(readyWork["acceptedRunAttempts"])) != 1 {
+		t.Fatalf("ready work summary = %+v", readyWork)
+	}
+	loaded, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Tables.Attempts) != 1 || text(loaded.Tables.Attempts[0], "itemId") != "item_orchestrator_ready" {
+		t.Fatalf("orchestrator did not create attempt for ready work: %+v", loaded.Tables.Attempts)
+	}
+	waitForAttemptJobsToDrain(t, server, 3*time.Second)
 }
 
 func TestJobSupervisorTickBackfillsWorkflowContractMetadata(t *testing.T) {
@@ -1834,6 +2297,68 @@ func TestJobSupervisorRecoversProofBackedHumanReviewAttempt(t *testing.T) {
 	}
 }
 
+func TestJobSupervisorDoesNotRecoverProofBackedHumanReviewAfterApproval(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	root := t.TempDir()
+	workspace := filepath.Join(root, "OMG-31-devflow-pr")
+	proofDir := filepath.Join(workspace, ".omega", "proof")
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proofDir, "human-review-request.md"), []byte("Review the PR."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{
+		"pipelineId":     "pipeline_approved_human",
+		"workItemId":     "item_approved_human",
+		"workspacePath":  workspace,
+		"branchName":     "omega/OMG-31-devflow",
+		"pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/41",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	item := map[string]any{"id": "item_approved_human", "key": "OMG-31", "repositoryTargetId": "repo_test", "status": "In Review", "stageId": "merging"}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_approved_human"
+	pipeline["status"] = "running"
+	pipeline = markDevFlowStageProgress(pipeline, "human_review", "passed", "")
+	pipeline = markDevFlowStageProgress(pipeline, "merging", "running", "")
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "merging")
+	attempt["id"] = "attempt_approved_human"
+	attempt["status"] = "stalled"
+	attempt["workspacePath"] = workspace
+	attempt["pullRequestUrl"] = "https://github.com/ZYOOO/TestRepo/pull/41"
+	attempt["events"] = append(arrayMaps(attempt["events"]), map[string]any{
+		"type":      "attempt.worker.orphaned",
+		"message":   "No active local worker host lease for running attempt.",
+		"stageId":   "merging",
+		"createdAt": nowISO(),
+	})
+	checkpoint := map[string]any{
+		"id":         "pipeline_approved_human:human_review",
+		"pipelineId": "pipeline_approved_human",
+		"attemptId":  "attempt_approved_human",
+		"stageId":    "human_review",
+		"status":     "approved",
+		"updatedAt":  nowISO(),
+	}
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems:   []map[string]any{item},
+		Pipelines:   []map[string]any{pipeline},
+		Attempts:    []map[string]any{attempt},
+		Checkpoints: []map[string]any{checkpoint},
+	}}
+
+	summary := server.reconcileAttemptIntegrityInDatabase(context.Background(), database)
+	if intValue(summary["recoveredProofHumanGates"]) != 0 {
+		t.Fatalf("approved human review should not be proof-recovered: summary=%+v", summary)
+	}
+	if text(database.Tables.Checkpoints[0], "status") != "approved" || text(database.Tables.Pipelines[0], "status") != "running" {
+		t.Fatalf("approved delivery state changed unexpectedly: checkpoint=%+v pipeline=%+v", database.Tables.Checkpoints[0], database.Tables.Pipelines[0])
+	}
+}
+
 func TestJobSupervisorScanRecoverableAttemptsRespectsBackoffAndLimit(t *testing.T) {
 	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -2053,6 +2578,9 @@ func TestWorkspaceSessionScopeOmitsExecutionHeavyTables(t *testing.T) {
 	if len(scoped.Tables.WorkItems) != 1 || len(scoped.Tables.Projects) != 1 {
 		t.Fatalf("session scope lost UI tables: %+v", scoped.Tables)
 	}
+	if len(scoped.Tables.MissionControlStates) != 1 || len(arrayMaps(scoped.Tables.MissionControlStates[0]["workItems"])) != 1 {
+		t.Fatalf("session scope returned stale mission control work items: %+v", scoped.Tables.MissionControlStates)
+	}
 	if text(scoped.Tables.WorkItems[0], "source") != "manual" || text(scoped.Tables.WorkItems[0], "repositoryTargetId") != "repo_1" {
 		t.Fatalf("session scope lost full work item fields: %+v", scoped.Tables.WorkItems[0])
 	}
@@ -2203,6 +2731,9 @@ func TestAttemptTimelineAggregatesRunRecords(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 
 	var timeline AttemptTimelineResponse
 	decode(t, mustGet(t, api.URL+"/attempts/attempt_timeline/timeline"), &timeline)
@@ -2288,6 +2819,61 @@ func TestCompleteDevFlowCycleBackfillsMissingAttempt(t *testing.T) {
 	decode(t, mustGet(t, api.URL+"/checkpoints"), &checkpoints)
 	if len(checkpoints) != 1 || text(checkpoints[0], "attemptId") != "missing-attempt-id" {
 		t.Fatalf("checkpoint attempt link = %+v", checkpoints)
+	}
+}
+
+func TestCompleteDevFlowCycleUsesNormalizedExecutionStateWhenSnapshotIsCorrupt(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	seedWorkspace(t, server.Repo)
+	ctx := context.Background()
+	database, err := server.Repo.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := map[string]any{
+		"id": "item_complete_snapshot_free", "projectId": "project_omega", "key": "OMG-complete-snapshot", "title": "Complete without snapshot", "description": "Use normalized execution state.",
+		"status": "In Review", "priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "in_progress", "target": "No target", "repositoryTargetId": "repo_complete_snapshot_free", "createdAt": nowISO(), "updatedAt": nowISO(),
+	}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_complete_snapshot_free"
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	pipelineIndex := len(database.Tables.Pipelines)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	next, pipeline, attempt := beginDevFlowAttempt(*database, pipelineIndex, item, pipeline, "manual")
+	attempt["id"] = "attempt_complete_snapshot_free"
+	next.Tables.Attempts = appendOrReplace(next.Tables.Attempts, attempt)
+	if err := server.Repo.Save(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Repo.exec(ctx, "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+
+	proofPath := filepath.Join(root, "proof.md")
+	result := map[string]any{
+		"status":     "done",
+		"proofFiles": []string{proofPath},
+		"agentInvocations": []any{map[string]any{
+			"id": "operation_complete_snapshot_free", "stageId": "in_progress", "agentId": "coding", "status": "passed", "summary": "Implemented.", "prompt": "Do the work.", "proofFiles": []any{proofPath},
+		}},
+	}
+	if _, _, err := server.completeDevFlowCycleJob(ctx, text(pipeline, "id"), "attempt_complete_snapshot_free", result); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := server.Repo.LoadSupervisorExecutionState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptIndex := findByID(loaded.Tables.Attempts, "attempt_complete_snapshot_free")
+	if attemptIndex < 0 || text(loaded.Tables.Attempts[attemptIndex], "status") != "done" {
+		t.Fatalf("completed attempt missing: %+v", loaded.Tables.Attempts)
+	}
+	if findByID(loaded.Tables.Operations, "operation_complete_snapshot_free") < 0 {
+		t.Fatalf("agent operation not persisted: %+v", loaded.Tables.Operations)
+	}
+	if findByID(loaded.Tables.ProofRecords, "operation_complete_snapshot_free:agent-proof:1") < 0 {
+		t.Fatalf("agent proof not persisted: %+v", loaded.Tables.ProofRecords)
 	}
 }
 
@@ -2523,7 +3109,7 @@ echo "fake coding agent completed"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(planRaw), "acme/demo") || !strings.Contains(string(planRaw), "implement the requested product change") {
+	if !strings.Contains(string(planRaw), "acme/demo") || !strings.Contains(string(planRaw), "implement the requested product change") || !strings.Contains(string(planRaw), "Functional TODO List") || !strings.Contains(string(planRaw), "Project TODO List") {
 		t.Fatalf("solution plan = %s", string(planRaw))
 	}
 	logRaw, err := os.ReadFile(ghLog)
@@ -2644,6 +3230,169 @@ func TestApproveDevFlowCheckpointIgnoresBranchCleanupFailure(t *testing.T) {
 	}
 }
 
+func TestApproveDevFlowCheckpointUsesLatestDeliverableAttempt(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	workspace := filepath.Join(root, "workspace", "OMG-latest")
+	repoWorkspace := filepath.Join(workspace, "repo")
+	proofDir := filepath.Join(workspace, ".omega", "proof")
+	if err := os.MkdirAll(repoWorkspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoWorkspace, "init")
+	runGit(t, repoWorkspace, "checkout", "-b", "main")
+	runGit(t, repoWorkspace, "config", "user.email", "omega-test@example.local")
+	runGit(t, repoWorkspace, "config", "user.name", "Omega Test")
+	if err := os.WriteFile(filepath.Join(repoWorkspace, "README.md"), []byte("demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoWorkspace, "add", ".")
+	runGit(t, repoWorkspace, "commit", "-m", "initial")
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{"merged": false}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	gh := filepath.Join(bin, "gh")
+	script := "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  printf 'merged\\n'\n  exit 0\nfi\nprintf 'MERGED\\n'\n"
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	item := map[string]any{"id": "item_latest_approve", "key": "OMG-latest", "repositoryTargetId": "repo_latest", "status": "In Review", "stageId": "human_review"}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_latest_approve"
+	pipeline["status"] = "waiting-human"
+	oldAttempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	oldAttempt["id"] = "attempt_latest_stale"
+	oldAttempt["status"] = "failed"
+	oldAttempt["workspacePath"] = ""
+	oldAttempt["pullRequestUrl"] = ""
+	newAttempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	newAttempt["id"] = "attempt_latest_ready"
+	newAttempt["status"] = "waiting-human"
+	newAttempt["workspacePath"] = workspace
+	newAttempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/3"
+	newAttempt["branchName"] = "omega/missing-latest-branch"
+	checkpoint := map[string]any{"id": "checkpoint_latest_approve", "pipelineId": text(pipeline, "id"), "attemptId": text(oldAttempt, "id"), "stageId": "human_review", "status": "approved"}
+	database := WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems:   []map[string]any{item},
+		Pipelines:   []map[string]any{pipeline},
+		Attempts:    []map[string]any{oldAttempt, newAttempt},
+		Checkpoints: []map[string]any{checkpoint},
+	}}
+
+	if err := server.completeApprovedDevFlowCheckpoint(&database, checkpoint, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if text(database.Tables.Pipelines[0], "status") != "done" {
+		t.Fatalf("pipeline should complete through deliverable attempt: %+v", database.Tables.Pipelines[0])
+	}
+	if text(database.Tables.Attempts[0], "status") != "failed" || text(database.Tables.Attempts[1], "status") != "done" {
+		t.Fatalf("wrong attempt completed: attempts=%+v", database.Tables.Attempts)
+	}
+	if text(database.Tables.Checkpoints[0], "attemptId") != "attempt_latest_ready" {
+		t.Fatalf("checkpoint should be relinked to deliverable attempt: %+v", database.Tables.Checkpoints[0])
+	}
+}
+
+func TestMarkApprovedDevFlowDeliveryQueuedUsesLatestDeliverableAttempt(t *testing.T) {
+	item := map[string]any{"id": "item_queue_latest", "key": "OMG-queue", "repositoryTargetId": "repo_queue", "status": "In Review", "stageId": "human_review"}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_queue_latest"
+	pipeline["status"] = "waiting-human"
+	oldAttempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	oldAttempt["id"] = "attempt_queue_stale"
+	oldAttempt["status"] = "failed"
+	newAttempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	newAttempt["id"] = "attempt_queue_ready"
+	newAttempt["status"] = "waiting-human"
+	newAttempt["workspacePath"] = "/tmp/omega-queue"
+	newAttempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/4"
+	checkpoint := map[string]any{"id": "checkpoint_queue_latest", "pipelineId": text(pipeline, "id"), "attemptId": text(oldAttempt, "id"), "stageId": "human_review", "status": "approved"}
+	database := WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems:   []map[string]any{item},
+		Pipelines:   []map[string]any{pipeline},
+		Attempts:    []map[string]any{oldAttempt, newAttempt},
+		Checkpoints: []map[string]any{checkpoint},
+	}}
+
+	markApprovedDevFlowDeliveryQueued(&database, checkpoint, "alice")
+	if text(database.Tables.Pipelines[0], "status") != "running" || text(database.Tables.Attempts[1], "currentStageId") != "merging" || text(database.Tables.Attempts[1], "status") != "running" {
+		t.Fatalf("delivery queue did not move latest attempt to merging: pipeline=%+v attempts=%+v", database.Tables.Pipelines[0], database.Tables.Attempts)
+	}
+	if text(database.Tables.Checkpoints[0], "attemptId") != "attempt_queue_ready" {
+		t.Fatalf("checkpoint should be relinked to queued attempt: %+v", database.Tables.Checkpoints[0])
+	}
+	if text(database.Tables.WorkItems[0], "stageId") != "merging" {
+		t.Fatalf("work item did not move to merging: %+v", database.Tables.WorkItems[0])
+	}
+}
+
+func TestJobSupervisorQueuesApprovedDevFlowDeliveryContinuation(t *testing.T) {
+	server := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml"))
+	item := map[string]any{"id": "item_supervisor_delivery", "key": "OMG-delivery", "repositoryTargetId": "repo_delivery", "status": "In Review", "stageId": "human_review"}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_supervisor_delivery"
+	pipeline["status"] = "waiting-human"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_supervisor_delivery"
+	attempt["status"] = "waiting-human"
+	attempt["workspacePath"] = "/tmp/omega-delivery"
+	attempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/5"
+	checkpoint := map[string]any{"id": "checkpoint_supervisor_delivery", "pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "stageId": "human_review", "status": "approved"}
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems:   []map[string]any{item},
+		Pipelines:   []map[string]any{pipeline},
+		Attempts:    []map[string]any{attempt},
+		Checkpoints: []map[string]any{checkpoint},
+	}}
+
+	summary := server.scanApprovedDevFlowDeliveryContinuations(context.Background(), database)
+	if summary["approvedDeliveryContinuations"] != 1 || summary["changed"] != 1 {
+		t.Fatalf("approved delivery was not queued: summary=%+v", summary)
+	}
+	if text(database.Tables.Pipelines[0], "status") != "running" || text(database.Tables.Attempts[0], "currentStageId") != "merging" {
+		t.Fatalf("approved delivery state not queued: pipeline=%+v attempt=%+v", database.Tables.Pipelines[0], database.Tables.Attempts[0])
+	}
+	if got := stringSlice(summary["approvedDeliveryContinuationCheckpoints"]); len(got) != 1 || got[0] != "checkpoint_supervisor_delivery" {
+		t.Fatalf("checkpoint continuation list = %+v", summary)
+	}
+}
+
+func TestJobSupervisorRelinksApprovedCheckpointToCompletedAttempt(t *testing.T) {
+	item := map[string]any{"id": "item_relink_done", "key": "OMG-relink", "repositoryTargetId": "repo_relink", "status": "Done", "stageId": "done"}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_relink_done"
+	pipeline["status"] = "done"
+	staleAttempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "in_progress")
+	staleAttempt["id"] = "attempt_relink_stale"
+	staleAttempt["status"] = "failed"
+	doneAttempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "done")
+	doneAttempt["id"] = "attempt_relink_done"
+	doneAttempt["status"] = "done"
+	doneAttempt["workspacePath"] = "/tmp/omega-relink"
+	doneAttempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/6"
+	checkpoint := map[string]any{"id": "checkpoint_relink_done", "pipelineId": text(pipeline, "id"), "attemptId": text(staleAttempt, "id"), "stageId": "human_review", "status": "approved"}
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems:   []map[string]any{item},
+		Pipelines:   []map[string]any{pipeline},
+		Attempts:    []map[string]any{staleAttempt, doneAttempt},
+		Checkpoints: []map[string]any{checkpoint},
+	}}
+
+	summary := NewServer(filepath.Join(t.TempDir(), "omega.db"), filepath.Join(t.TempDir(), "workspace"), filepath.Join(t.TempDir(), "openapi.yaml")).reconcileAttemptIntegrityInDatabase(context.Background(), database)
+	if summary["relinkedApprovedCheckpoints"] != 1 {
+		t.Fatalf("approved checkpoint was not relinked: summary=%+v", summary)
+	}
+	if text(database.Tables.Checkpoints[0], "attemptId") != "attempt_relink_done" {
+		t.Fatalf("checkpoint should point at completed attempt: %+v", database.Tables.Checkpoints[0])
+	}
+}
+
 func TestApproveDevFlowCheckpointCanContinueDeliveryAsync(t *testing.T) {
 	api, repo := newTestAPI(t)
 	root := t.TempDir()
@@ -2669,7 +3418,7 @@ func TestApproveDevFlowCheckpointCanContinueDeliveryAsync(t *testing.T) {
 	}
 	bin := t.TempDir()
 	gh := filepath.Join(bin, "gh")
-	script := "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  sleep 1\n  printf 'merged\\n'\n  exit 0\nfi\nprintf 'MERGED\\n'\n"
+	script := "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  sleep 2\n  printf 'merged\\n'\n  exit 0\nfi\nprintf 'MERGED\\n'\n"
 	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2698,15 +3447,15 @@ func TestApproveDevFlowCheckpointCanContinueDeliveryAsync(t *testing.T) {
 	start := time.Now()
 	var approved map[string]any
 	decode(t, postJSON(t, api.URL+"/checkpoints/checkpoint_async_approve/approve", map[string]any{"reviewer": "alice", "asyncDelivery": true}), &approved)
-	if elapsed := time.Since(start); elapsed > 900*time.Millisecond {
+	if elapsed := time.Since(start); elapsed > 1800*time.Millisecond {
 		t.Fatalf("async approval waited for merge: %s", elapsed)
 	}
 	if approved["status"] != "approved" {
 		t.Fatalf("approved response = %+v", approved)
 	}
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		updated, err := repo.Load(context.Background())
+		updated, err := repo.LoadSupervisorExecutionState(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2717,7 +3466,7 @@ func TestApproveDevFlowCheckpointCanContinueDeliveryAsync(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	updated, _ := repo.Load(context.Background())
+	updated, _ := repo.LoadSupervisorExecutionState(context.Background())
 	t.Fatalf("async delivery did not complete: pipelines=%+v attempts=%+v", updated.Tables.Pipelines, updated.Tables.Attempts)
 }
 
@@ -2941,13 +3690,16 @@ func TestRunnerHeartbeatRefreshesAttemptAndLogsTrace(t *testing.T) {
 	if err := server.Repo.Save(context.Background(), *database); err != nil {
 		t.Fatal(err)
 	}
+	if err := server.Repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 
 	server.recordAttemptRunnerHeartbeat(context.Background(), text(pipeline, "id"), text(item, "id"), "attempt_runner_heartbeat", "in_progress", "coding", "codex", SupervisedCommandEvent{
 		Stream:    "stdout",
 		Chunk:     "still working",
 		CreatedAt: "2026-04-29T00:01:00Z",
 	})
-	updated, err := server.Repo.Load(context.Background())
+	updated, err := server.Repo.LoadSupervisorExecutionState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3040,6 +3792,71 @@ func TestListOperationsSupportsFilteredFastPath(t *testing.T) {
 	decode(t, mustGet(t, api.URL+"/operations?pipelineId=pipeline_item_manual_1&limit=1"), &operations)
 	if len(operations) != 1 || text(operations[0], "id") != "pipeline_item_manual_1:agent:todo:requirement" {
 		t.Fatalf("filtered operations = %+v", operations)
+	}
+}
+
+func TestSaveSupervisorExecutionStateUsesOperationColumnNamesForLegacySchema(t *testing.T) {
+	api, repo := newTestAPI(t)
+	t.Cleanup(api.Close)
+	seedWorkspace(t, repo)
+	if err := repo.exec(context.Background(), `
+DROP TABLE operations;
+CREATE TABLE operations (
+  id TEXT PRIMARY KEY,
+  mission_id TEXT NOT NULL,
+  stage_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  required_proof_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  record_json TEXT
+);
+`); err != nil {
+		t.Fatal(err)
+	}
+	now := "2026-05-05T11:11:11Z"
+	database, err := repo.LoadSupervisorExecutionState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	database.Tables.Missions = []map[string]any{{
+		"id": "mission_legacy_columns", "pipelineId": "pipeline_legacy_columns", "workItemId": "item_legacy_columns",
+		"title": "Legacy columns", "status": "running", "mission": map[string]any{"id": "mission_legacy_columns"},
+		"createdAt": now, "updatedAt": now,
+	}}
+	database.Tables.Operations = []map[string]any{{
+		"id": "operation_legacy_columns", "missionId": "mission_legacy_columns", "stageId": "coding", "agentId": "coding",
+		"status": "running", "prompt": "Edit the repo.", "requiredProof": []any{"artifact"},
+		"createdAt": now, "updatedAt": now,
+	}}
+	if err := repo.SaveSupervisorExecutionState(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+	output, err := repo.query(context.Background(), `.mode json
+SELECT created_at AS createdAt, updated_at AS updatedAt, record_json AS recordJson
+FROM operations
+WHERE id = 'operation_legacy_columns';`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(output), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0]["createdAt"] != now || rows[0]["updatedAt"] != now {
+		t.Fatalf("operation columns shifted: %+v", rows)
+	}
+	if !strings.Contains(text(rows[0], "recordJson"), `"id":"operation_legacy_columns"`) {
+		t.Fatalf("operation record_json missing record: %+v", rows[0])
+	}
+	snapshotRaw, err := repo.query(context.Background(), "SELECT database_json FROM workspace_snapshots WHERE id = 'default';")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(snapshotRaw, "operation_legacy_columns") {
+		t.Fatalf("legacy workspace snapshot should not mirror operation records")
 	}
 }
 
@@ -3159,8 +3976,8 @@ func TestLLMProviderSelectionAndAgentDefinitions(t *testing.T) {
 		t.Fatal(err)
 	}
 	decode(t, providersResponse, &providers)
-	if len(providers) < 2 {
-		t.Fatalf("provider count = %d", len(providers))
+	if len(providers) < 3 || findByID(providers, "kimi") < 0 {
+		t.Fatalf("providers should include Kimi, got %+v", providers)
 	}
 
 	var defaultSelection map[string]any
@@ -3179,6 +3996,11 @@ func TestLLMProviderSelectionAndAgentDefinitions(t *testing.T) {
 	if saved["providerId"] != "openai-compatible" {
 		t.Fatalf("saved provider = %v", saved["providerId"])
 	}
+	var kimiSaved map[string]any
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/llm-provider-selection", map[string]any{"providerId": "kimi", "model": "kimi-k2-0711-preview", "reasoningEffort": "medium"}), &kimiSaved)
+	if kimiSaved["providerId"] != "kimi" {
+		t.Fatalf("saved Kimi provider = %+v", kimiSaved)
+	}
 
 	var agents []map[string]any
 	agentsResponse, err := http.Get(api.URL + "/agent-definitions")
@@ -3190,7 +4012,7 @@ func TestLLMProviderSelectionAndAgentDefinitions(t *testing.T) {
 		t.Fatalf("agent count = %d", len(agents))
 	}
 	defaultModel := mapValue(agents[0]["defaultModel"])
-	if defaultModel["providerId"] != "openai-compatible" {
+	if defaultModel["providerId"] != "kimi" {
 		t.Fatalf("agent model provider = %v", defaultModel["providerId"])
 	}
 
@@ -3810,10 +4632,75 @@ func TestOrchestratorWatcherPersistsAndScansReadyIssues(t *testing.T) {
 		t.Fatalf("watcher did not claim a ready issue: %+v", database.Tables.WorkItems)
 	}
 	var watchers []map[string]any
-	decode(t, mustGet(t, api.URL+"/orchestrator/watchers"), &watchers)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		decode(t, mustGet(t, api.URL+"/orchestrator/watchers"), &watchers)
+		if len(watchers) == 1 && watchers[0]["lastTickStatus"] == "claimed" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	if len(watchers) != 1 || watchers[0]["lastTickStatus"] != "claimed" {
 		t.Fatalf("watchers = %+v", watchers)
 	}
+}
+
+func TestActiveOrchestratorWatcherRunsAfterRuntimeStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell gh script uses POSIX sh")
+	}
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	api := httptest.NewServer(server.Handler())
+	t.Cleanup(api.Close)
+	seedWorkspace(t, server.Repo)
+	bin := t.TempDir()
+	gh := filepath.Join(bin, "gh")
+	script := "#!/bin/sh\nprintf '%s' '[{\"number\":17,\"title\":\"Startup watcher issue\",\"body\":\"The local watcher should resume after runtime start.\",\"url\":\"https://github.com/acme/demo/issues/17\",\"labels\":[{\"name\":\"omega-ready\"}],\"assignees\":[]}]'\n"
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	decode(t, postJSON(t, api.URL+"/github/bind-repository-target", map[string]any{
+		"owner":         "acme",
+		"repo":          "demo",
+		"nameWithOwner": "acme/demo",
+		"defaultBranch": "main",
+		"url":           "https://github.com/acme/demo",
+	}), &WorkspaceDatabase{})
+	if err := server.Repo.SetSetting(context.Background(), orchestratorWatcherID("repo_acme_demo"), map[string]any{
+		"id":                 orchestratorWatcherID("repo_acme_demo"),
+		"repositoryTargetId": "repo_acme_demo",
+		"status":             "active",
+		"intervalSeconds":    60,
+		"autoRun":            false,
+		"autoApproveHuman":   false,
+		"autoMerge":          false,
+		"limit":              "20",
+		"createdAt":          nowISO(),
+		"updatedAt":          nowISO(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stopWatchers := server.StartOrchestratorWatchers(context.Background())
+	defer stopWatchers()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var database WorkspaceDatabase
+		decode(t, mustGet(t, api.URL+"/workspace"), &database)
+		if len(database.Tables.WorkItems) == 1 {
+			if database.Tables.WorkItems[0]["sourceExternalRef"] != "acme/demo#17" {
+				t.Fatalf("claimed wrong item: %+v", database.Tables.WorkItems[0])
+			}
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	var watchers []map[string]any
+	decode(t, mustGet(t, api.URL+"/orchestrator/watchers"), &watchers)
+	t.Fatalf("startup watcher did not run, watchers=%+v", watchers)
 }
 
 func TestExecutionLocksCanBeListedAndReleased(t *testing.T) {
@@ -4362,6 +5249,9 @@ exit 1
 func TestGitHubBindRepositoryTargetPersistsProjectTarget(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 
 	var database WorkspaceDatabase
 	decode(t, postJSON(t, api.URL+"/github/bind-repository-target", map[string]any{
@@ -4383,12 +5273,54 @@ func TestGitHubBindRepositoryTargetPersistsProjectTarget(t *testing.T) {
 		t.Fatalf("default target = %+v", database.Tables.Projects[0])
 	}
 
-	loaded, err := repo.Load(context.Background())
+	loaded, err := repo.LoadWorkspaceSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(arrayMaps(loaded.Tables.Projects[0]["repositoryTargets"])) != 1 {
 		t.Fatalf("loaded project = %+v", loaded.Tables.Projects[0])
+	}
+}
+
+func TestLocalRepositoryTargetPersistsProjectDirectory(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	repoPath := filepath.Join(t.TempDir(), "local-app")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoPath, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte("local app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoPath, "add", "README.md")
+	runGit(t, repoPath, "commit", "-m", "initial")
+	resolvedRepoPath := strings.TrimSpace(runGit(t, repoPath, "rev-parse", "--show-toplevel"))
+
+	var database WorkspaceDatabase
+	decode(t, postJSON(t, api.URL+"/repository-targets/local", map[string]any{
+		"path": repoPath,
+	}), &database)
+
+	targets := arrayMaps(database.Tables.Projects[0]["repositoryTargets"])
+	if len(targets) != 1 {
+		t.Fatalf("repository targets = %+v", targets)
+	}
+	target := targets[0]
+	if text(target, "kind") != "local" || text(target, "path") != resolvedRepoPath || text(target, "defaultBranch") != "main" {
+		t.Fatalf("local repository target = %+v", target)
+	}
+	if text(database.Tables.Projects[0], "defaultRepositoryTargetId") != text(target, "id") {
+		t.Fatalf("default target = %+v", database.Tables.Projects[0])
+	}
+
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedTarget := mapValue(arrayMaps(loaded.Tables.Projects[0]["repositoryTargets"])[0])
+	if text(loadedTarget, "path") != resolvedRepoPath || repositoryTargetCloneTarget(loadedTarget) != resolvedRepoPath {
+		t.Fatalf("loaded local target = %+v", loadedTarget)
 	}
 }
 
@@ -4525,6 +5457,37 @@ func TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords(t *testing.T) {
 		"target": "https://github.com/acme/demo/issues/1", "source": "github_issue", "repositoryTargetId": "repo_acme_demo",
 	}
 	_ = postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+	workspacePath := filepath.Join(filepath.Dir(repo.Path), "workspace", "GH-1-devflow")
+	if err := os.MkdirAll(workspacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Tables.Pipelines = append(loaded.Tables.Pipelines, map[string]any{"id": "pipeline_item_repo_1", "workItemId": "item_repo_1", "status": "running", "run": map[string]any{"stages": []any{}}})
+	loaded.Tables.Attempts = append(loaded.Tables.Attempts, map[string]any{"id": "attempt_repo_1", "pipelineId": "pipeline_item_repo_1", "itemId": "item_repo_1", "repositoryTargetId": "repo_acme_demo", "workspacePath": workspacePath})
+	loaded.Tables.RunWorkpads = append(loaded.Tables.RunWorkpads, map[string]any{"id": "attempt_repo_1:workpad", "attemptId": "attempt_repo_1", "pipelineId": "pipeline_item_repo_1", "workItemId": "item_repo_1"})
+	if err := repo.Save(context.Background(), *loaded); err != nil {
+		t.Fatal(err)
+	}
+	now := nowISO()
+	largeLegacyField := strings.Repeat("x", 64*1024)
+	if err := repo.exec(context.Background(), strings.Join([]string{
+		"BEGIN;",
+		fmt.Sprintf("INSERT INTO missions VALUES (%s,%s,%s,%s,%s,%s,%s,%s);",
+			sqlQuote("mission_delete_fast"), sqlQuote("pipeline_item_repo_1"), sqlQuote("item_repo_1"), sqlQuote("Delete fast"), sqlQuote("running"), sqlQuote(`{"id":"mission_delete_fast"}`), sqlQuote(now), sqlQuote(now)),
+		fmt.Sprintf("INSERT INTO operations VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+			sqlQuote("operation_delete_fast"), sqlQuote("mission_delete_fast"), sqlQuote("implementation"), sqlQuote("codex"), sqlQuote("running"), sqlQuote("prompt"), sqlQuote(`[]`), sqlQuote(`{"summary":"large legacy operation"}`), sqlQuote(largeLegacyField), sqlQuote(largeLegacyField)),
+		fmt.Sprintf("INSERT INTO proof_records VALUES (%s,%s,%s,%s,%s,%s);",
+			sqlQuote("proof_delete_fast"), sqlQuote("operation_delete_fast"), sqlQuote("proof"), sqlQuote("ok"), "NULL", sqlQuote(now)),
+		"COMMIT;",
+	}, "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 
 	response := requestJSON(t, http.MethodDelete, api.URL+"/github/repository-targets/repo_acme_demo", nil)
 	if response.StatusCode != http.StatusOK {
@@ -4536,6 +5499,151 @@ func TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords(t *testing.T) {
 	}
 	if len(database.Tables.WorkItems) != 0 {
 		t.Fatalf("work items = %+v", database.Tables.WorkItems)
+	}
+	if len(database.Tables.Pipelines) != 0 || len(database.Tables.Attempts) != 0 || len(database.Tables.RunWorkpads) != 0 {
+		t.Fatalf("execution records remained pipelines=%+v attempts=%+v runWorkpads=%+v", database.Tables.Pipelines, database.Tables.Attempts, database.Tables.RunWorkpads)
+	}
+	output, err := repo.query(context.Background(), `.mode list
+SELECT COUNT(*) FROM operations WHERE id = 'operation_delete_fast';
+SELECT COUNT(*) FROM proof_records WHERE id = 'proof_delete_fast';`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(output); got != "0\n0" {
+		t.Fatalf("linked operation/proof records should be deleted, got %q", got)
+	}
+	if _, err := os.Stat(workspacePath); err != nil {
+		t.Fatalf("local workspace should remain without explicit cleanup opt-in: %v", err)
+	}
+}
+
+func TestGitHubDeleteRepositoryTargetCanRemoveLocalWorkspacesWhenRequested(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	var database WorkspaceDatabase
+	decode(t, postJSON(t, api.URL+"/github/bind-repository-target", map[string]any{
+		"owner":         "acme",
+		"repo":          "demo",
+		"nameWithOwner": "acme/demo",
+		"defaultBranch": "main",
+		"url":           "https://github.com/acme/demo",
+	}), &database)
+	item := map[string]any{
+		"id": "item_repo_cleanup", "key": "GH-cleanup", "title": "Repo scoped cleanup", "description": "Bound to repo.",
+		"status": "Ready", "priority": "High", "assignee": "requirement", "labels": []any{"github"}, "team": "Omega", "stageId": "intake",
+		"target": "https://github.com/acme/demo/issues/2", "source": "github_issue", "repositoryTargetId": "repo_acme_demo",
+	}
+	_ = postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+	workspacePath := filepath.Join(filepath.Dir(repo.Path), "workspace", "GH-cleanup-devflow")
+	if err := os.MkdirAll(filepath.Join(workspacePath, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Tables.Pipelines = append(loaded.Tables.Pipelines, map[string]any{"id": "pipeline_item_repo_cleanup", "workItemId": "item_repo_cleanup", "status": "done", "run": map[string]any{"stages": []any{}}})
+	loaded.Tables.Attempts = append(loaded.Tables.Attempts, map[string]any{"id": "attempt_repo_cleanup", "pipelineId": "pipeline_item_repo_cleanup", "itemId": "item_repo_cleanup", "repositoryTargetId": "repo_acme_demo", "workspacePath": workspacePath})
+	if err := repo.Save(context.Background(), *loaded); err != nil {
+		t.Fatal(err)
+	}
+
+	response := requestJSON(t, http.MethodDelete, api.URL+"/github/repository-targets/repo_acme_demo?deleteLocalWorkspaces=true", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d", response.StatusCode)
+	}
+	if _, err := os.Stat(workspacePath); !os.IsNotExist(err) {
+		t.Fatalf("local workspace should be removed, stat err=%v", err)
+	}
+}
+
+func TestGitHubDeleteRepositoryTargetRemovesPagePilotRecordsAndWorkspaces(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	var database WorkspaceDatabase
+	decode(t, postJSON(t, api.URL+"/github/bind-repository-target", map[string]any{
+		"owner":         "acme",
+		"repo":          "demo",
+		"nameWithOwner": "acme/demo",
+		"defaultBranch": "main",
+		"url":           "https://github.com/acme/demo",
+	}), &database)
+	workspaceRoot := filepath.Join(filepath.Dir(repo.Path), "workspace")
+	pagePilotWorkspace := filepath.Join(workspaceRoot, "page-pilot", "acme_demo")
+	if err := os.MkdirAll(filepath.Join(pagePilotWorkspace, ".omega"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pagePilotRun := map[string]any{
+		"id":                 "page_pilot_cleanup",
+		"projectId":          "project_omega",
+		"repositoryTargetId": "repo_acme_demo",
+		"status":             "applied",
+		"repositoryPath":     pagePilotWorkspace,
+		"changedFiles":       []any{"src/Page.tsx"},
+		"isolation":          map[string]any{"mode": "isolated-devflow", "workspacePath": pagePilotWorkspace},
+		"previewRuntimeProfile": map[string]any{
+			"repositoryTargetId": "repo_acme_demo",
+			"workingDirectory":   pagePilotWorkspace,
+			"previewUrl":         "http://127.0.0.1:3009/",
+		},
+	}
+	if err := repo.SetPagePilotRun(context.Background(), pagePilotRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetSetting(context.Background(), pagePilotRunSettingPrefix+"legacy_cleanup", cloneMap(pagePilotRun)); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetSetting(context.Background(), pagePilotPreviewRuntimeKey("repo_acme_demo"), map[string]any{
+		"repositoryTargetId": "repo_acme_demo",
+		"repositoryPath":     pagePilotWorkspace,
+		"previewUrl":         "http://127.0.0.1:3009/",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lock := map[string]any{
+		"id":                 "execution-lock:page-pilot-live:repo_acme_demo",
+		"scope":              "page-pilot-live:repo_acme_demo",
+		"status":             "claimed",
+		"repositoryTargetId": "repo_acme_demo",
+		"pagePilotRunId":     "page_pilot_cleanup",
+	}
+	if err := repo.SetSetting(context.Background(), text(lock, "id"), lock); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetSetting(context.Background(), orchestratorWatcherID("repo_acme_demo"), map[string]any{
+		"id":                 orchestratorWatcherID("repo_acme_demo"),
+		"repositoryTargetId": "repo_acme_demo",
+		"status":             "active",
+		"autoRun":            true,
+		"intervalSeconds":    60,
+		"createdAt":          nowISO(),
+		"updatedAt":          nowISO(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := requestJSON(t, http.MethodDelete, api.URL+"/github/repository-targets/repo_acme_demo?deleteLocalWorkspaces=true", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d", response.StatusCode)
+	}
+	var runs []map[string]any
+	decode(t, mustGet(t, api.URL+"/page-pilot/runs"), &runs)
+	if len(runs) != 0 {
+		t.Fatalf("Page Pilot runs should be removed after repository target delete: %+v", runs)
+	}
+	if _, err := repo.GetSetting(context.Background(), pagePilotPreviewRuntimeKey("repo_acme_demo")); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("preview runtime setting should be removed, err=%v", err)
+	}
+	if _, err := repo.GetSetting(context.Background(), text(lock, "id")); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("execution lock should be removed, err=%v", err)
+	}
+	if _, err := repo.GetSetting(context.Background(), orchestratorWatcherID("repo_acme_demo")); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("orchestrator watcher should be removed, err=%v", err)
+	}
+	if _, err := os.Stat(pagePilotWorkspace); !os.IsNotExist(err) {
+		t.Fatalf("Page Pilot isolated workspace should be removed, stat err=%v", err)
 	}
 }
 
@@ -4727,8 +5835,35 @@ func TestProjectAgentProfilePersistsAndFeedsRuntimeBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(codexPolicy), "write requirement artifact") {
+	if !strings.Contains(string(codexPolicy), "write requirement artifact") || !strings.Contains(string(codexPolicy), "browser-use") || !strings.Contains(string(codexPolicy), "github") {
 		t.Fatalf("codex policy not written: %s", codexPolicy)
+	}
+	capabilitiesMarkdown, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "agent-capabilities.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(capabilitiesMarkdown), "## Stage Skills") || !strings.Contains(string(capabilitiesMarkdown), "browser-use") || !strings.Contains(string(capabilitiesMarkdown), "## Stage MCP") || !strings.Contains(string(capabilitiesMarkdown), "github") {
+		t.Fatalf("capabilities markdown not written: %s", capabilitiesMarkdown)
+	}
+	capabilitiesRaw, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "agent-capabilities.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var capabilities map[string]any
+	if err := json.Unmarshal(capabilitiesRaw, &capabilities); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(stringSlice(capabilities["skills"]), ","); !strings.Contains(got, "browser-use") {
+		t.Fatalf("capability skills = %+v", capabilities["skills"])
+	}
+	if got := strings.Join(stringSlice(capabilities["mcp"]), ","); !strings.Contains(got, "github") {
+		t.Fatalf("capability mcp = %+v", capabilities["mcp"])
+	}
+	if got := strings.Join(stringSlice(capabilities["skillAllowlist"]), ","); !strings.Contains(got, "browser-use") {
+		t.Fatalf("capability skill allowlist = %+v", capabilities["skillAllowlist"])
+	}
+	if got := strings.Join(stringSlice(capabilities["mcpAllowlist"]), ","); !strings.Contains(got, "github") {
+		t.Fatalf("capability mcp allowlist = %+v", capabilities["mcpAllowlist"])
 	}
 }
 
@@ -4786,6 +5921,252 @@ func TestProfileRunnerRegistrySelectsConfiguredAgentRunner(t *testing.T) {
 	}
 	if !strings.Contains(result.Stdout, "opencode profile runner ok") {
 		t.Fatalf("stdout = %q", result.Stdout)
+	}
+}
+
+func TestProfileSkillsAndMCPAreMaterializedForRunnerProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opencode script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	opencode := filepath.Join(bin, "opencode")
+	script := `#!/bin/sh
+test -f .omega/agent-capabilities.json || { echo missing-capabilities-json >&2; exit 17; }
+test -f .omega/agent-capabilities.md || { echo missing-capabilities-md >&2; exit 18; }
+grep -q 'playwright' .omega/agent-capabilities.json || { echo missing-skill-json >&2; exit 19; }
+grep -q 'omega-git' .omega/agent-capabilities.json || { echo missing-mcp-json >&2; exit 20; }
+grep -q 'security-best-practices' .codex/OMEGA.md || { echo missing-codex-skill >&2; exit 21; }
+grep -q 'omega-filesystem' .claude/CLAUDE.md || { echo missing-claude-mcp >&2; exit 22; }
+printf '%s\n' "$OMEGA_AGENT_SKILLS" | grep -q 'playwright' || { echo missing-skill-env >&2; exit 23; }
+printf '%s\n' "$OMEGA_AGENT_MCP" | grep -q 'omega-git' || { echo missing-mcp-env >&2; exit 24; }
+printf '%s\n' 'capability manifest visible to runner'
+`
+	if err := os.WriteFile(opencode, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"skillAllowlist":   "playwright\nsecurity-best-practices\ngh-fix-ci",
+		"mcpAllowlist":     "omega-filesystem\nomega-git\nomega-puppeteer",
+		"agentProfiles": []map[string]any{{
+			"id":         "coding",
+			"label":      "Coding",
+			"runner":     "opencode",
+			"model":      "gpt-5.4-mini",
+			"skills":     "playwright\nsecurity-best-practices",
+			"mcp":        "omega-filesystem\nomega-git",
+			"stageNotes": "Use browser and git capability manifests.",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+	if saved.AgentProfiles[0].Skills != "playwright\nsecurity-best-practices" || saved.AgentProfiles[0].MCP != "omega-filesystem\nomega-git" {
+		t.Fatalf("saved profile = %+v", saved)
+	}
+
+	mission := map[string]any{
+		"id":               "mission_OMG-94_coding",
+		"sourceIssueKey":   "OMG-94",
+		"sourceWorkItemId": "item_manual_94",
+		"title":            "Use stage capabilities",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run with stage-level skills and MCP.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	if !strings.Contains(result.Stdout, "capability manifest visible to runner") {
+		t.Fatalf("stdout = %q stderr=%q", result.Stdout, result.Stderr)
+	}
+	capabilitiesRaw, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "agent-capabilities.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var capabilities map[string]any
+	if err := json.Unmarshal(capabilitiesRaw, &capabilities); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(stringSlice(capabilities["skills"]), ",") != "playwright,security-best-practices" {
+		t.Fatalf("capability skills = %+v", capabilities["skills"])
+	}
+	if strings.Join(stringSlice(capabilities["mcp"]), ",") != "omega-filesystem,omega-git" {
+		t.Fatalf("capability mcp = %+v", capabilities["mcp"])
+	}
+}
+
+func TestRunnerCredentialQualifiesOpenCodeModelAndEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opencode script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	opencode := filepath.Join(bin, "opencode")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > opencode-args.txt\nprintf '%s\\n' \"$DEEPSEEK_API_KEY\" \"$DEEPSEEK_BASE_URL\" > opencode-env.txt\nprintf '%s\\n' \"$OPENCODE_CONFIG\" > opencode-config-path.txt\nif [ -n \"$OPENCODE_CONFIG\" ]; then cat \"$OPENCODE_CONFIG\" > opencode-config.json; fi\nprintf '%s\\n' 'opencode credential runner ok'\n"
+	if err := os.WriteFile(opencode, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
+		"runner":   "opencode",
+		"provider": "deepseek",
+		"label":    "opencode DeepSeek",
+		"model":    "deepseek-chat",
+		"baseUrl":  "https://api.deepseek.test",
+		"apiKey":   "secret-opencode-key",
+	}), &map[string]any{})
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "opencode",
+			"model":  "gpt-5.4-mini",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &saved)
+	mission := map[string]any{
+		"id":               "mission_OMG-93_coding",
+		"sourceIssueKey":   "OMG-93",
+		"sourceWorkItemId": "item_manual_93",
+		"title":            "Use encrypted opencode account",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run with encrypted opencode account.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	args, err := os.ReadFile(filepath.Join(result.WorkspacePath, "opencode-args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--model deepseek/deepseek-chat") || strings.Contains(string(args), "secret-opencode-key") {
+		t.Fatalf("opencode args = %s", args)
+	}
+	envOutput, err := os.ReadFile(filepath.Join(result.WorkspacePath, "opencode-env.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(envOutput)); got != "secret-opencode-key\nhttps://api.deepseek.test" {
+		t.Fatalf("opencode env = %q", got)
+	}
+	configRaw, err := os.ReadFile(filepath.Join(result.WorkspacePath, "opencode-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configText := string(configRaw)
+	if !strings.Contains(configText, `"npm": "@ai-sdk/openai-compatible"`) || !strings.Contains(configText, `"deepseek-chat"`) {
+		t.Fatalf("opencode config = %s", configText)
+	}
+	if strings.Contains(configText, "secret-opencode-key") || !strings.Contains(configText, "{env:DEEPSEEK_API_KEY}") {
+		t.Fatalf("opencode config leaked secret or missed env reference: %s", configText)
+	}
+}
+
+func TestRunnerCredentialKeyFollowsConfiguredWorkspaceRootAfterRestart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opencode script uses POSIX sh")
+	}
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "omega.db")
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configuredWorkspaceRoot := filepath.Join(root, "configured-workspaces")
+
+	firstServer := NewServer(databasePath, filepath.Join(root, "boot-workspaces"), openAPI)
+	firstAPI := httptest.NewServer(firstServer.Handler())
+	seedWorkspace(t, firstServer.Repo)
+	decode(t, requestJSON(t, http.MethodPut, firstAPI.URL+"/local-workspace-root", map[string]any{
+		"workspaceRoot": configuredWorkspaceRoot,
+	}), &map[string]any{})
+	decode(t, requestJSON(t, http.MethodPut, firstAPI.URL+"/runner-credentials", map[string]any{
+		"runner":   "opencode",
+		"provider": "deepseek",
+		"model":    "deepseek-chat",
+		"baseUrl":  "https://api.deepseek.test",
+		"apiKey":   "secret-after-restart",
+	}), &map[string]any{})
+	firstAPI.Close()
+
+	if _, err := os.Stat(filepath.Join(configuredWorkspaceRoot, ".omega", credentialKeyFilename)); err != nil {
+		t.Fatalf("configured workspace credential key was not written: %v", err)
+	}
+
+	bin := t.TempDir()
+	opencode := filepath.Join(bin, "opencode")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$DEEPSEEK_API_KEY\" \"$DEEPSEEK_BASE_URL\" > opencode-env.txt\nprintf '%s\\n' 'opencode restart credential ok'\n"
+	if err := os.WriteFile(opencode, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	restartedServer := NewServer(databasePath, filepath.Join(root, "different-boot-workspaces"), openAPI)
+	restartedAPI := httptest.NewServer(restartedServer.Handler())
+	defer restartedAPI.Close()
+
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "opencode",
+			"model":  "gpt-5.4-mini",
+		}},
+	}
+	var saved ProjectAgentProfile
+	decode(t, requestJSON(t, http.MethodPut, restartedAPI.URL+"/agent-profile", profile), &saved)
+	mission := map[string]any{
+		"id":               "mission_OMG-94_coding",
+		"sourceIssueKey":   "OMG-94",
+		"sourceWorkItemId": "item_manual_94",
+		"title":            "Use encrypted opencode account after restart",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run with encrypted opencode account.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, restartedAPI.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	envOutput, err := os.ReadFile(filepath.Join(result.WorkspacePath, "opencode-env.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(envOutput)); got != "secret-after-restart\nhttps://api.deepseek.test" {
+		t.Fatalf("opencode env after restart = %q", got)
 	}
 }
 
@@ -4850,6 +6231,17 @@ func TestTraeAgentRunnerUsesTraeCLI(t *testing.T) {
 	}
 	if !strings.Contains(string(args), "run Run using Trae Agent.") || !strings.Contains(string(args), "--working-dir") || !strings.Contains(string(args), "--provider doubao") {
 		t.Fatalf("trae args = %s", args)
+	}
+	if !strings.Contains(string(args), "--config-file") {
+		t.Fatalf("expected trae config file arg, got %s", args)
+	}
+	configRaw, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "trae-runner-config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configText := string(configRaw)
+	if !strings.Contains(configText, "provider: \"doubao\"") || !strings.Contains(configText, "model: \"doubao-seed-1.6\"") {
+		t.Fatalf("trae config = %s", configText)
 	}
 }
 
@@ -4938,6 +6330,93 @@ func TestRunnerCredentialEncryptsAndInjectsTraeEnv(t *testing.T) {
 	}
 	if strings.Contains(string(args), "secret-trae-key") || !strings.Contains(string(args), "--model ep-test-001") {
 		t.Fatalf("trae args = %s", args)
+	}
+	configRaw, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "trae-runner-config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configText := string(configRaw)
+	if strings.Contains(configText, "secret-trae-key") || !strings.Contains(configText, "provider: \"doubao\"") || !strings.Contains(configText, "model: \"ep-test-001\"") {
+		t.Fatalf("trae config = %s", configText)
+	}
+}
+
+func TestRunnerCredentialMapsKimiForTraeThroughOpenAICompatibleConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake trae-cli script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	trae := filepath.Join(bin, "trae-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > trae-args.txt\nprintf '%s\\n' \"$KIMI_API_KEY\" \"$KIMI_BASE_URL\" \"$OPENAI_API_KEY\" \"$OPENAI_BASE_URL\" > trae-env.txt\nprintf '%s\\n' 'trae kimi env ok'\n"
+	if err := os.WriteFile(trae, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
+		"runner":   "trae-agent",
+		"provider": "kimi",
+		"label":    "Trae Kimi",
+		"model":    "kimi-for-coding",
+		"baseUrl":  "https://kimi.a7m.com.cn",
+		"apiKey":   "secret-kimi-key",
+	}), &map[string]any{})
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "coding",
+			"label":  "Coding",
+			"runner": "trae-agent",
+			"model":  "gpt-5.4-mini",
+		}},
+	}
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &ProjectAgentProfile{})
+	mission := map[string]any{
+		"id":               "mission_OMG-94_coding",
+		"sourceIssueKey":   "OMG-94",
+		"sourceWorkItemId": "item_manual_94",
+		"title":            "Use Kimi through Trae",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_coding",
+			"stageId": "coding",
+			"agentId": "coding",
+			"status":  "ready",
+			"prompt":  "Run with Kimi-compatible Trae account.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_coding", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	args, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--provider openai") || !strings.Contains(string(args), "--model kimi-for-coding") || strings.Contains(string(args), "secret-kimi-key") {
+		t.Fatalf("trae args = %s", args)
+	}
+	envOutput, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-env.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(envOutput)); got != "secret-kimi-key\nhttps://kimi.a7m.com.cn\nsecret-kimi-key\nhttps://kimi.a7m.com.cn" {
+		t.Fatalf("trae env = %q", got)
+	}
+	if result.RunnerProcess["provider"] != "kimi" || result.RunnerProcess["cliProvider"] != "openai" {
+		t.Fatalf("runner process = %+v", result.RunnerProcess)
+	}
+	configRaw, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "trae-runner-config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configText := string(configRaw)
+	if strings.Contains(configText, "secret-kimi-key") || !strings.Contains(configText, "provider: \"openai\"") || !strings.Contains(configText, "model: \"kimi-for-coding\"") {
+		t.Fatalf("trae config = %s", configText)
 	}
 }
 
@@ -5094,17 +6573,25 @@ func TestAgentRunnerPreflightUsesTraeCredential(t *testing.T) {
 	api, _ := newTestAPI(t)
 	bin := t.TempDir()
 	trae := filepath.Join(bin, "trae-cli")
-	script := "#!/bin/sh\nif [ \"$1\" = \"show-config\" ]; then printf 'model=%s\\nkey=%s\\n' \"$TRAE_MODEL\" \"$DOUBAO_API_KEY\"; exit 0; fi\nexit 1\n"
+	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'trae-cli, version 0.1.0\\n'; exit 0; fi\nif [ \"$1\" = \"show-config\" ]; then printf 'model=%s\\nkey=%s\\n' \"$TRAE_MODEL\" \"$DOUBAO_API_KEY\"; exit 0; fi\nexit 1\n"
 	if err := os.WriteFile(trae, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	provider := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("authorization") != "Bearer secret-trae-key" {
+			t.Fatalf("authorization = %q", request.Header.Get("authorization"))
+		}
+		writeJSON(response, http.StatusOK, map[string]any{"data": []map[string]any{{"id": "ep-test-001"}}})
+	}))
+	defer provider.Close()
 	var credential map[string]any
 	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
 		"runner":   "trae-agent",
 		"provider": "doubao",
 		"label":    "Trae Doubao",
 		"model":    "ep-test-001",
+		"baseUrl":  provider.URL,
 		"apiKey":   "secret-trae-key",
 	}), &credential)
 
@@ -5123,6 +6610,257 @@ func TestAgentRunnerPreflightUsesTraeCredential(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprint(result), "secret-trae-key") {
 		t.Fatalf("preflight leaked API key: %+v", result)
+	}
+}
+
+func TestAgentRunnerPreflightTestsTransientOpenCodeProviderCredential(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opencode script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	opencode := filepath.Join(bin, "opencode")
+	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'opencode 1.14.31\\n'; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(opencode, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	provider := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("authorization") != "Bearer transient-key" {
+			t.Fatalf("authorization = %q", request.Header.Get("authorization"))
+		}
+		writeJSON(response, http.StatusOK, map[string]any{"data": []map[string]any{{"id": "kimi-for-coding"}}})
+	}))
+	defer provider.Close()
+
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-runner/preflight", map[string]any{
+		"agentId":  "global-opencode",
+		"runner":   "opencode",
+		"provider": "kimi",
+		"model":    "kimi-for-coding",
+		"baseUrl":  provider.URL,
+		"apiKey":   "transient-key",
+	}), &result)
+	if result["status"] != "ready" || result["effectiveModel"] != "kimi/kimi-for-coding" || result["modelCount"] != float64(1) {
+		t.Fatalf("expected transient provider preflight, got %+v", result)
+	}
+	if strings.Contains(fmt.Sprint(result), "transient-key") {
+		t.Fatalf("preflight leaked API key: %+v", result)
+	}
+}
+
+func TestRunnerModelDiscoveryUsesSavedProviderCredential(t *testing.T) {
+	api, _ := newTestAPI(t)
+	provider := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/models" {
+			t.Fatalf("path = %s", request.URL.Path)
+		}
+		if request.Header.Get("authorization") != "Bearer secret-provider-key" {
+			t.Fatalf("authorization = %q", request.Header.Get("authorization"))
+		}
+		writeJSON(response, http.StatusOK, map[string]any{
+			"data": []map[string]any{
+				{"id": "deepseek-chat"},
+				{"id": "deepseek-reasoner"},
+			},
+		})
+	}))
+	defer provider.Close()
+
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
+		"runner":   "opencode",
+		"provider": "deepseek",
+		"label":    "opencode DeepSeek",
+		"baseUrl":  provider.URL,
+		"apiKey":   "secret-provider-key",
+	}), &map[string]any{})
+
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-runner/models", map[string]any{
+		"runner":   "opencode",
+		"provider": "deepseek",
+	}), &result)
+	if result["status"] != "ready" || result["credentialConfigured"] != true {
+		t.Fatalf("model discovery result = %+v", result)
+	}
+	models := strings.Join(stringArray(result["models"]), ",")
+	if models != "deepseek/deepseek-chat,deepseek/deepseek-reasoner" {
+		t.Fatalf("models = %s result=%+v", models, result)
+	}
+	if strings.Contains(fmt.Sprint(result), "secret-provider-key") {
+		t.Fatalf("model discovery leaked API key: %+v", result)
+	}
+}
+
+func TestRunnerModelDiscoveryKnowsKimiBaseURL(t *testing.T) {
+	if got := defaultRunnerProviderBaseURL("kimi"); got != "https://api.moonshot.ai/v1" {
+		t.Fatalf("Kimi base URL = %q", got)
+	}
+	if got := defaultRunnerProviderBaseURL("moonshot"); got != "https://api.moonshot.ai/v1" {
+		t.Fatalf("Moonshot alias base URL = %q", got)
+	}
+}
+
+func TestRunnerModelDiscoveryReadsCodexLocalModelCache(t *testing.T) {
+	api, _ := newTestAPI(t)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte("model = \"gpt-5.5\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cache := `{"models":[{"slug":"gpt-5.5"},{"slug":"gpt-5.4"},{"slug":"gpt-5.4-mini"}]}`
+	if err := os.WriteFile(filepath.Join(codexHome, "models_cache.json"), []byte(cache), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-runner/models", map[string]any{
+		"runner": "codex",
+	}), &result)
+	if result["status"] != "ready" || result["source"] != "Codex local model cache" {
+		t.Fatalf("model discovery result = %+v", result)
+	}
+	models := strings.Join(stringArray(result["models"]), ",")
+	if models != "gpt-5.5,gpt-5.4,gpt-5.4-mini" {
+		t.Fatalf("models = %s result=%+v", models, result)
+	}
+}
+
+func TestAgentRunnerPreflightUsesCodexSavedModelAsDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codex script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	codex := filepath.Join(bin, "codex")
+	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.98.0\\n'; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(codex, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/runner-credentials", map[string]any{
+		"runner":   "codex",
+		"provider": "openai",
+		"model":    "gpt-5.5",
+	}), &map[string]any{})
+
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-runner/preflight", map[string]any{
+		"agentId": "coding",
+		"label":   "Coding",
+		"runner":  "codex",
+		"model":   "gpt-5.4-mini",
+	}), &result)
+	if result["status"] != "ready" || result["effectiveModel"] != "gpt-5.5" {
+		t.Fatalf("expected saved Codex model default, got %+v", result)
+	}
+}
+
+func TestAgentRunnerPreflightLeavesLegacyClaudeModelToLocalConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	claude := filepath.Join(bin, "claude")
+	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'claude 1.0.0\\n'; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(claude, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-runner/preflight", map[string]any{
+		"agentId": "review",
+		"label":   "Review",
+		"runner":  "claude-code",
+		"model":   "gpt-5.4-mini",
+	}), &result)
+	if result["status"] != "ready" {
+		t.Fatalf("expected Claude preflight ready, got %+v", result)
+	}
+	if result["effectiveModel"] != nil && strings.TrimSpace(fmt.Sprint(result["effectiveModel"])) != "" {
+		t.Fatalf("expected Claude to use local CLI model config, got %+v", result)
+	}
+}
+
+func TestClaudeCodeRunnerDoesNotOverrideLocalModelForLegacyDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+	bin := t.TempDir()
+	claude := filepath.Join(bin, "claude")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > claude-args.txt\nprintf '%s\\n' 'claude local config ok'\n"
+	if err := os.WriteFile(claude, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	profile := map[string]any{
+		"projectId":        "project_omega",
+		"workflowTemplate": "devflow-pr",
+		"agentProfiles": []map[string]any{{
+			"id":     "review",
+			"label":  "Review",
+			"runner": "claude-code",
+			"model":  "gpt-5.4-mini",
+		}},
+	}
+	decode(t, requestJSON(t, http.MethodPut, api.URL+"/agent-profile", profile), &ProjectAgentProfile{})
+	mission := map[string]any{
+		"id":               "mission_OMG-95_review",
+		"sourceIssueKey":   "OMG-95",
+		"sourceWorkItemId": "item_manual_95",
+		"title":            "Use Claude local config",
+		"target":           "No target",
+		"operations": []map[string]any{{
+			"id":      "operation_review",
+			"stageId": "review",
+			"agentId": "review",
+			"status":  "ready",
+			"prompt":  "Run with Claude local config.",
+		}},
+	}
+	var result OperationResult
+	decode(t, postJSON(t, api.URL+"/operations/run", map[string]any{"mission": mission, "operationId": "operation_review", "runner": "profile"}), &result)
+	if result.Status != "passed" {
+		t.Fatalf("operation status = %s result=%+v", result.Status, result)
+	}
+	args, err := os.ReadFile(filepath.Join(result.WorkspacePath, "claude-args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(args), "--model") || result.RunnerProcess["model"] != "local-config" {
+		t.Fatalf("claude args=%s process=%+v", args, result.RunnerProcess)
+	}
+}
+
+func TestRunnerModelDiscoveryParsesOpenCodeModelsCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opencode script uses POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+	bin := t.TempDir()
+	opencode := filepath.Join(bin, "opencode")
+	script := "#!/bin/sh\nif [ \"$1\" = \"models\" ]; then printf 'openrouter/gpt-5\\nopenrouter/deepseek-r1\\n'; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(opencode, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var result map[string]any
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-runner/models", map[string]any{
+		"runner":   "opencode",
+		"provider": "openrouter",
+	}), &result)
+	if result["status"] != "ready" || result["source"] != "opencode models" {
+		t.Fatalf("model discovery result = %+v", result)
+	}
+	models := strings.Join(stringArray(result["models"]), ",")
+	if models != "openrouter/deepseek-r1,openrouter/gpt-5" {
+		t.Fatalf("models = %s result=%+v", models, result)
 	}
 }
 
@@ -5303,6 +7041,9 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if err := repo.SetSetting(context.Background(), text(conflictLock, "id"), conflictLock); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 	conversationBatch := map[string]any{
 		"id":                  "page_pilot_batch_test",
 		"createdAt":           "17:05:38",
@@ -5459,7 +7200,7 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if report := mapValue(storedRun["sourceMappingReport"]); text(report, "status") != "strong" {
 		t.Fatalf("stored run should keep source mapping report: %+v", storedRun)
 	}
-	linkedDatabase, err := repo.Load(context.Background())
+	linkedDatabase, err := repo.LoadSupervisorExecutionState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5520,7 +7261,7 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if text(releasedLock, "status") != "released" {
 		t.Fatalf("discard should release Page Pilot lock: %+v", releasedLock)
 	}
-	discardedDatabase, err := repo.Load(context.Background())
+	discardedDatabase, err := repo.LoadSupervisorExecutionState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5579,7 +7320,7 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if text(releasedLock, "status") != "released" {
 		t.Fatalf("delivery should release Page Pilot lock: %+v", releasedLock)
 	}
-	deliveredRun, err := repo.Load(context.Background())
+	deliveredRun, err := repo.LoadSupervisorExecutionState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5827,6 +7568,7 @@ func TestFeishuReviewRequestSendsInteractiveWebhookCard(t *testing.T) {
 }
 
 func TestFeishuAutoReviewRecordsNeedsConfigurationWhenNoTarget(t *testing.T) {
+	enableFeishuAutoDeliveryForTest(t)
 	root := t.TempDir()
 	fakeLark := filepath.Join(root, "lark-cli")
 	if err := os.WriteFile(fakeLark, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
@@ -5859,6 +7601,7 @@ func TestFeishuAutoReviewFallsBackToCurrentLarkUser(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake shell script uses POSIX sh")
 	}
+	enableFeishuAutoDeliveryForTest(t)
 	root := t.TempDir()
 	openAPI := filepath.Join(root, "openapi.yaml")
 	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
@@ -5892,6 +7635,248 @@ func TestFeishuAutoReviewFallsBackToCurrentLarkUser(t *testing.T) {
 	review := mapValue(loaded.Tables.Checkpoints[0]["feishuReview"])
 	if text(review, "status") != "sent" || text(review, "route") != "direct-user" || text(review, "format") != "task-review" || text(review, "fallback") != "current-user-task" {
 		t.Fatalf("checkpoint feishu review = %+v", review)
+	}
+}
+
+func TestFeishuAutoReviewDoesNotResendAlreadySentCheckpoint(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	enableFeishuAutoDeliveryForTest(t)
+	root := t.TempDir()
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	seedFeishuReviewCheckpoint(t, server.Repo, map[string]any{
+		"status":       "sent",
+		"format":       "task-review",
+		"taskGuid":     "task_existing",
+		"checkpointId": "pipeline_1:human_review",
+	})
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args.txt")
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argsFile + "\nprintf '%s' '{\"data\":{\"task\":{\"guid\":\"task_new\"}}}'\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	server.sendFeishuReviewForPipelineIfConfigured(context.Background(), "pipeline_1")
+
+	if raw, err := os.ReadFile(argsFile); err == nil && strings.Contains(string(raw), "task +create") {
+		t.Fatalf("auto review resent an already-sent checkpoint: %s", raw)
+	}
+	loaded, err := server.Repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := mapValue(loaded.Tables.Checkpoints[0]["feishuReview"])
+	if text(review, "taskGuid") != "task_existing" {
+		t.Fatalf("checkpoint feishu review was overwritten: %+v", review)
+	}
+}
+
+func TestFeishuAutoReviewDoesNotResendWithDeliveryReceipt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	enableFeishuAutoDeliveryForTest(t)
+	root := t.TempDir()
+	openAPI := filepath.Join(root, "openapi.yaml")
+	if err := os.WriteFile(openAPI, []byte("openapi: 3.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), openAPI)
+	seedFeishuReviewCheckpoint(t, server.Repo, nil)
+	if err := server.Repo.UpsertFeishuDeliveryReceipt(context.Background(), map[string]any{
+		"dedupeKey":  feishuReviewDeliveryKey("pipeline_1:human_review"),
+		"provider":   "feishu",
+		"kind":       "human_review",
+		"entityId":   "pipeline_1:human_review",
+		"pipelineId": "pipeline_1",
+		"attemptId":  "attempt_1",
+		"status":     "sent",
+		"format":     "task-review",
+		"taskGuid":   "task_existing",
+		"payload": map[string]any{
+			"status":       "sent",
+			"provider":     "feishu",
+			"format":       "task-review",
+			"checkpointId": "pipeline_1:human_review",
+			"taskGuid":     "task_existing",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args.txt")
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argsFile + "\nprintf '%s' '{\"data\":{\"task\":{\"guid\":\"task_new\"}}}'\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	server.sendFeishuReviewForPipelineIfConfigured(context.Background(), "pipeline_1")
+
+	if raw, err := os.ReadFile(argsFile); err == nil && strings.Contains(string(raw), "task +create") {
+		t.Fatalf("auto review ignored delivery receipt and created a task: %s", raw)
+	}
+}
+
+func TestUpsertPendingCheckpointPreservesFeishuReviewState(t *testing.T) {
+	database := &WorkspaceDatabase{Tables: WorkspaceTables{
+		Pipelines: []map[string]any{{
+			"id":     "pipeline_1",
+			"status": "waiting-human",
+			"run": map[string]any{"stages": []any{
+				map[string]any{"id": "human_review", "title": "Human Review", "status": "needs-human"},
+			}},
+		}},
+		Attempts: []map[string]any{{
+			"id":         "attempt_2",
+			"pipelineId": "pipeline_1",
+			"status":     "waiting-human",
+		}},
+		Checkpoints: []map[string]any{{
+			"id":           "pipeline_1:human_review",
+			"pipelineId":   "pipeline_1",
+			"attemptId":    "attempt_1",
+			"stageId":      "human_review",
+			"status":       "pending",
+			"title":        "Human Review",
+			"summary":      "Waiting for approval.",
+			"feishuReview": map[string]any{"status": "sent", "format": "task-review", "taskGuid": "task_existing"},
+			"createdAt":    "2026-05-05T00:00:00Z",
+			"updatedAt":    "2026-05-05T00:00:00Z",
+		}},
+	}}
+
+	upsertPendingCheckpoint(database, database.Tables.Pipelines[0])
+
+	if len(database.Tables.Checkpoints) != 1 {
+		t.Fatalf("checkpoint count = %d", len(database.Tables.Checkpoints))
+	}
+	checkpoint := database.Tables.Checkpoints[0]
+	if text(checkpoint, "attemptId") != "attempt_2" {
+		t.Fatalf("checkpoint was not relinked to latest attempt: %+v", checkpoint)
+	}
+	review := mapValue(checkpoint["feishuReview"])
+	if text(review, "taskGuid") != "task_existing" || !feishuReviewAlreadySent(review) {
+		t.Fatalf("checkpoint feishu review was not preserved: %+v", checkpoint["feishuReview"])
+	}
+}
+
+func TestSQLiteCheckpointStoresFeishuReviewJSON(t *testing.T) {
+	repo := NewSQLiteRepository(filepath.Join(t.TempDir(), "omega.db"))
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{
+		"status":       "sent",
+		"format":       "task-review",
+		"taskGuid":     "task_existing",
+		"checkpointId": "pipeline_1:human_review",
+	})
+
+	output, err := repo.query(context.Background(), `.mode json
+SELECT
+  attempt_id AS attemptId,
+  feishu_review_status AS feishuReviewStatus,
+  feishu_task_guid AS feishuTaskGuid,
+  feishu_task_id AS feishuTaskId,
+  feishu_message_id AS feishuMessageId,
+  feishu_review_json AS feishuReviewJson
+FROM checkpoints
+WHERE id = 'pipeline_1:human_review';
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(output), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("checkpoint rows = %+v", rows)
+	}
+	if text(rows[0], "attemptId") != "attempt_1" {
+		t.Fatalf("attempt_id = %q", text(rows[0], "attemptId"))
+	}
+	if text(rows[0], "feishuReviewStatus") != "sent" || text(rows[0], "feishuTaskGuid") != "task_existing" {
+		t.Fatalf("checkpoint feishu fact columns = %+v", rows[0])
+	}
+	var review map[string]any
+	if err := json.Unmarshal([]byte(text(rows[0], "feishuReviewJson")), &review); err != nil {
+		t.Fatal(err)
+	}
+	if text(review, "taskGuid") != "task_existing" || text(review, "status") != "sent" {
+		t.Fatalf("feishu_review_json = %+v", review)
+	}
+	checkpoints, err := repo.ListCheckpoints(context.Background(), map[string]string{"attemptId": "attempt_1", "feishuTaskGuid": "task_existing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 1 {
+		t.Fatalf("ListCheckpoints rows = %+v", checkpoints)
+	}
+	listedReview := mapValue(checkpoints[0]["feishuReview"])
+	if text(checkpoints[0], "attemptId") != "attempt_1" || text(checkpoints[0], "feishuReviewStatus") != "sent" || text(listedReview, "taskGuid") != "task_existing" {
+		t.Fatalf("ListCheckpoints normalized checkpoint = %+v", checkpoints[0])
+	}
+}
+
+func TestSQLiteAttemptStoresFeishuFailureFacts(t *testing.T) {
+	repo := NewSQLiteRepository(filepath.Join(t.TempDir(), "omega.db"))
+	seedFeishuReviewCheckpoint(t, repo, nil)
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := cloneMap(database.Tables.Attempts[0])
+	attempt["feishuFailureNotifiedAt"] = "2026-05-05T03:00:00Z"
+	attempt["feishuFailure"] = map[string]any{
+		"status":    "sent",
+		"provider":  "feishu",
+		"messageId": "message_existing",
+	}
+	database.Tables.Attempts[0] = attempt
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := repo.query(context.Background(), `.mode json
+SELECT
+  feishu_failure_notified_at AS feishuFailureNotifiedAt,
+  feishu_failure_status AS feishuFailureStatus,
+  feishu_failure_message_id AS feishuFailureMessageId,
+  feishu_failure_json AS feishuFailureJson
+FROM attempts
+WHERE id = 'attempt_1';
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(output), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("attempt rows = %+v", rows)
+	}
+	if text(rows[0], "feishuFailureNotifiedAt") == "" || text(rows[0], "feishuFailureStatus") != "sent" || text(rows[0], "feishuFailureMessageId") != "message_existing" {
+		t.Fatalf("attempt feishu failure columns = %+v", rows[0])
+	}
+	attempts, err := repo.ListAttempts(context.Background(), map[string]string{"id": "attempt_1", "feishuFailureMessageId": "message_existing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("ListAttempts rows = %+v", attempts)
+	}
+	listedFailure := mapValue(attempts[0]["feishuFailure"])
+	if !attemptFeishuFailureAlreadySent(attempts[0]) || text(listedFailure, "messageId") != "message_existing" {
+		t.Fatalf("ListAttempts normalized attempt = %+v", attempts[0])
 	}
 }
 
@@ -6017,6 +8002,9 @@ func TestFeishuReviewTaskSyncApprovesCompletedTask(t *testing.T) {
 	}
 	api, repo := newTestAPI(t)
 	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 	bin := t.TempDir()
 	larkCLI := filepath.Join(bin, "lark-cli")
 	script := "#!/bin/sh\ncase \"$*\" in\n*\"task tasks get\"*) printf '%s' '{\"task\":{\"guid\":\"task_123\",\"status\":\"done\",\"completed_at\":\"2026-05-01T10:00:00Z\"}}' ;;\n*\"task +comment\"*) printf '%s' '{\"comment_id\":\"comment_123\"}' ;;\n*) printf '%s' '{}' ;;\nesac\n"
@@ -6032,7 +8020,7 @@ func TestFeishuReviewTaskSyncApprovesCompletedTask(t *testing.T) {
 	if len(synced) != 1 || text(synced[0], "state") != "synced" || text(synced[0], "decision") != "approved" {
 		t.Fatalf("sync result = %+v", result)
 	}
-	loaded, err := repo.Load(context.Background())
+	loaded, err := repo.LoadSupervisorExecutionState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6041,9 +8029,54 @@ func TestFeishuReviewTaskSyncApprovesCompletedTask(t *testing.T) {
 	}
 }
 
+func TestFeishuReviewTaskSyncDoesNotApproveTodoTaskWithZeroCompletedAt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell script uses POSIX sh")
+	}
+	api, repo := newTestAPI(t)
+	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	larkCLI := filepath.Join(bin, "lark-cli")
+	script := "#!/bin/sh\ncase \"$*\" in\n*\"task tasks get\"*) printf '%s' '{\"task\":{\"guid\":\"task_123\",\"status\":\"todo\",\"completed_at\":\"0\"}}' ;;\n*) printf '%s' '{}' ;;\nesac\n"
+	if err := os.WriteFile(larkCLI, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	response := postJSON(t, api.URL+"/feishu/review-task/sync", map[string]any{"checkpointId": "pipeline_1:human_review"})
+	var result map[string]any
+	decode(t, response, &result)
+	synced := arrayMaps(result["synced"])
+	if len(synced) != 1 || text(synced[0], "state") != "pending" || text(synced[0], "decision") == "approved" {
+		t.Fatalf("sync result = %+v", result)
+	}
+	loaded, err := repo.LoadSupervisorExecutionState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text(loaded.Tables.Checkpoints[0], "status") != "pending" {
+		t.Fatalf("checkpoint after sync = %+v", loaded.Tables.Checkpoints[0])
+	}
+}
+
+func TestExtractLarkTaskAcceptsNoisyCLIJSON(t *testing.T) {
+	output := "[lark-cli] [WARN] proxy detected: all_proxy=http://127.0.0.1:7890\n" +
+		`{"ok":true,"identity":"bot","data":{"guid":"task_456","url":"https://task.example/task_456"}}`
+	task := extractLarkTask(output)
+	if text(task, "taskGuid") != "task_456" || text(task, "taskUrl") != "https://task.example/task_456" {
+		t.Fatalf("task = %+v", task)
+	}
+}
+
 func TestFeishuReviewTaskBridgeDryRunListsPendingTasks(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 
 	response := postJSON(t, api.URL+"/feishu/review-task/bridge/tick", map[string]any{"dryRun": true, "limit": 5})
 	var result map[string]any
@@ -6060,6 +8093,9 @@ func TestFeishuReviewTaskCommentRequestsChanges(t *testing.T) {
 	}
 	api, repo := newTestAPI(t)
 	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 	bin := t.TempDir()
 	larkCLI := filepath.Join(bin, "lark-cli")
 	script := "#!/bin/sh\nprintf '%s' '{\"comment_id\":\"comment_123\"}'\n"
@@ -6079,7 +8115,7 @@ func TestFeishuReviewTaskCommentRequestsChanges(t *testing.T) {
 	if text(result, "classification") != "request_changes" || text(result, "decision") != "rejected" {
 		t.Fatalf("comment result = %+v", result)
 	}
-	loaded, err := repo.Load(context.Background())
+	loaded, err := repo.LoadSupervisorExecutionState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6092,6 +8128,9 @@ func TestFeishuReviewTaskCommentRequestsChanges(t *testing.T) {
 func TestFeishuReviewTaskCommentNeedInfoRecordsOnly(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedFeishuReviewCheckpoint(t, repo, map[string]any{"format": "task-review", "taskGuid": "task_123", "nonce": "pipeline_1-human_review_attempt_1"})
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 
 	response := postJSON(t, api.URL+"/feishu/review-task/comment", map[string]any{
 		"taskGuid": "task_123",
@@ -6104,7 +8143,7 @@ func TestFeishuReviewTaskCommentNeedInfoRecordsOnly(t *testing.T) {
 	if text(result, "classification") != "need_info" || text(result, "decision") != "need_info" {
 		t.Fatalf("comment result = %+v", result)
 	}
-	loaded, err := repo.Load(context.Background())
+	loaded, err := repo.LoadSupervisorExecutionState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6218,9 +8257,44 @@ func TestSQLiteSaveToleratesLegacyDuplicateRecordIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Tables.WorkItems) != 2 {
-		t.Fatalf("snapshot work items should be preserved, got %+v", loaded.Tables.WorkItems)
+	if len(loaded.Tables.WorkItems) != 1 || text(loaded.Tables.WorkItems[0], "title") != "Legacy duplicate" {
+		t.Fatalf("structured work items should tolerate and collapse duplicate ids, got %+v", loaded.Tables.WorkItems)
 	}
+}
+
+func waitForAttemptJobsToDrain(t *testing.T, server *Server, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		runningAttempts := 0
+		if database, err := server.Repo.LoadSupervisorExecutionState(context.Background()); err == nil {
+			for _, attempt := range database.Tables.Attempts {
+				if text(attempt, "status") == "running" {
+					runningAttempts++
+				}
+			}
+		}
+		server.jobMu.Lock()
+		active := len(server.attemptCancels)
+		for _, cancel := range server.attemptCancels {
+			cancel()
+		}
+		server.jobMu.Unlock()
+		if active == 0 && runningAttempts == 0 {
+			time.Sleep(25 * time.Millisecond)
+			server.jobMu.Lock()
+			active = len(server.attemptCancels)
+			server.jobMu.Unlock()
+			if active == 0 {
+				return
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	server.jobMu.Lock()
+	active := len(server.attemptCancels)
+	server.jobMu.Unlock()
+	t.Fatalf("attempt jobs did not drain; active=%d", active)
 }
 
 func TestPagePilotApplyUsesIsolatedWorkspaceForGitHubTarget(t *testing.T) {
@@ -6466,6 +8540,14 @@ func containsSuffix(values []string, suffix string) bool {
 		}
 	}
 	return false
+}
+
+func stringArray(value any) []string {
+	values := []string{}
+	for _, item := range arrayValues(value) {
+		values = append(values, fmt.Sprint(item))
+	}
+	return values
 }
 
 func containsEventType(events []map[string]any, eventType string) bool {

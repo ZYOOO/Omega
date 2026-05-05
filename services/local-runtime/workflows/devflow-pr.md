@@ -14,7 +14,7 @@ stages:
     agentId: coding
     agents: [architect, coding, testing]
     humanGate: false
-    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report]
+    outputArtifacts: [technical-plan, functional-todo-list, project-todo-list, code-diff, changed-files, implementation-notes, test-report, ci-report]
   - id: code_review_round_1
     title: Code Review Round 1
     agentId: review
@@ -33,7 +33,7 @@ stages:
     agents: [coding, testing]
     humanGate: false
     inputArtifacts: [review-report, blocking-risks, code-diff, changed-files]
-    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report]
+    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report, ci-report]
   - id: human_review
     title: Human Review
     agentId: delivery
@@ -71,7 +71,7 @@ states:
     agentId: coding
     agents: [architect, coding, testing]
     inputArtifacts: [structured-requirement, acceptance-criteria, repository-target]
-    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report, pull-request]
+    outputArtifacts: [technical-plan, functional-todo-list, project-todo-list, code-diff, changed-files, implementation-notes, test-report, pull-request, ci-report]
     actions:
       - id: classify_task
         type: classify_task
@@ -81,7 +81,7 @@ states:
         type: run_agent
         agent: architect
         prompt: architect
-        outputArtifacts: [technical-plan]
+        outputArtifacts: [technical-plan, functional-todo-list, project-todo-list]
       - id: implement_change
         type: run_agent
         agent: coding
@@ -97,6 +97,10 @@ states:
         type: ensure_pr
         agent: delivery
         outputArtifacts: [pull-request]
+      - id: collect_ci_results
+        type: run_ci_checks
+        agent: testing
+        outputArtifacts: [ci-report, check-status, check-log]
     transitions:
       passed: code_review_round_1
       failed: rework
@@ -104,7 +108,7 @@ states:
     title: Code Review Round 1
     agentId: review
     agents: [review]
-    inputArtifacts: [code-diff, changed-files, test-report]
+    inputArtifacts: [technical-plan, functional-todo-list, project-todo-list, code-diff, changed-files, test-report, ci-report, check-status, check-log]
     outputArtifacts: [review-report, blocking-risks, merge-recommendation]
     actions:
       - id: review_round_1
@@ -121,7 +125,7 @@ states:
     title: Code Review Round 2
     agentId: review
     agents: [review]
-    inputArtifacts: [pull-request, test-report, review-report]
+    inputArtifacts: [technical-plan, functional-todo-list, project-todo-list, pull-request, test-report, ci-report, check-status, check-log, review-report]
     outputArtifacts: [review-report, blocking-risks, merge-recommendation]
     actions:
       - id: review_round_2
@@ -138,8 +142,8 @@ states:
     title: Rework
     agentId: coding
     agents: [coding, testing]
-    inputArtifacts: [review-report, human-decision, check-log, code-diff]
-    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report]
+    inputArtifacts: [technical-plan, functional-todo-list, project-todo-list, review-report, human-decision, check-log, code-diff]
+    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report, ci-report]
     actions:
       - id: build_rework_checklist
         type: build_rework_checklist
@@ -160,6 +164,10 @@ states:
         type: ensure_pr
         agent: delivery
         outputArtifacts: [pull-request]
+      - id: collect_rework_ci_results
+        type: run_ci_checks
+        agent: testing
+        outputArtifacts: [ci-report, check-status, check-log]
     transitions:
       passed: code_review_round_1
       failed: human_review
@@ -168,7 +176,7 @@ states:
     agentId: delivery
     agents: [human, review, delivery]
     humanGate: true
-    inputArtifacts: [pull-request, review-report, test-report, run-report]
+    inputArtifacts: [technical-plan, functional-todo-list, project-todo-list, pull-request, review-report, test-report, ci-report, run-report]
     outputArtifacts: [human-decision, review-notes]
     actions:
       - id: wait_human_decision
@@ -282,12 +290,13 @@ Runtime policy:
 1. Work only inside the isolated repository workspace.
 2. The item must be bound to a repository target before any runner starts.
 3. Implementation must produce a real git diff in the target repository.
-4. Validation must run before review.
+4. Validation and GitHub Actions CI collection must run before review.
 5. Review agents are read-only and must emit one explicit verdict line.
 6. `CHANGES_REQUESTED` is a normal workflow transition into Rework, not an execution failure.
-7. Rework runs in the same repository workspace, same branch, and same pull request, with the review report as input.
-8. Human Review is a blocking gate. Delivery and merge must wait for an explicit approval.
-9. Reject sends the work back for rework with the human reason preserved.
+7. Failed or missing required GitHub Actions checks become rework feedback before Human Review.
+8. Rework runs in the same repository workspace, same branch, and same pull request, with the review and CI report as input.
+9. Human Review is a blocking gate. Delivery and merge must wait for an explicit approval.
+10. Reject sends the work back for rework with the human reason preserved.
 
 Review verdict contract:
 
@@ -374,6 +383,12 @@ Integration risks:
 Validation plan:
 - Focused checks to run before review.
 
+Functional todo list:
+- User-visible behavior tasks, written as checkable todo items.
+
+Project todo list:
+- Repository/file/test/CI tasks, written as checkable todo items.
+
 Agent handoff:
 - Concrete instructions for coding, testing, review, and delivery.
 ```
@@ -382,6 +397,8 @@ Rules:
 - Keep the plan tied to the repository boundary.
 - Prefer local project patterns over new abstractions.
 - Call out unknowns instead of hiding them.
+- The todo lists must be concrete enough for Review to verify item-by-item.
+- Use `- [ ]` for open work and `- [x]` only for items already proven by existing code or validation.
 
 ## Prompt: coding
 
@@ -445,6 +462,7 @@ Residual risk:
 Rules:
 - A failing command must become an actionable failure, not a vague error.
 - If no project-specific tests ran, explain the remaining risk.
+- GitHub Actions CI is collected after the PR is published and must be included as remote check evidence for review.
 
 ## Prompt: rework
 
@@ -489,6 +507,9 @@ Requirement:
 Human / previous review feedback to verify:
 {{reviewFeedback}}
 
+Plan and todo list to verify:
+{{planOutput}}
+
 Diff:
 ```diff
 {{diff}}
@@ -530,6 +551,8 @@ Residual risks:
 
 Rules:
 - If this is a human-requested rework, treat the diff as the increment since the previous reviewed version and verify it directly addresses the human feedback.
+- Verify the diff against the Functional todo list and Project todo list; call out unchecked or contradicted items in Validation gaps or Blocking findings.
+- Treat failed GitHub Actions checks and failed check logs as blocking validation unless they are clearly unrelated infrastructure flakes.
 - If the verdict is `CHANGES_REQUESTED`, include at least one Blocking finding or Rework instruction.
 - If the verdict is `NEEDS_HUMAN_INFO`, include the exact question a human must answer.
 - If the verdict is `APPROVED`, explain why the diff satisfies the requirement and list residual risk.
@@ -568,7 +591,7 @@ What changed:
 - User-facing and technical summary.
 
 Proof:
-- PR, commits, changed files, validation, review artifacts.
+- PR, commits, changed files, validation, GitHub Actions CI status, review artifacts.
 
 Rollback plan:
 - How to revert safely if needed.

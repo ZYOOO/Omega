@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -33,6 +34,8 @@ type Server struct {
 	jobMu          sync.Mutex
 	attemptCancels map[string]context.CancelFunc
 	checkpointMu   sync.Mutex
+	deliveryMu     sync.Mutex
+	deliveryJobs   map[string]bool
 	previewMu      sync.Mutex
 	previewRuntime map[string]*previewRuntimeSession
 }
@@ -58,6 +61,7 @@ func NewServer(databasePath, workspaceRoot, openAPIPath string) *Server {
 		},
 		HTTPClient:     http.DefaultClient,
 		attemptCancels: map[string]context.CancelFunc{},
+		deliveryJobs:   map[string]bool{},
 		previewRuntime: map[string]*previewRuntimeSession{},
 	}
 }
@@ -93,7 +97,7 @@ func ensureCommonLocalToolPaths() {
 }
 
 func (server *Server) observability(response http.ResponseWriter, request *http.Request) {
-	database, err := server.Repo.Load(request.Context())
+	database, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if errors.Is(err, sql.ErrNoRows) {
 		summary := emptyObservability()
 		if logs, logErr := server.Repo.ListRuntimeLogs(request.Context(), map[string]string{"level": "ERROR"}, 5); logErr == nil {
@@ -134,10 +138,18 @@ func (server *Server) createProject(response http.ResponseWriter, request *http.
 		writeError(response, http.StatusBadRequest, fmt.Errorf("project name is required"))
 		return
 	}
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadWorkspaceSession(request.Context())
+	var database WorkspaceDatabase
+	if errors.Is(err, sql.ErrNoRows) {
+		database = defaultWorkspaceDatabase()
+	} else if err == nil {
+		database = *databasePtr
+	}
 	if err != nil {
-		writeError(response, http.StatusNotFound, err)
-		return
+		if !errors.Is(err, sql.ErrNoRows) {
+			writeError(response, http.StatusNotFound, err)
+			return
+		}
 	}
 	projectID := strings.TrimSpace(payload.ID)
 	if projectID == "" {
@@ -175,7 +187,7 @@ func (server *Server) createProject(response http.ResponseWriter, request *http.
 		"updatedAt":   timestamp,
 	})
 	touch(&database)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.SaveWorkItemsState(request.Context(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -302,25 +314,21 @@ func (server *Server) listTable(response http.ResponseWriter, request *http.Requ
 		writeJSON(response, http.StatusOK, records)
 		return
 	case "operations":
-		if len(filters) > 0 {
-			records, err := server.Repo.ListOperations(request.Context(), filters)
-			if err != nil {
-				writeError(response, http.StatusInternalServerError, err)
-				return
-			}
-			writeJSON(response, http.StatusOK, records)
+		records, err := server.Repo.ListOperations(request.Context(), filters)
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
 			return
 		}
+		writeJSON(response, http.StatusOK, records)
+		return
 	case "proofRecords":
-		if len(filters) > 0 {
-			records, err := server.Repo.ListProofRecords(request.Context(), filters)
-			if err != nil {
-				writeError(response, http.StatusInternalServerError, err)
-				return
-			}
-			writeJSON(response, http.StatusOK, records)
+		records, err := server.Repo.ListProofRecords(request.Context(), filters)
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
 			return
 		}
+		writeJSON(response, http.StatusOK, records)
+		return
 	case "checkpoints":
 		if len(filters) > 0 && filters["reconcile"] == "" {
 			records, err := server.Repo.ListCheckpoints(request.Context(), filters)
@@ -331,6 +339,31 @@ func (server *Server) listTable(response http.ResponseWriter, request *http.Requ
 			writeJSON(response, http.StatusOK, records)
 			return
 		}
+		database, err := server.Repo.LoadSupervisorExecutionState(request.Context())
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(response, http.StatusOK, []map[string]any{})
+			return
+		}
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
+			return
+		}
+		if summary := server.reconcileAttemptIntegrityInDatabase(request.Context(), database); intValue(summary["changed"]) > 0 {
+			if err := server.Repo.SaveSupervisorExecutionState(request.Context(), *database); err != nil {
+				writeError(response, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		writeJSON(response, http.StatusOK, database.Tables.Checkpoints)
+		return
+	case "missions":
+		records, err := server.Repo.ListMissions(request.Context(), filters)
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(response, http.StatusOK, records)
+		return
 	case "runWorkpads":
 		records, err := server.Repo.ListRunWorkpads(request.Context(), filters)
 		if err != nil {
@@ -338,6 +371,19 @@ func (server *Server) listTable(response http.ResponseWriter, request *http.Requ
 			return
 		}
 		writeJSON(response, http.StatusOK, records)
+		return
+	}
+	if table == "requirements" {
+		database, err := server.Repo.LoadWorkspaceSession(request.Context())
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(response, http.StatusOK, []map[string]any{})
+			return
+		}
+		if err != nil {
+			writeError(response, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(response, http.StatusOK, database.Tables.Requirements)
 		return
 	}
 	database, err := server.Repo.Load(request.Context())
@@ -348,14 +394,6 @@ func (server *Server) listTable(response http.ResponseWriter, request *http.Requ
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
-	}
-	if table == "checkpoints" {
-		if summary := server.reconcileAttemptIntegrityInDatabase(request.Context(), database); intValue(summary["changed"]) > 0 {
-			if err := server.Repo.Save(request.Context(), *database); err != nil {
-				writeError(response, http.StatusInternalServerError, err)
-				return
-			}
-		}
 	}
 	switch table {
 	case "requirements":
@@ -386,17 +424,18 @@ func (server *Server) cancelAttempt(response http.ResponseWriter, request *http.
 	}
 	_ = json.NewDecoder(request.Body).Decode(&payload)
 	cancelSignalSent := server.cancelRegisteredAttemptJob(attemptID)
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadRepositoryTargetDeleteState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	database := *databasePtr
 	nextDatabase, attempt := markAttemptCanceled(database, attemptID, stringOr(payload.Reason, "Canceled by operator."))
 	if attempt == nil {
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "attempt not found", "cancelSignalSent": cancelSignalSent})
 		return
 	}
-	if err := server.Repo.Save(request.Context(), nextDatabase); err != nil {
+	if err := server.Repo.SaveSupervisorExecutionState(request.Context(), nextDatabase); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -421,10 +460,18 @@ func (server *Server) listMigrations(response http.ResponseWriter, request *http
 }
 
 func (server *Server) createWorkItem(response http.ResponseWriter, request *http.Request) {
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadWorkspaceSession(request.Context())
+	var database WorkspaceDatabase
+	if errors.Is(err, sql.ErrNoRows) {
+		database = defaultWorkspaceDatabase()
+	} else if err == nil {
+		database = *databasePtr
+	}
 	if err != nil {
-		writeError(response, http.StatusNotFound, err)
-		return
+		if !errors.Is(err, sql.ErrNoRows) {
+			writeError(response, http.StatusNotFound, err)
+			return
+		}
 	}
 	var payload struct {
 		Item map[string]any `json:"item"`
@@ -434,7 +481,7 @@ func (server *Server) createWorkItem(response http.ResponseWriter, request *http
 		return
 	}
 	next := appendWorkItem(database, payload.Item)
-	if err := server.Repo.Save(request.Context(), next); err != nil {
+	if err := server.Repo.SaveWorkItemsState(request.Context(), next); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -443,18 +490,23 @@ func (server *Server) createWorkItem(response http.ResponseWriter, request *http
 
 func (server *Server) patchWorkItem(response http.ResponseWriter, request *http.Request) {
 	itemID := strings.TrimPrefix(request.URL.Path, "/work-items/")
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadWorkspaceSession(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	database := *databasePtr
 	var patch map[string]any
 	if err := json.NewDecoder(request.Body).Decode(&patch); err != nil {
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
+	if findWorkItem(database, itemID) == nil {
+		writeJSON(response, http.StatusNotFound, map[string]any{"error": "work item not found"})
+		return
+	}
 	next := updateWorkItem(database, itemID, patch)
-	if err := server.Repo.Save(request.Context(), next); err != nil {
+	if err := server.Repo.SaveWorkItemsState(request.Context(), next); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -463,11 +515,13 @@ func (server *Server) patchWorkItem(response http.ResponseWriter, request *http.
 
 func (server *Server) deleteWorkItem(response http.ResponseWriter, request *http.Request) {
 	itemID := strings.TrimPrefix(request.URL.Path, "/work-items/")
-	database, err := mustLoad(server, request.Context())
+	database, err := server.loadWorkItemMutationState(request.Context(), itemID)
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	item := findWorkItem(database, itemID)
+	requirementID := text(item, "requirementId")
 	next, deleted, reason := deleteWorkItemRecord(database, itemID)
 	if !deleted {
 		status := http.StatusConflict
@@ -477,19 +531,51 @@ func (server *Server) deleteWorkItem(response http.ResponseWriter, request *http
 		writeJSON(response, status, map[string]any{"error": reason})
 		return
 	}
-	if err := server.Repo.Save(request.Context(), next); err != nil {
+	if workItemRequirementStillReferenced(next.Tables.WorkItems, requirementID) {
+		requirementID = ""
+	}
+	if err := server.Repo.DeleteWorkItemState(request.Context(), next, itemID, requirementID); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(response, http.StatusOK, next)
 }
 
+func (server *Server) loadWorkItemMutationState(ctx context.Context, itemID string) (WorkspaceDatabase, error) {
+	session, err := server.Repo.LoadWorkspaceSession(ctx)
+	if err != nil {
+		return WorkspaceDatabase{}, err
+	}
+	database := *session
+	if pipelines, err := server.Repo.ListPipelines(ctx, map[string]string{"workItemId": itemID}); err == nil {
+		database.Tables.Pipelines = pipelines
+	}
+	if attempts, err := server.Repo.ListAttempts(ctx, map[string]string{"workItemId": itemID}); err == nil {
+		database.Tables.Attempts = attempts
+	}
+	if missions, err := server.Repo.ListMissions(ctx, map[string]string{"workItemId": itemID}); err == nil {
+		database.Tables.Missions = missions
+	}
+	if operations, err := server.Repo.ListOperations(ctx, map[string]string{"workItemId": itemID}); err == nil {
+		database.Tables.Operations = operations
+	}
+	if proofRecords, err := server.Repo.ListProofRecords(ctx, map[string]string{"workItemId": itemID}); err == nil {
+		database.Tables.ProofRecords = proofRecords
+	}
+	if checkpoints, err := server.Repo.ListCheckpoints(ctx, nil); err == nil {
+		database.Tables.Checkpoints = checkpoints
+	}
+	ensureTables(&database)
+	return database, nil
+}
+
 func (server *Server) createPipeline(response http.ResponseWriter, request *http.Request) {
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadRepositoryTargetDeleteState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	database := *databasePtr
 	var payload struct {
 		Item map[string]any `json:"item"`
 	}
@@ -503,7 +589,7 @@ func (server *Server) createPipeline(response http.ResponseWriter, request *http
 	pipeline = attachAgentProfileToPipeline(pipeline, profile)
 	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 	touch(&database)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.SaveSupervisorExecutionState(request.Context(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -511,11 +597,12 @@ func (server *Server) createPipeline(response http.ResponseWriter, request *http
 }
 
 func (server *Server) createPipelineFromTemplate(response http.ResponseWriter, request *http.Request) {
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	database := *databasePtr
 	var payload struct {
 		Item       map[string]any `json:"item"`
 		TemplateID string         `json:"templateId"`
@@ -539,7 +626,7 @@ func (server *Server) createPipelineFromTemplate(response http.ResponseWriter, r
 		database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 	}
 	touch(&database)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.SaveSupervisorExecutionState(request.Context(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -554,11 +641,12 @@ func (server *Server) runDevFlowCycle(response http.ResponseWriter, request *htt
 	}
 	_ = json.NewDecoder(request.Body).Decode(&payload)
 	pipelineID := pathID(request.URL.Path)
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	database := *databasePtr
 	pipelineIndex := findByID(database.Tables.Pipelines, pipelineID)
 	if pipelineIndex < 0 {
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "pipeline not found"})
@@ -608,7 +696,7 @@ func (server *Server) runDevFlowCycle(response http.ResponseWriter, request *htt
 		"pipelineId":         text(pipeline, "id"),
 		"attemptId":          text(attempt, "id"),
 	})
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.SaveSupervisorExecutionState(request.Context(), database); err != nil {
 		nextLock := cloneMap(lock)
 		nextLock["status"] = "released"
 		nextLock["runnerProcessState"] = "failed"
@@ -719,11 +807,12 @@ func (server *Server) runCurrentPipelineStage(response http.ResponseWriter, requ
 		payload.Runner = "local-proof"
 	}
 	pipelineID := pathID(request.URL.Path)
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	database := *databasePtr
 	index := findByID(database.Tables.Pipelines, pipelineID)
 	if index < 0 {
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "pipeline not found"})
@@ -774,7 +863,7 @@ func (server *Server) runCurrentPipelineStage(response http.ResponseWriter, requ
 		database, _ = failAttemptRecord(database, text(attempt, "id"), pipeline, err.Error(), nil)
 		upsertRunWorkpad(&database, text(attempt, "id"))
 		touch(&database)
-		_ = server.Repo.Save(context.Background(), database)
+		_ = server.Repo.SaveSupervisorExecutionState(context.Background(), database)
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -833,7 +922,7 @@ func (server *Server) runCurrentPipelineStage(response http.ResponseWriter, requ
 	}
 	upsertRunWorkpad(&database, text(attempt, "id"))
 	touch(&database)
-	if err := server.Repo.Save(context.Background(), database); err != nil {
+	if err := server.Repo.SaveSupervisorExecutionState(context.Background(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -850,11 +939,12 @@ func (server *Server) setPipelineStatus(response http.ResponseWriter, request *h
 
 func (server *Server) mutatePipeline(response http.ResponseWriter, request *http.Request, mutate func(map[string]any) map[string]any) {
 	pipelineID := pathID(request.URL.Path)
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	database := *databasePtr
 	index := findByID(database.Tables.Pipelines, pipelineID)
 	if index < 0 {
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "pipeline not found"})
@@ -864,7 +954,7 @@ func (server *Server) mutatePipeline(response http.ResponseWriter, request *http
 	database.Tables.Pipelines[index] = pipeline
 	upsertPendingCheckpoint(&database, pipeline)
 	touch(&database)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.SaveSupervisorExecutionState(request.Context(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -894,11 +984,12 @@ func (server *Server) applyCheckpointDecision(ctx context.Context, checkpointID 
 	server.checkpointMu.Lock()
 	defer server.checkpointMu.Unlock()
 	server.logRuntimeDiagnosticFile("DEBUG", "checkpoint.decision.requested", "Checkpoint decision requested.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
-	database, err := mustLoad(server, ctx)
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		server.logError(ctx, "checkpoint.decision.load_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "status": status})
 		return nil, http.StatusNotFound, err
 	}
+	database := *databasePtr
 	index := findByID(database.Tables.Checkpoints, checkpointID)
 	if index < 0 {
 		server.reconcileAttemptIntegrityInDatabase(ctx, &database)
@@ -930,10 +1021,10 @@ func (server *Server) applyCheckpointDecision(ctx context.Context, checkpointID 
 	if status == "approved" {
 		reviewer := stringOr(payload["reviewer"], "human")
 		checkpoint["decisionNote"] = fmt.Sprintf("approved by %s", reviewer)
-		approvePipelineStage(&database, checkpoint)
+		approvePipelineStage(&database, checkpoint, reviewer)
 		asyncApprovedDelivery = boolValue(payload["asyncDelivery"]) && server.canCompleteApprovedDevFlowCheckpointAsync(database, checkpoint)
 		if asyncApprovedDelivery {
-			markApprovedDevFlowDeliveryQueued(&database, checkpoint)
+			markApprovedDevFlowDeliveryQueued(&database, checkpoint, reviewer)
 		} else {
 			if err := server.completeApprovedDevFlowCheckpoint(&database, checkpoint, reviewer); err != nil {
 				server.logError(ctx, "checkpoint.approve.failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
@@ -985,7 +1076,7 @@ func (server *Server) applyCheckpointDecision(ctx context.Context, checkpointID 
 	checkpoint["updatedAt"] = nowISO()
 	database.Tables.Checkpoints[index] = checkpoint
 	touch(&database)
-	if err := server.Repo.Save(ctx, database); err != nil {
+	if err := server.Repo.SaveSupervisorExecutionState(ctx, database); err != nil {
 		if reworkLock != nil {
 			nextLock := cloneMap(reworkLock)
 			nextLock["status"] = "released"
@@ -1031,9 +1122,9 @@ func (server *Server) createMission(response http.ResponseWriter, request *http.
 		return
 	}
 	mission := makeMission(item)
-	if database, err := server.Repo.Load(request.Context()); err == nil {
+	if database, err := server.Repo.LoadSupervisorExecutionState(request.Context()); err == nil {
 		upsertMissionAndOperation(database, mission, fmt.Sprintf("pipeline_%s", text(payload.Item, "id")))
-		_ = server.Repo.Save(request.Context(), *database)
+		_ = server.Repo.SaveSupervisorExecutionState(request.Context(), *database)
 	}
 	writeJSON(response, http.StatusOK, mission)
 }
@@ -1070,7 +1161,7 @@ func (server *Server) runOperation(response http.ResponseWriter, request *http.R
 		return
 	}
 	if persist {
-		if database, err := server.Repo.Load(request.Context()); err == nil {
+		if database, err := server.Repo.LoadSupervisorExecutionState(request.Context()); err == nil {
 			applyMissionEvents(database, result.Events)
 			upsertMissionAndOperation(database, mission, fmt.Sprintf("pipeline_%s", text(mission, "sourceWorkItemId")))
 			upsertOperationStatus(database, mission, payload.OperationID, "done")
@@ -1085,7 +1176,7 @@ func (server *Server) runOperation(response http.ResponseWriter, request *http.R
 					"createdAt":   nowISO(),
 				})
 			}
-			_ = server.Repo.Save(request.Context(), *database)
+			_ = server.Repo.SaveSupervisorExecutionState(request.Context(), *database)
 		}
 	}
 	writeJSON(response, http.StatusOK, result)
@@ -1315,7 +1406,7 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 			OutputPath: filepath.Join(proofDir, resolvedRunnerID+"-last-message.txt"),
 			Sandbox:    "workspace-write",
 			Model:      model,
-			Env:        env,
+			Env:        mergeEnvMaps(agentCapabilityEnv(profile, agentID), env),
 		})
 		return demoCodeRunResult{stdout: text(turn.Process, "stdout"), stderr: text(turn.Process, "stderr"), runnerProcess: turn.Process}, turn.Error
 	}
@@ -1345,7 +1436,7 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 		OutputPath: filepath.Join(proofDir, resolvedRunnerID+"-last-message.txt"),
 		Sandbox:    "workspace-write",
 		Model:      model,
-		Env:        env,
+		Env:        mergeEnvMaps(agentCapabilityEnv(profile, agentID), env),
 	})
 	process := turn.Process
 	stdout := text(process, "stdout")
@@ -1487,7 +1578,7 @@ func runCommand(dir string, name string, args ...string) (string, error) {
 	return string(output), nil
 }
 
-func buildDevFlowReviewPrompt(item map[string]any, repoSlug string, prURL string, changedFiles []string, diffText string, testOutput string, checksOutput string, focus string, reviewFeedback string) string {
+func buildDevFlowReviewPrompt(item map[string]any, repoSlug string, prURL string, changedFiles []string, diffText string, testOutput string, checksOutput string, focus string, reviewFeedback string, planOutput string) string {
 	return fmt.Sprintf(`You are the review agent for Omega.
 
 Repository: %s
@@ -1502,6 +1593,9 @@ Acceptance criteria:
 %s
 
 Human or previous review feedback to verify:
+%s
+
+Plan and todo list to verify:
 %s
 
 Changed files:
@@ -1522,6 +1616,7 @@ Diff:
 Review rules:
 - Review the actual diff against the requirement and acceptance criteria.
 - If this is a human-requested rework, treat the diff as the increment since the previous reviewed version and verify it directly addresses the human feedback.
+- Verify the diff against the functional todo list and project todo list; call out unchecked or contradicted items.
 - Do not approve just because a file changed or tests passed.
 - If the diff does not satisfy the requested behavior, request changes.
 - Do not edit files.
@@ -1553,7 +1648,7 @@ Residual risks:
 If the verdict is CHANGES_REQUESTED, include at least one Blocking finding or Rework instruction.
 If the verdict is NEEDS_HUMAN_INFO, include the exact question a human must answer.
 If the verdict is APPROVED, explain why the diff satisfies the requirement and list residual risk.
-`, repoSlug, prURL, text(item, "key"), text(item, "title"), text(item, "description"), markdownAnyList(item["acceptanceCriteria"]), stringOr(strings.TrimSpace(reviewFeedback), "None."), markdownFileList(changedFiles), focus, truncateForProof(testOutput, 4000), truncateForProof(checksOutput, 4000), truncateForProof(diffText, 12000))
+`, repoSlug, prURL, text(item, "key"), text(item, "title"), text(item, "description"), markdownAnyList(item["acceptanceCriteria"]), stringOr(strings.TrimSpace(reviewFeedback), "None."), truncateForProof(stringOr(strings.TrimSpace(planOutput), "No plan or todo list was captured."), 4000), markdownFileList(changedFiles), focus, truncateForProof(testOutput, 4000), truncateForProof(checksOutput, 4000), truncateForProof(diffText, 12000))
 }
 
 func runDevFlowReviewAgent(repoWorkspace string, prompt string, outputPath string, model string) (map[string]any, error) {
@@ -1845,10 +1940,7 @@ func (server *Server) githubStatus(response http.ResponseWriter, request *http.R
 	_, ghPathErr := exec.LookPath("gh")
 	account := githubAccountFromStatusOutput(string(output))
 	if err == nil {
-		if database, loadErr := server.Repo.Load(request.Context()); loadErr == nil {
-			upsertGitHubConnection(database, stringOr(account, "gh-cli"))
-			_ = server.Repo.Save(request.Context(), *database)
-		}
+		_ = server.Repo.UpsertConnection(request.Context(), githubConnectionRecord(stringOr(account, "gh-cli")))
 	}
 	oauthToken, oauthErr := server.Repo.GetSetting(request.Context(), "github_oauth_token")
 	writeJSON(response, http.StatusOK, map[string]any{
@@ -2013,10 +2105,7 @@ func (server *Server) githubOAuthCallback(response http.ResponseWriter, request 
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	if database, err := server.Repo.Load(request.Context()); err == nil {
-		upsertGitHubConnection(database, "github-oauth")
-		_ = server.Repo.Save(request.Context(), *database)
-	}
+	_ = server.Repo.UpsertConnection(request.Context(), githubConnectionRecord("github-oauth"))
 	writeJSON(response, http.StatusOK, map[string]any{
 		"connected": true,
 		"accountId": "github-oauth",
@@ -2196,10 +2285,18 @@ func (server *Server) githubBindRepositoryTarget(response http.ResponseWriter, r
 		writeError(response, http.StatusBadRequest, fmt.Errorf("repository is required"))
 		return
 	}
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadWorkspaceSession(request.Context())
+	var database WorkspaceDatabase
+	if errors.Is(err, sql.ErrNoRows) {
+		database = defaultWorkspaceDatabase()
+	} else if err == nil {
+		database = *databasePtr
+	}
 	if err != nil {
-		writeError(response, http.StatusNotFound, err)
-		return
+		if !errors.Is(err, sql.ErrNoRows) {
+			writeError(response, http.StatusNotFound, err)
+			return
+		}
 	}
 	if payload.ProjectID != "" && findByID(database.Tables.Projects, payload.ProjectID) < 0 {
 		writeError(response, http.StatusNotFound, fmt.Errorf("project %s not found", payload.ProjectID))
@@ -2207,7 +2304,48 @@ func (server *Server) githubBindRepositoryTarget(response http.ResponseWriter, r
 	}
 	upsertGitHubRepositoryTargetForProject(&database, payload.ProjectID, repo, payload.DefaultBranch, payload.URL)
 	touch(&database)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.SaveWorkItemsState(request.Context(), database); err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, database)
+}
+
+func (server *Server) bindLocalRepositoryTarget(response http.ResponseWriter, request *http.Request) {
+	var payload struct {
+		ProjectID     string `json:"projectId"`
+		Path          string `json:"path"`
+		DefaultBranch string `json:"defaultBranch"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
+	repoPath, branch, err := resolveLocalRepositoryTargetPath(payload.Path, payload.DefaultBranch)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, err)
+		return
+	}
+	databasePtr, err := server.Repo.LoadWorkspaceSession(request.Context())
+	var database WorkspaceDatabase
+	if errors.Is(err, sql.ErrNoRows) {
+		database = defaultWorkspaceDatabase()
+	} else if err == nil {
+		database = *databasePtr
+	}
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			writeError(response, http.StatusNotFound, err)
+			return
+		}
+	}
+	if payload.ProjectID != "" && findByID(database.Tables.Projects, payload.ProjectID) < 0 {
+		writeError(response, http.StatusNotFound, fmt.Errorf("project %s not found", payload.ProjectID))
+		return
+	}
+	upsertLocalRepositoryTargetForProject(&database, payload.ProjectID, repoPath, branch)
+	touch(&database)
+	if err := server.Repo.SaveWorkItemsState(request.Context(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -2220,30 +2358,40 @@ func (server *Server) githubDeleteRepositoryTarget(response http.ResponseWriter,
 		writeError(response, http.StatusBadRequest, fmt.Errorf("repository target id is required"))
 		return
 	}
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
-	next, deleted := deleteRepositoryTarget(database, targetID)
-	if !deleted {
+	database := *databasePtr
+	next, deleteResult := deleteRepositoryTarget(database, targetID)
+	if !deleteResult.Deleted {
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "repository target not found"})
 		return
 	}
 	touch(&next)
-	if err := server.Repo.Save(request.Context(), next); err != nil {
+	if err := server.Repo.DeleteRepositoryTargetState(request.Context(), next, targetID, deleteResult); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
+	}
+	pagePilotRuns, err := server.deleteRepositoryTargetPagePilotRecords(request.Context(), targetID)
+	if err != nil {
+		writeError(response, http.StatusInternalServerError, err)
+		return
+	}
+	for _, run := range pagePilotRuns {
+		for _, workspacePath := range pagePilotRunWorkspacePaths(run) {
+			deleteResult.WorkspacePaths = appendUniqueString(deleteResult.WorkspacePaths, workspacePath)
+		}
+	}
+	server.stopPagePilotPreviewRuntimeSession(pagePilotPreviewRuntimeKey(targetID))
+	if truthyQueryValue(request.URL.Query().Get("deleteLocalWorkspaces")) {
+		server.removeRepositoryTargetLocalWorkspaces(request.Context(), targetID, deleteResult.WorkspacePaths)
 	}
 	writeJSON(response, http.StatusOK, next)
 }
 
 func (server *Server) githubImportIssues(response http.ResponseWriter, request *http.Request) {
-	database, err := mustLoad(server, request.Context())
-	if err != nil {
-		writeError(response, http.StatusNotFound, err)
-		return
-	}
 	var payload map[string]string
 	_ = json.NewDecoder(request.Body).Decode(&payload)
 	repo := payload["owner"] + "/" + payload["repo"]
@@ -2258,6 +2406,19 @@ func (server *Server) githubImportIssues(response http.ResponseWriter, request *
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
+	databasePtr, err := server.Repo.LoadWorkspaceSession(request.Context())
+	var database WorkspaceDatabase
+	if errors.Is(err, sql.ErrNoRows) {
+		database = defaultWorkspaceDatabase()
+	} else if err == nil {
+		database = *databasePtr
+	}
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			writeError(response, http.StatusNotFound, err)
+			return
+		}
+	}
 	upsertGitHubRepositoryTarget(&database, repo, "", "")
 	for _, issue := range issues {
 		item := githubIssueToWorkItem(repo, issue)
@@ -2265,7 +2426,7 @@ func (server *Server) githubImportIssues(response http.ResponseWriter, request *
 			database = appendWorkItem(database, item)
 		}
 	}
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.SaveWorkItemsState(request.Context(), database); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -2292,7 +2453,7 @@ func writeError(response http.ResponseWriter, status int, err error) {
 }
 
 func mustLoad(server *Server, ctx context.Context) (WorkspaceDatabase, error) {
-	database, err := server.Repo.Load(ctx)
+	database, err := server.Repo.LoadWorkspaceSession(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return defaultWorkspaceDatabase(), nil
 	}
@@ -2426,14 +2587,32 @@ func upsertPendingCheckpoint(database *WorkspaceDatabase, pipeline map[string]an
 	if stage == nil {
 		return
 	}
-	checkpoint := map[string]any{"id": fmt.Sprintf("%s:%s", text(pipeline, "id"), text(stage, "id")), "pipelineId": pipeline["id"], "stageId": stage["id"], "status": "pending", "title": fmt.Sprintf("%s 审批", text(stage, "title")), "summary": fmt.Sprintf("%s 需要人工确认后才能继续", text(stage, "title")), "createdAt": nowISO(), "updatedAt": nowISO()}
+	checkpointID := fmt.Sprintf("%s:%s", text(pipeline, "id"), text(stage, "id"))
+	now := nowISO()
+	checkpoint := map[string]any{}
+	for _, existing := range database.Tables.Checkpoints {
+		if text(existing, "id") == checkpointID {
+			checkpoint = cloneMap(existing)
+			break
+		}
+	}
+	if text(checkpoint, "createdAt") == "" {
+		checkpoint["createdAt"] = now
+	}
+	checkpoint["id"] = checkpointID
+	checkpoint["pipelineId"] = pipeline["id"]
+	checkpoint["stageId"] = stage["id"]
+	checkpoint["status"] = "pending"
+	checkpoint["title"] = fmt.Sprintf("%s 审批", text(stage, "title"))
+	checkpoint["summary"] = fmt.Sprintf("%s 需要人工确认后才能继续", text(stage, "title"))
+	checkpoint["updatedAt"] = now
 	if attemptIndex := latestAttemptIndexForPipeline(*database, text(pipeline, "id")); attemptIndex >= 0 {
 		checkpoint["attemptId"] = text(database.Tables.Attempts[attemptIndex], "id")
 	}
 	database.Tables.Checkpoints = appendOrReplace(database.Tables.Checkpoints, checkpoint)
 }
 
-func approvePipelineStage(database *WorkspaceDatabase, checkpoint map[string]any) {
+func approvePipelineStage(database *WorkspaceDatabase, checkpoint map[string]any, reviewer string) {
 	for index, pipeline := range database.Tables.Pipelines {
 		if text(pipeline, "id") != text(checkpoint, "pipelineId") {
 			continue
@@ -2442,7 +2621,7 @@ func approvePipelineStage(database *WorkspaceDatabase, checkpoint map[string]any
 		for _, stage := range arrayMaps(run["stages"]) {
 			if text(stage, "id") == text(checkpoint, "stageId") {
 				stage["status"] = "passed"
-				stage["approvedBy"] = "human"
+				stage["approvedBy"] = stringOr(reviewer, "human")
 				markNextStageReady(run, text(stage, "id"))
 			}
 		}
@@ -2464,7 +2643,7 @@ func (server *Server) canCompleteApprovedDevFlowCheckpointAsync(database Workspa
 	return isDevFlowPRTemplate(text(database.Tables.Pipelines[pipelineIndex], "templateId"))
 }
 
-func markApprovedDevFlowDeliveryQueued(database *WorkspaceDatabase, checkpoint map[string]any) {
+func markApprovedDevFlowDeliveryQueued(database *WorkspaceDatabase, checkpoint map[string]any, reviewer string) {
 	for index, pipeline := range database.Tables.Pipelines {
 		if text(pipeline, "id") != text(checkpoint, "pipelineId") {
 			continue
@@ -2480,7 +2659,7 @@ func markApprovedDevFlowDeliveryQueued(database *WorkspaceDatabase, checkpoint m
 			switch text(stage, "id") {
 			case "human_review":
 				stage["status"] = "passed"
-				stage["approvedBy"] = "human"
+				stage["approvedBy"] = stringOr(reviewer, "human")
 				stage["completedAt"] = nowISO()
 			case mergeStageID:
 				if text(stage, "status") == "ready" || text(stage, "status") == "waiting" {
@@ -2495,16 +2674,42 @@ func markApprovedDevFlowDeliveryQueued(database *WorkspaceDatabase, checkpoint m
 		next["status"] = "running"
 		next["updatedAt"] = nowISO()
 		database.Tables.Pipelines[index] = next
+		if attemptIndex := attemptIndexForApprovedDevFlowDelivery(*database, checkpoint); attemptIndex >= 0 {
+			nextAttempt := cloneMap(database.Tables.Attempts[attemptIndex])
+			linkCheckpointToAttempt(database, text(checkpoint, "id"), text(nextAttempt, "id"))
+			nextAttempt["status"] = "running"
+			nextAttempt["currentStageId"] = mergeStageID
+			nextAttempt["stages"] = attemptStageSnapshot(next)
+			nextAttempt["lastSeenAt"] = nowISO()
+			nextAttempt["updatedAt"] = text(nextAttempt, "lastSeenAt")
+			events := arrayMaps(nextAttempt["events"])
+			events = append(events, map[string]any{
+				"type":      "delivery.merge.started",
+				"message":   "Human review approved. Merge is running.",
+				"stageId":   mergeStageID,
+				"createdAt": text(nextAttempt, "updatedAt"),
+			})
+			nextAttempt["events"] = events
+			database.Tables.Attempts[attemptIndex] = nextAttempt
+			if item := findWorkItem(*database, text(nextAttempt, "itemId")); item != nil {
+				*database = updateWorkItem(*database, text(item, "id"), map[string]any{"status": "In Review", "stageId": mergeStageID})
+			}
+		}
 		upsertLatestRunWorkpadForPipeline(database, text(next, "id"))
 		return
 	}
 }
 
 func (server *Server) completeApprovedDevFlowCheckpointInBackground(checkpointID string, reviewer string) {
+	if !server.registerApprovedDeliveryJob(checkpointID) {
+		server.logInfo(context.Background(), "checkpoint.approve.delivery_already_running", "Approved delivery continuation is already running.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID})
+		return
+	}
 	go func() {
+		defer server.unregisterApprovedDeliveryJob(checkpointID)
 		ctx := context.Background()
 		server.logInfo(ctx, "checkpoint.approve.delivery_started", "Approved delivery continuation started.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID})
-		database, err := mustLoad(server, ctx)
+		database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 		if err != nil {
 			server.logError(ctx, "checkpoint.approve.delivery_load_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID})
 			return
@@ -2515,17 +2720,44 @@ func (server *Server) completeApprovedDevFlowCheckpointInBackground(checkpointID
 			return
 		}
 		checkpoint := cloneMap(database.Tables.Checkpoints[index])
-		if err := server.completeApprovedDevFlowCheckpoint(&database, checkpoint, reviewer); err != nil {
+		if err := server.completeApprovedDevFlowCheckpoint(database, checkpoint, reviewer); err != nil {
 			server.logError(ctx, "checkpoint.approve.delivery_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
 			return
 		}
-		touch(&database)
-		if err := server.Repo.Save(ctx, database); err != nil {
+		touch(database)
+		if err := server.Repo.SaveSupervisorExecutionState(ctx, *database); err != nil {
 			server.logError(ctx, "checkpoint.approve.delivery_save_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
 			return
 		}
 		server.logInfo(ctx, "checkpoint.approve.delivery_completed", "Approved delivery continuation completed.", map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
 	}()
+}
+
+func (server *Server) registerApprovedDeliveryJob(checkpointID string) bool {
+	checkpointID = strings.TrimSpace(checkpointID)
+	if checkpointID == "" {
+		return false
+	}
+	server.deliveryMu.Lock()
+	defer server.deliveryMu.Unlock()
+	if server.deliveryJobs == nil {
+		server.deliveryJobs = map[string]bool{}
+	}
+	if server.deliveryJobs[checkpointID] {
+		return false
+	}
+	server.deliveryJobs[checkpointID] = true
+	return true
+}
+
+func (server *Server) unregisterApprovedDeliveryJob(checkpointID string) {
+	checkpointID = strings.TrimSpace(checkpointID)
+	if checkpointID == "" {
+		return
+	}
+	server.deliveryMu.Lock()
+	defer server.deliveryMu.Unlock()
+	delete(server.deliveryJobs, checkpointID)
 }
 
 func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatabase, checkpoint map[string]any, reviewer string) error {
@@ -2540,7 +2772,7 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 	if !isDevFlowPRTemplate(text(pipeline, "templateId")) {
 		return nil
 	}
-	attemptIndex := attemptIndexForCheckpoint(*database, checkpoint)
+	attemptIndex := attemptIndexForApprovedDevFlowDelivery(*database, checkpoint)
 	if attemptIndex < 0 {
 		server.logError(context.Background(), "checkpoint.approve.missing_attempt", "Human review approval could not continue delivery because attempt record is missing.", map[string]any{"pipelineId": text(pipeline, "id"), "stageId": text(checkpoint, "stageId")})
 		run := mapValue(pipeline["run"])
@@ -2550,6 +2782,7 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 		return nil
 	}
 	attempt := cloneMap(database.Tables.Attempts[attemptIndex])
+	linkCheckpointToAttempt(database, text(checkpoint, "id"), text(attempt, "id"))
 	workspace := text(attempt, "workspacePath")
 	prURL := text(attempt, "pullRequestUrl")
 	if workspace == "" || prURL == "" {
@@ -2677,6 +2910,20 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 		})
 	}
 	return nil
+}
+
+func linkCheckpointToAttempt(database *WorkspaceDatabase, checkpointID string, attemptID string) {
+	if database == nil || strings.TrimSpace(checkpointID) == "" || strings.TrimSpace(attemptID) == "" {
+		return
+	}
+	index := findByID(database.Tables.Checkpoints, checkpointID)
+	if index < 0 || text(database.Tables.Checkpoints[index], "attemptId") == attemptID {
+		return
+	}
+	nextCheckpoint := cloneMap(database.Tables.Checkpoints[index])
+	nextCheckpoint["attemptId"] = attemptID
+	nextCheckpoint["updatedAt"] = nowISO()
+	database.Tables.Checkpoints[index] = nextCheckpoint
 }
 
 func (server *Server) mergeApprovedDevFlowPullRequest(repoWorkspace string, prURL string, branchName string, pipelineID string, attemptID string) error {
@@ -2982,6 +3229,26 @@ func appendOrReplace(records []map[string]any, record map[string]any) []map[stri
 	return append(output, record)
 }
 
+func appendOrReplaceByKey(records []map[string]any, record map[string]any, key string) []map[string]any {
+	value := text(record, key)
+	output := []map[string]any{}
+	replaced := false
+	for index, candidate := range records {
+		if text(candidate, key) == value {
+			if !replaced {
+				output = append(output, record)
+				replaced = true
+			}
+			continue
+		}
+		output = append(output, records[index])
+	}
+	if replaced {
+		return output
+	}
+	return append(output, record)
+}
+
 func findByID(records []map[string]any, id string) int {
 	for index, record := range records {
 		if text(record, "id") == id {
@@ -3130,7 +3397,7 @@ func (server *Server) resolveWorkItemRepositoryTarget(ctx context.Context, item 
 	if text(item, "repositoryTargetId") == "" {
 		return cloneMap(item), nil
 	}
-	database, err := server.Repo.Load(ctx)
+	database, err := server.Repo.LoadWorkspaceSession(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -3143,7 +3410,7 @@ func (server *Server) resolveMissionRepositoryTarget(ctx context.Context, missio
 	if targetID == "" {
 		return next, nil
 	}
-	database, err := server.Repo.Load(ctx)
+	database, err := server.Repo.LoadWorkspaceSession(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -3232,9 +3499,132 @@ func upsertGitHubRepositoryTargetForProject(database *WorkspaceDatabase, project
 	database.Tables.Projects[projectIndex] = project
 }
 
-func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (WorkspaceDatabase, bool) {
+func upsertLocalRepositoryTargetForProject(database *WorkspaceDatabase, projectID string, repositoryPath string, defaultBranch string) {
+	if len(database.Tables.Projects) == 0 {
+		database.Tables.Projects = append(database.Tables.Projects, map[string]any{
+			"id":                "project_omega",
+			"name":              "Omega",
+			"description":       "",
+			"team":              "Omega",
+			"status":            "Active",
+			"labels":            []any{},
+			"repositoryTargets": []any{},
+			"createdAt":         nowISO(),
+			"updatedAt":         nowISO(),
+		})
+	}
+	projectIndex := 0
+	if projectID != "" {
+		projectIndex = findByID(database.Tables.Projects, projectID)
+		if projectIndex < 0 {
+			projectIndex = 0
+		}
+	}
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	target := map[string]any{
+		"id":            localRepositoryTargetID(repositoryPath),
+		"kind":          "local",
+		"path":          repositoryPath,
+		"defaultBranch": defaultBranch,
+		"updatedAt":     nowISO(),
+	}
+	project := cloneMap(database.Tables.Projects[projectIndex])
+	targets := arrayMaps(project["repositoryTargets"])
+	nextTargets := make([]any, 0, len(targets)+1)
+	found := false
+	for _, candidate := range targets {
+		nextCandidate := cloneMap(candidate)
+		if text(candidate, "id") == text(target, "id") || (text(candidate, "kind") == "local" && text(candidate, "path") == repositoryPath) {
+			createdAt := text(candidate, "createdAt")
+			if createdAt == "" {
+				createdAt = nowISO()
+			}
+			target["createdAt"] = createdAt
+			nextCandidate = target
+			found = true
+		}
+		nextTargets = append(nextTargets, nextCandidate)
+	}
+	if !found {
+		target["createdAt"] = nowISO()
+		nextTargets = append(nextTargets, target)
+	}
+	project["repositoryTargets"] = nextTargets
+	if text(project, "defaultRepositoryTargetId") == "" {
+		project["defaultRepositoryTargetId"] = target["id"]
+	}
+	project["updatedAt"] = nowISO()
+	database.Tables.Projects[projectIndex] = project
+}
+
+func resolveLocalRepositoryTargetPath(path string, defaultBranch string) (string, string, error) {
+	raw := strings.TrimSpace(path)
+	if raw == "" {
+		return "", "", errors.New("local repository path is required")
+	}
+	normalized, err := normalizeWorkspaceRoot(raw)
+	if err != nil {
+		return "", "", err
+	}
+	stat, err := os.Stat(normalized)
+	if err != nil {
+		return "", "", fmt.Errorf("local repository path is not readable: %w", err)
+	}
+	if !stat.IsDir() {
+		return "", "", fmt.Errorf("local repository path is not a directory: %s", normalized)
+	}
+	topLevelOutput, err := runCommand(normalized, "git", "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", "", fmt.Errorf("local repository path is not a git worktree: %w", err)
+	}
+	topLevel, err := filepath.Abs(strings.TrimSpace(topLevelOutput))
+	if err != nil {
+		return "", "", err
+	}
+	branch := strings.TrimSpace(defaultBranch)
+	if branch == "" {
+		if output, branchErr := runCommand(topLevel, "git", "symbolic-ref", "--short", "HEAD"); branchErr == nil {
+			branch = strings.TrimSpace(output)
+		}
+	}
+	if branch == "" {
+		branch = "main"
+	}
+	return topLevel, branch, nil
+}
+
+func localRepositoryTargetID(repositoryPath string) string {
+	hash := sha1.Sum([]byte(repositoryPath))
+	name := strings.Trim(safeSegment(filepath.Base(repositoryPath)), ".-_")
+	if name == "" {
+		name = "repository"
+	}
+	return fmt.Sprintf("repo_local_%s_%s", name, hex.EncodeToString(hash[:4]))
+}
+
+type repositoryTargetDeleteResult struct {
+	Deleted        bool
+	WorkspacePaths []string
+	WorkItemIDs    map[string]bool
+	RequirementIDs map[string]bool
+	PipelineIDs    map[string]bool
+	AttemptIDs     map[string]bool
+	MissionIDs     map[string]bool
+	OperationIDs   map[string]bool
+}
+
+func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (WorkspaceDatabase, repositoryTargetDeleteResult) {
+	result := repositoryTargetDeleteResult{
+		WorkItemIDs:    map[string]bool{},
+		RequirementIDs: map[string]bool{},
+		PipelineIDs:    map[string]bool{},
+		AttemptIDs:     map[string]bool{},
+		MissionIDs:     map[string]bool{},
+		OperationIDs:   map[string]bool{},
+	}
 	deleted := false
-	deletedWorkItemIDs := map[string]bool{}
 	for projectIndex, project := range database.Tables.Projects {
 		targets := arrayMaps(project["repositoryTargets"])
 		nextTargets := make([]any, 0, len(targets))
@@ -3258,16 +3648,16 @@ func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (Worksp
 		database.Tables.Projects[projectIndex] = nextProject
 	}
 	if !deleted {
-		return database, false
+		return database, result
 	}
+	result.Deleted = true
 
 	nextWorkItems := make([]map[string]any, 0, len(database.Tables.WorkItems))
-	deletedRequirementIDs := map[string]bool{}
 	for _, item := range database.Tables.WorkItems {
 		if text(item, "repositoryTargetId") == targetID {
-			deletedWorkItemIDs[text(item, "id")] = true
+			result.WorkItemIDs[text(item, "id")] = true
 			if requirementID := text(item, "requirementId"); requirementID != "" {
-				deletedRequirementIDs[requirementID] = true
+				result.RequirementIDs[requirementID] = true
 			}
 			continue
 		}
@@ -3276,7 +3666,8 @@ func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (Worksp
 	database.Tables.WorkItems = nextWorkItems
 	nextRequirements := make([]map[string]any, 0, len(database.Tables.Requirements))
 	for _, requirement := range database.Tables.Requirements {
-		if text(requirement, "repositoryTargetId") == targetID || deletedRequirementIDs[text(requirement, "id")] {
+		if text(requirement, "repositoryTargetId") == targetID || result.RequirementIDs[text(requirement, "id")] {
+			result.RequirementIDs[text(requirement, "id")] = true
 			continue
 		}
 		nextRequirements = append(nextRequirements, requirement)
@@ -3287,7 +3678,7 @@ func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (Worksp
 		items := arrayMaps(nextState["workItems"])
 		nextItems := make([]any, 0, len(items))
 		for _, item := range items {
-			if deletedWorkItemIDs[text(item, "id")] {
+			if result.WorkItemIDs[text(item, "id")] {
 				continue
 			}
 			nextItems = append(nextItems, item)
@@ -3297,42 +3688,60 @@ func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (Worksp
 		database.Tables.MissionControlStates[stateIndex] = nextState
 	}
 
-	deletedPipelineIDs := map[string]bool{}
 	nextPipelines := make([]map[string]any, 0, len(database.Tables.Pipelines))
 	for _, pipeline := range database.Tables.Pipelines {
-		if deletedWorkItemIDs[text(pipeline, "workItemId")] {
-			deletedPipelineIDs[text(pipeline, "id")] = true
+		if result.WorkItemIDs[text(pipeline, "workItemId")] {
+			result.PipelineIDs[text(pipeline, "id")] = true
 			continue
 		}
 		nextPipelines = append(nextPipelines, pipeline)
 	}
 	database.Tables.Pipelines = nextPipelines
 
+	nextAttempts := make([]map[string]any, 0, len(database.Tables.Attempts))
+	for _, attempt := range database.Tables.Attempts {
+		if result.PipelineIDs[text(attempt, "pipelineId")] || result.WorkItemIDs[text(attempt, "itemId")] || text(attempt, "repositoryTargetId") == targetID {
+			result.AttemptIDs[text(attempt, "id")] = true
+			result.WorkspacePaths = appendUniqueString(result.WorkspacePaths, text(attempt, "workspacePath"))
+			continue
+		}
+		nextAttempts = append(nextAttempts, attempt)
+	}
+	database.Tables.Attempts = nextAttempts
+
+	nextRunWorkpads := make([]map[string]any, 0, len(database.Tables.RunWorkpads))
+	for _, workpad := range database.Tables.RunWorkpads {
+		if result.AttemptIDs[text(workpad, "attemptId")] || result.PipelineIDs[text(workpad, "pipelineId")] || result.WorkItemIDs[text(workpad, "workItemId")] || text(workpad, "repositoryTargetId") == targetID {
+			result.WorkspacePaths = appendUniqueString(result.WorkspacePaths, firstNonEmpty(text(workpad, "workspacePath"), text(workpad, "workspace")))
+			continue
+		}
+		nextRunWorkpads = append(nextRunWorkpads, workpad)
+	}
+	database.Tables.RunWorkpads = nextRunWorkpads
+
 	nextCheckpoints := make([]map[string]any, 0, len(database.Tables.Checkpoints))
 	for _, checkpoint := range database.Tables.Checkpoints {
-		if deletedPipelineIDs[text(checkpoint, "pipelineId")] {
+		if result.PipelineIDs[text(checkpoint, "pipelineId")] || result.AttemptIDs[text(checkpoint, "attemptId")] {
 			continue
 		}
 		nextCheckpoints = append(nextCheckpoints, checkpoint)
 	}
 	database.Tables.Checkpoints = nextCheckpoints
 
-	deletedMissionIDs := map[string]bool{}
 	nextMissions := make([]map[string]any, 0, len(database.Tables.Missions))
 	for _, mission := range database.Tables.Missions {
-		if deletedWorkItemIDs[text(mission, "workItemId")] || deletedPipelineIDs[text(mission, "pipelineId")] {
-			deletedMissionIDs[text(mission, "id")] = true
+		if result.WorkItemIDs[text(mission, "workItemId")] || result.PipelineIDs[text(mission, "pipelineId")] {
+			result.MissionIDs[text(mission, "id")] = true
 			continue
 		}
 		nextMissions = append(nextMissions, mission)
 	}
 	database.Tables.Missions = nextMissions
 
-	deletedOperationIDs := map[string]bool{}
 	nextOperations := make([]map[string]any, 0, len(database.Tables.Operations))
 	for _, operation := range database.Tables.Operations {
-		if deletedMissionIDs[text(operation, "missionId")] {
-			deletedOperationIDs[text(operation, "id")] = true
+		if result.MissionIDs[text(operation, "missionId")] {
+			result.OperationIDs[text(operation, "id")] = true
 			continue
 		}
 		nextOperations = append(nextOperations, operation)
@@ -3341,13 +3750,105 @@ func deleteRepositoryTarget(database WorkspaceDatabase, targetID string) (Worksp
 
 	nextProofs := make([]map[string]any, 0, len(database.Tables.ProofRecords))
 	for _, proof := range database.Tables.ProofRecords {
-		if deletedOperationIDs[text(proof, "operationId")] {
+		if result.OperationIDs[text(proof, "operationId")] {
 			continue
 		}
 		nextProofs = append(nextProofs, proof)
 	}
 	database.Tables.ProofRecords = nextProofs
-	return database, true
+	return database, result
+}
+
+func (server *Server) deleteRepositoryTargetPagePilotRecords(ctx context.Context, targetID string) ([]map[string]any, error) {
+	deletedRuns, err := server.Repo.DeletePagePilotRunsByRepositoryTarget(ctx, targetID)
+	if err != nil {
+		return nil, err
+	}
+	legacyRuns, err := server.Repo.DeleteSettingsByRepositoryTarget(ctx, pagePilotRunSettingPrefix, targetID)
+	if err != nil {
+		return nil, err
+	}
+	deletedRuns = append(deletedRuns, legacyRuns...)
+	if err := server.Repo.DeleteSetting(ctx, pagePilotPreviewRuntimeKey(targetID)); err != nil {
+		return nil, err
+	}
+	if err := server.Repo.DeleteSetting(ctx, orchestratorWatcherID(targetID)); err != nil {
+		return nil, err
+	}
+	if _, err := server.Repo.DeleteSettingsByRepositoryTarget(ctx, "execution-lock:", targetID); err != nil {
+		return nil, err
+	}
+	if len(deletedRuns) > 0 {
+		server.logInfo(ctx, "repository_workspace.page_pilot_cleanup_completed", "Page Pilot records removed after repository workspace delete.", map[string]any{"repositoryTargetId": targetID, "pagePilotRuns": len(deletedRuns)})
+	}
+	return deletedRuns, nil
+}
+
+func pagePilotRunWorkspacePaths(run map[string]any) []string {
+	paths := []string{}
+	paths = appendUniqueString(paths, text(run, "repositoryPath"))
+	isolation := mapValue(run["isolation"])
+	paths = appendUniqueString(paths, text(isolation, "workspacePath"))
+	paths = appendUniqueString(paths, text(isolation, "repositoryPath"))
+	profile := mapValue(run["previewRuntimeProfile"])
+	paths = appendUniqueString(paths, text(profile, "workingDirectory"))
+	return paths
+}
+
+func (server *Server) removeRepositoryTargetLocalWorkspaces(ctx context.Context, targetID string, workspacePaths []string) {
+	removed := 0
+	for _, workspacePath := range workspacePaths {
+		if strings.TrimSpace(workspacePath) == "" {
+			continue
+		}
+		if err := removeLocalAttemptWorkspace(ctx, server, workspacePath); err != nil {
+			server.logError(ctx, "repository_workspace.local_cleanup_failed", err.Error(), map[string]any{"repositoryTargetId": targetID, "workspacePath": workspacePath})
+			continue
+		}
+		removed++
+		server.logInfo(ctx, "repository_workspace.local_cleanup_removed", "Local attempt workspace removed after repository workspace delete.", map[string]any{"repositoryTargetId": targetID, "workspacePath": workspacePath})
+	}
+	if removed > 0 {
+		server.logInfo(ctx, "repository_workspace.local_cleanup_completed", "Local attempt workspace cleanup completed.", map[string]any{"repositoryTargetId": targetID, "removedWorkspaces": removed})
+	}
+}
+
+func removeLocalAttemptWorkspace(ctx context.Context, server *Server, workspacePath string) error {
+	workspaceRoot := server.localWorkspaceRoot(ctx)
+	path, err := ensurePathInsideRoot(workspaceRoot, workspacePath)
+	if err != nil {
+		return err
+	}
+	root, err := normalizeWorkspaceRoot(workspaceRoot)
+	if err != nil {
+		return err
+	}
+	if path == root {
+		return fmt.Errorf("cleanup refuses to remove workspace root: %s", path)
+	}
+	return os.RemoveAll(path)
+}
+
+func truthyQueryValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func appendUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func defaultGitHubRedirectURI() string {
@@ -3465,14 +3966,18 @@ func scopesFromString(input string) []any {
 	return scopes
 }
 
-func upsertGitHubConnection(database *WorkspaceDatabase, connectedAs string) {
-	record := map[string]any{
+func githubConnectionRecord(connectedAs string) map[string]any {
+	return map[string]any{
 		"providerId":         "github",
 		"status":             "connected",
 		"grantedPermissions": []any{"repo:read", "pull_request:write", "checks:read", "issues:write"},
 		"connectedAs":        stringOr(connectedAs, "github"),
 		"updatedAt":          nowISO(),
 	}
+}
+
+func upsertGitHubConnection(database *WorkspaceDatabase, connectedAs string) {
+	record := githubConnectionRecord(connectedAs)
 	for index, connection := range database.Tables.Connections {
 		if text(connection, "providerId") == "github" {
 			database.Tables.Connections[index] = record

@@ -184,12 +184,15 @@ func (server *Server) proofRecordPreview(response http.ResponseWriter, request *
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
-	database, err := mustLoad(server, request.Context())
+	proofs, err := server.Repo.ListProofRecords(request.Context(), map[string]string{"id": proofID, "limit": "1"})
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	proof := findRecordByID(database.Tables.ProofRecords, proofID)
+	proof := map[string]any{}
+	if len(proofs) > 0 {
+		proof = proofs[0]
+	}
 	if len(proof) == 0 {
 		if sourcePath, ok := resolveProofPreviewPath(proofID); ok {
 			preview, previewErr := previewLocalTextFile(sourcePath, 128*1024)

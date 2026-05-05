@@ -2,9 +2,12 @@ package omegalocal
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -147,6 +150,8 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 	sandbox := stringOr(request.Sandbox, "workspace-write")
 	if err := executableAvailable("codex"); err != nil {
 		process := runnerProcessNotAvailable("codex", "codex", request.Workspace, err)
+		process["model"] = model
+		process["effort"] = effort
 		return AgentTurnResult{Status: "failed", Process: process, Error: err}
 	}
 	process, err := runSupervisedCommandContextWithOptions(
@@ -172,6 +177,8 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 		status = "failed"
 	}
 	process["runner"] = "codex"
+	process["model"] = model
+	process["effort"] = effort
 	return AgentTurnResult{Status: status, Process: process, Error: err}
 }
 
@@ -181,10 +188,21 @@ func (runner OpenCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurn
 	model := stringOr(request.Model, "gpt-5.4-mini")
 	if err := executableAvailable("opencode"); err != nil {
 		process := runnerProcessNotAvailable("opencode", "opencode", request.Workspace, err)
+		process["model"] = model
 		return AgentTurnResult{Status: "failed", Process: process, Error: err}
 	}
-	args := []string{"run", "--model", model, "-"}
-	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: request.Env}, request.Workspace, request.Prompt, "opencode", args...)
+	provider, providerModel := opencodeProviderAndModel(model)
+	env := cloneStringMap(request.Env)
+	if configPath, configErr := writeOpenCodeRunnerConfig(request.Workspace, provider, providerModel, env); configErr == nil && configPath != "" {
+		env["OPENCODE_CONFIG"] = configPath
+	} else if configErr != nil {
+		process := runnerProcessNotAvailable("opencode", "opencode", request.Workspace, configErr)
+		process["model"] = model
+		process["provider"] = provider
+		return AgentTurnResult{Status: "failed", Process: process, Error: configErr}
+	}
+	args := []string{"run", "--model", model, "--dangerously-skip-permissions", request.Prompt}
+	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: env}, request.Workspace, "", "opencode", args...)
 	if request.OutputPath != "" {
 		ensureAgentOutputFile(request.OutputPath, process)
 	}
@@ -193,7 +211,65 @@ func (runner OpenCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurn
 		status = "failed"
 	}
 	process["runner"] = "opencode"
+	process["model"] = model
+	if provider != "" {
+		process["provider"] = provider
+	}
 	return AgentTurnResult{Status: status, Process: process, Error: err}
+}
+
+func writeOpenCodeRunnerConfig(workspace string, provider string, model string, env map[string]string) (string, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return "", nil
+	}
+	prefix := credentialEnvPrefix(provider)
+	baseURL := firstNonEmpty(strings.TrimSpace(env[prefix+"_BASE_URL"]), defaultRunnerProviderBaseURL(provider))
+	if baseURL == "" {
+		return "", nil
+	}
+	configDir := filepath.Join(workspace, ".omega")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return "", err
+	}
+	configPath := filepath.Join(configDir, "opencode-runner-config.json")
+	apiKey := ""
+	if strings.TrimSpace(env[prefix+"_API_KEY"]) != "" {
+		apiKey = "{env:" + prefix + "_API_KEY}"
+	}
+	payload := map[string]any{
+		"$schema": "https://opencode.ai/config.json",
+		"provider": map[string]any{
+			provider: map[string]any{
+				"npm":  "@ai-sdk/openai-compatible",
+				"name": runnerProviderDisplayName(provider),
+				"options": map[string]any{
+					"baseURL": baseURL,
+					"apiKey":  apiKey,
+				},
+				"models": map[string]any{
+					model: map[string]any{
+						"name":      model,
+						"tool_call": true,
+						"reasoning": true,
+						"limit": map[string]any{
+							"context": 128000,
+							"output":  8192,
+						},
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		return "", err
+	}
+	return configPath, nil
 }
 
 type TraeAgentRunner struct{}
@@ -205,15 +281,31 @@ func (runner TraeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequ
 	}
 	args := []string{"run", request.Prompt, "--working-dir", request.Workspace}
 	provider, model := traeProviderAndModel(request.Model)
+	if model == "" {
+		model = strings.TrimSpace(os.Getenv("OMEGA_TRAE_MODEL"))
+	}
+	cliProvider := traeCLIProvider(provider)
+	env := mergeEnvMaps(traeProviderEnv(provider), request.Env)
+	env = addTraeProviderCompatibilityEnv(provider, cliProvider, env)
+	configPath, configErr := writeTraeRunnerConfig(request.Workspace, cliProvider, model)
+	if configErr != nil {
+		process := runnerProcessNotAvailable("trae-agent", "trae-cli", request.Workspace, configErr)
+		process["provider"] = provider
+		process["model"] = model
+		return AgentTurnResult{Status: "failed", Process: process, Error: configErr}
+	}
+	if configPath != "" {
+		args = append(args, "--config-file", configPath)
+	}
 	if model != "" {
-		if provider != "" {
-			args = append(args, "--provider", provider)
+		if cliProvider != "" {
+			args = append(args, "--provider", cliProvider)
 		}
 		args = append(args, "--model", model)
 	}
 	process, err := runSupervisedCommandContextWithOptions(
 		ctx,
-		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: mergeEnvMaps(traeProviderEnv(provider), request.Env)},
+		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: env},
 		request.Workspace,
 		"",
 		"trae-cli",
@@ -227,7 +319,94 @@ func (runner TraeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequ
 		status = "failed"
 	}
 	process["runner"] = "trae-agent"
+	if provider != "" {
+		process["provider"] = provider
+	}
+	if cliProvider != "" && cliProvider != provider {
+		process["cliProvider"] = cliProvider
+	}
+	if model != "" {
+		process["model"] = model
+	}
 	return AgentTurnResult{Status: status, Process: process, Error: err}
+}
+
+func writeTraeRunnerConfig(workspace string, provider string, model string) (string, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return "", nil
+	}
+	configDir := filepath.Join(workspace, ".omega")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return "", err
+	}
+	configPath := filepath.Join(configDir, "trae-runner-config.yaml")
+	raw := strings.Join([]string{
+		"agents:",
+		"  trae_agent:",
+		"    enable_lakeview: false",
+		"    model: omega_model",
+		"    max_steps: 200",
+		"    tools:",
+		"      - bash",
+		"      - str_replace_based_edit_tool",
+		"      - sequentialthinking",
+		"      - task_done",
+		"model_providers:",
+		"  " + yamlKey(provider) + ":",
+		"    api_key: \"\"",
+		"    provider: " + yamlString(provider),
+		"    base_url: \"\"",
+		"models:",
+		"  omega_model:",
+		"    model_provider: " + yamlString(provider),
+		"    model: " + yamlString(model),
+		"    max_tokens: 4096",
+		"    temperature: 0.2",
+		"    top_p: 1",
+		"    top_k: 0",
+		"    max_retries: 3",
+		"    parallel_tool_calls: true",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+		return "", err
+	}
+	return configPath, nil
+}
+
+func yamlKey(value string) string {
+	return strings.Trim(strconv.Quote(strings.TrimSpace(value)), `"`)
+}
+
+func yamlString(value string) string {
+	return strconv.Quote(strings.TrimSpace(value))
+}
+
+func traeCLIProvider(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "kimi", "moonshot", "moonshotai":
+		return "openai"
+	default:
+		return strings.ToLower(strings.TrimSpace(provider))
+	}
+}
+
+func addTraeProviderCompatibilityEnv(provider string, cliProvider string, env map[string]string) map[string]string {
+	providerPrefix := credentialEnvPrefix(provider)
+	cliPrefix := credentialEnvPrefix(cliProvider)
+	if providerPrefix == "" || cliPrefix == "" || providerPrefix == cliPrefix {
+		return env
+	}
+	next := cloneStringMap(env)
+	if next[cliPrefix+"_API_KEY"] == "" && next[providerPrefix+"_API_KEY"] != "" {
+		next[cliPrefix+"_API_KEY"] = next[providerPrefix+"_API_KEY"]
+	}
+	if next[cliPrefix+"_BASE_URL"] == "" && next[providerPrefix+"_BASE_URL"] != "" {
+		next[cliPrefix+"_BASE_URL"] = next[providerPrefix+"_BASE_URL"]
+	}
+	return next
 }
 
 func traeProviderAndModel(rawModel string) (string, string) {
@@ -250,6 +429,8 @@ func traeProviderAndModel(rawModel string) (string, string) {
 			provider = "openai"
 		case strings.HasPrefix(lower, "gemini"):
 			provider = "google"
+		case strings.HasPrefix(lower, "kimi"), strings.HasPrefix(lower, "moonshot"):
+			provider = "kimi"
 		}
 	}
 	return provider, model
@@ -273,19 +454,42 @@ func traeProviderEnv(provider string) map[string]string {
 	return env
 }
 
+func runnerProviderDisplayName(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "kimi", "moonshot", "moonshotai":
+		return "Kimi (Moonshot)"
+	case "qwen":
+		return "Qwen"
+	case "deepseek":
+		return "DeepSeek"
+	case "openrouter":
+		return "OpenRouter"
+	case "openai":
+		return "OpenAI"
+	default:
+		return strings.TrimSpace(provider)
+	}
+}
+
 type ClaudeCodeAgentRunner struct{}
 
 func (runner ClaudeCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequest) AgentTurnResult {
-	model := stringOr(request.Model, "claude-sonnet-4-5")
+	model := strings.TrimSpace(request.Model)
 	executable := "claude"
 	if err := executableAvailable(executable); err != nil {
 		if fallbackErr := executableAvailable("claude-code"); fallbackErr != nil {
 			process := runnerProcessNotAvailable("claude-code", "claude", request.Workspace, err)
+			if model != "" {
+				process["model"] = model
+			}
 			return AgentTurnResult{Status: "failed", Process: process, Error: err}
 		}
 		executable = "claude-code"
 	}
-	args := []string{"-p", "-", "--model", model}
+	args := []string{"-p", "-"}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
 	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: request.Env}, request.Workspace, request.Prompt, executable, args...)
 	if request.OutputPath != "" {
 		ensureAgentOutputFile(request.OutputPath, process)
@@ -295,6 +499,11 @@ func (runner ClaudeCodeAgentRunner) RunTurn(ctx context.Context, request AgentTu
 		status = "failed"
 	}
 	process["runner"] = "claude-code"
+	if model != "" {
+		process["model"] = model
+	} else {
+		process["model"] = "local-config"
+	}
 	return AgentTurnResult{Status: status, Process: process, Error: err}
 }
 

@@ -57,22 +57,23 @@ func (server *Server) cancelRegisteredAttemptJob(attemptID string) bool {
 }
 
 type jobSupervisorTickOptions struct {
-	StaleAfterSeconds         int  `json:"staleAfterSeconds"`
-	AutoRunReady              bool `json:"autoRunReady"`
-	AutoRetryFailed           bool `json:"autoRetryFailed"`
-	AutoCleanupWorkspaces     bool `json:"autoCleanupWorkspaces"`
-	MaxRetryAttempts          int  `json:"maxRetryAttempts"`
-	RetryBackoffSeconds       int  `json:"retryBackoffSeconds"`
-	WorkspaceRetentionSeconds int  `json:"workspaceRetentionSeconds"`
-	Limit                     int  `json:"limit"`
+	StaleAfterSeconds         int    `json:"staleAfterSeconds"`
+	AutoRunReady              bool   `json:"autoRunReady"`
+	AutoRetryFailed           bool   `json:"autoRetryFailed"`
+	AutoCleanupWorkspaces     bool   `json:"autoCleanupWorkspaces"`
+	MaxRetryAttempts          int    `json:"maxRetryAttempts"`
+	RetryBackoffSeconds       int    `json:"retryBackoffSeconds"`
+	WorkspaceRetentionSeconds int    `json:"workspaceRetentionSeconds"`
+	Limit                     int    `json:"limit"`
+	RepositoryTargetID        string `json:"repositoryTargetId"`
 }
 
 func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options jobSupervisorTickOptions) (map[string]any, error) {
-	database, err := mustLoad(server, ctx)
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return nil, err
 	}
-	loadedSavedAt := database.SavedAt
+	database := *databasePtr
 	summary := server.reconcileAttemptIntegrityInDatabase(ctx, &database)
 	mergeSupervisorSummary(summary, server.scanWorkflowContracts(ctx, &database))
 	mergeSupervisorSummary(summary, server.scanRemoteAttemptSignals(ctx, &database, options))
@@ -85,17 +86,13 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 	}
 	mergeSupervisorSummary(summary, server.markStalledAttempts(ctx, &database, options.StaleAfterSeconds))
 	mergeSupervisorSummary(summary, server.scanWorkerHostLeases(ctx, &database))
+	mergeSupervisorSummary(summary, server.scanApprovedDevFlowDeliveryContinuations(ctx, &database))
 	jobs := []map[string]any{}
 	mergeSupervisorSummary(summary, server.scanRunnableWork(ctx, &database, options, &jobs))
 	mergeSupervisorSummary(summary, server.scanRecoverableAttempts(ctx, &database, options, &jobs))
 	mergeSupervisorSummary(summary, server.scanWorkspaceCleanup(ctx, &database, workspaceCleanupOptions{AutoCleanupWorkspaces: options.AutoCleanupWorkspaces, WorkspaceRetentionSeconds: options.WorkspaceRetentionSeconds, Limit: options.Limit}))
 	if intValue(summary["changed"]) > 0 {
-		if currentSavedAt, err := server.Repo.WorkspaceSavedAt(ctx); err == nil && currentSavedAt != "" && loadedSavedAt != "" && currentSavedAt != loadedSavedAt {
-			summary["saveSkippedStaleSnapshot"] = 1
-			server.logRuntimeDiagnosticFile("DEBUG", "job_supervisor.save.skipped_stale_snapshot", "JobSupervisor skipped saving because the workspace changed during this tick.", map[string]any{"loadedSavedAt": loadedSavedAt, "currentSavedAt": currentSavedAt, "changed": intValue(summary["changed"])})
-			return summary, nil
-		}
-		if err := server.Repo.Save(ctx, database); err != nil {
+		if err := server.Repo.SaveSupervisorExecutionState(ctx, database); err != nil {
 			return nil, err
 		}
 		for _, attempt := range database.Tables.Attempts {
@@ -109,6 +106,9 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 	}
 	for _, job := range jobs {
 		server.startDevFlowCycleJob(text(job, "pipelineId"), text(job, "attemptId"), false, false, mapValue(job["lock"]))
+	}
+	for _, checkpointID := range uniqueStrings(stringSlice(summary["approvedDeliveryContinuationCheckpoints"])) {
+		server.completeApprovedDevFlowCheckpointInBackground(checkpointID, "job-supervisor")
 	}
 	return summary, nil
 }
@@ -490,6 +490,7 @@ func (server *Server) reconcileAttemptIntegrityInDatabase(ctx context.Context, d
 		"stalledAttempts":               0,
 		"recoveredHumanGates":           0,
 		"recoveredProofHumanGates":      0,
+		"relinkedApprovedCheckpoints":   0,
 		"feishuReviewPipelines":         []any{},
 	}
 	if database == nil {
@@ -567,6 +568,10 @@ func (server *Server) reconcileAttemptIntegrityInDatabase(ctx context.Context, d
 		for _, pipelineID := range reviewPipelines {
 			summary["feishuReviewPipelines"] = append(arrayValues(summary["feishuReviewPipelines"]), pipelineID)
 		}
+	}
+	if relinked := relinkApprovedHumanReviewCheckpoints(database); relinked > 0 {
+		summary["relinkedApprovedCheckpoints"] = relinked
+		summary["changed"] = intValue(summary["changed"]) + relinked
 	}
 	return summary
 }
@@ -657,7 +662,7 @@ func (server *Server) recoverProofBackedHumanReviewAttempts(ctx context.Context,
 			continue
 		}
 		pipelineID := text(attempt, "pipelineId")
-		if pipelineHasPendingHumanReviewCheckpoint(*database, pipelineID) {
+		if pipelineHasHumanReviewCheckpointWithStatus(*database, pipelineID, "pending", "approved") {
 			continue
 		}
 		pipelineIndex := findByID(database.Tables.Pipelines, pipelineID)
@@ -739,6 +744,79 @@ func (server *Server) recoverProofBackedHumanReviewAttempts(ctx context.Context,
 	return recovered, reviewPipelines
 }
 
+func (server *Server) scanApprovedDevFlowDeliveryContinuations(ctx context.Context, database *WorkspaceDatabase) map[string]any {
+	summary := map[string]any{
+		"changed":                                 0,
+		"approvedDeliveryContinuations":           0,
+		"approvedDeliveryContinuationCheckpoints": []any{},
+	}
+	if database == nil {
+		return summary
+	}
+	for _, checkpoint := range database.Tables.Checkpoints {
+		if text(checkpoint, "stageId") != "human_review" || text(checkpoint, "status") != "approved" {
+			continue
+		}
+		pipelineIndex := findByID(database.Tables.Pipelines, text(checkpoint, "pipelineId"))
+		if pipelineIndex < 0 {
+			continue
+		}
+		pipeline := database.Tables.Pipelines[pipelineIndex]
+		if text(pipeline, "status") == "done" || !isDevFlowPRTemplate(text(pipeline, "templateId")) {
+			continue
+		}
+		attemptIndex := attemptIndexForApprovedDevFlowDelivery(*database, checkpoint)
+		if attemptIndex < 0 {
+			continue
+		}
+		attempt := database.Tables.Attempts[attemptIndex]
+		if text(attempt, "status") == "done" || !attemptHasDeliveryContinuationProof(attempt) {
+			continue
+		}
+		if !approvedDevFlowDeliveryQueued(*database, checkpoint) {
+			markApprovedDevFlowDeliveryQueued(database, checkpoint, "job-supervisor")
+			summary["changed"] = intValue(summary["changed"]) + 1
+		}
+		summary["approvedDeliveryContinuations"] = intValue(summary["approvedDeliveryContinuations"]) + 1
+		summary["approvedDeliveryContinuationCheckpoints"] = append(arrayValues(summary["approvedDeliveryContinuationCheckpoints"]), text(checkpoint, "id"))
+		server.logInfo(ctx, "job_supervisor.approved_delivery.continuation_detected", "Approved human review delivery continuation is ready to run.", map[string]any{
+			"checkpointId": text(checkpoint, "id"),
+			"pipelineId":   text(checkpoint, "pipelineId"),
+			"attemptId":    text(attempt, "id"),
+		})
+	}
+	return summary
+}
+
+func approvedDevFlowDeliveryQueued(database WorkspaceDatabase, checkpoint map[string]any) bool {
+	pipelineIndex := findByID(database.Tables.Pipelines, text(checkpoint, "pipelineId"))
+	if pipelineIndex < 0 {
+		return false
+	}
+	pipeline := database.Tables.Pipelines[pipelineIndex]
+	route := workflowActionRouteFromPipeline(pipeline, "human_review", "human", "passed")
+	mergeStageID := stringOr(route.NextStageID, "merging")
+	if text(pipeline, "status") != "running" {
+		return false
+	}
+	mergeRunning := false
+	for _, stage := range arrayMaps(mapValue(pipeline["run"])["stages"]) {
+		if text(stage, "id") == mergeStageID && text(stage, "status") == "running" {
+			mergeRunning = true
+			break
+		}
+	}
+	if !mergeRunning {
+		return false
+	}
+	attemptIndex := attemptIndexForApprovedDevFlowDelivery(database, checkpoint)
+	if attemptIndex < 0 {
+		return false
+	}
+	attempt := database.Tables.Attempts[attemptIndex]
+	return text(attempt, "status") == "running" && text(attempt, "currentStageId") == mergeStageID
+}
+
 func attemptHasWorkerOrphanMark(attempt map[string]any) bool {
 	if strings.Contains(text(attempt, "statusReason"), "No active local worker host lease") {
 		return true
@@ -755,8 +833,21 @@ func attemptHasWorkerOrphanMark(attempt map[string]any) bool {
 }
 
 func pipelineHasPendingHumanReviewCheckpoint(database WorkspaceDatabase, pipelineID string) bool {
+	return pipelineHasHumanReviewCheckpointWithStatus(database, pipelineID, "pending")
+}
+
+func pipelineHasHumanReviewCheckpointWithStatus(database WorkspaceDatabase, pipelineID string, statuses ...string) bool {
+	wanted := map[string]bool{}
+	for _, status := range statuses {
+		if strings.TrimSpace(status) != "" {
+			wanted[status] = true
+		}
+	}
 	for _, checkpoint := range database.Tables.Checkpoints {
-		if text(checkpoint, "pipelineId") == pipelineID && text(checkpoint, "stageId") == "human_review" && text(checkpoint, "status") == "pending" {
+		if text(checkpoint, "pipelineId") != pipelineID || text(checkpoint, "stageId") != "human_review" {
+			continue
+		}
+		if wanted[text(checkpoint, "status")] {
 			return true
 		}
 	}
@@ -834,6 +925,9 @@ func (server *Server) scanRunnableWork(ctx context.Context, database *WorkspaceD
 			break
 		}
 		if text(item, "status") != "Ready" || text(item, "repositoryTargetId") == "" {
+			continue
+		}
+		if options.RepositoryTargetID != "" && text(item, "repositoryTargetId") != options.RepositoryTargetID {
 			continue
 		}
 		summary["checkedReadyItems"] = intValue(summary["checkedReadyItems"]) + 1
@@ -1066,7 +1160,7 @@ func (server *Server) refreshDatabaseWhenAttemptChanged(ctx context.Context, dat
 	if database == nil || text(attempt, "id") == "" {
 		return false
 	}
-	fresh, err := mustLoad(server, ctx)
+	fresh, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return false
 	}
@@ -1078,7 +1172,7 @@ func (server *Server) refreshDatabaseWhenAttemptChanged(ctx context.Context, dat
 	if text(freshAttempt, "status") == text(attempt, "status") && text(freshAttempt, "updatedAt") == text(attempt, "updatedAt") {
 		return false
 	}
-	*database = fresh
+	*database = *fresh
 	return true
 }
 
@@ -1149,6 +1243,54 @@ func attemptIndexForCheckpoint(database WorkspaceDatabase, checkpoint map[string
 		}
 	}
 	return latestAttemptIndexForPipeline(database, text(checkpoint, "pipelineId"))
+}
+
+func attemptIndexForApprovedDevFlowDelivery(database WorkspaceDatabase, checkpoint map[string]any) int {
+	if attemptID := text(checkpoint, "attemptId"); attemptID != "" {
+		if index := findByID(database.Tables.Attempts, attemptID); index >= 0 && attemptHasDeliveryContinuationProof(database.Tables.Attempts[index]) {
+			return index
+		}
+	}
+	for index := len(database.Tables.Attempts) - 1; index >= 0; index-- {
+		attempt := database.Tables.Attempts[index]
+		if text(attempt, "pipelineId") == text(checkpoint, "pipelineId") && text(attempt, "status") == "done" && attemptHasDeliveryContinuationProof(attempt) {
+			return index
+		}
+	}
+	for index := len(database.Tables.Attempts) - 1; index >= 0; index-- {
+		attempt := database.Tables.Attempts[index]
+		if text(attempt, "pipelineId") == text(checkpoint, "pipelineId") && attemptHasDeliveryContinuationProof(attempt) {
+			return index
+		}
+	}
+	return attemptIndexForCheckpoint(database, checkpoint)
+}
+
+func attemptHasDeliveryContinuationProof(attempt map[string]any) bool {
+	return text(attempt, "workspacePath") != "" && text(attempt, "pullRequestUrl") != ""
+}
+
+func relinkApprovedHumanReviewCheckpoints(database *WorkspaceDatabase) int {
+	if database == nil {
+		return 0
+	}
+	changed := 0
+	for _, checkpoint := range database.Tables.Checkpoints {
+		if text(checkpoint, "stageId") != "human_review" || text(checkpoint, "status") != "approved" {
+			continue
+		}
+		attemptIndex := attemptIndexForApprovedDevFlowDelivery(*database, checkpoint)
+		if attemptIndex < 0 {
+			continue
+		}
+		attemptID := text(database.Tables.Attempts[attemptIndex], "id")
+		if attemptID == "" || text(checkpoint, "attemptId") == attemptID {
+			continue
+		}
+		linkCheckpointToAttempt(database, text(checkpoint, "id"), attemptID)
+		changed++
+	}
+	return changed
 }
 
 func recoverAttemptDeliveryFromProof(database WorkspaceDatabase, pipelineID string) map[string]any {

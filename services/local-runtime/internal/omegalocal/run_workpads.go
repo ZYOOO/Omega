@@ -98,13 +98,12 @@ func (server *Server) patchRunWorkpad(response http.ResponseWriter, request *htt
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
-	database, err := mustLoad(server, request.Context())
+	records, err := server.Repo.ListRunWorkpads(request.Context(), map[string]string{"id": recordID, "limit": "1"})
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	index := findByID(database.Tables.RunWorkpads, recordID)
-	if index < 0 {
+	if len(records) == 0 {
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "run workpad not found"})
 		return
 	}
@@ -122,7 +121,7 @@ func (server *Server) patchRunWorkpad(response http.ResponseWriter, request *htt
 		writeJSON(response, http.StatusBadRequest, map[string]any{"error": "workpad patch is empty"})
 		return
 	}
-	record := cloneMap(database.Tables.RunWorkpads[index])
+	record := cloneMap(records[0])
 	fieldPatches := mapValue(record["fieldPatches"])
 	fieldPatches = mergeRunWorkpadMaps(fieldPatches, patch)
 	workpad := applyRunWorkpadFieldPatches(mapValue(record["workpad"]), fieldPatches)
@@ -144,8 +143,7 @@ func (server *Server) patchRunWorkpad(response http.ResponseWriter, request *htt
 	record["fieldPatchSources"] = fieldPatchSources
 	record["fieldPatchHistory"] = fieldPatchHistory
 	record["updatedAt"] = timestamp
-	database.Tables.RunWorkpads[index] = record
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.UpsertRunWorkpad(request.Context(), record); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}

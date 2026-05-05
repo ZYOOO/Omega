@@ -33,7 +33,7 @@ func TestBuildAttemptActionPlanUsesWorkflowSnapshot(t *testing.T) {
 	if text(currentAction, "id") != "classify_task" || text(currentAction, "status") != "running" {
 		t.Fatalf("current action = %+v", currentAction)
 	}
-	if len(arrayMaps(plan["actions"])) != 5 || intValue(plan["contractActionCount"]) < 10 {
+	if len(arrayMaps(plan["actions"])) != 6 || intValue(plan["contractActionCount"]) < 10 {
 		t.Fatalf("actions not from workflow snapshot = %+v", plan)
 	}
 	if !workflowActionPlanHasTransition(plan, "passed", "code_review_round_1") {
@@ -59,6 +59,9 @@ func TestAttemptActionPlanAPIIncludesRetryPolicy(t *testing.T) {
 	database.Tables.Pipelines = []map[string]any{pipeline}
 	database.Tables.Attempts = []map[string]any{attempt}
 	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
 		t.Fatal(err)
 	}
 

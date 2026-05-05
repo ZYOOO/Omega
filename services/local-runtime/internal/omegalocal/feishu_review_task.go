@@ -41,8 +41,9 @@ func sendFeishuReviewTask(ctx context.Context, packet map[string]any, options fe
 	checkpointID := text(checkpoint, "id")
 	nonce := feishuReviewNonce(checkpointID, text(attempt, "id"))
 	doc := createFeishuReviewDocIfConfigured(ctx, packet, nonce, options)
-	description := renderFeishuReviewTaskDescription(packet, nonce, doc)
-	summary := fmt.Sprintf("%s · 人工审核 · %s", stringOr(text(item, "key"), text(item, "id")), stringOr(text(item, "title"), text(checkpoint, "title")))
+	description := renderFeishuReviewTaskDescriptionForLanguage(packet, nonce, doc, options.Language)
+	summaryMiddle := feishuLabel(options.Language, "Human review", "人工审核")
+	summary := fmt.Sprintf("%s · %s · %s", stringOr(text(item, "key"), text(item, "id")), summaryMiddle, stringOr(text(item, "title"), text(checkpoint, "title")))
 
 	args := []string{"task", "+create", "--as", "bot", "--summary", summary, "--description", description, "--idempotency-key", "omega-review-" + safeSegment(checkpointID)}
 	if assignee := strings.TrimSpace(stringOr(options.AssigneeID, os.Getenv("OMEGA_FEISHU_REVIEW_ASSIGNEE_ID"))); assignee != "" {
@@ -81,7 +82,7 @@ func sendFeishuReviewTask(ctx context.Context, packet map[string]any, options fe
 	}
 	taskGuid := stringOr(text(task, "taskGuid"), text(task, "taskId"))
 	if taskGuid != "" {
-		_, _ = sendFeishuTaskComment(ctx, taskGuid, renderFeishuReviewTaskInitialComment(packet, nonce))
+		_, _ = sendFeishuTaskComment(ctx, taskGuid, renderFeishuReviewTaskInitialCommentForLanguage(packet, nonce, options.Language))
 	}
 	return result, nil
 }
@@ -94,8 +95,9 @@ func createFeishuReviewDocIfConfigured(ctx context.Context, packet map[string]an
 		return map[string]any{"mode": "preview-only"}
 	}
 	item := mapValue(packet["item"])
-	title := fmt.Sprintf("%s 人工审核", stringOr(text(item, "key"), nonce))
-	content := buildFeishuReviewDocMarkdown(packet) + "\n\n---\n\nReview token: `" + nonce + "`\n"
+	titleSuffix := feishuLabel(options.Language, "Human review", "人工审核")
+	title := fmt.Sprintf("%s %s", stringOr(text(item, "key"), nonce), titleSuffix)
+	content := buildFeishuReviewDocMarkdown(packet, options.Language) + "\n\n---\n\nReview token: `" + nonce + "`\n"
 	tempDir := os.TempDir()
 	path := filepath.Join(tempDir, "omega-feishu-review-"+safeSegment(nonce)+".md")
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -120,37 +122,69 @@ func createFeishuReviewDocIfConfigured(ctx context.Context, packet map[string]an
 }
 
 func renderFeishuReviewTaskDescription(packet map[string]any, nonce string, doc map[string]any) string {
+	return renderFeishuReviewTaskDescriptionForLanguage(packet, nonce, doc, "zh-CN")
+}
+
+func renderFeishuReviewTaskDescriptionForLanguage(packet map[string]any, nonce string, doc map[string]any, language string) string {
+	lang := normalizeUILanguage(language)
 	item := mapValue(packet["item"])
 	attempt := mapValue(packet["attempt"])
 	reviewPacket := mapValue(packet["reviewPacket"])
 	requirement := mapValue(packet["requirement"])
 	requirementText := stringOr(text(requirement, "description"), text(item, "description"))
-	lines := []string{
-		fmt.Sprintf("Omega 审核标识: %s", nonce),
-		fmt.Sprintf("工作项: %s %s", stringOr(text(item, "key"), text(item, "id")), text(item, "title")),
-		fmt.Sprintf("PR: %s", stringOr(text(attempt, "pullRequestUrl"), "not created")),
-		fmt.Sprintf("分支: %s", text(attempt, "branchName")),
-		"",
-		"审核方式:",
-		"- 完成这条任务表示审核通过。",
-		"- 不完成任务并留下明确修改评论，Omega 会同步为 request changes。",
-		"- 信息不足时可以留下问题，Omega 会记录为 need-info。",
-		"",
-		"需求摘要:",
-		truncateForProof(requirementText, 900),
+	lines := []string{}
+	if lang == "zh-CN" {
+		lines = append(lines,
+			"✅ Omega 人工审核",
+			fmt.Sprintf("审核标识: %s", nonce),
+			fmt.Sprintf("工作项: %s (%s) · %s", stringOr(text(item, "key"), text(item, "id")), stringOr(text(item, "id"), "unknown"), text(item, "title")),
+			fmt.Sprintf("PR: %s", stringOr(text(attempt, "pullRequestUrl"), "not created")),
+			fmt.Sprintf("分支: %s", text(attempt, "branchName")),
+			"",
+			"🛠️ 审核方式",
+			"完成这条任务: 审核通过",
+			"评论明确修改意见: Omega 同步为 request changes",
+			"评论问题或阻塞原因: Omega 记录为 need-info",
+			"",
+			"📋 需求摘要",
+			truncateForProof(requirementText, 900),
+		)
+	} else {
+		lines = append(lines,
+			"✅ Omega human review",
+			fmt.Sprintf("Review token: %s", nonce),
+			fmt.Sprintf("Work item: %s (%s) · %s", stringOr(text(item, "key"), text(item, "id")), stringOr(text(item, "id"), "unknown"), text(item, "title")),
+			fmt.Sprintf("PR: %s", stringOr(text(attempt, "pullRequestUrl"), "not created")),
+			fmt.Sprintf("Branch: %s", text(attempt, "branchName")),
+			"",
+			"🛠️ How to review",
+			"Complete this task: approve",
+			"Comment with specific requested changes: Omega records request changes",
+			"Comment with questions or blockers: Omega records need-info",
+			"",
+			"📋 Requirement summary",
+			truncateForProof(requirementText, 900),
+		)
 	}
 	if url := stringOr(text(doc, "url"), text(doc, "docUrl")); url != "" {
-		lines = append(lines, "", "审核文档:", url)
+		lines = append(lines, "", feishuLabel(lang, "📄 Review doc", "📄 审核文档"), url)
 	}
 	if summary := text(reviewPacket, "summary"); summary != "" {
-		lines = append(lines, "", "审核包摘要:", truncateForProof(summary, 700))
+		lines = append(lines, "", feishuLabel(lang, "🧾 Review packet", "🧾 审核包摘要"), truncateForProof(summary, 700))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func renderFeishuReviewTaskInitialComment(packet map[string]any, nonce string) string {
+	return renderFeishuReviewTaskInitialCommentForLanguage(packet, nonce, "zh-CN")
+}
+
+func renderFeishuReviewTaskInitialCommentForLanguage(packet map[string]any, nonce string, language string) string {
 	item := mapValue(packet["item"])
-	return fmt.Sprintf("这条飞书任务已绑定 Omega 工作项 `%s`：`%s`。完成任务表示审核通过；如需修改，请直接评论具体修改意见。请不要把这个审核标识复制到其他任务：`%s`。", text(item, "id"), text(item, "title"), nonce)
+	if normalizeUILanguage(language) == "zh-CN" {
+		return fmt.Sprintf("✅ 这条飞书任务已绑定 Omega 工作项 %s：%s。完成任务表示审核通过；如需修改，请直接评论具体修改意见。请不要把这个审核标识复制到其他任务：%s。", text(item, "id"), text(item, "title"), nonce)
+	}
+	return fmt.Sprintf("✅ This Feishu task is bound to Omega work item %s: %s. Complete the task to approve; comment with specific changes to request changes. Do not copy this review token to another task: %s.", text(item, "id"), text(item, "title"), nonce)
 }
 
 func feishuReviewNonce(checkpointID string, attemptID string) string {
@@ -225,7 +259,7 @@ func (server *Server) tickFeishuReviewTaskBridge(ctx context.Context, checkpoint
 		limit = 20
 	}
 	if dryRun {
-		database, err := mustLoad(server, ctx)
+		database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 		if err != nil {
 			return nil, http.StatusNotFound, err
 		}
@@ -253,7 +287,7 @@ func (server *Server) tickFeishuReviewTaskBridge(ctx context.Context, checkpoint
 }
 
 func (server *Server) syncFeishuReviewTasks(ctx context.Context, checkpointID string) (map[string]any, int, error) {
-	database, err := mustLoad(server, ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return nil, http.StatusNotFound, err
 	}
@@ -344,11 +378,11 @@ func (server *Server) applyFeishuReviewTaskComment(ctx context.Context, checkpoi
 	if comment == "" {
 		return map[string]any{"status": "ignored", "reason": "empty comment"}, http.StatusOK, nil
 	}
-	database, err := mustLoad(server, ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return nil, http.StatusNotFound, err
 	}
-	checkpoint, ok := findFeishuTaskCheckpoint(database, checkpointID, taskGuid)
+	checkpoint, ok := findFeishuTaskCheckpoint(*database, checkpointID, taskGuid)
 	if !ok {
 		return nil, http.StatusNotFound, fmt.Errorf("linked checkpoint not found")
 	}
@@ -402,7 +436,7 @@ func (server *Server) recordFeishuReviewTaskComment(ctx context.Context, checkpo
 }
 
 func (server *Server) patchFeishuReviewTaskComment(ctx context.Context, checkpointID string, entry map[string]any) (map[string]any, error) {
-	database, err := mustLoad(server, ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -417,8 +451,8 @@ func (server *Server) patchFeishuReviewTaskComment(ctx context.Context, checkpoi
 	checkpoint["feishuReview"] = review
 	checkpoint["updatedAt"] = nowISO()
 	database.Tables.Checkpoints[index] = checkpoint
-	touch(&database)
-	if err := server.Repo.Save(ctx, database); err != nil {
+	touch(database)
+	if err := server.Repo.SaveSupervisorExecutionState(ctx, *database); err != nil {
 		return nil, err
 	}
 	return checkpoint, nil
@@ -467,7 +501,24 @@ func findFeishuTaskCheckpoint(database WorkspaceDatabase, checkpointID string, t
 
 func feishuTaskIsDone(task map[string]any) bool {
 	status := strings.ToLower(strings.TrimSpace(text(task, "status")))
-	return status == "done" || status == "completed" || text(task, "completed_at") != "" || text(task, "completedAt") != ""
+	switch status {
+	case "done", "completed":
+		return true
+	case "":
+		return meaningfulFeishuCompletedAt(task["completed_at"]) || meaningfulFeishuCompletedAt(task["completedAt"])
+	default:
+		return false
+	}
+}
+
+func meaningfulFeishuCompletedAt(value any) bool {
+	raw := strings.TrimSpace(fmt.Sprint(value))
+	if value == nil || raw == "" || raw == "<nil>" {
+		return false
+	}
+	normalized := strings.Trim(raw, "\"")
+	normalized = strings.TrimSpace(normalized)
+	return normalized != "" && normalized != "0" && normalized != "null"
 }
 
 func extractLarkTask(output string) map[string]any {
@@ -501,8 +552,16 @@ func extractNestedMap(output string, key string) map[string]any {
 
 func parseJSONMap(output string) map[string]any {
 	var payload map[string]any
-	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &payload); err == nil && payload != nil {
+	trimmed := strings.TrimSpace(output)
+	if err := json.Unmarshal([]byte(trimmed), &payload); err == nil && payload != nil {
 		return payload
+	}
+	start := strings.Index(trimmed, "{")
+	end := strings.LastIndex(trimmed, "}")
+	if start >= 0 && end > start {
+		if err := json.Unmarshal([]byte(trimmed[start:end+1]), &payload); err == nil && payload != nil {
+			return payload
+		}
 	}
 	return map[string]any{}
 }

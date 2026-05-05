@@ -14,6 +14,20 @@ Requirement 需求源
 
 因此，GitHub 是第一阶段最核心的外部工程管理依赖；Feishu 仍然是重要的人机协作入口，但优先级要服从这个主闭环。
 
+近期完成：
+
+- [x] Work Item 详情页执行态热路径收缩：live polling 按当前 Work Item / Pipeline / Repository Workspace 读取，Attempt Timeline 不再读取 full supervisor snapshot。
+- [x] Work Item 详情页 light / dark 视觉收口：产物预览、Agent 操作弹窗、Review packet 和 Agent trace 卡片统一主题颜色，避免浅色页面混入深色弹窗壳。
+- [x] 四类 Agent runner 启动链路拆成 runner-specific adapter：Codex 走 `codex exec`，Claude Code 继承本机 CLI 配置，opencode 生成临时 `OPENCODE_CONFIG`，Trae Agent 生成临时 `trae_config.yaml`。
+- [x] Work Item 详情页按阶段展示真实 Agent 运行摘要：已启动次数、agent role、runner、provider/model；未启动阶段显示计划 Agent 数量。
+- [x] Codex runner 支持在右侧全局 Agent Access 保存默认模型，并从本地 Codex 配置 / `models_cache.json` 发现真实模型候选；运行前会替换旧默认 `gpt-5.4-mini`。
+- [x] Global Agent Access 四个 runner 都支持真实 Test connection；账号型 runner 会验证命令、当前 provider/base URL/API key 和 provider 模型接口。
+- [x] Workspace Agent Studio 移除阶段模型静态 preset 下拉；模型为空表示继承全局 runner 默认，切换 runner 不再自动改模型。
+- [x] Repository Workspace 删除链路补齐 Page Pilot：同步清理 page_pilot_runs、Preview Runtime setting、live lock，并在用户勾选时删除 Omega 管理的 Page Pilot 隔离 workspace。
+- [x] Workboard 默认展示 Not Started / Running / Human Review / Blocked / Done 流程栏，空阶段也保留栏位；创建入口统一使用顶部 New requirement。
+- [x] Runner account 支持在右侧全局 Agent Access 中为 opencode / Trae Agent 输入 API key、发现可用模型，并在运行时按 provider 注入授权环境变量。
+- [x] Global Agent Access 支持 Kimi (Moonshot) provider，默认 Moonshot OpenAI-compatible base URL；runner account 输入框改为无假模型 preset，发现模型后再展示真实候选。
+
 当前对象从属关系：
 
 ```text
@@ -189,6 +203,7 @@ Item
 - [x] 增加 GitHub PR/checks 读取 API：`POST /github/pr-status`，通过 `gh pr view` / `gh pr checks` 返回 review state、checks、deliveryGate、proofRecords
 - [x] Project 页面支持从本机 `gh` 仓库列表选择 repo，并绑定为当前 Project 的 repository target
 - [x] Repository workspace 下支持从 App 内部直接新建需求，自动继承当前 repo target，并进入本地 runner 执行链路
+- [x] Projects 页面支持真实绑定本地项目目录为 Repository Workspace：Electron 目录选择器返回绝对路径，Go runtime 校验 git worktree 并持久化 `kind=local` target。
 - [x] GitHub issue URL / repo URL 可作为 runner 的代码目标解析来源，支持真实 `gh repo clone` 后在隔离 workspace 生成 branch / commit / proof
 - [x] 增加 App 可配置的本地 workspace root：默认 `~/Omega/workspaces`，并通过 Go API 持久化
 - [x] 参照外部项目模板完成 Omega 映射：project slug -> Omega Project/Repository workspace，repo/default branch/workspace root -> App 配置与 repository target
@@ -451,6 +466,7 @@ Item
 - [x] 收敛 Workboard / detail 刷新性能：首屏和轮询不再全量拉取 operations/proof records，后端列表接口支持 SQLite 规范化表过滤读取。
 - [x] runtime logs 噪音治理第一版：成功 GET 访问日志不再默认落库，JobSupervisor interval tick / remote poll 去噪；被跳过的高频诊断日志写入 `.omega/logs` daily JSONL 并保留约 1 天，通过 SQLite migration compact 历史 `api.request` / tick / poll 日志。
 - [x] Workspace session 轻量化：UI 会话恢复改走 `/workspace?scope=session`，不再在 live polling 中传输 missions / operations / proof records 等执行重表；后端 session read model 从 SQLite 规范化表组装，不再反序列化完整 snapshot；`/run-workpads` 切换到 SQLite 规范化表读取。
+- [x] 全局语言偏好基础版：Web 产品壳支持 English / 简体中文切换，偏好同步到 Go local runtime；飞书 Human Review / Task review / failure alert 文本跟随语言偏好。
 - [ ] 继续治理历史数据体积：为 stdout / stderr / runner details 等真实执行日志增加按天或按数量的长期 retention，避免 `.omega/omega.db` 长期膨胀。
 - [ ] 增加由服务端数据驱动的 activity / event timeline 页面
 - [x] 增加 Operator 视图基础版（队列 / waiting-human / proof / runtime model / checkpoint）
@@ -506,6 +522,26 @@ Item
 - [x] Connections 主列表移除暂未产品化的 Google identity 占位，只展示 GitHub / Feishu / CI，避免默认 `on` 误导。
 - [x] Feishu Human Review approve 路由收敛：未配置 Card Request URL 时不再发送会报 `200340` 的卡片按钮，当前用户 fallback 改走可同步的 Task 审核。
 - [x] Sidebar Agent Access：左侧 sidebar 展示本机级 runner / model / profile / account 绑定状态，点击进入 Agent Studio；workspace 级 stage 分配继续保留在 Agent Studio 内。
+- [x] Stage 级 Skills / MCP 真实物化：Agent Profile 保存后，runner 启动前写入 `.omega/agent-capabilities.*`、`.codex/OMEGA.md`、`.claude/CLAUDE.md`，注入 `OMEGA_AGENT_*` 环境变量，并用 fake runner 测试证明 Agent 进程可读取。
+- [x] 本机 Skills / MCP 安装与映射文档：安装 stage 适用 Skills / MCP server，并在 `docs/agent-skills-and-mcp.md` 记录安装位置、默认 stage 映射和验证方式。
+- [x] GitHub Actions CI 进入默认 DevFlow：PR publish/update 后执行 `run_ci_checks`，采集 checks 和 failed run logs，写入 CI proof，并将 failed/missing required checks 输入 Rework / Review / Workpad。
+- [x] DevFlow Plan/TODO 显式化：Architect action 作为 Plan 等价阶段，输出 technical plan、functional todo list、project todo list，Review prompt 按清单核对 diff / validation / CI。
+- [x] Work Item 详情页展示 Plan/TODO 进度：Run Workpad 的 Plan 卡片显示 Plan stage、Functional TODO、Project TODO、Review alignment，并链接 plan artifacts。
+- [x] Checkpoint / Feishu review 数据收口：Human Review checkpoint 的 attempt 归属、Feishu sent 状态、task/message id 已列化，自动发送入口可在加载 full snapshot 前跳过已发送任务。
+- [x] Attempt failure alert 数据收口：stalled/orphaned attempt 的 Feishu failure notified 状态、status、message id 已列化，自动告警入口可在加载 full snapshot 前跳过已发送告警。
+- [x] JobSupervisor 执行态读写收口：maintenance tick 改用规范化 execution read model 和局部 table upsert，stalled detection / recovery 不再以 full workspace snapshot 作为扫描起点或整库保存路径。
+- [x] Run Workpad patch 数据收口：Workpad field patches / sources / history 已进入 `run_workpads.record_json`，patch API 不再依赖 full snapshot。
+- [x] Attempt cancel 数据收口：cancel API 复用 execution state 局部读写路径，更新 attempt / pipeline / work item / checkpoint / workpad 不再整库读写。
+- [x] Work Item create / patch / delete 数据收口：常用 Work Item 手动操作改走 session read model 和局部 table writer，snapshot 损坏时仍可创建、修改、删除未开始 item。
+- [x] Attempt retry / DevFlow 后台执行态数据收口：retry、background job load、worker host、complete / fail / cancel、Agent invocation、runner heartbeat 改走规范化 execution read/write path，并同步保存 mission / operation / proof records。
+- [x] Attempt 详情热路径与手动执行入口数据收口：action plan、timeline、Feishu review task bridge、manual DevFlow run、run-current-stage、pipeline status mutation、workspace cleanup 改走规范化 execution read/write path。
+- [x] 继续缩小剩余 legacy manual handler 的 `mustLoad` 使用范围：workflow template、Page Pilot apply/deliver/discard、repository target binding/deletion/import、GitHub issue import、approved Human Review delivery、Feishu delivery persistence、operation runner detail 和 orchestrator tick 已改为局部 table update / execution state path。
+- [x] Workspace Auto run 语义补齐：Auto 开关会优先运行当前 Repository Workspace 中 Not Started / Ready 的 Work Item；GitHub workspace 没有 ready work 时再扫描 ready issue，Local workspace 也可自动启动已有工作项。
+- [x] Approved Human Review delivery recovery：Human Review approve 后的 Merging continuation 会绑定最新可交付 attempt，重启后可由 JobSupervisor 续跑，详情页会展示真实 running 阶段状态。
+- [x] Work Item 详情页动作收口：顶部主按钮只负责启动未开始项；完成后的重新运行和失败/阻塞恢复不再混在顶部，attempt 级失败恢复保留在 attempt 卡片。
+- [x] Work Item 产物区 UI 收口：Artifact 卡片和预览弹窗改为证据/文档式排版，Markdown 产物按标题、列表、checkbox、代码块格式化展示。
+- [x] Agent operations 弹窗 UI 收口：状态/runner/model/exit/duration 进入 metadata，Summary/Prompt/Stdout/Stderr 分块展示，Prompt 常见结构格式化为可读文档。
+- [ ] 收尾剩余 full snapshot 兼容层：`GET/PUT /workspace`、少量 connection 状态镜像和旧 missionEvents fallback 仍保留为兼容/导出/恢复用途，后续要继续收窄或标记为 legacy-only。
 
 ## Page Pilot 产品化
 

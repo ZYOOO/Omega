@@ -47,6 +47,51 @@ var sqliteMigrations = []sqliteMigration{
 		}
 		return repo.ensureWorkItemRecordJSON(ctx)
 	}},
+	{Version: "20260505_001", Name: "checkpoint_feishu_review_json", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		return repo.ensureCheckpointFeishuReviewJSON(ctx)
+	}},
+	{Version: "20260505_002", Name: "checkpoint_core_fact_columns", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		if err := repo.ensureCheckpointFeishuReviewJSON(ctx); err != nil {
+			return err
+		}
+		return repo.ensureCheckpointCoreFacts(ctx)
+	}},
+	{Version: "20260505_003", Name: "attempt_delivery_fact_columns", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		return repo.ensureAttemptDeliveryFacts(ctx)
+	}},
+	{Version: "20260505_004", Name: "attempt_record_json", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		return repo.ensureAttemptDeliveryFacts(ctx)
+	}},
+	{Version: "20260505_005", Name: "run_workpad_record_json", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		return repo.ensureRunWorkpadRecordJSON(ctx)
+	}},
+	{Version: "20260505_006", Name: "operation_record_json", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		return repo.ensureOperationRecordJSON(ctx)
+	}},
+	{Version: "20260505_007", Name: "feishu_delivery_receipts", Up: func(ctx context.Context, repo *SQLiteRepository) error {
+		if err := repo.initializeBaselineSchema(ctx); err != nil {
+			return err
+		}
+		return repo.ensureFeishuDeliveryReceipts(ctx)
+	}},
 }
 
 func (repo *SQLiteRepository) applyPendingSQLiteMigrations(ctx context.Context) error {

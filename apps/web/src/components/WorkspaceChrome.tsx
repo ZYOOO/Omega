@@ -1,4 +1,5 @@
 import type { ConnectionProvider, ProjectRecord, ProviderId, RepositoryTarget, WorkItem } from "../core";
+import { LanguageToggle, useI18n, type UiLanguage } from "../i18n";
 
 export type PrimaryNav = "Projects" | "Views" | "Issues" | "Page Pilot" | "Settings";
 export type UiTheme = "light" | "dark";
@@ -9,7 +10,6 @@ export type AgentAccessSidebarItem = {
   label: string;
   value: string;
   status: "ready" | "partial" | "setup";
-  targetTab: "agents" | "runtime";
 };
 
 type WorkspaceChromeProps = {
@@ -19,9 +19,11 @@ type WorkspaceChromeProps = {
   activeDetailCompleted: boolean;
   detailRunDisabled: boolean;
   detailRunLabel: string;
+  detailRunVisible: boolean;
   runnerMessage: string;
   searchQuery: string;
   uiTheme: UiTheme;
+  uiLanguage: UiLanguage;
   repositoryTargets: RepositoryTarget[];
   workItems: WorkItem[];
   activeRepositoryWorkspaceTargetId: string;
@@ -39,6 +41,7 @@ type WorkspaceChromeProps = {
   onRunDetail: () => void;
   onSearchChange: (value: string) => void;
   onToggleTheme: () => void;
+  onLanguageChange: (language: UiLanguage) => void;
   onToggleWorkspaceSection: (open: boolean) => void;
   onToggleConnectionsSection: (open: boolean) => void;
   onToggleAgentAccessSection: (open: boolean) => void;
@@ -66,9 +69,11 @@ export function WorkspaceChrome({
   activeDetailRepositoryLabel,
   detailRunDisabled,
   detailRunLabel,
+  detailRunVisible,
   runnerMessage,
   searchQuery,
   uiTheme,
+  uiLanguage,
   repositoryTargets,
   workItems,
   activeRepositoryWorkspaceTargetId,
@@ -86,6 +91,7 @@ export function WorkspaceChrome({
   onRunDetail,
   onSearchChange,
   onToggleTheme,
+  onLanguageChange,
   onToggleWorkspaceSection,
   onToggleConnectionsSection,
   onToggleAgentAccessSection,
@@ -95,20 +101,21 @@ export function WorkspaceChrome({
   onAgentAccessClick,
   onNewRequirement
 }: WorkspaceChromeProps) {
+  const { t } = useI18n();
   return (
     <>
-      <aside className="sidebar" aria-label="Workspace navigation">
+      <aside className="sidebar" aria-label={t("Workspace navigation")}>
         <div className="brand-lockup">
           <img className="brand-logo" src="/omega-logo.png" alt="Omega AI DevFlow Engine" />
           <button type="button" className="sidebar-home-button" onClick={onHome}>
-            Home
+            {t("Home")}
           </button>
         </div>
 
         <nav className="nav-stack">
           {(["Projects", "Views", "Issues", "Page Pilot"] as const).map((item) => (
             <button key={item} className={item === activeNav ? "nav-item active" : "nav-item"} onClick={() => onNavigate(item)}>
-              <span>{primaryNavLabel(item)}</span>
+              <span>{t(primaryNavLabel(item))}</span>
             </button>
           ))}
         </nav>
@@ -120,9 +127,9 @@ export function WorkspaceChrome({
             onToggle={(event) => onToggleWorkspaceSection(event.currentTarget.open)}
           >
             <summary>
-              <span className="section-label">Workspaces</span>
+              <span className="section-label">{t("Workspaces")}</span>
             </summary>
-            <nav className="workspace-stack" aria-label="Project workspaces">
+            <nav className="workspace-stack" aria-label={t("Project workspaces")}>
               {repositoryTargets.map((target) => {
                 const label = target.kind === "github" ? `${target.owner}/${target.repo}` : target.path;
                 const targetItems = workItems.filter((item) => item.repositoryTargetId === target.id);
@@ -137,14 +144,14 @@ export function WorkspaceChrome({
                       <span className="dot online" aria-hidden="true" />
                       <span>
                         <strong>{label}</strong>
-                        <small>{targetItems.length} items</small>
+                        <small>{t(targetItems.length === 1 ? "{count} item" : "{count} items", { count: targetItems.length })}</small>
                       </span>
                     </button>
                     <button
                       type="button"
                       className="workspace-config-button"
-                      aria-label={`Configure ${label}`}
-                      title="Workspace config"
+                      aria-label={t("Configure {label}", { label })}
+                      title={t("Workspace config")}
                       onClick={() => onConfigureWorkspace(target)}
                     >
                       <span aria-hidden="true">⚙</span>
@@ -161,8 +168,8 @@ export function WorkspaceChrome({
           open={connectionsSectionOpen}
           onToggle={(event) => onToggleConnectionsSection(event.currentTarget.open)}
         >
-          <summary>
-            <span className="section-label">Connections</span>
+            <summary>
+            <span className="section-label">{t("Connections")}</span>
           </summary>
           <div className="connection-stack">
             {visibleConnectionProviders.map((provider) => (
@@ -173,7 +180,7 @@ export function WorkspaceChrome({
               >
                 <span className={connections[provider.id].status === "connected" ? "dot online" : "dot"} />
                 <span>{provider.name}</span>
-                <small>{connections[provider.id].status === "connected" ? "on" : "off"}</small>
+                <small>{t(connections[provider.id].status === "connected" ? "on" : "off")}</small>
               </button>
             ))}
           </div>
@@ -184,8 +191,8 @@ export function WorkspaceChrome({
           open={agentAccessSectionOpen}
           onToggle={(event) => onToggleAgentAccessSection(event.currentTarget.open)}
         >
-          <summary>
-            <span className="section-label">Agents</span>
+            <summary>
+            <span className="section-label">{t("Agents")}</span>
           </summary>
           <div className="connection-stack agent-access-stack">
             {agentAccessItems.map((item) => (
@@ -193,13 +200,13 @@ export function WorkspaceChrome({
                 key={item.id}
                 type="button"
                 className="connection-row agent-access-row"
-                aria-label={`${item.label}: ${item.value}`}
+                aria-label={`${item.label}: ${t(item.value)}`}
                 onClick={() => onAgentAccessClick(item)}
-                title={`${item.label}: ${item.value}`}
+                title={`${item.label}: ${t(item.value)}`}
               >
                 <span className={item.status === "ready" ? "dot online" : item.status === "partial" ? "dot warning" : "dot"} />
                 <span>{item.label}</span>
-                <small>{item.value}</small>
+                <small>{t(item.value)}</small>
               </button>
             ))}
           </div>
@@ -210,9 +217,9 @@ export function WorkspaceChrome({
         <header className={activeWorkItemDetail ? "topbar detail-mode" : "topbar"}>
           {activeWorkItemDetail ? (
             <>
-              <nav className="detail-breadcrumb" aria-label="Issue detail breadcrumb">
+              <nav className="detail-breadcrumb" aria-label={t("Work item")}>
                 <button type="button" onClick={onBackToWorkItems}>
-                  Work items
+                  {t("Work items")}
                 </button>
                 <span>›</span>
                 {activeDetailRepositoryLabel ? <span>{activeDetailRepositoryLabel}</span> : null}
@@ -226,36 +233,40 @@ export function WorkspaceChrome({
                     {runnerMessageSummary(runnerMessage)}
                   </span>
                 ) : null}
+                <LanguageToggle language={uiLanguage} onLanguageChange={onLanguageChange} />
                 <ThemeToggle uiTheme={uiTheme} onToggleTheme={onToggleTheme} />
                 <button type="button" onClick={() => navigator.clipboard?.writeText(activeWorkItemDetail.target)}>
-                  Copy target
+                  {t("Copy target")}
                 </button>
-                <button type="button" className="primary-action" disabled={detailRunDisabled} onClick={onRunDetail}>
-                  {detailRunLabel}
-                </button>
+                {detailRunVisible ? (
+                  <button type="button" className="primary-action" disabled={detailRunDisabled} onClick={onRunDetail}>
+                    {detailRunLabel}
+                  </button>
+                ) : null}
               </div>
             </>
           ) : (
             <>
               <div>
                 <p className="section-label">Omega</p>
-                <h1>{primaryNavLabel(activeNav)}</h1>
+                <h1>{t(primaryNavLabel(activeNav))}</h1>
               </div>
               <div className="search-control">
                 <input
                   className="command-input"
                   value={searchQuery}
                   onChange={(event) => onSearchChange(event.currentTarget.value)}
-                  placeholder={topbarSearchPlaceholder(activeNav)}
+                  placeholder={t(topbarSearchPlaceholder(activeNav))}
                 />
-                <button type="button">Search</button>
+                <button type="button">{t("Search")}</button>
               </div>
               <div className="topbar-actions">
                 {activeNav === "Issues" ? (
                   <button type="button" className="topbar-create" onClick={onNewRequirement}>
-                    <span className="topbar-create-label">New requirement</span>
+                    <span className="topbar-create-label">{t("New requirement")}</span>
                   </button>
                 ) : null}
+                <LanguageToggle language={uiLanguage} onLanguageChange={onLanguageChange} />
                 <ThemeToggle uiTheme={uiTheme} onToggleTheme={onToggleTheme} />
               </div>
             </>
@@ -268,10 +279,11 @@ export function WorkspaceChrome({
 }
 
 function ThemeToggle({ uiTheme, onToggleTheme }: { uiTheme: UiTheme; onToggleTheme: () => void }) {
+  const { t } = useI18n();
   return (
-    <button type="button" className="theme-toggle" onClick={onToggleTheme} aria-label={`Switch to ${uiTheme === "light" ? "night" : "day"} mode`}>
+    <button type="button" className="theme-toggle" onClick={onToggleTheme} aria-label={t(uiTheme === "light" ? "Switch to night mode" : "Switch to day mode")}>
       <span aria-hidden="true">{uiTheme === "light" ? "☾" : "☼"}</span>
-      {uiTheme === "light" ? "Night" : "Day"}
+      {t(uiTheme === "light" ? "Night" : "Day")}
     </button>
   );
 }

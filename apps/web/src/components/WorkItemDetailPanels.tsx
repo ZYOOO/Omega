@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import { useI18n } from "../i18n";
 import type {
   AttemptRecordInfo,
   AttemptActionPlanInfo,
@@ -88,14 +89,15 @@ export function WorkItemAttemptPanel({
   pullRequestStatus,
   timelineItems = []
 }: WorkItemAttemptPanelProps) {
+  const { t } = useI18n();
   if (!attempt) {
     if (checkpoint) {
       return (
         <article className="attempt-card review-ready-card">
           <header>
             <div>
-              <strong>Waiting for human review</strong>
-              <span>Review the delivery packet, then approve or request changes.</span>
+              <strong>{t("Waiting for human review")}</strong>
+              <span>{t("Review the delivery packet, then approve or request changes.")}</span>
             </div>
           </header>
           <HumanGateCard
@@ -111,7 +113,7 @@ export function WorkItemAttemptPanel({
         </article>
       );
     }
-    return <p className="muted-copy">No execution attempt yet. Run this item to create a traceable attempt.</p>;
+    return <p className="muted-copy">{t("No execution attempt yet. Run this item to create a traceable attempt.")}</p>;
   }
 
   const planStates = actionPlan?.states?.length ? actionPlan.states : [];
@@ -135,13 +137,13 @@ export function WorkItemAttemptPanel({
         ) : null}
         {retryable && onRetryAttempt ? (
           <button type="button" className="attempt-retry-action" onClick={() => onRetryAttempt(attempt.id)}>
-            Retry attempt
+            {t("Retry attempt")}
           </button>
         ) : null}
       </header>
 
       <details className="attempt-stage-details">
-        <summary>Stage details</summary>
+        <summary>{t("Stage details")}</summary>
         <ActionPlanSummary actionPlan={actionPlan} />
         <div className="attempt-stage-flow" aria-label={`Attempt ${attempt.id} stages`}>
           {stages.map((stage) => (
@@ -603,10 +605,11 @@ export function AgentTraceList({
 }: Pick<LabelHelpers, "agentShortLabel" | "operationStatusLabel" | "pipelineStageClassName"> & {
   operations: OperationRecordInfo[];
 }) {
+  const { t } = useI18n();
   const [activeOperationId, setActiveOperationId] = useState<string | null>(null);
   const activeOperation = operations.find((operation) => operation.id === activeOperationId);
   if (!operations.length) {
-    return <p className="muted-copy">Agent trace will appear as soon as the local orchestrator starts assigning stage work.</p>;
+    return <p className="muted-copy">{t("Agent trace will appear as soon as the local orchestrator starts assigning stage work.")}</p>;
   }
 
   return (
@@ -643,38 +646,54 @@ export function AgentTraceList({
                 <span>{activeOperation.stageId ?? "stage"}</span>
                 <strong>{agentShortLabel(activeOperation.agentId ?? "agent")}</strong>
               </div>
-              <button type="button" onClick={() => setActiveOperationId(null)}>Close</button>
+              <button type="button" onClick={() => setActiveOperationId(null)}>{t("Close")}</button>
             </header>
-            <div className="detail-popover-body">
-              <div className="agent-operation-dialog-summary">
-                <strong>{operationStatusLabel(activeOperation.status)}</strong>
-                <p>{activeOperation.summary || agentOperationPreview(activeOperation)}</p>
+            <div className="detail-popover-body agent-operation-body">
+              <div className="agent-operation-meta" aria-label={t("Agent operation metadata")}>
+                <span>
+                  <strong>{t("Status")}</strong>
+                  <small>{operationStatusLabel(activeOperation.status)}</small>
+                </span>
+                {activeOperation.runnerProcess?.runner ? (
+                  <span>
+                    <strong>{t("Runner")}</strong>
+                    <small>{activeOperation.runnerProcess.runner}</small>
+                  </span>
+                ) : null}
+                {activeOperation.runnerProcess?.model ? (
+                  <span>
+                    <strong>{t("Model")}</strong>
+                    <small>{activeOperation.runnerProcess.model}</small>
+                  </span>
+                ) : null}
+                {activeOperation.runnerProcess?.status ? (
+                  <span>
+                    <strong>{t("Process")}</strong>
+                    <small>{activeOperation.runnerProcess.status}</small>
+                  </span>
+                ) : null}
+                {typeof activeOperation.runnerProcess?.exitCode === "number" ? (
+                  <span>
+                    <strong>{t("Exit")}</strong>
+                    <small>{activeOperation.runnerProcess.exitCode}</small>
+                  </span>
+                ) : null}
+                {typeof activeOperation.runnerProcess?.durationMs === "number" ? (
+                  <span>
+                    <strong>{t("Duration")}</strong>
+                    <small>{activeOperation.runnerProcess.durationMs}ms</small>
+                  </span>
+                ) : null}
               </div>
-              {activeOperation.runnerProcess ? (
-                <div className="agent-runner-meta">
-                  <span>{activeOperation.runnerProcess.runner ?? "runner"}</span>
-                  {activeOperation.runnerProcess.status ? <span>{activeOperation.runnerProcess.status}</span> : null}
-                  {typeof activeOperation.runnerProcess.exitCode === "number" ? <span>exit {activeOperation.runnerProcess.exitCode}</span> : null}
-                  {typeof activeOperation.runnerProcess.durationMs === "number" ? <span>{activeOperation.runnerProcess.durationMs}ms</span> : null}
-                </div>
-              ) : null}
+              <OperationDetailBlock title={t("Summary")} content={activeOperation.summary || agentOperationPreview(activeOperation)} />
               {activeOperation.prompt ? (
-                <section className="agent-detail-block">
-                  <strong>Prompt</strong>
-                  <code>{activeOperation.prompt}</code>
-                </section>
+                <OperationDetailBlock title={t("Prompt")} content={activeOperation.prompt} />
               ) : null}
               {activeOperation.runnerProcess?.stdout ? (
-                <section className="agent-detail-block">
-                  <strong>Stdout</strong>
-                  <code>{activeOperation.runnerProcess.stdout}</code>
-                </section>
+                <OperationDetailBlock title={t("Stdout")} content={activeOperation.runnerProcess.stdout} log />
               ) : null}
               {activeOperation.runnerProcess?.stderr ? (
-                <section className="agent-detail-block">
-                  <strong>Stderr</strong>
-                  <code>{activeOperation.runnerProcess.stderr}</code>
-                </section>
+                <OperationDetailBlock title={t("Stderr")} content={activeOperation.runnerProcess.stderr} log />
               ) : null}
             </div>
           </article>
@@ -684,6 +703,33 @@ export function AgentTraceList({
   );
 }
 
+function OperationDetailBlock({ content, log = false, title }: { content: string; log?: boolean; title: string }) {
+  const formatted = formatOperationText(content);
+  return (
+    <section className="agent-detail-block">
+      <strong>{title}</strong>
+      {log ? (
+        <pre className="agent-log-content">
+          <code>{formatted}</code>
+        </pre>
+      ) : (
+        <MarkdownPreview content={formatted} compact />
+      )}
+    </section>
+  );
+}
+
+function formatOperationText(value: string): string {
+  return value
+    .replace(/\\n/g, "\n")
+    .replace(/^```(?:\w+)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .replace(/\s+(Summary|Repository|Repository path|Pull request|Focus|Changed files|Requirement|验收标准|Rules|Rework input|Failure reason|Rework checklist):/g, "\n\n$1:")
+    .replace(/([^\n])\s+(\d+)\.\s+/g, "$1\n$2. ")
+    .replace(/([^\n])\s+-\s+/g, "$1\n- ")
+    .trim();
+}
+
 export function ArtifactGrid({
   onFetchProofPreview,
   proofs
@@ -691,9 +737,10 @@ export function ArtifactGrid({
   onFetchProofPreview?: (proofId: string) => Promise<ProofPreviewInfo>;
   proofs: DetailProofCard[];
 }) {
+  const { t } = useI18n();
   const previewState = useProofPreviewDialog(onFetchProofPreview);
   if (!proofs.length) {
-    return <p className="muted-copy">No artifact has been collected yet.</p>;
+    return <p className="muted-copy">{t("No artifact has been collected yet.")}</p>;
   }
 
   return (
@@ -713,7 +760,7 @@ export function ArtifactGrid({
               {proof.stage ? <small>{proof.stage}</small> : null}
               {proof.path ? <code>{compactArtifactPath(proof.path)}</code> : null}
             </div>
-            <span className="proof-open-label">Preview</span>
+            <span className="proof-open-label">{t("Preview")}</span>
           </button>
         ))}
       </div>
@@ -864,9 +911,12 @@ function useProofPreviewDialog(onFetchProofPreview?: (proofId: string) => Promis
 }
 
 function ProofPreviewDialog({ state }: { state: ReturnType<typeof useProofPreviewDialog> }) {
+  const { t } = useI18n();
   if (!state.proof) return null;
   const sourcePath = state.preview?.sourcePath || state.proof.path || "";
   const content = state.preview?.content ?? "";
+  const previewType = state.preview?.previewType ?? "text";
+  const isMarkdown = previewType === "markdown" || /\.md(?:$|[?#])/i.test(sourcePath || state.proof.label);
   return (
     <section className="detail-popover-backdrop" role="presentation" onClick={state.close}>
       <article
@@ -880,24 +930,183 @@ function ProofPreviewDialog({ state }: { state: ReturnType<typeof useProofPrevie
           <div>
             <span>{state.proof.kind}</span>
             <strong>{artifactFileName(state.proof)}</strong>
+            {state.proof.stage ? <small>{state.proof.stage}</small> : null}
           </div>
-          <button type="button" onClick={state.close}>Close</button>
+          <button type="button" onClick={state.close}>{t("Close")}</button>
         </header>
-        <div className="detail-popover-body">
-          {sourcePath ? <code className="proof-preview-path">{sourcePath}</code> : null}
-          {state.loading ? <p className="muted-copy">Loading artifact preview...</p> : null}
+        <div className="detail-popover-body proof-preview-body">
+          <div className="proof-preview-meta" aria-label={t("Artifact metadata")}>
+            {sourcePath ? (
+              <span>
+                <strong>{t("Source")}</strong>
+                <code title={sourcePath}>{compactArtifactPath(sourcePath)}</code>
+              </span>
+            ) : null}
+            <span>
+              <strong>{t("Format")}</strong>
+              <small>{previewType}</small>
+            </span>
+            {state.preview?.truncated ? (
+              <span>
+                <strong>{t("Preview")}</strong>
+                <small>{t("Truncated")}</small>
+              </span>
+            ) : null}
+          </div>
+          {state.loading ? <p className="muted-copy proof-preview-loading">{t("Loading artifact preview...")}</p> : null}
           {state.error ? <p className="attempt-error">{state.error}</p> : null}
           {!state.loading && content ? (
-            <pre className={`proof-preview-content proof-preview-${state.preview?.previewType ?? "text"}`}>
-              <code>{content}</code>
-            </pre>
+            isMarkdown ? (
+              <MarkdownPreview content={content} />
+            ) : (
+              <pre className={`proof-preview-content proof-preview-${previewType}`}>
+                <code>{content}</code>
+              </pre>
+            )
           ) : null}
-          {!state.loading && !state.error && !content ? <p className="muted-copy">No preview content captured for this artifact.</p> : null}
-          {state.preview?.truncated ? <small className="muted-copy">Preview truncated to keep the detail view responsive.</small> : null}
+          {!state.loading && !state.error && !content ? <p className="muted-copy">{t("No preview content captured for this artifact.")}</p> : null}
         </div>
       </article>
     </section>
   );
+}
+
+type MarkdownBlock =
+  | { type: "code"; language: string; content: string }
+  | { type: "heading"; level: number; text: string }
+  | { type: "list"; ordered: boolean; items: { checked?: boolean; text: string }[] }
+  | { type: "paragraph"; text: string };
+
+function MarkdownPreview({ compact = false, content }: { compact?: boolean; content: string }) {
+  const blocks = parseMarkdownBlocks(content);
+  return (
+    <div className={compact ? "proof-preview-document artifact-markdown artifact-markdown-compact" : "proof-preview-document artifact-markdown"}>
+      {blocks.map((block, index) => renderMarkdownBlock(block, index))}
+    </div>
+  );
+}
+
+function parseMarkdownBlocks(content: string): MarkdownBlock[] {
+  const blocks: MarkdownBlock[] = [];
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  let paragraph: string[] = [];
+  let list: MarkdownBlock & { type: "list" } | null = null;
+  let codeLanguage = "";
+  let codeLines: string[] | null = null;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    blocks.push({ type: "paragraph", text: paragraph.join(" ").trim() });
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (!list) return;
+    blocks.push(list);
+    list = null;
+  };
+
+  for (const line of lines) {
+    const fenceMatch = line.match(/^```(\S*)\s*$/);
+    if (codeLines) {
+      if (fenceMatch) {
+        blocks.push({ type: "code", language: codeLanguage, content: codeLines.join("\n") });
+        codeLines = null;
+        codeLanguage = "";
+      } else {
+        codeLines.push(line);
+      }
+      continue;
+    }
+    if (fenceMatch) {
+      flushParagraph();
+      flushList();
+      codeLanguage = fenceMatch[1] || "";
+      codeLines = [];
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "heading", level: headingMatch[1].length, text: headingMatch[2].trim() });
+      continue;
+    }
+
+    const listMatch = line.match(/^\s*((?:[-*])|(?:\d+[.)]))\s+(?:\[( |x|X)\]\s+)?(.+)$/);
+    if (listMatch) {
+      flushParagraph();
+      const ordered = /^\d/.test(listMatch[1]);
+      if (!list || list.ordered !== ordered) {
+        flushList();
+        list = { type: "list", ordered, items: [] };
+      }
+      const checkedMarker = listMatch[2];
+      list.items.push({
+        checked: checkedMarker ? checkedMarker.toLowerCase() === "x" : undefined,
+        text: listMatch[3].trim()
+      });
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line.trim());
+  }
+
+  if (codeLines) blocks.push({ type: "code", language: codeLanguage, content: codeLines.join("\n") });
+  flushParagraph();
+  flushList();
+  return blocks;
+}
+
+function renderMarkdownBlock(block: MarkdownBlock, index: number): ReactNode {
+  if (block.type === "heading") {
+    const Heading = (`h${Math.min(block.level + 1, 5)}` as keyof JSX.IntrinsicElements);
+    return <Heading key={index}>{renderInlineMarkdown(block.text)}</Heading>;
+  }
+  if (block.type === "code") {
+    return (
+      <pre key={index} className="artifact-markdown-code">
+        {block.language ? <span>{block.language}</span> : null}
+        <code>{block.content}</code>
+      </pre>
+    );
+  }
+  if (block.type === "list") {
+    const List = block.ordered ? "ol" : "ul";
+    return (
+      <List key={index}>
+        {block.items.map((item, itemIndex) => (
+          <li key={`${index}-${itemIndex}`} className={typeof item.checked === "boolean" ? "artifact-task-item" : undefined}>
+            {typeof item.checked === "boolean" ? (
+              <span className={item.checked ? "artifact-task-check checked" : "artifact-task-check"} aria-hidden="true" />
+            ) : null}
+            <span>{renderInlineMarkdown(item.text)}</span>
+          </li>
+        ))}
+      </List>
+    );
+  }
+  return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
+}
+
+function renderInlineMarkdown(value: string): ReactNode[] {
+  const parts = value.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return <code key={index}>{part.slice(1, -1)}</code>;
+    }
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return <strong key={index}>{part.slice(2, -2)}</strong>;
+    }
+    return part;
+  });
 }
 
 function artifactFileName(proof: DetailProofCard): string {

@@ -8,7 +8,7 @@ import type { PipelineRun, PipelineStageId } from "./types";
 
 export const workspacePersistenceSchemaVersion = 1;
 
-export type InspectorPanelPersistence = "properties" | "provider";
+export type InspectorPanelPersistence = "properties" | "provider" | "agents";
 export type PrimaryNavPersistence = "Projects" | "Views" | "Issues" | "Page Pilot";
 export type RunnerPresetPersistence = "local-proof" | "demo-code" | "codex" | "opencode" | "claude-code" | "trae-agent";
 type LegacyRunnerPresetPersistence = RunnerPresetPersistence | "claude";

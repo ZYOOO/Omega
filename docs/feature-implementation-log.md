@@ -2,6 +2,268 @@
 
 这个文档用于记录每个功能的落地方式。后续每完成一个功能，都按相同结构补一节：目标、入口、数据/API、运行时行为、验证、后续工作。
 
+## 2026-05-05: Runner-specific Agent Launch Adapters
+
+### 目标
+
+把 Codex、Claude Code、opencode、Trae Agent 的启动方式从“共用一组 provider/model/env 规则”拆成各自 adapter，避免 UI 配置 Kimi/opencode 时运行期误走 Trae/Doubao，或 Trae 因缺少 config file 在 Coding 阶段直接失败。
+
+### 数据/API
+
+- opencode：运行前根据 Omega 加密保存的 provider/model/base URL/API key 生成临时 `.omega/opencode-runner-config.json`，通过 `OPENCODE_CONFIG` 注入；API key 使用 `{env:<PROVIDER>_API_KEY}` 引用，不写入 config 明文。
+- Trae Agent：运行前生成 `.omega/trae-runner-config.yaml` 并传 `--config-file`；Kimi / Moonshot 这类 OpenAI-compatible provider 在 Trae 内映射为 `provider=openai`，同时把 `KIMI_*` 环境变量桥接到 `OPENAI_*`。
+- Claude Code：旧模板里的 `gpt-5.4-mini` 不再被强行映射成某个 Claude 模型；未显式选择模型时使用本机 `~/.claude/settings.json`。
+- Codex：继续使用 `codex exec` 和本机 Codex 登录态；runner process 保留 model / effort 元数据。
+
+### 运行时行为
+
+- 四个 runner 的启动参数、临时配置和凭据来源互不串线。
+- opencode / Trae 的临时配置写在当前 attempt workspace 的 `.omega` 下，权限为 `0600`，不进入命令参数、API 回包或 runtime log。
+- Trae 的 `runnerProcess` 会同时记录用户语义 provider 和实际 CLI provider，例如 `provider=kimi`、`cliProvider=openai`。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunnerModelDiscovery|TestAgentRunnerPreflight|TestRunnerCredential|TestTraeAgentRunner|TestClaudeCodeRunner' -count=1
+```
+
+## 2026-05-05: Per-stage Agent Runtime Summary
+
+### 目标
+
+让 Work Item 详情页不只展示模板计划中的阶段参与者，而是能看到每个阶段真实启动过多少个 Agent，以及对应的 agent role、runner、provider 和 model。
+
+### 入口
+
+- Work Item detail 的 `Delivery flow` 阶段卡片。
+
+### 数据/API
+
+- 前端从当前 Work Item 对应的 Operation 记录聚合 `stageId`、`agentId`、`runnerProcess.runner`、`runnerProcess.provider`、`runnerProcess.model`。
+- Operation 缺失时，使用 attempt / pipeline event 中的 `agent.*` 事件做兜底，但不会与已有 Operation 重复计数。
+- Runner process payload 扩展 `model`、`provider`、`effort` 字段，后续落库可保留真实运行模型。
+
+### 运行时行为
+
+- 阶段已启动过 Agent 时显示 `已启动 N 个 Agent · Coding (opencode · kimi · kimi-for-coding)` 这类运行摘要。
+- 阶段还未启动时显示计划数量，例如 `计划 2 个 Agent · Coding + Testing`。
+- 显示内容来自 operation/event，不从模板伪造“已运行”状态。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+go test ./services/local-runtime/internal/omegalocal -run 'TestAgentRunnerPreflight|TestRunnerModelDiscovery|TestRunDevFlowCycle' -count=1
+git diff --check
+```
+
+## 2026-05-05: Codex Runner Model Selection
+
+### 目标
+
+让 Codex runner 不再看起来只能使用旧默认 `gpt-5.4-mini`，而是基于本机 Codex CLI 配置选择真实可用模型，并把选择接入 Agent 运行链路。
+
+### 入口
+
+- 右侧全局 Agent Access 面板。
+- 选择 `Codex` runner 后显示模型配置，不显示 API key 配置。
+
+### 数据/API
+
+- `PUT /runner-credentials` 复用 runner credential setting，保存 `runner=codex`、`provider=openai`、`model=<codex model>`。
+- `POST /agent-runner/models` 支持 `runner=codex`，读取 `CODEX_HOME` 或 `~/.codex`：
+  - `config.toml` 中的当前 `model`。
+  - `models_cache.json` 中的真实 Codex 模型 slug。
+- Codex 不在 Omega 中保存 API key；认证仍由本地 Codex CLI 负责。
+
+### 运行时行为
+
+- 用户可以手动输入模型，也可以点击 `Discover models` 从本地 Codex 模型缓存生成候选 chip。
+- 四个 runner 都可以在 Global Agent Access 点击 `Test connection` 做真实预检。
+- Codex / Claude Code 预检本地 CLI 可用性；opencode / Trae Agent 预检本地命令和当前账号配置，并用 provider `/models` 验证 API key / base URL 可访问。
+- Workspace Agent Studio 的 Agent Override 不再维护静态模型 preset；模型为空表示继承全局 runner 默认配置，手动输入才表示该阶段 override。
+- 切换 runner 不再自动切换模型，避免 workspace 详情页把预设模型误当作真实测试结果。
+- 保存模型后，Agent Profile 中空模型或旧默认 `gpt-5.4-mini` 会在运行前替换为保存的 Codex 模型。
+- 如果某个阶段在 Workspace Agent Studio 中显式指定了其他模型，则继续尊重该阶段配置；Claude Code 会把旧模板遗留的 `gpt-5.4-mini` 映射为 Claude CLI 默认模型。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunnerModelDiscoveryReadsCodexLocalModelCache|TestAgentRunnerPreflightUsesCodexSavedModelAsDefault|TestRunnerModelDiscoveryKnowsKimiBaseURL|TestRunnerModelDiscoveryUsesSavedProviderCredential' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestAgentRunnerPreflightTestsTransientOpenCodeProviderCredential|TestAgentRunnerPreflightUsesTraeCredential|TestAgentRunnerPreflightUsesCodexSavedModelAsDefault|TestRunnerModelDiscoveryUsesSavedProviderCredential' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestAgentRunnerPreflightLeavesLegacyClaudeModelToLocalConfig|TestAgentRunnerPreflightUsesCodexSavedModelAsDefault' -count=1
+npm run test -- apps/web/src/components/__tests__/GlobalAgentAccessPanel.test.tsx apps/web/src/components/__tests__/WorkspaceAgentStudio.test.tsx --testTimeout=30000
+```
+
+## 2026-05-05: Kimi Provider for Agent Access
+
+### 目标
+
+让使用 Kimi / Moonshot API 的用户不需要把它伪装成 generic OpenAI-compatible provider，而是在全局 Agent Access 中直接选择 Kimi、保存 API key、使用默认 base URL 并执行模型发现。
+
+### 入口
+
+- 右侧全局 Agent Access 面板。
+- `opencode` 和 `Trae Agent` 的 Runner 账号配置。
+
+### 数据/API
+
+- Runner credential provider 新增 `kimi`。
+- 默认 base URL：`https://api.moonshot.ai/v1`。
+- 模型发现沿用 OpenAI-compatible `/models` API，认证使用 `Authorization: Bearer <api key>`。
+- LLM providers 中新增 `Kimi (Moonshot)`，用于后端 provider selection 和 agent definitions。
+
+### 运行时行为
+
+- Provider 下拉显示 `Kimi (Moonshot)`，保存时 provider id 为 `kimi`。
+- 选择 Kimi 时自动填入 Moonshot base URL，model placeholder 按 runner 使用 `kimi/model` 或 `kimi:model`。
+- Model 输入框不再展示静态 preset；模型候选只来自用户点击 `Discover models` 后的 provider API 返回结果。
+- 保存后 API key 仍以本地加密密文保存；执行 runner 或模型发现时才解密。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestLLMProviderSelectionAndAgentDefinitions|TestRunnerModelDiscoveryKnowsKimiBaseURL' -count=1
+npm run test -- apps/web/src/components/__tests__/GlobalAgentAccessPanel.test.tsx --testTimeout=30000
+git diff --check
+```
+
+## 2026-05-05: Workboard Empty Workflow Lanes
+
+### 目标
+
+让 Workboard 默认展示 Omega 的核心执行流程栏，用户即使某个阶段还没有 Work Item，也能看到 Not Started / Running / Human Review / Blocked / Done 的完整流转结构。
+
+### 入口
+
+- Work items 页面。
+- Work items 页面默认展示；当前 repository workspace 或过滤条件下没有可显示 Work Item 时，各流程栏保持为空。
+
+### 数据/API
+
+- 不新增 API。
+- 前端基于当前 filtered Work Items 做 UI-only lane projection：
+  - Not Started：`Ready`、`Backlog`
+  - Running：`Planning`、`In Review`
+  - Human Review：`Human Review`
+  - Blocked：`Blocked`
+  - Done：`Done`
+
+### 运行时行为
+
+- Workboard 始终展示流程 lane，每个 lane 保留 count 和空栏说明。
+- 删除旧空态中的额外创建表单，只保留顶部 `New requirement` 统一入口。
+- 有 Work Item 时列表分组使用同一套高层流程 lane，卡片内仍显示 item 的 canonical status / progress / review / retry / done 行为。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "operator dashboard|local repository workspace|imports GitHub issues" --testTimeout=30000
+git diff --check
+```
+
+## 2026-05-05: Local Project Directory Repository Workspace
+
+### 目标
+
+把“创建 Repository Workspace 时自选本地项目目录”从 UI 意图补成真实链路，用户可以选择已有本地 git 项目作为 Omega repository target，而不是只能绑定 GitHub repository 或手工在测试数据里塞 `kind=local`。
+
+### 入口
+
+- Projects / Repository workspace / `Attach project directory`。
+- 桌面端 `Choose folder` 通过 Electron 目录选择器返回绝对路径。
+- 浏览器环境保留手动粘贴绝对路径的 fallback。
+
+### 数据/API
+
+- 新增 `POST /repository-targets/local`。
+- 请求包含 `projectId`、`path`、可选 `defaultBranch`。
+- 后端会解析绝对路径，执行 `git rev-parse --show-toplevel` 确认是 git worktree，并读取当前 branch 作为默认分支。
+- 成功后写入 Project `repositoryTargets[]`：
+  - `kind=local`
+  - `path=<resolved repo root>`
+  - `defaultBranch=<current branch or main>`
+  - 稳定 id 基于本地路径生成。
+
+### 运行时行为
+
+- Work Item 在该 workspace 下创建时会绑定 local `repositoryTargetId`。
+- DevFlow 仍在隔离 workspace 内执行，会从本地路径 clone 一份 repo checkout，避免直接误写用户原目录。
+- Page Pilot 对 local repository target 使用真实本地路径，继续走 source mapping / apply / discard / deliver 链路。
+- 目录选择只负责选择路径；真正是否可运行由后端 git worktree 校验决定。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestLocalRepositoryTargetPersistsProjectDirectory' -count=1
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "local repository workspace" --testTimeout=30000
+```
+
+## 2026-05-05: Repository Workspace Delete Local Cleanup
+
+### 目标
+
+让用户在清空某个 repository workspace 重新测试 Work Items 时，可以选择同时删除该 workspace 下历史 attempt 的本地执行目录，避免 Omega 数据入口已删除但 `.omega/workspaceRoot` 下仍残留不可达目录。
+
+### 入口
+
+- Project / Workspace controls / Delete workspace。
+- 默认仍只从 Omega 删除 repository workspace 数据。
+- 用户勾选 `Also delete local attempt workspaces` 后，才会清理本地执行目录。
+
+### 数据/API
+
+- `DELETE /github/repository-targets/{targetId}`：默认行为不变。
+- `DELETE /github/repository-targets/{targetId}?deleteLocalWorkspaces=true`：额外删除关联 attempt 记录里的 `workspacePath`。
+- 删除 repository target 时同步移除关联 Work Item、Requirement、Pipeline、Attempt、Run Workpad、Checkpoint、Mission、Operation、ProofRecord。
+
+### 运行时行为
+
+- 本地目录删除只允许发生在配置的 local workspace root 内。
+- 后端拒绝删除 workspace root 本身，避免路径误伤。
+- 删除失败写 runtime log，不阻断 Omega 数据删除。
+- 不删除 GitHub 仓库、issue、PR、branch。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords|TestGitHubDeleteRepositoryTargetCanRemoveLocalWorkspacesWhenRequested' -count=1
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "GitHub repositories" --testTimeout=30000
+```
+
+## 2026-05-05: Runner Account Model Discovery
+
+### 目标
+
+让 opencode 和 Trae Agent 的账号配置从“手填 API key 和手填 model”升级为“用户输入 key 后，Omega 可主动发现该 provider 可用模型”，降低 runner 授权和模型选择的试错成本。
+
+### 入口
+
+- 左侧 `Agents` 中点击 `opencode` / `Trae Agent`，右侧 inspector 打开全局 `Agent access`。
+- `Agent access` 中的 Runner account 面板提供 API key 保存和 `Discover models`。
+- Workspace Agent Studio 的 Runtime files 只保留 workflow/runtime 文件和策略预览，不再承载全局账号授权。
+
+### 数据/API
+
+- 新增 `POST /agent-runner/models`。
+- 请求包含 `runner`、`provider`、可选 `baseUrl`、`model`、临时 `secret/apiKey`。
+- 若未传临时 key，后端会读取 `/runner-credentials` 中已加密保存的 key，解密后仅用于本次发现。
+- opencode 优先调用 `opencode models`；没有命令结果时回退 provider `/models` API。
+- Trae Agent 使用 provider `/models` API；默认支持 OpenAI-compatible、OpenRouter、DeepSeek、Qwen、Doubao Ark、Anthropic、Google Gemini。
+
+### 运行时行为
+
+- API key 不写入命令行参数，不进入 public response；provider discovery 返回模型列表、source 和状态。
+- opencode 保存的 provider/model 会归一化为 `provider/model`，运行时按 provider 注入 `<PROVIDER>_API_KEY` 和 `<PROVIDER>_BASE_URL`。
+- Trae Agent 有已保存 key 时，preflight 不再强依赖 `trae-cli show-config`，避免仅使用 Omega 账号配置时被本机 config 文件缺失误判。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunnerModelDiscovery|TestRunnerCredentialQualifiesOpenCodeModelAndEnv|TestRunnerCredentialEncryptsAndInjectsTraeEnv|TestAgentRunnerPreflightUsesTraeCredential' -count=1
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts apps/web/src/__tests__/App.operatorView.test.tsx --testNamePattern "Agent|runner|observability" --testTimeout=30000
+```
+
 ## 2026-05-04: Sidebar Agent Access
 
 ### 目标
@@ -2614,6 +2876,36 @@ go test ./services/local-runtime/internal/omegalocal
 go test ./services/local-runtime/internal/omegalocal
 ```
 
+## 2026-05-05: Product UI Language Switch and Feishu Localization
+
+### 功能作用
+
+Omega Web 新增全局语言偏好，当前支持 English / 简体中文。产品页面的导航、Workboard、Projects、Page Pilot、Run Workpad、Provider / Agent Access 等系统文案会随语言切换；用户输入的需求、prompt、Agent 输出、proof、文档正文不做强制翻译，保持原始语义。
+
+飞书发送链路读取同一 UI language preference：Human Review、review task 和 failure/stalled alert 的普通文本按语言偏好输出，并继续保留 PR、Pipeline、Agent、Runner 等必要英文术语。
+
+### 实现架构
+
+- Web：
+  - 新增 `apps/web/src/i18n.tsx`，提供 `I18nProvider`、`useI18n`、`LanguageToggle`、localStorage fallback 和插值翻译。
+  - `PortalHome` 与 `WorkspaceChrome` 增加语言切换入口，偏好写入 localStorage 并同步到 local runtime。
+  - Workboard、Projects、Requirement composer、Page Pilot、Work Item detail、Run Workpad、Global Agent Access 接入产品文案翻译。
+- Go runtime：
+  - 新增 `GET /ui/language` / `PUT /ui/language`，使用 `omega_settings` 保存全局 UI 语言。
+  - Feishu review/failure/task 渲染函数接受 language，并在发送前从服务端偏好补齐。
+- 测试：
+  - App operator view 覆盖首页默认英文与切换简中。
+  - Feishu text 渲染保持普通飞书文本，不暴露 Markdown 标记。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+go test ./services/local-runtime/internal/omegalocal -run 'TestRenderFeishuFailureTextIncludesReadableContext|TestRenderFeishuReviewTextUsesPlainFeishuText|TestFeishuReviewRequestUsesLarkCLITextWhenCardCallbackUnavailable' -count=1
+npm run lint
+```
+
 ## 2026-05-02: 服务端写入收口与可执行迁移
 
 ### 功能作用
@@ -2692,4 +2984,212 @@ npm run build
 go test ./services/local-runtime/internal/omegalocal -count=1
 npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
 npm run lint
+```
+
+## 2026-05-05: Agent Skills / MCP 阶段级能力物化
+
+### 功能作用
+
+把 Workspace Agent Studio 中配置的每阶段 Skills / MCP 从“可保存配置”推进到“runner 启动时可验证的能力边界”。这解决了只看 UI 无法判断 Agent 进程是否真的拿到能力的问题，也为不同 stage 使用不同浏览器、Git、安全、CI 和交付能力打基础。
+
+### 实现架构
+
+- Go runtime：
+  - `agentRuntimeMetadata` 增加 `.omega/agent-capabilities.json`、`.omega/agent-capabilities.md`、`.codex/OMEGA.md`、`.claude/CLAUDE.md` runtime files 声明。
+  - `writeRunnerPolicyFiles` 在 operation workspace 或 repository clone workspace 写入机器可读和人类可读的能力文件。
+  - Agent runner 子进程注入 `OMEGA_AGENT_SKILLS`、`OMEGA_AGENT_MCP`、allowlist 和 workflow 环境变量。
+  - 默认 Agent Profile 改为使用本机已安装的 Skills / MCP 名称，并按 Requirement / Architect / Coding / Testing / Review / Delivery 映射。
+- Web：
+  - 默认 Agent Profile 与后端保持一致。
+  - Workspace Agent Studio 的 Skills / MCP 快捷选项更新为本机安装和全局 MCP 配置中的名称。
+- 本机环境：
+  - 安装 Skills 到 `/Users/zyong/.codex/skills`。
+  - 安装 MCP server npm 包并写入 `/Users/zyong/.codex/config.toml`。
+  - 新增 `docs/agent-skills-and-mcp.md` 记录安装位置、stage 映射和验证方式。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestProjectAgentProfilePersistsAndFeedsRuntimeBundle|TestProfileRunnerRegistrySelectsConfiguredAgentRunner|TestProfileSkillsAndMCPAreMaterializedForRunnerProcess' -count=1
+```
+
+## 2026-05-05: GitHub Actions CI 进入 DevFlow 链路
+
+### 功能作用
+
+让用户项目的 GitHub Actions CI 成为 Omega DevFlow 的一等证据，而不是只在 merge 前临时看一眼。PR 创建或更新后，Omega 会采集 checks 和失败 run log；Review Agent、Rework Agent、Run Workpad、Human Review 报告都消费同一份 CI 结果。
+
+### 实现架构
+
+- Workflow contract：
+  - 新增 `run_ci_checks` action handler。
+  - 默认 `devflow-pr` 在 `publish_pull_request` 后执行 `collect_ci_results`。
+  - rework 更新 PR 后执行 `collect_rework_ci_results`。
+- Go runtime：
+  - 新增 `devflow_ci.go`，封装 `gh pr checks`、`githubPullRequestChecks`、`githubPullRequestCheckLogFeedback` 和 CI proof report。
+  - CI 采集结果写入 `.omega/proof/ci-checks*.md`。
+  - failed / missing required checks 继续通过 `devFlowRemoteGateFeedback` 进入自动 rework。
+  - Review prompt 的 `Remote checks`、Run Workpad check preview、Rework Checklist、Review Packet 复用同一份 `checksOutput` 和 `checkLogFeedback`。
+- 权限：
+  - 默认依赖本机 `gh` 登录态。
+  - 推荐 scope 为 `repo` 和 `workflow`；当前机器已具备这两类 scope。
+  - 详细说明见 `docs/github-actions-ci-chain.md`。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestDefaultDevFlowWorkflowIncludesGitHubActionsCIAction|TestDevFlowCIReport|TestRunDevFlowContractStateUsesReworkAndMergingActions' -count=1
+```
+
+## 2026-05-05: DevFlow Plan/TODO 清单进入 Review
+
+### 功能作用
+
+明确当前 Architect action 就是默认 Plan 阶段的等价物，并把它从“方案笔记”升级成 Review 可逐项核对的计划清单。这样用户不需要从长 review 文本里猜 Agent 到底按什么计划做事，Review Packet 也能更直观地展示计划、完成项和缺口。
+
+### 实现架构
+
+- 默认 `devflow-pr`：
+  - `architecture_handoff` 的输出扩展为 `technical-plan`、`functional-todo-list`、`project-todo-list`。
+  - Review / Rework / Human Review 的 input artifacts 增加 plan/todo list。
+  - `Prompt: architect` 明确要求输出 Functional todo list 和 Project todo list，并使用 `- [ ]` / `- [x]` 清单格式。
+  - `Prompt: review` 新增 `{{planOutput}}`，要求 Review 按功能 todo 和项目 todo 核对 diff、validation 和 CI。
+- Go runtime：
+  - `solution-plan.md` 增加 Functional TODO List 和 Project TODO List。
+  - Review fallback prompt 增加 plan/todo list 上下文。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestDefaultDevFlowWorkflowIncludesGitHubActionsCIAction|TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestRunDevFlowPRCycleCreatesProofBackedReviewPacket' -count=1
+```
+
+## 2026-05-05: Work Item 详情页展示 Plan/TODO 进度
+
+### 功能作用
+
+让用户在 Work Item 里直接看到 Plan 等价阶段的执行进度，而不是只能去 artifacts 里找 `solution-plan.md`。Run Workpad 的 Plan 卡片现在会展示 Plan stage、Functional TODO、Project TODO、Review alignment 四个信号，并继续链接对应 plan artifacts。
+
+### 实现架构
+
+- Web：
+  - Work Item detail 将 canonical attempt action plan 传入 Run Workpad。
+  - Plan 卡片根据 `architecture_handoff` action 的 status / output artifacts 和 proof cards 计算进度。
+  - 点开 Plan 卡片可看到 TODO 是否已捕获，以及 Review 是否会按 plan/todo list 对齐检查。
+- i18n / 样式：
+  - 新增中英文文案。
+  - Plan progress 列表兼容 light / dark theme。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+```
+
+## 2026-05-05: Checkpoint / Attempt Feishu 投递幂等状态列化
+
+### 功能作用
+
+Human Review 的 Feishu Task / message 是否已经发送，现在是 checkpoint 的可查询事实；stalled attempt 的 failure alert 是否已发送，现在是 attempt 的可查询事实。两者都不再只能从 full workspace snapshot 或嵌套 JSON 里推断。重启后 JobSupervisor 再扫描 waiting-human pipeline 或失败通知时，可以先读规范化列判断已发送状态，避免重复给用户创建审核 Task 或告警消息。
+
+### 实现架构
+
+- SQLite：
+  - `checkpoints` 新增 `attempt_id`、Feishu review status、task guid、task id、message id 和 `feishu_review_json`。
+  - migration `20260505_002` 为已有库补列、回填旧数据并创建查询索引。
+  - `attempts` 新增 `feishu_failure_notified_at`、failure status、message id 和 `feishu_failure_json`。
+  - migration `20260505_003` 为已有库补列、回填旧 failure delivery 状态并创建查询索引。
+  - `attempts.record_json` 保存 attempt-local 扩展字段，migration `20260505_004` 从旧 snapshot 回填。
+  - `run_workpads.record_json` 保存 Workpad field patches、sources 和 history，migration `20260505_005` 从旧 snapshot 回填。
+- Runtime：
+  - `Save` 写入 checkpoint 时同步写列和 provider payload。
+  - `ListCheckpoints` 返回规范化 checkpoint，并支持按 attempt / Feishu task 过滤。
+  - Feishu auto-review send 入口先查询 checkpoint 列；已发送则直接跳过，不再加载 full snapshot。
+  - `ListAttempts` 返回 failure delivery facts，并支持按 failure status / message id 过滤。
+  - Feishu failure alert send 入口先查询 attempt 列；已发送则直接跳过，不再加载 full snapshot。
+  - JobSupervisor maintenance tick 使用规范化执行态 read model 和局部 execution table upsert；不再以 full snapshot 作为 stalled detection / recovery 扫描起点。
+  - `SaveSupervisorExecutionState` 会把局部 execution table upsert 结果镜像回 full snapshot 兼容层，snapshot 不再是 supervisor 扫描源。
+  - Run Workpad patch 直接读写 `run_workpads` 表。
+  - Attempt cancel 使用 supervisor execution read/write path 更新执行态，不再整库读写。
+  - Work Item create / patch / delete 使用 session read model 和局部 work item writer；full snapshot 损坏时仍可操作。
+  - Work Item delete 继续通过规范化历史表检查 pipeline / attempt / mission / operation / proof 记录，避免误删有历史的 item。
+  - Attempt retry、DevFlow background job load/worker host/complete/fail/cancel、Agent invocation persistence 和 runner heartbeat 使用同一规范化 execution read/write path。
+  - `SaveSupervisorExecutionState` 同步 upsert mission / operation / proof records，保证 run evidence 不再只靠 full snapshot 承载。
+  - Attempt action plan、run timeline、Feishu review task bridge、manual DevFlow run、run-current-stage、pipeline status mutation 和 workspace cleanup 使用规范化 execution read/write path。
+- 文档：
+  - 新增 `docs/data-ownership-and-read-model.md`，定义 SQLite、局部 JSON payload、full snapshot 的使用边界。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewDoesNotResendAlreadySentCheckpoint|TestUpsertPendingCheckpointPreservesFeishuReviewState|TestSQLiteCheckpointStoresFeishuReviewJSON|TestJobSupervisorRecoversProofBackedHumanReviewAttempt' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestSQLiteAttemptStoresFeishuFailureFacts|TestSQLiteCheckpointStoresFeishuReviewJSON|TestFeishuAutoReviewDoesNotResendAlreadySentCheckpoint|TestJobSupervisorTickMarksStalledRunningAttempt' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisorTickUsesNormalizedExecutionStateWhenSnapshotIsCorrupt|TestJobSupervisorTickMarksStalledRunningAttempt|TestJobSupervisorLoopRunsMaintenanceTicks|TestSQLiteAttemptStoresFeishuFailureFacts|TestSQLiteCheckpointStoresFeishuReviewJSON|TestJobSupervisorRecoversProofBackedHumanReviewAttempt' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestPatchRunWorkpadPersistsFieldPatchesAcrossRefresh|TestPatchRunWorkpadUsesNormalizedTableWhenSnapshotIsCorrupt|TestCancelAttemptAPIUpdatesStateAndSignalsRunningJob|TestCancelAttemptUsesNormalizedExecutionStateWhenSnapshotIsCorrupt|TestJobSupervisorTickUsesNormalizedExecutionStateWhenSnapshotIsCorrupt' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestWorkspaceAndWorkItemAPI|TestCreateWorkItemInitializesEmptyWorkspace|TestCreateWorkItemUsesSessionTablesWhenSnapshotIsCorrupt|TestPatchWorkItemUsesSessionTablesWhenSnapshotIsCorrupt|TestDeleteNotStartedWorkItemRemovesUnsharedRequirement|TestDeleteWorkItemUsesSessionTablesWhenSnapshotIsCorrupt|TestDeleteWorkItemRejectsItemsWithHistory' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestPrepareDevFlowAttemptRetryUsesNormalizedExecutionStateWhenSnapshotIsCorrupt|TestCompleteDevFlowCycleUsesNormalizedExecutionStateWhenSnapshotIsCorrupt|TestRunnerHeartbeatRefreshesAttemptAndLogsTrace|TestCompleteDevFlowCycleBackfillsMissingAttempt|TestListOperationsSupportsFilteredFastPath' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestAttemptActionPlanAPIIncludesRetryPolicy|TestAttemptTimelineAggregatesRunRecords|TestFeishuReviewTaskSyncApprovesCompletedTask|TestFeishuReviewTaskBridgeDryRunListsPendingTasks|TestFeishuReviewTaskCommentRequestsChanges|TestFeishuReviewTaskCommentNeedInfoRecordsOnly|TestRunCurrentPipelineStagePersistsOperationProofAndCheckpoint|TestWorkspaceCleanupRemovesRepoAndRetainsProof' -count=1
+```
+
+## 2026-05-05: Full snapshot 热路径继续收缩
+
+### 功能作用
+
+跑真实案例前，Repository Workspace、Page Pilot、Workflow Template、Human Review delivery、Feishu delivery、Operation runner details 和 Orchestrator auto-run 不再依赖 full workspace JSON snapshot。即使兼容 snapshot 损坏，用户仍能绑定/删除 repo、清理 Page Pilot 记录、保存模板、运行 Page Pilot、同步飞书审核状态、查看 operation runner process，并让 orchestrator 自动审批进入交付。
+
+### 实现架构
+
+- Repository target：
+  - bind/import 使用 session read model 和 `SaveWorkItemsState`。
+  - delete 使用 `DeleteRepositoryTargetState` 专用事务删除 scoped records，并清理 Page Pilot run / preview runtime / execution lock。
+- Page Pilot：
+  - workspace resolve 使用 session read model。
+  - apply 的 Work Item / Pipeline 创建分别写入 session/execution 表。
+  - discard/deliver 同步 Work Item、Pipeline、Mission、Operation、Proof 使用 `SaveSupervisorExecutionState`。
+- Workflow Template：
+  - list/save/restore-default 使用 `workflow_templates` 表和 `UpsertWorkflowTemplate`。
+- Feishu / Human Review：
+  - review send 和 failure alert send 保存结果走 `SaveSupervisorExecutionState`。
+  - approved Human Review background delivery 从规范化 execution state 恢复。
+- Operation：
+  - `operations.record_json` 保存 `runnerProcess` 等局部 detail。
+  - `ListOperations` 合并规范化列和 record payload。
+- Orchestrator：
+  - tick 使用规范化 execution read/write path。
+  - `autoApproveHuman` 通过 checkpoint decision path 自动 approve Human Review checkpoint。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestGitHubBindRepositoryTargetPersistsProjectTarget|TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords|TestGitHubDeleteRepositoryTargetCanRemoveLocalWorkspacesWhenRequested|TestGitHubDeleteRepositoryTargetRemovesPagePilotRecordsAndWorkspaces' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget|TestWorkflowTemplateFirstClassAPIValidateSaveRestore|TestRunOperationPersistsRunnerProcessResult|TestOrchestratorTickCanClaimAndRunDevFlowCycle' -count=1
+go test ./services/local-runtime/internal/omegalocal -count=1
+```
+
+## 2026-05-05: Workspace Auto run 启动 Not Started 工作项
+
+### 功能作用
+
+Workspace controls 的 Auto 不再只是 GitHub issue watcher。开启后，Omega 会优先在当前 Repository Workspace 中寻找 Not Started（内部状态 `Ready`）的 Work Item 并启动 DevFlow；如果当前 workspace 是 GitHub repo 且没有可运行工作项，再继续扫描带 ready label 的 GitHub issue。
+
+### 实现架构
+
+- Orchestrator tick：
+  - `autoRun=true` 时先执行 scoped JobSupervisor ready-work scan。
+  - 有可运行项时返回 `accepted-ready-work`，并异步启动 DevFlow attempt。
+  - Local repository target 不调用 `gh issue list`，只做 Not Started 自动运行。
+  - GitHub repository target 在没有 ready work 时继续扫描 ready issue。
+- JobSupervisor：
+  - `jobSupervisorTickOptions` 新增 `repositoryTargetId`。
+  - `scanRunnableWork` 按 repository target 过滤，避免跨 workspace 自动运行。
+- Web：
+  - Workspace controls 文案改为 `Auto run`。
+  - GitHub workspace 显示“Not Started + ready issues”，Local workspace 显示“Not Started items”。
+  - Auto switch 不再限制为 GitHub workspace。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestOrchestratorTickAutoRunsExistingNotStartedWorkItem|TestJobSupervisorTickReportsRunnableReadyWork|TestOrchestratorTickClaimsNextGitHubIssueAndCreatesDevFlowPipeline|TestOrchestratorWatcherPersistsAndScansReadyIssues' -count=1
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
 ```

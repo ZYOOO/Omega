@@ -1,4 +1,5 @@
 import type { MissionControlRunnerPreset } from "./missionControlApiClient";
+import type { UiLanguage } from "./i18n";
 
 export interface ObservabilitySummary {
   counts: {
@@ -107,6 +108,17 @@ export interface RunnerCredentialUpdate {
   apiKey?: string;
 }
 
+export interface RunnerModelDiscoveryResult {
+  runner: string;
+  provider: string;
+  status: string;
+  message?: string;
+  source?: string;
+  models: string[];
+  credentialConfigured?: boolean;
+  baseUrl?: string;
+}
+
 export interface FeishuConfigInfo {
   mode: string;
   chatId: string;
@@ -125,6 +137,11 @@ export interface FeishuConfigInfo {
   taskBridgeEnabled: boolean;
   larkCliAvailable: boolean;
   larkCliVersion?: string;
+  updatedAt?: string;
+}
+
+export interface UiLanguagePreferenceInfo {
+  language: UiLanguage;
   updatedAt?: string;
 }
 
@@ -187,6 +204,17 @@ export interface AgentRunnerPreflightResult {
   credentialModel?: string;
   stdout?: string;
   stderr?: string;
+}
+
+export interface AgentRunnerPreflightInput {
+  agentId: string;
+  label?: string;
+  runner: string;
+  provider?: string;
+  model?: string;
+  baseUrl?: string;
+  secret?: string;
+  apiKey?: string;
 }
 
 export interface PipelineTemplateInfo {
@@ -676,6 +704,9 @@ export interface RequirementRecordInfo {
 
 export interface RunnerProcessInfo {
   runner?: string;
+  model?: string;
+  provider?: string;
+  effort?: string;
   command?: string;
   args?: string[];
   cwd?: string;
@@ -1184,7 +1215,7 @@ export async function searchFeishuUsers(
 
 export async function testAgentRunner(
   apiUrl: string,
-  input: { agentId: string; label?: string; runner: string; model?: string },
+  input: AgentRunnerPreflightInput,
   fetchImpl: typeof fetch = fetch
 ): Promise<AgentRunnerPreflightResult> {
   const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/agent-runner/preflight`, {
@@ -1201,6 +1232,25 @@ export async function testAgentRunner(
     message: `HTTP ${response.status}`
   })) as AgentRunnerPreflightResult;
   return result;
+}
+
+export async function discoverRunnerModels(
+  apiUrl: string,
+  input: { runner: string; provider: string; model?: string; baseUrl?: string; secret?: string; apiKey?: string },
+  fetchImpl: typeof fetch = fetch
+): Promise<RunnerModelDiscoveryResult> {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/agent-runner/models`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return response.json().catch(() => ({
+    runner: input.runner,
+    provider: input.provider,
+    status: "failed",
+    message: `HTTP ${response.status}`,
+    models: []
+  })) as Promise<RunnerModelDiscoveryResult>;
 }
 
 export async function fetchPipelineTemplates(
@@ -1497,7 +1547,7 @@ export async function fetchAttemptActionPlan(
 
 export async function fetchRunWorkpads(
   apiUrl: string,
-  filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string; status?: string } = {},
+  filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string; status?: string; limit?: number } = {},
   fetchImpl: typeof fetch = fetch
 ): Promise<RunWorkpadRecordInfo[]> {
   const params = new URLSearchParams();
@@ -1749,6 +1799,7 @@ export interface OrchestratorTickResult {
   pipeline?: unknown;
   lock?: unknown;
   runResult?: RunDevFlowCycleResult;
+  readyWork?: Record<string, unknown>;
 }
 
 export interface OrchestratorWatcherInfo {
@@ -1825,4 +1876,19 @@ export async function requestCheckpointChanges(
   fetchImpl: typeof fetch = fetch
 ): Promise<CheckpointRecordInfo> {
   return postJson<CheckpointRecordInfo>(apiUrl, `/checkpoints/${checkpointId}/request-changes`, { reason }, fetchImpl);
+}
+
+export async function fetchUiLanguagePreference(
+  apiUrl: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<UiLanguagePreferenceInfo> {
+  return fetchJson<UiLanguagePreferenceInfo>(apiUrl, "/ui/language", fetchImpl);
+}
+
+export async function updateUiLanguagePreference(
+  apiUrl: string,
+  language: UiLanguage,
+  fetchImpl: typeof fetch = fetch
+): Promise<UiLanguagePreferenceInfo> {
+  return putJson<UiLanguagePreferenceInfo>(apiUrl, "/ui/language", { language }, fetchImpl);
 }

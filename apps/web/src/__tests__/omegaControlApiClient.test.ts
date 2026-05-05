@@ -5,6 +5,7 @@ import {
   createPipelineFromTemplate,
   createGitHubPullRequest,
   deliverPagePilotChange,
+  discoverRunnerModels,
   decomposeRequirement,
   discardPagePilotRun,
   fetchCheckpoints,
@@ -706,6 +707,33 @@ describe("omegaControlApiClient", () => {
         fetchImpl
       )
     ).resolves.toMatchObject({ status: "ready", credentialConfigured: true });
+  });
+
+  it("discovers runner models through the local control plane", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://omega.local/agent-runner/models");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        runner: "opencode",
+        provider: "deepseek",
+        secret: "secret-key"
+      });
+      return Promise.resolve(jsonResponse({
+        runner: "opencode",
+        provider: "deepseek",
+        status: "ready",
+        source: "provider-api",
+        models: ["deepseek/deepseek-chat"]
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(
+      discoverRunnerModels(
+        "http://omega.local",
+        { runner: "opencode", provider: "deepseek", secret: "secret-key" },
+        fetchImpl
+      )
+    ).resolves.toMatchObject({ status: "ready", models: ["deepseek/deepseek-chat"] });
   });
 
   it("imports an Agent Profile template through the local control plane", async () => {

@@ -8,6 +8,7 @@ import {
   type PagePilotSelectionContext,
 } from "../omegaControlApiClient";
 import { workItemDetailHash } from "../workItemRoutes";
+import { useI18n } from "../i18n";
 import { PagePilotOverlay } from "./PagePilotOverlay";
 
 type PagePilotPreviewProps = {
@@ -50,6 +51,8 @@ type PreviewLaunchTarget = {
   url: string;
   profile?: PreviewRuntimeProfile | null;
 };
+
+type LaunchStatusTone = "info" | "success" | "error";
 
 const previewResolveTimeoutMs = 20000;
 const previewStartTimeoutMs = 65000;
@@ -215,6 +218,7 @@ export function PagePilotPreview({
   onDiscard,
   onFetchRuns,
 }: PagePilotPreviewProps) {
+  const { t } = useI18n();
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const [previewMode, setPreviewMode] = useState<PreviewMode>(initialPreviewMode);
   const [draftUrl, setDraftUrl] = useState(initialPreviewUrl);
@@ -222,6 +226,7 @@ export function PagePilotPreview({
   const [targetDocument, setTargetDocument] = useState<Document | null>(null);
   const [targetMessage, setTargetMessage] = useState("");
   const [status, setStatus] = useState("");
+  const [statusTone, setStatusTone] = useState<LaunchStatusTone>("info");
   const [runs, setRuns] = useState<PagePilotRunInfo[]>([]);
   const [runsLoading, setRunsLoading] = useState(false);
   const [runsError, setRunsError] = useState("");
@@ -236,6 +241,16 @@ export function PagePilotPreview({
   const selectedRepositoryLabel = selectedRepositoryTarget
     ? repositoryTargetLabel(selectedRepositoryTarget)
     : repositoryLabel || "";
+
+  function setLaunchStatus(message: string, tone: LaunchStatusTone = "info") {
+    setStatus(message);
+    setStatusTone(tone);
+  }
+
+  function clearLaunchStatus() {
+    setStatus("");
+    setStatusTone("info");
+  }
 
   useEffect(() => {
     window.localStorage.setItem(previewModeStorageKey, previewMode);
@@ -277,26 +292,26 @@ export function PagePilotPreview({
 
   async function resolveSelectedRepoPreview() {
     if (!selectedRepositoryTarget) {
-      setStatus("Choose a Repository Workspace first.");
+      setLaunchStatus(t("Choose a Repository Workspace first."), "error");
       return { url: "" };
     }
     if (!desktopBridge?.resolvePreviewTarget) {
-      setStatus("Electron is required to prepare an isolated preview workspace.");
+      setLaunchStatus(t("Electron is required to prepare an isolated preview workspace."), "error");
       return { url: "" };
     }
-    setStatus("Preparing isolated preview workspace...");
+    setLaunchStatus(t("Preparing isolated preview workspace..."));
     const result = await withTimeout(desktopBridge.resolvePreviewTarget(selectedRepositoryTarget), "Preparing repository preview", previewResolveTimeoutMs);
     if (!result.ok) {
-      setStatus(result.error ?? "Could not prepare the target repository preview.");
+      setLaunchStatus(result.error ?? t("Could not prepare the target repository preview."), "error");
       return { url: "" };
     }
     if (result.hasPackageJson) {
       if (!desktopBridge?.startPreviewDevServer) {
         setActivePreviewRuntimeProfile(null);
-        setStatus("Preview Runtime Agent is required to start this repository.");
+        setLaunchStatus(t("Preview Runtime Agent is required to start this repository."), "error");
         return { url: "" };
       }
-      setStatus("Preview Runtime Agent is starting the repository dev server...");
+      setLaunchStatus(t("Preview Runtime Agent is starting the repository dev server..."));
       const runtime = await withTimeout(desktopBridge.startPreviewDevServer({
         target: selectedRepositoryTarget,
         projectId,
@@ -305,13 +320,13 @@ export function PagePilotPreview({
       }), "Starting Preview Runtime Agent", previewStartTimeoutMs);
       if (!runtime.ok || !runtime.previewUrl) {
         setActivePreviewRuntimeProfile(runtime.profile ?? null);
-        setStatus(runtime.error ?? "Preview Runtime Agent could not start the repository dev server.");
+        setLaunchStatus(runtime.error ?? t("Preview Runtime Agent could not start the repository dev server."), "error");
         return { url: "" };
       }
       setDraftUrl(runtime.previewUrl);
       setActivePreviewRuntimeProfile(runtime.profile ?? null);
       const source = runtime.profile?.source ? ` (${runtime.profile.source})` : "";
-      setStatus(`Preview Runtime Agent started${source}: ${runtime.previewUrl}`);
+      setLaunchStatus(`${t("Preview Runtime Agent started")}${source}: ${runtime.previewUrl}`, "success");
       return { url: runtime.previewUrl, profile: runtime.profile ?? null };
     }
     if (result.htmlFile) {
@@ -329,7 +344,7 @@ export function PagePilotPreview({
       };
       setDraftUrl(result.htmlFile);
       setActivePreviewRuntimeProfile(profile);
-      setStatus(`HTML preview ready: ${result.repoPath ?? result.htmlFile}`);
+      setLaunchStatus(`${t("HTML preview ready")}: ${result.repoPath ?? result.htmlFile}`, "success");
       return { url: fileUrl, profile };
     }
     if (result.previewUrl) {
@@ -345,25 +360,25 @@ export function PagePilotPreview({
       };
       setDraftUrl(result.previewUrl);
       setActivePreviewRuntimeProfile(profile);
-      setStatus(`Dev server preview ready: ${result.previewUrl}`);
+      setLaunchStatus(`${t("Dev server preview ready")}: ${result.previewUrl}`, "success");
       return { url: result.previewUrl, profile };
     }
     setActivePreviewRuntimeProfile(null);
-    setStatus(`Repository ready: ${result.repoPath ?? ""}. Enter a preview URL or HTML file.`);
+    setLaunchStatus(`${t("Repository ready")}: ${result.repoPath ?? ""}. ${t("Enter a preview URL or HTML file.")}`, "error");
     return { url: "" };
   }
 
   async function startDevServerPreview() {
     if (!selectedRepositoryTarget) {
-      setStatus("Choose a Repository Workspace first.");
+      setLaunchStatus(t("Choose a Repository Workspace first."), "error");
       return { url: "" };
     }
     if (!desktopBridge?.startPreviewDevServer) {
-      setStatus("This desktop shell does not support the Preview Runtime Agent yet.");
+      setLaunchStatus(t("This desktop shell does not support the Preview Runtime Agent yet."), "error");
       return { url: "" };
     }
     const launchInput = devServerLaunchInput(draftUrl);
-    setStatus("Preview Runtime Agent is starting the dev server...");
+    setLaunchStatus(t("Preview Runtime Agent is starting the dev server..."));
     const result = await withTimeout(desktopBridge.startPreviewDevServer({
       target: selectedRepositoryTarget,
       projectId,
@@ -372,27 +387,27 @@ export function PagePilotPreview({
       previewUrl: launchInput.previewUrl,
     }), "Starting Preview Runtime Agent", previewStartTimeoutMs);
     if (!result.ok || !result.previewUrl) {
-      setStatus(result.error ?? "Preview Runtime Agent could not start the dev server.");
+      setLaunchStatus(result.error ?? t("Preview Runtime Agent could not start the dev server."), "error");
       return { url: "" };
     }
     const nextUrl = withPreviewIntent(result.previewUrl, launchInput.intent);
     setDraftUrl(result.previewUrl);
     setActivePreviewRuntimeProfile(result.profile ?? null);
     const source = result.profile?.source ? ` (${result.profile.source})` : "";
-    setStatus(`Preview Runtime Agent started${source}: ${result.previewUrl}`);
+    setLaunchStatus(`${t("Preview Runtime Agent started")}${source}: ${result.previewUrl}`, "success");
     return { url: nextUrl, profile: result.profile ?? null };
   }
 
   async function startApiRuntimePreview(intent = "", previewUrl?: string) {
     if (!effectiveRepositoryTargetId) {
-      setStatus("Choose a Repository Workspace first.");
+      setLaunchStatus(t("Choose a Repository Workspace first."), "error");
       return { url: "" };
     }
     if (!apiUrl) {
-      setStatus("Browser mode needs the local runtime API to prepare a repository preview.");
+      setLaunchStatus(t("Browser mode needs the local runtime API to prepare a repository preview."), "error");
       return { url: "" };
     }
-    setStatus("Preview Runtime Agent is starting the preview server...");
+    setLaunchStatus(t("Preview Runtime Agent is starting the preview server..."));
     const result = await withTimeout(startPagePilotPreviewRuntime(apiUrl, {
       projectId,
       repositoryTargetId: effectiveRepositoryTargetId,
@@ -401,7 +416,7 @@ export function PagePilotPreview({
     }), "Starting Preview Runtime Agent", previewStartTimeoutMs);
     if (!result.ok || !result.previewUrl) {
       setActivePreviewRuntimeProfile((result.profile as PreviewRuntimeProfile | undefined) ?? null);
-      setStatus(result.error ?? "Preview Runtime Agent could not start the preview server.");
+      setLaunchStatus(result.error ?? t("Preview Runtime Agent could not start the preview server."), "error");
       return { url: "" };
     }
     const profile = (result.profile as PreviewRuntimeProfile | undefined) ?? {
@@ -415,7 +430,7 @@ export function PagePilotPreview({
     setDraftUrl(result.previewUrl);
     setActivePreviewRuntimeProfile(profile);
     const source = profile.source ? ` (${profile.source})` : "";
-    setStatus(`Preview Runtime Agent started${source}: ${result.previewUrl}`);
+    setLaunchStatus(`${t("Preview Runtime Agent started")}${source}: ${result.previewUrl}`, "success");
     return { url: withPreviewIntent(result.previewUrl, intent), profile };
   }
 
@@ -423,9 +438,9 @@ export function PagePilotPreview({
     const explicitPath = draftUrl.trim();
     if (explicitPath) {
       if (/^https?:\/\//i.test(explicitPath)) {
-        setStatus("Finding HTML entry in the selected workspace...");
+        setLaunchStatus(t("Finding HTML entry in the selected workspace..."));
       } else if (!looksLikeHtmlFilePath(explicitPath)) {
-        setStatus("HTML file mode needs a local .html file path. Clear the field to use the selected workspace index.html.");
+        setLaunchStatus(t("HTML file mode needs a local .html file path. Clear the field to use the selected workspace index.html."), "error");
         return { url: "" };
       } else {
         const previewUrl = normalizePreviewUrl(explicitPath, "html-file");
@@ -443,23 +458,23 @@ export function PagePilotPreview({
       }
     }
     if (!selectedRepositoryTarget) {
-      setStatus("Choose a Repository Workspace first.");
+      setLaunchStatus(t("Choose a Repository Workspace first."), "error");
       return { url: "" };
     }
     if (!desktopBridge?.resolvePreviewTarget) {
-      setStatus("Electron is required to find an HTML file in this workspace.");
+      setLaunchStatus(t("Electron is required to find an HTML file in this workspace."), "error");
       return { url: "" };
     }
     if (!explicitPath) {
-      setStatus("Finding HTML entry in the selected workspace...");
+      setLaunchStatus(t("Finding HTML entry in the selected workspace..."));
     }
     const result = await withTimeout(desktopBridge.resolvePreviewTarget(selectedRepositoryTarget), "Finding HTML entry", previewResolveTimeoutMs);
     if (!result.ok) {
-      setStatus(result.error ?? "Could not prepare the selected repository workspace.");
+      setLaunchStatus(result.error ?? t("Could not prepare the selected repository workspace."), "error");
       return { url: "" };
     }
     if (!result.htmlFile) {
-      setStatus(`No root index.html was found in ${result.repoPath ?? "the selected workspace"}. Enter an HTML file path.`);
+      setLaunchStatus(`${t("No root index.html was found in")} ${result.repoPath ?? t("the selected workspace")}. ${t("Enter an HTML file path.")}`, "error");
       return { url: "" };
     }
     const fileUrl = fileUrlFor(result.htmlFile);
@@ -476,13 +491,13 @@ export function PagePilotPreview({
     };
     setDraftUrl(result.htmlFile);
     setActivePreviewRuntimeProfile(profile);
-    setStatus(`HTML preview ready: ${result.htmlFile}`);
+    setLaunchStatus(`${t("HTML preview ready")}: ${result.htmlFile}`, "success");
     return { url: fileUrl, profile };
   }
 
   async function openDirectPilot() {
     if (!selectedRepositoryTarget || !effectiveRepositoryTargetId) {
-      setStatus("Choose a Repository Workspace first. Page Pilot changes must be locked to one target repository.");
+      setLaunchStatus(t("Choose a Repository Workspace first. Page Pilot changes must be locked to one target repository."), "error");
       return;
     }
     if (launching) return;
@@ -497,13 +512,8 @@ export function PagePilotPreview({
         } else {
           launchTarget = await resolveHtmlFilePreview();
         }
-        if (!launchTarget.url) {
-          if (previewMode === "repo-source") {
-            setStatus("Preview Runtime Agent must start the target project first.");
-          }
-          return;
-        }
-        setStatus("Opening target page...");
+        if (!launchTarget.url) return;
+        setLaunchStatus(t("Opening target page..."));
         const result = await withTimeout(desktopBridge.openPreview({
           url: launchTarget.url,
           projectId,
@@ -512,7 +522,10 @@ export function PagePilotPreview({
           returnUrl: "#page-pilot",
           previewRuntimeProfile: launchTarget.profile ?? undefined,
         }), "Opening Page Pilot", previewOpenTimeoutMs);
-        setStatus(result.ok ? "Target page opened. Select elements, add notes, and apply changes there." : result.error ?? "Could not open Page Pilot.");
+        setLaunchStatus(
+          result.ok ? t("Target page opened. Select elements, add notes, and apply changes there.") : result.error ?? t("Could not open Page Pilot."),
+          result.ok ? "success" : "error",
+        );
       } else {
         if (previewMode === "dev-server") {
           const launchInput = devServerLaunchInput(draftUrl);
@@ -521,7 +534,7 @@ export function PagePilotPreview({
           } else if (launchInput.previewUrl) {
             launchTarget = { url: withPreviewIntent(launchInput.previewUrl, launchInput.intent) };
           } else {
-            setStatus("Browser mode needs a full preview URL, such as http://127.0.0.1:3009/.");
+            setLaunchStatus(t("Browser mode needs a full preview URL, such as http://127.0.0.1:3009/."), "error");
             return;
           }
         } else {
@@ -529,10 +542,10 @@ export function PagePilotPreview({
         }
         if (!launchTarget.url) return;
         setBrowserPreviewUrl(browserFrameUrlFor(launchTarget.url));
-        setStatus("Browser preview opened. Select elements in the embedded preview when it is inspectable.");
+        setLaunchStatus(t("Browser preview opened. Select elements in the embedded preview when it is inspectable."), "success");
       }
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      setLaunchStatus(error instanceof Error ? error.message : String(error), "error");
     } finally {
       setLaunching(false);
     }
@@ -560,20 +573,20 @@ export function PagePilotPreview({
     <section className="page-pilot-surface page-pilot-launcher">
       <section className="page-pilot-repository-picker" aria-label="Page Pilot repository workspace">
         <div>
-          <span className="section-label">Repository Workspace</span>
-          <strong>{selectedRepositoryLabel || "Choose a target repository"}</strong>
-          <small>Page Pilot will edit the preview workspace for this repository only.</small>
+          <span className="section-label">{t("Repository Workspace")}</span>
+          <strong>{selectedRepositoryLabel || t("Choose a target repository")}</strong>
+          <small>{t("Page Pilot will edit the preview workspace for this repository only.")}</small>
         </div>
         <label>
-          <span>Target repo</span>
+          <span>{t("Target repo")}</span>
           <select
             value={effectiveRepositoryTargetId}
             onChange={(event) => {
               onSelectRepositoryTarget(event.currentTarget.value);
-              setStatus("");
+              clearLaunchStatus();
             }}
           >
-            <option value="">Select repository...</option>
+            <option value="">{t("Select repository...")}</option>
             {repositoryTargets.map((target) => (
               <option key={repositoryTargetStableId(target)} value={repositoryTargetStableId(target)}>
                 {repositoryTargetLabel(target)}
@@ -584,7 +597,7 @@ export function PagePilotPreview({
       </section>
 
       <section className="page-pilot-launch-panel">
-        <span className="section-label">Preview source</span>
+        <span className="section-label">{t("Preview source")}</span>
         <form
           className="page-pilot-url-form"
           onSubmit={(event) => {
@@ -598,23 +611,27 @@ export function PagePilotPreview({
             onChange={(event) => {
               const nextMode = event.currentTarget.value as PreviewMode;
               setPreviewMode(nextMode);
-              setStatus("");
+              clearLaunchStatus();
             }}
             aria-label="Preview source"
           >
-            <option value="repo-source">Repository source</option>
-            <option value="dev-server">Dev server by Agent</option>
-            <option value="html-file">HTML file</option>
+            <option value="repo-source">{t("Repository source")}</option>
+            <option value="dev-server">{t("Dev server by Agent")}</option>
+            <option value="html-file">{t("HTML file")}</option>
           </select>
           <input
             value={draftUrl}
             onChange={(event) => setDraftUrl(event.currentTarget.value)}
-            placeholder={previewMode === "html-file" ? "/Users/demo/app/index.html" : previewMode === "dev-server" ? "Optional: /login or launch note" : "Resolved from selected repository"}
+            placeholder={t(previewMode === "html-file" ? "/Users/demo/app/index.html" : previewMode === "dev-server" ? "Optional: /login or launch note" : "Resolved from selected repository")}
             disabled={previewMode === "repo-source"}
           />
-          <button type="submit" disabled={!apiAvailable || launching}>{launching ? "Opening..." : "Open page editor"}</button>
+          <button type="submit" disabled={!apiAvailable || launching}>{launching ? t("Opening...") : t("Open page editor")}</button>
         </form>
-        {status ? <p className="page-pilot-launch-status">{status}</p> : null}
+        {status ? (
+          <p className={`page-pilot-launch-status tone-${statusTone}`} role={statusTone === "error" ? "alert" : "status"}>
+            {status}
+          </p>
+        ) : null}
       </section>
 
       {browserPreviewUrl ? (
@@ -628,11 +645,11 @@ export function PagePilotPreview({
         </div>
       ) : null}
 
-      <section className="page-pilot-runs-panel" aria-label="Recent Page Pilot runs">
+      <section className="page-pilot-runs-panel" aria-label={t("Recent runs")}>
         <header>
           <div>
-            <span className="section-label">Recent runs</span>
-            <h3>Traceable Page Pilot sessions</h3>
+            <span className="section-label">{t("Recent runs")}</span>
+            <h3>{t("Traceable Page Pilot sessions")}</h3>
           </div>
           <button
             type="button"
@@ -646,13 +663,13 @@ export function PagePilotPreview({
             }}
             disabled={!apiAvailable || !effectiveRepositoryTargetId || runsLoading}
           >
-            Refresh
+            {t("Refresh")}
           </button>
         </header>
-        {runsError ? <p className="page-pilot-launch-status">{runsError}</p> : null}
-        {runsLoading ? <p className="page-pilot-run-empty">Loading Page Pilot runs...</p> : null}
+        {runsError ? <p className="page-pilot-launch-status tone-error" role="alert">{runsError}</p> : null}
+        {runsLoading ? <p className="page-pilot-run-empty">{t("Loading Page Pilot runs...")}</p> : null}
         {!runsLoading && runs.length === 0 ? (
-          <p className="page-pilot-run-empty">No Page Pilot runs recorded for this repository yet.</p>
+          <p className="page-pilot-run-empty">{t("No Page Pilot runs recorded for this repository yet.")}</p>
         ) : (
           <div className="page-pilot-run-list">
             {runs.map((run) => (
@@ -663,7 +680,7 @@ export function PagePilotPreview({
                   <small>{pagePilotRunSubtitle(run)}</small>
                 </div>
                 <div className="page-pilot-run-actions">
-                  <button type="button" onClick={() => setSelectedRun(run)}>Details</button>
+                  <button type="button" onClick={() => setSelectedRun(run)}>{t("Details")}</button>
                   {run.pullRequestUrl ? <a href={run.pullRequestUrl} target="_blank" rel="noreferrer">PR</a> : null}
                   {run.workItemId ? <a href={workItemDetailHash(run.workItemId)}>Work Item</a> : null}
                   {run.pipelineId ? <span>{run.pipelineId}</span> : null}
@@ -674,7 +691,7 @@ export function PagePilotPreview({
         )}
       </section>
       {selectedRun ? (
-        <div className="page-pilot-run-modal" role="dialog" aria-modal="true" aria-label="Page Pilot run details">
+        <div className="page-pilot-run-modal" role="dialog" aria-modal="true" aria-label={t("Page Pilot run details")}>
           <div className="page-pilot-run-modal-panel">
             <header>
               <div>
@@ -682,15 +699,15 @@ export function PagePilotPreview({
                 <h3>{pagePilotRunTitle(selectedRun)}</h3>
                 <p>{pagePilotRunSubtitle(selectedRun)}</p>
               </div>
-              <button type="button" onClick={() => setSelectedRun(null)}>Close</button>
+              <button type="button" onClick={() => setSelectedRun(null)}>{t("Close")}</button>
             </header>
             <div className="page-pilot-run-detail-grid">
-              <RunDetailBlock title="PR preview" value={selectedRun.prPreview?.title || selectedRun.pullRequestUrl || "Not created yet"} body={selectedRun.prPreview?.body} />
-              <RunDetailBlock title="Diff summary" value={`${selectedRun.changedFiles?.length ?? 0} changed file(s)`} body={[selectedRun.diffSummary, selectedRun.lineDiffSummary].filter(Boolean).join("\n\n")} />
-              <RunDetailBlock title="Source mapping" value={String(selectedRun.sourceMappingReport?.status ?? "unknown")} body={formatRecord(selectedRun.sourceMappingReport)} />
-              <RunDetailBlock title="Visual proof" value={String(selectedRun.visualProof?.kind ?? "not captured")} body={formatRecord(selectedRun.visualProof)} />
-              <RunDetailBlock title="Preview runtime" value={String(selectedRun.previewRuntimeProfile?.source ?? "unknown")} body={formatRecord(selectedRun.previewRuntimeProfile)} />
-              <RunDetailBlock title="Conversation" value={`${selectedRun.submittedAnnotations?.length ?? 0} annotations · round ${selectedRun.roundNumber ?? 1}`} body={formatRecord(selectedRun.conversationBatch)} />
+              <RunDetailBlock title={t("PR preview")} value={selectedRun.prPreview?.title || selectedRun.pullRequestUrl || t("Not created yet")} body={selectedRun.prPreview?.body} />
+              <RunDetailBlock title={t("Diff summary")} value={t("{count} changed file(s)", { count: selectedRun.changedFiles?.length ?? 0 })} body={[selectedRun.diffSummary, selectedRun.lineDiffSummary].filter(Boolean).join("\n\n")} />
+              <RunDetailBlock title={t("Source mapping")} value={String(selectedRun.sourceMappingReport?.status ?? t("unknown"))} body={formatRecord(selectedRun.sourceMappingReport)} />
+              <RunDetailBlock title={t("Visual proof")} value={String(selectedRun.visualProof?.kind ?? "not captured")} body={formatRecord(selectedRun.visualProof)} />
+              <RunDetailBlock title={t("Preview runtime")} value={String(selectedRun.previewRuntimeProfile?.source ?? t("unknown"))} body={formatRecord(selectedRun.previewRuntimeProfile)} />
+              <RunDetailBlock title={t("Conversation")} value={`${selectedRun.submittedAnnotations?.length ?? 0} annotations · round ${selectedRun.roundNumber ?? 1}`} body={formatRecord(selectedRun.conversationBatch)} />
             </div>
           </div>
         </div>

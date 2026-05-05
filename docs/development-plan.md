@@ -141,6 +141,8 @@ Item
 - Codex runner process supervisor 基础版。
 - `run-devflow-cycle` 默认异步化：Run 立即返回 Attempt，后台 job 继续执行，前端通过轮询观察进度。
 - 默认 `devflow-pr` 已抽成 Markdown workflow：`services/local-runtime/workflows/devflow-pr.md`。Go runtime 会从该模板读取 stages、agents、artifact 和 review rounds，而不是只依赖代码 hardcode。
+- GitHub Actions CI 已作为默认 `devflow-pr` 的 `run_ci_checks` action 接入：PR publish/update 后采集 checks 和 failed run logs，并进入 Review / Rework / Workpad 报告链路。
+- Architect action 是默认 Plan 等价阶段：模板要求输出 technical plan、functional todo list 和 project todo list，Review 必须按清单核对实现、验证和 CI。
 
 继续：
 

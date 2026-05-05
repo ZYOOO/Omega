@@ -62,6 +62,10 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.getWorkspace(response, request)
 	case request.Method == http.MethodPut && path == "/workspace":
 		server.putWorkspace(response, request)
+	case request.Method == http.MethodGet && path == "/ui/language":
+		server.getUILanguage(response, request)
+	case request.Method == http.MethodPut && path == "/ui/language":
+		server.putUILanguage(response, request)
 	case request.Method == http.MethodPost && path == "/projects":
 		server.createProject(response, request)
 	case request.Method == http.MethodGet && path == "/requirements":
@@ -150,6 +154,8 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.localCapabilities(response, request)
 	case request.Method == http.MethodPost && path == "/agent-runner/preflight":
 		server.testAgentRunner(response, request)
+	case request.Method == http.MethodPost && path == "/agent-runner/models":
+		server.discoverRunnerModels(response, request)
 	case request.Method == http.MethodGet && path == "/local-workspace-root":
 		server.getLocalWorkspaceRoot(response, request)
 	case request.Method == http.MethodPut && path == "/local-workspace-root":
@@ -184,6 +190,8 @@ func (server *Server) route(response http.ResponseWriter, request *http.Request)
 		server.githubRepositories(response, request)
 	case request.Method == http.MethodPost && path == "/github/repo-info":
 		server.githubRepoInfo(response, request)
+	case request.Method == http.MethodPost && path == "/repository-targets/local":
+		server.bindLocalRepositoryTarget(response, request)
 	case request.Method == http.MethodPost && path == "/github/bind-repository-target":
 		server.githubBindRepositoryTarget(response, request)
 	case request.Method == http.MethodDelete && strings.HasPrefix(path, "/github/repository-targets/"):

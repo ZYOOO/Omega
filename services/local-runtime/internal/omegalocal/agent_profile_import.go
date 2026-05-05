@@ -30,7 +30,7 @@ func (server *Server) importAgentProfileTemplate(response http.ResponseWriter, r
 	}
 	projectID := strings.TrimSpace(payload.ProjectID)
 	if projectID == "" {
-		if database, err := server.Repo.Load(request.Context()); err == nil {
+		if database, err := server.Repo.LoadWorkspaceSession(request.Context()); err == nil {
 			projectID = firstProjectIDFromDatabase(*database)
 		}
 	}
@@ -78,7 +78,7 @@ func (server *Server) agentProfileImportBasePath(ctx context.Context, source str
 		}
 		return filepath.Join(root, "docs", "test-workflow-fixtures"), nil
 	case "repository":
-		database, err := server.Repo.Load(ctx)
+		database, err := server.Repo.LoadWorkspaceSession(ctx)
 		if err != nil {
 			return "", err
 		}

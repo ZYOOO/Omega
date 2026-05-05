@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -33,10 +34,11 @@ func (server *Server) orchestratorTick(response http.ResponseWriter, request *ht
 }
 
 func (server *Server) runOrchestratorTick(ctx context.Context, payload orchestratorTickPayload) (map[string]any, int, error) {
-	database, err := mustLoad(server, ctx)
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return nil, http.StatusNotFound, err
 	}
+	database := *databasePtr
 	target := findRepositoryTarget(database, payload.RepositoryTargetID)
 	if target == nil && payload.RepositoryTargetID == "" {
 		target = firstRepositoryTarget(database)
@@ -47,6 +49,32 @@ func (server *Server) runOrchestratorTick(ctx context.Context, payload orchestra
 	repo := repositoryTargetLabel(target)
 	if repo == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("repository target %s has no repository label", text(target, "id"))
+	}
+
+	if payload.AutoRun {
+		readySummary, err := server.reconcileAttemptIntegrity(ctx, jobSupervisorTickOptions{
+			AutoRunReady:       true,
+			Limit:              orchestratorLimitInt(payload.Limit),
+			RepositoryTargetID: text(target, "id"),
+		})
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		if intValue(readySummary["acceptedReadyRuns"]) > 0 {
+			return map[string]any{
+				"status":             "accepted-ready-work",
+				"repositoryTargetId": text(target, "id"),
+				"readyWork":          readySummary,
+			}, http.StatusOK, nil
+		}
+	}
+
+	if text(target, "kind") != "github" {
+		return map[string]any{
+			"status":             "idle",
+			"repositoryTargetId": text(target, "id"),
+			"reason":             "no runnable work item found",
+		}, http.StatusOK, nil
 	}
 
 	issues, err := listGitHubIssues(ctx, repo, stringOr(payload.Limit, "20"))
@@ -82,7 +110,10 @@ func (server *Server) runOrchestratorTick(ctx context.Context, payload orchestra
 		database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 		pipelineIndex := len(database.Tables.Pipelines) - 1
 		touch(&database)
-		if err := server.Repo.Save(ctx, database); err != nil {
+		if err := server.Repo.SaveWorkItemsState(ctx, database); err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		if err := server.Repo.SaveSupervisorExecutionState(ctx, database); err != nil {
 			return nil, http.StatusInternalServerError, err
 		}
 		lock := map[string]any{
@@ -113,7 +144,7 @@ func (server *Server) runOrchestratorTick(ctx context.Context, payload orchestra
 			database, pipeline, attempt := beginDevFlowAttempt(database, pipelineIndex, item, pipeline, "orchestrator")
 			lock["runnerProcessState"] = "running"
 			lock["updatedAt"] = nowISO()
-			if err := server.Repo.Save(ctx, database); err != nil {
+			if err := server.Repo.SaveSupervisorExecutionState(ctx, database); err != nil {
 				return nil, http.StatusInternalServerError, err
 			}
 			if err := saveExecutionLock(ctx, server, lock); err != nil {
@@ -141,8 +172,16 @@ func (server *Server) runOrchestratorTick(ctx context.Context, payload orchestra
 	return map[string]any{
 		"status":             "idle",
 		"repositoryTargetId": text(target, "id"),
-		"reason":             "no eligible open issue found",
+		"reason":             "no runnable work item or eligible open issue found",
 	}, http.StatusOK, nil
+}
+
+func orchestratorLimitInt(limit string) int {
+	value, err := strconv.Atoi(strings.TrimSpace(limit))
+	if err != nil || value <= 0 {
+		return 10
+	}
+	return value
 }
 
 const orchestratorWatcherPrefix = "orchestrator-watcher:"
@@ -184,12 +223,12 @@ func (server *Server) putOrchestratorWatcher(response http.ResponseWriter, reque
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
-	database, err := mustLoad(server, request.Context())
+	database, err := server.Repo.LoadWorkspaceSession(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
-	target := findRepositoryTarget(database, targetID)
+	target := findRepositoryTarget(*database, targetID)
 	if target == nil {
 		writeError(response, http.StatusNotFound, fmt.Errorf("repository target not found"))
 		return
@@ -213,7 +252,8 @@ func (server *Server) putOrchestratorWatcher(response http.ResponseWriter, reque
 	responseWatcher := cloneMap(watcher)
 	if text(watcher, "status") == "active" {
 		server.ensureOrchestratorWatcherLoop()
-		go server.runOrchestratorWatcher(context.Background(), cloneMap(watcher), true)
+		server.runOrchestratorWatcher(context.Background(), watcher, true)
+		responseWatcher = cloneMap(watcher)
 	}
 	writeJSON(response, http.StatusOK, responseWatcher)
 }
@@ -286,18 +326,35 @@ func boolValueDefault(value any, fallback bool) bool {
 }
 
 func (server *Server) ensureOrchestratorWatcherLoop() {
+	server.StartOrchestratorWatchers(context.Background())
+}
+
+func (server *Server) StartOrchestratorWatchers(parent context.Context) context.CancelFunc {
 	server.watcherMu.Lock()
 	defer server.watcherMu.Unlock()
 	if server.watcherStarted {
-		return
+		return func() {}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	server.watcherCancel = cancel
 	server.watcherStarted = true
 	go server.orchestratorWatcherLoop(ctx)
+	return cancel
 }
 
 func (server *Server) orchestratorWatcherLoop(ctx context.Context) {
+	defer func() {
+		server.watcherMu.Lock()
+		defer server.watcherMu.Unlock()
+		if server.watcherCancel != nil {
+			server.watcherCancel = nil
+		}
+		server.watcherStarted = false
+	}()
+	server.runDueOrchestratorWatchers(ctx)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {

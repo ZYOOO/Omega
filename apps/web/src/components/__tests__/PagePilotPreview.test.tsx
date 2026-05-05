@@ -183,7 +183,51 @@ describe("PagePilotPreview", () => {
 
     await waitFor(() => expect(startPreviewDevServer).toHaveBeenCalled());
     expect(openPreview).not.toHaveBeenCalled();
-    expect(await screen.findByText("no preview command could be detected")).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("no preview command could be detected");
+    expect(screen.getByRole("button", { name: "Open page editor" })).toBeEnabled();
+  });
+
+  it("keeps repository Preview Runtime Agent errors visible and stops opening", async () => {
+    const resolvePreviewTarget = vi.fn().mockResolvedValue({
+      ok: true,
+      repoPath: "/Users/demo/App",
+      hasPackageJson: true,
+    });
+    const startPreviewDevServer = vi.fn().mockResolvedValue({
+      ok: false,
+      error: "port 3009 is already in use",
+    });
+    const openPreview = vi.fn().mockResolvedValue({ ok: true, url: "http://127.0.0.1:3009/" });
+    (window as Window & { omegaDesktop?: unknown }).omegaDesktop = {
+      resolvePreviewTarget,
+      startPreviewDevServer,
+      openPreview,
+    };
+
+    render(
+      <PagePilotPreview
+        projectId="project_omega"
+        repositoryTargets={[
+          { id: "repo_local", kind: "local", path: "/Users/demo/App", defaultBranch: "main" }
+        ]}
+        repositoryTargetId="repo_local"
+        repositoryLabel="/Users/demo/App"
+        apiAvailable={true}
+        onSelectRepositoryTarget={vi.fn()}
+        onApply={vi.fn()}
+        onDeliver={vi.fn()}
+        onDiscard={vi.fn()}
+        onFetchRuns={vi.fn().mockResolvedValue([])}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open page editor" }));
+
+    await waitFor(() => expect(startPreviewDevServer).toHaveBeenCalled());
+    expect(openPreview).not.toHaveBeenCalled();
+    expect(await screen.findByRole("alert")).toHaveTextContent("port 3009 is already in use");
+    expect(screen.queryByText("Preview Runtime Agent must start the target project first.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open page editor" })).toBeEnabled();
   });
 
   it("opens a browser fallback preview when Electron is not available", async () => {

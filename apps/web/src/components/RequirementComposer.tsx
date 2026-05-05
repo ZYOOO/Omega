@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useI18n } from "../i18n";
 
 type RequirementDescriptionMode = "write" | "preview";
 
@@ -44,29 +45,30 @@ export function RequirementComposer({
   onDescriptionModeChange,
   onCreate
 }: RequirementComposerProps) {
+  const { t } = useI18n();
   if (variant === "empty") {
     return (
       <div className="empty-create">
         <div className="empty-copy">
-          <h2>Create your first work item</h2>
-          <p>Start the Workboard with a concrete requirement Mission Control can turn into an operation.</p>
+          <h2>{t("Create your first work item")}</h2>
+          <p>{t("Start the Workboard with a concrete requirement Mission Control can turn into an operation.")}</p>
         </div>
-        <input value={title} onChange={(event) => onTitleChange(event.currentTarget.value)} placeholder="Work item title" />
+        <input value={title} onChange={(event) => onTitleChange(event.currentTarget.value)} placeholder={t("Work item title")} />
         <textarea
           value={description}
           onChange={(event) => onDescriptionChange(event.currentTarget.value)}
-          placeholder="Optional description"
+          placeholder={t("Optional description")}
         />
         {hasRepositoryWorkspace ? null : (
           <input
             value={target}
             onChange={(event) => onTargetChange(event.currentTarget.value)}
-            placeholder="Local repository path or GitHub repo URL"
+            placeholder={t("Local repository path or GitHub repo URL")}
           />
         )}
         <div className="empty-create-footer">
           <RequirementAssigneeSelect assignee={assignee} onAssigneeChange={onAssigneeChange} />
-          <CreateRequirementButton isCreating={isCreating} label="Create item" onCreate={onCreate} />
+          <CreateRequirementButton isCreating={isCreating} label={t("Create item")} onCreate={onCreate} />
         </div>
       </div>
     );
@@ -76,43 +78,53 @@ export function RequirementComposer({
     <section className="inline-create">
       <div className="inline-create-form">
         <label className="inline-title-field">
-          <span>Add a title *</span>
+          <span>{t("Add a title *")}</span>
           <input
             value={title}
             onFocus={onTitleFocus}
             onChange={(event) => onTitleChange(event.currentTarget.value)}
-            placeholder="Title"
+            placeholder={t("Title")}
           />
         </label>
         <RequirementAssigneeSelect assignee={assignee} onAssigneeChange={onAssigneeChange} />
-        <CreateRequirementButton isCreating={isCreating} label="Create" onCreate={onCreate} />
+        <CreateRequirementButton isCreating={isCreating} label={t("Create")} onCreate={onCreate} />
+        {hasRepositoryWorkspace ? null : (
+          <label className="inline-target-field">
+            <span>{t("Repository target")}</span>
+            <input
+              value={target}
+              onChange={(event) => onTargetChange(event.currentTarget.value)}
+              placeholder={t("Local repository path or GitHub repo URL")}
+            />
+          </label>
+        )}
         {isExpanded ? (
           <div className="description-composer">
-            <span>Add a description</span>
+            <span>{t("Add a description")}</span>
             <div className="composer-tabs">
               <button
                 type="button"
                 className={descriptionMode === "write" ? "active" : ""}
                 onClick={() => onDescriptionModeChange("write")}
               >
-                Write
+                {t("Write")}
               </button>
               <button
                 type="button"
                 className={descriptionMode === "preview" ? "active" : ""}
                 onClick={() => onDescriptionModeChange("preview")}
               >
-                Preview
+                {t("Preview")}
               </button>
             </div>
             {descriptionMode === "write" ? (
               <textarea
                 value={description}
                 onChange={(event) => onDescriptionChange(event.currentTarget.value)}
-                placeholder="Type your description here..."
+                placeholder={t("Type your description here...")}
               />
             ) : (
-              <div className="description-preview" aria-label="Description preview">
+              <div className="description-preview" aria-label={t("Description preview")}>
                 {descriptionPreview}
               </div>
             )}
@@ -148,9 +160,10 @@ function CreateRequirementButton({
   label: string;
   onCreate: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <button type="button" className="primary-action" onClick={onCreate} disabled={isCreating}>
-      {isCreating ? "Creating..." : label}
+      {isCreating ? t("Creating...") : label}
     </button>
   );
 }

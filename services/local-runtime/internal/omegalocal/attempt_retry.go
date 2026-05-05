@@ -33,11 +33,12 @@ func (server *Server) retryAttempt(response http.ResponseWriter, request *http.R
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
-	database, err := mustLoad(server, request.Context())
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
+	database := *databasePtr
 	database, pipeline, attempt, err := server.prepareDevFlowAttemptRetry(request.Context(), database, attemptID, payload.Reason)
 	if err != nil {
 		if retryErr, ok := err.(attemptRetryError); ok {
@@ -55,7 +56,7 @@ func (server *Server) retryAttempt(response http.ResponseWriter, request *http.R
 		writeJSON(response, http.StatusConflict, map[string]any{"error": lockErr.Error()})
 		return
 	}
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	if err := server.Repo.SaveSupervisorExecutionState(request.Context(), database); err != nil {
 		nextLock := cloneMap(lock)
 		nextLock["status"] = "released"
 		nextLock["runnerProcessState"] = "failed"

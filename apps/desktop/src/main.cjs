@@ -1,12 +1,18 @@
-const { app, BrowserWindow, BrowserView, ipcMain } = require("electron");
+const { app, BrowserWindow, BrowserView, dialog, ipcMain } = require("electron");
 const path = require("node:path");
 const { refreshPreviewRuntime, resolveRepositoryPreviewTarget, startDesktopServices, startRepositoryPreviewRuntime, stopDesktopServices } = require("./process-supervisor.cjs");
+
+if (process.env.OMEGA_ENABLE_GPU_ACCELERATION !== "1") {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-gpu-compositing");
+}
 
 let mainWindow;
 let previewView;
 let previewViewAttached = false;
 let desktopServices;
 let previewRuntimeSession;
+let omegaAppURL = "";
 
 function layoutPreviewView() {
   if (!mainWindow || !previewView) return;
@@ -131,6 +137,7 @@ async function loadPreviewURLWithStatus(view, url) {
 async function createWindow() {
   desktopServices = await startDesktopServices(app);
   const omegaUrl = desktopServices.web?.url || process.env.OMEGA_WEB_URL || "http://127.0.0.1:5173/";
+  omegaAppURL = omegaUrl;
 
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -151,6 +158,12 @@ async function createWindow() {
     mainWindow.loadURL(omegaUrl);
   }
   mainWindow.on("resize", layoutPreviewView);
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    const reason = details?.reason || "unknown";
+    const exitCode = typeof details?.exitCode === "number" ? details.exitCode : "";
+    console.error(`[omega-desktop] renderer stopped: ${reason}${exitCode !== "" ? ` (${exitCode})` : ""}`);
+    showRendererRecoveryPage(reason, exitCode);
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
     previewView = null;
@@ -245,7 +258,7 @@ ipcMain.handle("omega-preview:start-selection", async () => {
 
 ipcMain.handle("omega-app:reload", async () => {
   if (!mainWindow) return { ok: false, error: "Omega window is not open" };
-  mainWindow.webContents.reloadIgnoringCache();
+  await reloadOmegaApp();
   return { ok: true };
 });
 
@@ -260,6 +273,16 @@ ipcMain.handle("omega-desktop:services", async () => ({
   web: sanitizeServiceState(desktopServices?.web),
   preview: sanitizeServiceState(desktopServices?.preview),
 }));
+
+ipcMain.handle("omega-desktop:select-directory", async () => {
+  if (!mainWindow) return undefined;
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Choose project directory",
+    properties: ["openDirectory", "createDirectory"],
+  });
+  if (result.canceled || result.filePaths.length === 0) return undefined;
+  return result.filePaths[0];
+});
 
 function sanitizeServiceState(service) {
   if (!service) return { status: "unknown" };
@@ -317,6 +340,61 @@ function sanitizePreviewRuntimeResult(result) {
         }
       : undefined,
   };
+}
+
+async function reloadOmegaApp() {
+  if (!mainWindow) return;
+  if (desktopServices?.web?.status === "static" && desktopServices.web.filePath) {
+    await mainWindow.loadFile(desktopServices.web.filePath);
+    return;
+  }
+  await mainWindow.loadURL(omegaAppURL || desktopServices?.web?.url || process.env.OMEGA_WEB_URL || "http://127.0.0.1:5173/");
+}
+
+function showRendererRecoveryPage(reason, exitCode) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const detail = `${reason || "unknown"}${exitCode !== "" ? ` (${exitCode})` : ""}`;
+  const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Omega is recovering</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #eef5ff; color: #172033; }
+    main { display: grid; min-height: 100vh; place-items: center; padding: 32px; }
+    article { width: min(620px, 100%); border: 1px solid #bfd1eb; border-radius: 8px; background: #fff; padding: 28px; box-shadow: 0 20px 48px rgba(44, 78, 134, 0.14); }
+    span { color: #7a8699; font-size: 12px; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; }
+    h1 { margin: 10px 0 8px; font-size: 28px; }
+    p { margin: 0; color: #667085; line-height: 1.55; }
+  </style>
+</head>
+<body>
+  <main>
+    <article>
+      <span>Omega Desktop</span>
+      <h1>Renderer restarted</h1>
+      <p>The UI process stopped (${escapeHTML(detail)}). Omega is reopening the app instead of leaving a blank window.</p>
+    </article>
+  </main>
+</body>
+</html>`;
+  mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`).catch((error) => {
+    console.error("[omega-desktop] failed to show recovery page", error);
+  });
+  setTimeout(() => {
+    reloadOmegaApp().catch((error) => {
+      console.error("[omega-desktop] renderer recovery reload failed", error);
+    });
+  }, 900);
+}
+
+function escapeHTML(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 app.whenReady().then(createWindow).catch((error) => {

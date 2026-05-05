@@ -8,6 +8,7 @@ var workflowActionHandlerRegistry = map[string]string{
 	"run_agent":                  "devflow.runner.run_agent",
 	"run_validation":             "devflow.validation.run",
 	"ensure_pr":                  "devflow.github.ensure_pr",
+	"run_ci_checks":              "devflow.github_actions.run_ci_checks",
 	"run_review":                 "devflow.review.run",
 	"build_rework_checklist":     "devflow.rework.build_checklist",
 	"human_gate":                 "devflow.human_gate.wait",

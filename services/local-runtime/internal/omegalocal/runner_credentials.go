@@ -138,6 +138,8 @@ func (server *Server) saveRunnerCredential(ctx context.Context, input runnerCred
 
 func defaultRunnerCredentialLabel(runner string, provider string) string {
 	switch runner {
+	case "codex":
+		return "Codex local model"
 	case "trae-agent":
 		return "Trae " + provider
 	case "opencode":
@@ -208,7 +210,7 @@ func (server *Server) runnerCredentialRecords(ctx context.Context) ([]runnerCred
 }
 
 func (server *Server) runnerCredentialKeyPath() string {
-	root := strings.TrimSpace(server.WorkspaceRoot)
+	root := strings.TrimSpace(server.localWorkspaceRoot(context.Background()))
 	if root == "" {
 		if configDir, err := os.UserConfigDir(); err == nil && configDir != "" {
 			root = filepath.Join(configDir, "omega")
@@ -329,6 +331,19 @@ func credentialEnvPrefix(provider string) string {
 func (server *Server) runnerCredentialModelAndEnv(ctx context.Context, runnerID string, rawModel string) (string, map[string]string) {
 	normalizedRunner := normalizeRunnerCredentialRunner(runnerID)
 	switch normalizedRunner {
+	case "codex":
+		model := strings.TrimSpace(rawModel)
+		record, ok := server.runnerCredentialFor(ctx, normalizedRunner, "openai")
+		if ok && strings.TrimSpace(record.Model) != "" && (model == "" || model == "gpt-5.4-mini") {
+			model = strings.TrimSpace(record.Model)
+		}
+		return model, nil
+	case "claude", "claude-code":
+		model := strings.TrimSpace(rawModel)
+		if model == "gpt-5.4-mini" || model == "claude-default" {
+			model = ""
+		}
+		return model, nil
 	case "trae-agent":
 		provider, model := traeProviderAndModel(rawModel)
 		record, ok := server.runnerCredentialFor(ctx, normalizedRunner, provider)
@@ -356,14 +371,17 @@ func (server *Server) runnerCredentialModelAndEnv(ctx context.Context, runnerID 
 		}
 		return effectiveModel, env
 	case "opencode":
-		provider := ""
-		if candidate, _, ok := strings.Cut(rawModel, ":"); ok {
-			provider = candidate
-		}
+		provider, model := opencodeProviderAndModel(rawModel)
 		record, ok := server.runnerCredentialFor(ctx, normalizedRunner, provider)
 		env := map[string]string{}
 		if ok {
-			prefix := credentialEnvPrefix(record.Provider)
+			if provider == "" {
+				provider = record.Provider
+			}
+			if model == "" || strings.TrimSpace(rawModel) == "" || strings.TrimSpace(rawModel) == "gpt-5.4-mini" {
+				model = record.Model
+			}
+			prefix := credentialEnvPrefix(provider)
 			if secret, err := server.decryptRunnerSecret(record); err == nil && secret != "" && prefix != "" {
 				env[prefix+"_API_KEY"] = secret
 			}
@@ -371,8 +389,27 @@ func (server *Server) runnerCredentialModelAndEnv(ctx context.Context, runnerID 
 				env[prefix+"_BASE_URL"] = record.BaseURL
 			}
 		}
-		return rawModel, env
+		effectiveModel := strings.TrimSpace(rawModel)
+		if provider != "" && model != "" {
+			effectiveModel = provider + "/" + model
+		} else if model != "" {
+			effectiveModel = model
+		}
+		return effectiveModel, env
 	default:
 		return rawModel, nil
 	}
+}
+
+func opencodeProviderAndModel(rawModel string) (string, string) {
+	model := strings.TrimSpace(rawModel)
+	if model == "" || model == "gpt-5.4-mini" {
+		return "", ""
+	}
+	for _, delimiter := range []string{"/", ":"} {
+		if provider, configuredModel, ok := strings.Cut(model, delimiter); ok && provider != "" && configuredModel != "" {
+			return strings.TrimSpace(provider), strings.TrimSpace(configuredModel)
+		}
+	}
+	return "", model
 }

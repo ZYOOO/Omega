@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("omegaDesktop", {
   getServices: () => ipcRenderer.invoke("omega-desktop:services"),
+  selectDirectory: () => ipcRenderer.invoke("omega-desktop:select-directory"),
   reloadApp: () => ipcRenderer.invoke("omega-app:reload"),
   resolvePreviewTarget: (target) => ipcRenderer.invoke("omega-preview:resolve-target", target),
   startPreviewDevServer: (input) => ipcRenderer.invoke("omega-preview:start-dev-server", input),

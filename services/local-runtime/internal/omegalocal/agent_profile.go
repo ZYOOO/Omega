@@ -63,17 +63,17 @@ stages:
 			"Human Review: stop delivery until explicit approval; request changes becomes first-class feedback for the next rework attempt.",
 			"Delivery: after approval, run merge/check actions separately and record PR/check/proof output in the Run Workpad.",
 		}, "\n"),
-		SkillAllowlist: "browser-use\ngithub:github\ngithub:gh-fix-ci\ngithub:yeet",
-		MCPAllowlist:   "github\nfilesystem:repository-workspace\nbrowser:localhost-preview",
+		SkillAllowlist: "bb-browser\nplaywright\ngh-address-comments\ngh-fix-ci\nyeet\nsecurity-best-practices\nsecurity-threat-model\nopenai-docs",
+		MCPAllowlist:   "omega-filesystem\nomega-git\nomega-puppeteer\nomega-memory\nomega-sequential-thinking\nx-mcp",
 		CodexPolicy:    "sandbox: workspace-write\napproval: never inside automated stage\nrepo-scope: require repositoryTargetId match",
 		ClaudePolicy:   "workspace: repository target only\nhandoff: keep Omega artifact names stable",
 		AgentProfiles: []AgentProfileConfig{
-			{ID: "requirement", Label: "Requirement", Runner: "codex", Model: "gpt-5.4-mini", Skills: "github:github\nbrowser-use", MCP: "github\nfilesystem:repository-workspace", StageNotes: "Clarify acceptance criteria and repository boundary.", CodexPolicy: "write requirement artifact only", ClaudePolicy: "focus on ambiguity and acceptance criteria"},
-			{ID: "architect", Label: "Architect", Runner: "codex", Model: "gpt-5.4-mini", Skills: "github:github", MCP: "filesystem:repository-workspace", StageNotes: "Map affected files and risk.", CodexPolicy: "prefer read-only analysis", ClaudePolicy: "produce file-level impact notes"},
-			{ID: "coding", Label: "Coding", Runner: "codex", Model: "gpt-5.4-mini", Skills: "github:gh-fix-ci\nbrowser-use", MCP: "filesystem:repository-workspace\nbrowser:localhost-preview", StageNotes: "Edit only inside the locked repository workspace.", CodexPolicy: "workspace-write only; emit diff and summary", ClaudePolicy: "preserve existing project style"},
-			{ID: "testing", Label: "Testing", Runner: "codex", Model: "gpt-5.4-mini", Skills: "browser-use", MCP: "filesystem:repository-workspace\nbrowser:localhost-preview", StageNotes: "Run focused tests and capture output.", CodexPolicy: "capture test-report.md", ClaudePolicy: "summarize validation evidence"},
-			{ID: "review", Label: "Review", Runner: "codex", Model: "gpt-5.4-mini", Skills: "github:github\ngithub:gh-fix-ci", MCP: "github\nfilesystem:repository-workspace", StageNotes: "Review correctness, safety, tests, and contract drift.", CodexPolicy: "do not edit files; issue explicit verdict", ClaudePolicy: "return verdict and required fixes"},
-			{ID: "delivery", Label: "Delivery", Runner: "codex", Model: "gpt-5.4-mini", Skills: "github:yeet\ngithub:github", MCP: "github\nfilesystem:repository-workspace", StageNotes: "Prepare handoff after human approval.", CodexPolicy: "require human gate approval before delivery action", ClaudePolicy: "summarize shipped changes and caveats"},
+			{ID: "requirement", Label: "Requirement", Runner: "codex", Model: "gpt-5.4-mini", Skills: "bb-browser\nopenai-docs", MCP: "omega-filesystem\nomega-memory\nomega-sequential-thinking", StageNotes: "Clarify acceptance criteria and repository boundary.", CodexPolicy: "write requirement artifact only", ClaudePolicy: "focus on ambiguity and acceptance criteria"},
+			{ID: "architect", Label: "Architect", Runner: "codex", Model: "gpt-5.4-mini", Skills: "security-threat-model\nopenai-docs", MCP: "omega-filesystem\nomega-sequential-thinking", StageNotes: "Map affected files and risk.", CodexPolicy: "prefer read-only analysis", ClaudePolicy: "produce file-level impact notes"},
+			{ID: "coding", Label: "Coding", Runner: "codex", Model: "gpt-5.4-mini", Skills: "playwright\nsecurity-best-practices", MCP: "omega-filesystem\nomega-git\nomega-puppeteer", StageNotes: "Edit only inside the locked repository workspace.", CodexPolicy: "workspace-write only; emit diff and summary", ClaudePolicy: "preserve existing project style"},
+			{ID: "testing", Label: "Testing", Runner: "codex", Model: "gpt-5.4-mini", Skills: "playwright\ngh-fix-ci", MCP: "omega-filesystem\nomega-puppeteer\nomega-git", StageNotes: "Run focused tests and capture output.", CodexPolicy: "capture test-report.md", ClaudePolicy: "summarize validation evidence"},
+			{ID: "review", Label: "Review", Runner: "codex", Model: "gpt-5.4-mini", Skills: "gh-address-comments\ngh-fix-ci\nsecurity-best-practices", MCP: "omega-git\nomega-filesystem", StageNotes: "Review correctness, safety, tests, and contract drift.", CodexPolicy: "do not edit files; issue explicit verdict", ClaudePolicy: "return verdict and required fixes"},
+			{ID: "delivery", Label: "Delivery", Runner: "codex", Model: "gpt-5.4-mini", Skills: "yeet\ngh-address-comments", MCP: "omega-git\nomega-filesystem", StageNotes: "Prepare handoff after human approval.", CodexPolicy: "require human gate approval before delivery action", ClaudePolicy: "summarize shipped changes and caveats"},
 		},
 		Source: "default",
 	})
@@ -185,7 +185,7 @@ func (server *Server) resolveAgentProfile(ctx context.Context, database Workspac
 }
 
 func (server *Server) resolveAgentProfileForMission(ctx context.Context, mission map[string]any) ProjectAgentProfile {
-	database, err := server.Repo.Load(ctx)
+	database, err := server.Repo.LoadWorkspaceSession(ctx)
 	if err != nil {
 		return defaultAgentProfile("project_omega", text(mission, "repositoryTargetId"))
 	}
@@ -270,20 +270,95 @@ func agentRuntimeMetadata(profile ProjectAgentProfile, agentID string) map[strin
 			"codexPolicy":  agent.CodexPolicy,
 			"claudePolicy": agent.ClaudePolicy,
 		},
-		"runtimeFiles": []string{".omega/agent-runtime.json", ".codex/OMEGA.md", ".claude/CLAUDE.md"},
+		"runtimeFiles": []string{".omega/agent-runtime.json", ".omega/agent-capabilities.json", ".omega/agent-capabilities.md", ".codex/OMEGA.md", ".claude/CLAUDE.md"},
 	}
+}
+
+func agentCapabilityManifest(profile ProjectAgentProfile, agentID string) map[string]any {
+	agent := agentProfileForRole(profile, agentID)
+	return map[string]any{
+		"agentId":             stringOr(agent.ID, agentID),
+		"label":               stringOr(agent.Label, agentID),
+		"runner":              stringOr(agent.Runner, "codex"),
+		"model":               stringOr(agent.Model, "gpt-5.4-mini"),
+		"skills":              compactLines(agent.Skills),
+		"mcp":                 compactLines(agent.MCP),
+		"skillAllowlist":      compactLines(profile.SkillAllowlist),
+		"mcpAllowlist":        compactLines(profile.MCPAllowlist),
+		"stageNotes":          agent.StageNotes,
+		"workflowTemplate":    profile.WorkflowTemplate,
+		"profileSource":       profile.Source,
+		"repositoryTargetId":  profile.RepositoryTargetID,
+		"capabilityFileUsage": "Runner prompts and policy files must treat skills/mcp as the allowed capability surface for this stage.",
+	}
+}
+
+func agentCapabilityEnv(profile ProjectAgentProfile, agentID string) map[string]string {
+	agent := agentProfileForRole(profile, agentID)
+	return map[string]string{
+		"OMEGA_AGENT_ID":              stringOr(agent.ID, agentID),
+		"OMEGA_AGENT_LABEL":           stringOr(agent.Label, agentID),
+		"OMEGA_AGENT_RUNNER":          stringOr(agent.Runner, "codex"),
+		"OMEGA_AGENT_MODEL":           stringOr(agent.Model, "gpt-5.4-mini"),
+		"OMEGA_AGENT_SKILLS":          strings.Join(compactLines(agent.Skills), ","),
+		"OMEGA_AGENT_MCP":             strings.Join(compactLines(agent.MCP), ","),
+		"OMEGA_AGENT_SKILL_ALLOWLIST": strings.Join(compactLines(profile.SkillAllowlist), ","),
+		"OMEGA_AGENT_MCP_ALLOWLIST":   strings.Join(compactLines(profile.MCPAllowlist), ","),
+		"OMEGA_WORKFLOW_TEMPLATE":     stringOr(profile.WorkflowTemplate, "devflow-pr"),
+	}
+}
+
+func agentCapabilitiesMarkdown(profile ProjectAgentProfile, agentID string) string {
+	agent := agentProfileForRole(profile, agentID)
+	section := func(title string, values []string) string {
+		if len(values) == 0 {
+			return "## " + title + "\n\n- none\n"
+		}
+		lines := []string{"## " + title, ""}
+		for _, value := range values {
+			lines = append(lines, "- "+value)
+		}
+		return strings.Join(lines, "\n") + "\n"
+	}
+	parts := []string{
+		"# Omega Agent Capabilities",
+		"",
+		"Agent: " + stringOr(agent.Label, agent.ID),
+		"Runner: " + stringOr(agent.Runner, "codex"),
+		"Model: " + stringOr(agent.Model, "gpt-5.4-mini"),
+		"Workflow: " + stringOr(profile.WorkflowTemplate, "devflow-pr"),
+		"",
+		section("Stage Skills", compactLines(agent.Skills)),
+		section("Stage MCP", compactLines(agent.MCP)),
+		section("Project Skill Allowlist", compactLines(profile.SkillAllowlist)),
+		section("Project MCP Allowlist", compactLines(profile.MCPAllowlist)),
+	}
+	if notes := strings.TrimSpace(agent.StageNotes); notes != "" {
+		parts = append(parts, "## Stage Notes\n\n"+notes+"\n")
+	}
+	return strings.Join(parts, "\n")
 }
 
 func writeRunnerPolicyFiles(root string, profile ProjectAgentProfile, agentID string) error {
 	agent := agentProfileForRole(profile, agentID)
+	if err := os.MkdirAll(filepath.Join(root, ".omega"), 0o755); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Join(root, ".codex"), 0o755); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(root, ".claude"), 0o755); err != nil {
 		return err
 	}
-	codex := fmt.Sprintf("# Omega Agent Policy\n\nAgent: %s\nWorkflow: %s\nRunner: %s\nModel: %s\n\n%s\n", stringOr(agent.Label, agent.ID), profile.WorkflowTemplate, stringOr(agent.Runner, "codex"), stringOr(agent.Model, "gpt-5.4-mini"), stringOr(agent.CodexPolicy, profile.CodexPolicy))
-	claude := fmt.Sprintf("# Omega Agent Policy\n\nAgent: %s\nWorkflow: %s\nRunner: %s\nModel: %s\n\n%s\n", stringOr(agent.Label, agent.ID), profile.WorkflowTemplate, stringOr(agent.Runner, "codex"), stringOr(agent.Model, "gpt-5.4-mini"), stringOr(agent.ClaudePolicy, profile.ClaudePolicy))
+	if err := writeJSONFile(filepath.Join(root, ".omega", "agent-capabilities.json"), agentCapabilityManifest(profile, agentID)); err != nil {
+		return err
+	}
+	capabilitiesMarkdown := agentCapabilitiesMarkdown(profile, agentID)
+	if err := os.WriteFile(filepath.Join(root, ".omega", "agent-capabilities.md"), []byte(capabilitiesMarkdown), 0o644); err != nil {
+		return err
+	}
+	codex := fmt.Sprintf("# Omega Agent Policy\n\nAgent: %s\nWorkflow: %s\nRunner: %s\nModel: %s\n\n%s\n\n%s\n", stringOr(agent.Label, agent.ID), profile.WorkflowTemplate, stringOr(agent.Runner, "codex"), stringOr(agent.Model, "gpt-5.4-mini"), capabilitiesMarkdown, stringOr(agent.CodexPolicy, profile.CodexPolicy))
+	claude := fmt.Sprintf("# Omega Agent Policy\n\nAgent: %s\nWorkflow: %s\nRunner: %s\nModel: %s\n\n%s\n\n%s\n", stringOr(agent.Label, agent.ID), profile.WorkflowTemplate, stringOr(agent.Runner, "codex"), stringOr(agent.Model, "gpt-5.4-mini"), capabilitiesMarkdown, stringOr(agent.ClaudePolicy, profile.ClaudePolicy))
 	if err := os.WriteFile(filepath.Join(root, ".codex", "OMEGA.md"), []byte(codex), 0o644); err != nil {
 		return err
 	}
@@ -293,7 +368,7 @@ func writeRunnerPolicyFiles(root string, profile ProjectAgentProfile, agentID st
 func (server *Server) getAgentProfile(response http.ResponseWriter, request *http.Request) {
 	projectID := request.URL.Query().Get("projectId")
 	repositoryTargetID := request.URL.Query().Get("repositoryTargetId")
-	database, err := server.Repo.Load(request.Context())
+	database, err := server.Repo.LoadWorkspaceSession(request.Context())
 	if err == nil && projectID == "" {
 		projectID = firstProjectIDFromDatabase(*database)
 	}
@@ -344,7 +419,7 @@ func (server *Server) putAgentProfile(response http.ResponseWriter, request *htt
 		return
 	}
 	if profile.ProjectID == "" {
-		if database, err := server.Repo.Load(request.Context()); err == nil {
+		if database, err := server.Repo.LoadWorkspaceSession(request.Context()); err == nil {
 			profile.ProjectID = firstProjectIDFromDatabase(*database)
 		}
 	}

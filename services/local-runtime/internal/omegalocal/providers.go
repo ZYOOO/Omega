@@ -42,9 +42,17 @@ func llmProviders() []LLMProvider {
 			ID:           "openai-compatible",
 			Name:         "OpenAI-compatible",
 			Kind:         "openai-compatible",
-			Models:       []string{"qwen-plus", "deepseek-chat", "moonshot-v1"},
+			Models:       []string{"qwen-plus", "deepseek-chat", "kimi-k2-0711-preview", "moonshot-v1"},
 			DefaultModel: "qwen-plus",
 			EnvHint:      "OPENAI_COMPATIBLE_BASE_URL + OPENAI_COMPATIBLE_API_KEY",
+		},
+		{
+			ID:           "kimi",
+			Name:         "Kimi (Moonshot)",
+			Kind:         "openai-compatible",
+			Models:       []string{"kimi-k2-0711-preview", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"},
+			DefaultModel: "kimi-k2-0711-preview",
+			EnvHint:      "MOONSHOT_API_KEY",
 		},
 	}
 }

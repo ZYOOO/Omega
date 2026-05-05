@@ -2,6 +2,7 @@ import type { FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { retryReasonForAttempt } from "../attemptRetryReason";
 import type { RepositoryTarget, WorkItem, WorkItemStatus } from "../core";
+import { useI18n } from "../i18n";
 import type {
   AttemptRecordInfo,
   AttemptActionPlanInfo,
@@ -29,6 +30,12 @@ type StageSummary = {
   id: string;
   title?: string;
   status: string;
+};
+
+type StageAgentRunSummary = {
+  launchedCount: number;
+  agents: string[];
+  details: string[];
 };
 
 type WorkpadSection = {
@@ -190,6 +197,7 @@ export function WorkItemDetailPage({
   onRequestCheckpointChanges,
   onRetryAttempt
 }: WorkItemDetailPageProps) {
+  const { t } = useI18n();
   const requirement = workItem.requirementId
     ? requirements.find((candidate) => candidate.id === workItem.requirementId)
     : undefined;
@@ -210,7 +218,7 @@ export function WorkItemDetailPage({
       })
       .sort((left, right) => checkpointTime(right) - checkpointTime(left));
   }, [attempt?.id, checkpoints, pipeline]);
-  const checkpoint = humanReviewCheckpoints[0];
+  const checkpoint = displayCheckpointForCurrentRun(humanReviewCheckpoints[0], pipeline, attempt);
   const checkpointActionable =
     checkpoint?.status === "pending" &&
     (attempt ? attempt.status === "waiting-human" && attempt.currentStageId === "human_review" : true) &&
@@ -218,6 +226,10 @@ export function WorkItemDetailPage({
   const detailOperations = useMemo(
     () => operationsForWorkItem({ attempt, operations, pipeline, workItem }),
     [attempt, operations, pipeline, workItem]
+  );
+  const stageAgentRuns = useMemo(
+    () => summarizeStageAgentRuns({ agentShortLabel, attempt, operations: detailOperations, pipeline }),
+    [agentShortLabel, attempt, detailOperations, pipeline]
   );
   const proofCards = useMemo(
     () => proofCardsForWorkItem({ attempt, operations: detailOperations, pipeline, proofRecords, workItem }),
@@ -261,6 +273,7 @@ export function WorkItemDetailPage({
   const workpadSections = useMemo(
     () =>
       buildRunWorkpadSections({
+        actionPlan: attemptActionPlan,
         attempt,
         checkpoint,
         checkpointActionable,
@@ -271,9 +284,10 @@ export function WorkItemDetailPage({
         requirement,
         reviewEvents,
         runWorkpad,
+        t,
         workItem
       }),
-    [attempt, checkpoint, checkpointActionable, detailOperations, pipeline, proofCards, pullRequestStatus, requirement, reviewEvents, runWorkpad, workItem]
+    [attempt, attemptActionPlan, checkpoint, checkpointActionable, detailOperations, pipeline, proofCards, pullRequestStatus, requirement, reviewEvents, runWorkpad, t, workItem]
   );
   const timelineItems =
     attemptTimeline && attempt?.id && attemptTimeline.attempt?.id === attempt.id
@@ -282,13 +296,16 @@ export function WorkItemDetailPage({
   const workItemExternalRef = visibleExternalReference(workItem.sourceExternalRef);
   const requirementExternalRef = visibleExternalReference(requirement?.sourceExternalRef);
   const canOpenPagePilot = isPagePilotWorkItem(workItem);
+  const blockedReason = workItem.status === "Blocked"
+    ? blockedReasonForDetail({ attempt, failedStages, runWorkpad })
+    : "";
 
   return (
-    <section className="issue-detail-view work-item-detail-page" aria-label="Work item detail">
+    <section className="issue-detail-view work-item-detail-page" aria-label={t("Work item detail")}>
       <article className="issue-detail-document">
-        <nav className="detail-breadcrumb" aria-label="Requirement hierarchy">
-          <span>{repositoryLabel || "Workspace"}</span>
-          <span>Requirement</span>
+        <nav className="detail-breadcrumb" aria-label={t("Requirement")}>
+          <span>{repositoryLabel || t("Workspace")}</span>
+          <span>{t("Requirement")}</span>
           <strong>{workItem.key}</strong>
         </nav>
         <header className="issue-detail-title">
@@ -307,20 +324,28 @@ export function WorkItemDetailPage({
           {canOpenPagePilot ? (
             <div className="issue-detail-actions">
               <button type="button" onClick={onOpenPagePilot} disabled={!workItem.repositoryTargetId}>
-                Open in Page Pilot
+                {t("Open in Page Pilot")}
               </button>
+            </div>
+          ) : null}
+          {blockedReason ? (
+            <div className="detail-blocked-callout" role="status">
+              <span>{t("Blocked reason")}</span>
+              <strong>{blockedReason}</strong>
+              {attempt?.id ? <small>{t("Attempt")}: {attempt.id}</small> : null}
             </div>
           ) : null}
         </header>
 
         <section className="issue-detail-section detail-flow-priority">
-          <h3>Delivery flow</h3>
+          <h3>{t("Delivery flow")}</h3>
           <DeliveryFlowGrid
             actionPlan={attemptActionPlan}
             agentShortLabel={agentShortLabel}
             pipeline={pipeline}
             pipelineStageClassName={pipelineStageClassName}
             pipelineStageLabel={pipelineStageLabel}
+            stageAgentRuns={stageAgentRuns}
           />
           <ReworkReturnSignal actionPlan={attemptActionPlan} attempt={attempt} pipeline={pipeline} runWorkpad={runWorkpad} />
         </section>
@@ -328,16 +353,16 @@ export function WorkItemDetailPage({
         <RunWorkpad onPatch={onPatchRunWorkpad} record={runWorkpad} sections={workpadSections} />
 
         <section className="issue-detail-section">
-          <h3>Requirement source</h3>
+          <h3>{t("Requirement source")}</h3>
           <div className="requirement-source-card">
             <div>
-              <span>{requirement?.source === "github_issue" ? "GitHub issue" : "Manual requirement"}</span>
+              <span>{t(requirement?.source === "github_issue" ? "GitHub issue" : "Manual requirement")}</span>
               <strong>{requirement?.title ?? workItem.title}</strong>
             </div>
             <div className="requirement-source-meta">
               {requirementExternalRef ? <span>{requirementExternalRef}</span> : null}
               {requirement?.status ? <span>{requirement.status}</span> : null}
-              <span>{siblingItems.length || 1} item{(siblingItems.length || 1) === 1 ? "" : "s"}</span>
+              <span>{t("{count} work items", { count: siblingItems.length || 1 })}</span>
             </div>
           </div>
           {(requirement?.rawText || workItem.description) && workItem.description !== "No description provided." ? (
@@ -345,12 +370,12 @@ export function WorkItemDetailPage({
               {renderMarkdown(requirement?.rawText ?? workItem.description)}
             </div>
           ) : (
-            <p className="muted-copy">No description provided yet.</p>
+            <p className="muted-copy">{t("No description provided.")}</p>
           )}
         </section>
 
         <section className="issue-detail-section">
-          <h3>Current attempt</h3>
+          <h3>{t("Current attempt")}</h3>
           <WorkItemAttemptPanel
             agentShortLabel={agentShortLabel}
             actionPlan={attemptActionPlan}
@@ -378,7 +403,7 @@ export function WorkItemDetailPage({
         </section>
 
         <section className="issue-detail-section">
-          <h3>Agent operations</h3>
+          <h3>{t("Agent operations")}</h3>
           <AgentTraceList
             agentShortLabel={agentShortLabel}
             operations={detailOperations}
@@ -388,17 +413,17 @@ export function WorkItemDetailPage({
         </section>
 
         <section className="issue-detail-section">
-          <h3>Artifacts</h3>
+          <h3>{t("Artifacts")}</h3>
           <ArtifactGrid onFetchProofPreview={onFetchProofPreview} proofs={proofCards} />
         </section>
 
         <section className="issue-detail-section">
-          <h3>Attempt history</h3>
+          <h3>{t("Attempt history")}</h3>
           <AttemptHistory attempts={attempts} attemptStatusLabel={attemptStatusLabel} />
         </section>
 
         <section className="issue-detail-section">
-          <h3>Target</h3>
+          <h3>{t("Target")}</h3>
           <div className="detail-target-box">
             <span>{workItem.target}</span>
             {repositoryTargetLabel(repositoryTargets, workItem.repositoryTargetId) ? (
@@ -420,6 +445,7 @@ function RunWorkpad({
   record?: RunWorkpadRecordInfo;
   sections: WorkpadSection[];
 }) {
+  const { t } = useI18n();
   const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(true);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -447,10 +473,10 @@ function RunWorkpad({
       await onPatch(record.id, {
         workpad: buildWorkpadFieldPatch(selectedField, draftValue, record.workpad),
         updatedBy: "operator",
-        reason: draftReason.trim() || `Operator edited ${selectedOption.label}.`,
+        reason: draftReason.trim() || t("Operator edited {field}.", { field: selectedOption.label }),
         source: {
           kind: "ui",
-          label: "Run Workpad editor",
+          label: t("Run Workpad editor"),
           field: selectedField,
           attemptId: record.attemptId,
           workItemId: record.workItemId
@@ -459,23 +485,23 @@ function RunWorkpad({
       setEditorOpen(false);
       setDraftReason("");
     } catch (error) {
-      setPatchError(error instanceof Error ? error.message : "Failed to patch Run Workpad.");
+      setPatchError(error instanceof Error ? error.message : t("Failed to patch Run Workpad."));
     } finally {
       setPatchSaving(false);
     }
   }
 
   return (
-    <section className="run-workpad" aria-label="Run workpad">
+    <section className="run-workpad" aria-label={t("Run workpad")}>
       <header>
         <div>
-          <span className="section-label">Run workpad</span>
-          <h3>Execution brief</h3>
+          <span className="section-label">Run Workpad</span>
+          <h3>{t("Execution brief")}</h3>
         </div>
         <div className="run-workpad-actions">
           <small>{workpadSignalSummary(sections)}</small>
           <button type="button" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>
-            {expanded ? "Collapse" : "Expand"}
+            {expanded ? t("Collapse") : t("Expand")}
           </button>
           {canEdit ? (
             <button
@@ -485,7 +511,7 @@ function RunWorkpad({
                 setEditorOpen(true);
               }}
             >
-              Edit fields
+              {t("Edit fields")}
             </button>
           ) : null}
         </div>
@@ -499,9 +525,9 @@ function RunWorkpad({
               className={section.tone ? `workpad-card workpad-${section.tone}` : "workpad-card"}
               onClick={() => setActiveSectionId(section.id)}
             >
-              <span>{section.label}</span>
-              <strong>{section.title}</strong>
-              <p>{section.preview}</p>
+              <span>{t(section.label)}</span>
+              <strong>{t(section.title)}</strong>
+              <p>{t(section.preview)}</p>
             </button>
           ))}
         </div>
@@ -512,15 +538,15 @@ function RunWorkpad({
             className="detail-popover"
             role="dialog"
             aria-modal="true"
-            aria-label={`${activeSection.label} detail`}
+            aria-label={`${t(activeSection.label)} detail`}
             onClick={(event) => event.stopPropagation()}
           >
             <header>
               <div>
-                <span>{activeSection.label}</span>
-                <strong>{activeSection.title}</strong>
+                <span>{t(activeSection.label)}</span>
+                <strong>{t(activeSection.title)}</strong>
               </div>
-              <button type="button" onClick={() => setActiveSectionId(null)}>Close</button>
+              <button type="button" onClick={() => setActiveSectionId(null)}>{t("Close")}</button>
             </header>
             <div className="detail-popover-body">{activeSection.body}</div>
           </article>
@@ -532,50 +558,50 @@ function RunWorkpad({
             className="detail-popover workpad-edit-popover"
             role="dialog"
             aria-modal="true"
-            aria-label="Edit Run Workpad field"
+            aria-label={t("Edit Run Workpad field")}
             onClick={(event) => event.stopPropagation()}
           >
             <header>
               <div>
-                <span>Run Workpad patch</span>
-                <strong>Field editor</strong>
+                <span>{t("Run Workpad patch")}</span>
+                <strong>{t("Field editor")}</strong>
               </div>
-              <button type="button" onClick={() => setEditorOpen(false)}>Close</button>
+              <button type="button" onClick={() => setEditorOpen(false)}>{t("Close")}</button>
             </header>
             <form className="workpad-edit-form" onSubmit={submitPatch}>
               <label>
-                <span>Field</span>
+                <span>{t("Field")}</span>
                 <select
                   value={selectedField}
                   onChange={(event) => setSelectedField(event.target.value as WorkpadEditableField)}
                 >
                   {WORKPAD_EDITABLE_FIELDS.map((field) => (
-                    <option key={field.id} value={field.id}>{field.label}</option>
+                    <option key={field.id} value={field.id}>{t(field.label)}</option>
                   ))}
                 </select>
               </label>
-              <p>{selectedOption.description}</p>
+              <p>{t(selectedOption.description)}</p>
               <label>
-                <span>Patch value</span>
+                <span>{t("Patch value")}</span>
                 <textarea
                   value={draftValue}
-                  placeholder={selectedOption.placeholder}
+                  placeholder={t(selectedOption.placeholder)}
                   onChange={(event) => setDraftValue(event.target.value)}
                 />
               </label>
               <label>
-                <span>Reason</span>
+                <span>{t("Reason")}</span>
                 <input
                   value={draftReason}
-                  placeholder="Why this field is being patched"
+                  placeholder={t("Why this field is being patched")}
                   onChange={(event) => setDraftReason(event.target.value)}
                 />
               </label>
               {patchError ? <p className="workpad-edit-error">{patchError}</p> : null}
               <div className="workpad-edit-actions">
-                <button type="button" onClick={() => setEditorOpen(false)} disabled={patchSaving}>Cancel</button>
+                <button type="button" onClick={() => setEditorOpen(false)} disabled={patchSaving}>{t("Cancel")}</button>
                 <button type="submit" disabled={patchSaving || !record}>
-                  {patchSaving ? "Saving..." : "Save patch"}
+                  {patchSaving ? t("Saving...") : t("Save patch")}
                 </button>
               </div>
             </form>
@@ -584,6 +610,32 @@ function RunWorkpad({
       ) : null}
     </section>
   );
+}
+
+function blockedReasonForDetail({
+  attempt,
+  failedStages,
+  runWorkpad
+}: {
+  attempt?: AttemptRecordInfo;
+  failedStages: StageSummary[];
+  runWorkpad?: RunWorkpadRecordInfo;
+}): string {
+  const blockers = runWorkpad?.workpad?.blockers?.map((item) => item.trim()).filter(Boolean) ?? [];
+  if (blockers.length > 0) return blockers[0];
+  const retryReason = runWorkpad?.workpad?.retryReason?.trim();
+  if (retryReason) return retryReason;
+  const attemptReason = [
+    attempt?.failureReason,
+    attempt?.errorMessage,
+    attempt?.statusReason
+  ].find((value) => value && value.trim());
+  if (attemptReason) return attemptReason.trim();
+  const failedStage = failedStages[0];
+  if (failedStage) return `${failedStage.title ?? failedStage.id} ${failedStage.status}`;
+  if (attempt?.status === "failed") return "The last attempt failed before a detailed reason was captured.";
+  if (attempt?.status === "cancelled") return "The last attempt was cancelled.";
+  return "This item is blocked. Open the Run Workpad and attempt history for the latest recovery context.";
 }
 
 function workpadFieldToDraft(workpad: RunWorkpadRecordInfo["workpad"] | undefined, field: WorkpadEditableField): string {
@@ -652,11 +704,14 @@ function DeliveryFlowGrid({
   agentShortLabel,
   pipeline,
   pipelineStageClassName,
-  pipelineStageLabel
+  pipelineStageLabel,
+  stageAgentRuns
 }: Pick<DetailHelpers, "agentShortLabel" | "pipelineStageClassName" | "pipelineStageLabel"> & {
   actionPlan?: AttemptActionPlanInfo | null;
   pipeline?: PipelineRecordInfo;
+  stageAgentRuns: Map<string, StageAgentRunSummary>;
 }) {
+  const { t } = useI18n();
   const pipelineStages = pipeline?.run?.stages ?? [];
   const planStates = actionPlan?.states?.length ? actionPlan.states : [];
   const stages = pipelineStages.length ? pipelineStages : planStates;
@@ -669,14 +724,24 @@ function DeliveryFlowGrid({
         const stageRecord = stage as Record<string, unknown>;
         const agent = recordString(stageRecord, "agent") || recordString(stageRecord, "agentId");
         const agentIds = Array.isArray(stageRecord.agentIds) ? stageRecord.agentIds.map(String) : agent ? [agent] : [];
-        const status = recordString(stageRecord, "status");
+        const stageId = recordString(stageRecord, "id") || String(index);
+        const rawStatus = recordString(stageRecord, "status");
+        const startedAt = recordString(stageRecord, "startedAt");
+        const completedAt = recordString(stageRecord, "completedAt");
+        const hasRunningAgent = stageAgentRuns.get(stageId)?.details.some((detail) => /running/i.test(detail)) ?? false;
+        const status =
+          rawStatus === "waiting" && !completedAt && (hasRunningAgent || (pipeline?.status === "running" && startedAt))
+            ? "running"
+            : rawStatus;
         const participantLabel = stageParticipantLabel(stageRecord, agentIds, agentShortLabel);
+        const runtimeLabel = stageAgentRuntimeLabel(stageAgentRuns.get(stageId), agentIds, agentShortLabel, t);
         return (
-          <article key={recordString(stageRecord, "id") || String(index)} className={pipelineStageClassName(status)}>
+          <article key={stageId} className={pipelineStageClassName(status)}>
             <span>{index + 1}</span>
             <div>
               <strong>{recordString(stageRecord, "title") || recordString(stageRecord, "id")}</strong>
               {participantLabel ? <small>{participantLabel}</small> : null}
+              {runtimeLabel ? <small className="stage-agent-runtime">{runtimeLabel}</small> : null}
             </div>
             <em>{pipelineStageLabel(status)}</em>
           </article>
@@ -696,6 +761,31 @@ function stageParticipantLabel(stage: Record<string, unknown>, agentIds: string[
   if (/human/.test(raw)) return "Human Review";
   if (/merg|deliver|done|ship/.test(raw)) return "Delivery";
   return "Workflow stage";
+}
+
+function stageAgentRuntimeLabel(
+  summary: StageAgentRunSummary | undefined,
+  plannedAgentIds: string[],
+  agentShortLabel: (agentId: string) => string,
+  t: (key: string, params?: Record<string, string | number>) => string
+): string {
+  if (summary?.launchedCount) {
+    const detail = compactAgentRunDetails(summary.details.length ? summary.details : summary.agents);
+    return detail
+      ? `${t("{count} agent run(s)", { count: summary.launchedCount })} · ${detail}`
+      : t("{count} agent run(s)", { count: summary.launchedCount });
+  }
+  if (!plannedAgentIds.length) return "";
+  const planned = compactAgentRunDetails(plannedAgentIds.map(agentShortLabel));
+  return planned
+    ? `${t("{count} planned agent(s)", { count: plannedAgentIds.length })} · ${planned}`
+    : t("{count} planned agent(s)", { count: plannedAgentIds.length });
+}
+
+function compactAgentRunDetails(details: string[]): string {
+  const unique = Array.from(new Set(details.map((detail) => detail.trim()).filter(Boolean)));
+  if (unique.length <= 2) return unique.join(" + ");
+  return `${unique.slice(0, 2).join(" + ")} +${unique.length - 2}`;
 }
 
 function ReworkReturnSignal({
@@ -745,6 +835,7 @@ function ReworkReturnSignal({
 }
 
 function buildRunWorkpadSections({
+  actionPlan,
   attempt,
   checkpoint,
   checkpointActionable,
@@ -755,8 +846,10 @@ function buildRunWorkpadSections({
   requirement,
   reviewEvents,
   runWorkpad,
+  t,
   workItem
 }: {
+  actionPlan?: AttemptActionPlanInfo | null;
   attempt?: AttemptRecordInfo;
   checkpoint?: CheckpointRecordInfo;
   checkpointActionable?: boolean;
@@ -767,10 +860,12 @@ function buildRunWorkpadSections({
   requirement?: RequirementRecordInfo;
   reviewEvents: DetailReviewEventCard[];
   runWorkpad?: RunWorkpadRecordInfo;
+  t: (key: string, params?: Record<string, string | number>) => string;
   workItem: WorkItem;
 }): WorkpadSection[] {
   const workpad = runWorkpad?.workpad;
-  const planArtifacts = proofCards.filter((proof) => /plan|solution|implementation|summary/i.test(`${proof.label} ${proof.kind}`));
+  const planArtifacts = proofCards.filter((proof) => /plan|solution|architecture|todo/i.test(`${proof.label} ${proof.kind}`));
+  const planProgress = buildPlanProgress({ actionPlan, pipeline, planArtifacts, t });
   const validationOps = operations.filter((operation) => /test|check|validation/i.test(`${operation.stageId ?? ""} ${operation.agentId ?? ""} ${operation.summary ?? ""}`));
   const reviewOps = operations.filter((operation) => /review|rework/i.test(`${operation.stageId ?? ""} ${operation.agentId ?? ""} ${operation.summary ?? ""}`));
   const recordedBlockers = asStringArray(workpad?.blockers).filter((blocker) => {
@@ -864,8 +959,8 @@ function buildRunWorkpadSections({
       ? [{
           id: "patch-history",
           label: "Patch history",
-          title: `${patchHistory.length} update${patchHistory.length === 1 ? "" : "s"}`,
-          preview: patchHistory[0] ? `${patchHistory[0].updatedBy} updated ${patchHistory[0].fields.join(", ")}` : "No field patch recorded.",
+          title: t(patchHistory.length === 1 ? "{count} update" : "{count} updates", { count: patchHistory.length }),
+          preview: patchHistory[0] ? `${patchHistory[0].updatedBy} updated ${patchHistory[0].fields.join(", ")}` : t("No field patch recorded."),
           body: <WorkpadPatchHistory entries={patchHistory.slice(0, 5)} />
         }]
       : []),
@@ -874,7 +969,7 @@ function buildRunWorkpadSections({
           id: "review-packet",
           label: "Review packet",
           title: reviewPacketTitle(reviewPacket),
-          preview: shortText(recordString(reviewPacket, "summary") || reviewPacketFirstAction(reviewPacket) || "Diff, validation, checks and risk preview.", 120),
+          preview: shortText(recordString(reviewPacket, "summary") || reviewPacketFirstAction(reviewPacket) || t("Diff, validation, checks and risk preview."), 120),
           tone: reviewPacketTone(reviewPacket),
           body: <ReviewPacketPreview packet={reviewPacket} />
         }]
@@ -882,17 +977,25 @@ function buildRunWorkpadSections({
     {
       id: "plan",
       label: "Plan",
-      title: recordString(workpad?.plan, "currentStageId") || planArtifacts[0]?.label || pipeline?.templateId || "Plan pending",
-      preview: planArtifacts.length
-        ? `${planArtifacts.length} plan artifact${planArtifacts.length === 1 ? "" : "s"} captured.`
-        : shortText(requirement?.rawText ?? workItem.description, 120),
-      body: planArtifacts.length ? <ArtifactList artifacts={planArtifacts.slice(0, 3)} /> : <p>{shortText(requirement?.rawText ?? workItem.description)}</p>
+      title: recordString(workpad?.plan, "currentStageId") || planProgress.title,
+      preview: planProgress.preview,
+      tone: planProgress.tone,
+      body: (
+        <PlanProgressPanel
+          artifactCount={planArtifacts.length}
+          artifactHint={t("Open the Artifacts section below for the source file.")}
+          artifactSummary={planArtifacts.length === 1 ? t("1 plan artifact captured") : t("{count} plan artifacts captured.", { count: planArtifacts.length })}
+          fallback={shortText(requirement?.rawText ?? workItem.description)}
+          items={planProgress.items}
+          title={t("Plan progress")}
+        />
+      )
     },
     {
       id: "acceptance",
       label: "Acceptance criteria",
-      title: `${criteria.length} criteria`,
-      preview: shortText(criteria[0] ?? "No acceptance criteria captured.", 120),
+      title: t("{count} criteria", { count: criteria.length }),
+      preview: shortText(criteria[0] ?? t("No acceptance criteria captured."), 120),
       body: (
         <ul>
           {criteria.slice(0, 5).map((criterion) => <li key={criterion}>{criterion}</li>)}
@@ -902,58 +1005,58 @@ function buildRunWorkpadSections({
     {
       id: "validation",
       label: "Validation status",
-      title: validationStatus || pullRequestStatus?.deliveryGate || (validationOps.length ? "Validation captured" : "Pending"),
+      title: validationStatus || pullRequestStatus?.deliveryGate || (validationOps.length ? t("Validation captured") : t("Pending")),
       preview: validationOps[0]?.summary
         ? shortText(validationOps[0].summary, 120)
         : validationStatus
-          ? `Validation is ${validationStatus}.`
-          : "Waiting for test reports or checks.",
+          ? t("Validation is {status}.", { status: validationStatus })
+          : t("Waiting for test reports or checks."),
       tone: validationStatus === "passed" || pullRequestStatus?.deliveryGate === "passed" ? "success" : undefined,
-      body: validationOps.length ? <OperationSummaryList operations={validationOps.slice(-3)} /> : <p>Test reports and checks will appear here after validation runs.</p>
+      body: validationOps.length ? <OperationSummaryList operations={validationOps.slice(-3)} /> : <p>{t("Test reports and checks will appear here after validation runs.")}</p>
     },
     {
       id: "pr",
       label: "PR",
-      title: attempt?.pullRequestUrl ? "Pull request ready" : attempt?.branchName ? "Branch ready" : "Not created",
-      preview: attempt?.pullRequestUrl || attempt?.branchName || "No delivery branch or pull request yet.",
+      title: attempt?.pullRequestUrl ? t("Pull request ready") : attempt?.branchName ? t("Branch ready") : t("Not created"),
+      preview: attempt?.pullRequestUrl || attempt?.branchName || t("No delivery branch or pull request yet."),
       body: attempt?.pullRequestUrl ? (
-        <a href={attempt.pullRequestUrl} target="_blank" rel="noreferrer">Open PR</a>
+        <a href={attempt.pullRequestUrl} target="_blank" rel="noreferrer">{t("Open PR")}</a>
       ) : (
-        <p>{attempt?.branchName ?? "PR link will appear after delivery creates it."}</p>
+        <p>{attempt?.branchName ?? t("PR link will appear after delivery creates it.")}</p>
       )
     },
     {
       id: "feedback",
       label: "Review Feedback",
-      title: reviewFeedback ? "Feedback captured" : "No feedback yet",
-      preview: reviewFeedback ? shortText(reviewFeedback, 120) : "No review, PR, or human feedback captured.",
-      body: reviewFeedback ? <p>{shortText(reviewFeedback, 360)}</p> : <p>Review agent, PR comments and human requested changes will be merged here.</p>
+      title: reviewFeedback ? t("Feedback captured") : t("No feedback yet"),
+      preview: reviewFeedback ? shortText(reviewFeedback, 120) : t("No review, PR, or human feedback captured."),
+      body: reviewFeedback ? <p>{shortText(reviewFeedback, 360)}</p> : <p>{t("Review agent, PR comments and human requested changes will be merged here.")}</p>
     },
     {
       id: "blockers",
       label: "Blockers",
-      title: blockers.length ? `${blockers.length} active signal${blockers.length === 1 ? "" : "s"}` : "No active blockers",
-      preview: blockers.length ? shortText(blockers[0], 120) : "No blocking failure is recorded.",
+      title: blockers.length ? t(blockers.length === 1 ? "{count} active signal" : "{count} active signals", { count: blockers.length }) : t("No active blockers"),
+      preview: blockers.length ? shortText(blockers[0], 120) : t("No blocking failure is recorded."),
       tone: blockers.length ? "warning" : "success",
       body: blockers.length ? (
         <ul>{blockers.slice(0, 4).map((blocker) => <li key={blocker}>{shortText(blocker, 220)}</li>)}</ul>
       ) : (
-        <p>No blocking failure is recorded for the current attempt.</p>
+        <p>{t("No blocking failure is recorded for the current attempt.")}</p>
       )
     },
     {
       id: "retry",
       label: "Retry Reason",
-      title: retryReason ? "Ready for retry" : "No retry needed",
-      preview: retryReason ? shortText(retryReason, 120) : "Current run has no retry reason.",
-      body: retryReason ? <p>{shortText(retryReason, 420)}</p> : <p>Retry will reuse the captured blocker and review feedback when needed.</p>
+      title: retryReason ? t("Ready for retry") : t("No retry needed"),
+      preview: retryReason ? shortText(retryReason, 120) : t("Current run has no retry reason."),
+      body: retryReason ? <p>{shortText(retryReason, 420)}</p> : <p>{t("Retry will reuse the captured blocker and review feedback when needed.")}</p>
     },
     {
       id: "notes",
       label: "Notes",
-      title: `${operations.length} operation${operations.length === 1 ? "" : "s"}`,
-      preview: operations.length ? shortText(operations[operations.length - 1]?.summary ?? "Latest operation recorded.", 120) : "No operation notes yet.",
-      body: operations.length ? <OperationSummaryList operations={operations.slice(-3)} /> : <p>Agent notes will appear as operations are recorded.</p>
+      title: t(operations.length === 1 ? "{count} operation" : "{count} operations", { count: operations.length }),
+      preview: operations.length ? shortText(operations[operations.length - 1]?.summary ?? t("Latest operation recorded."), 120) : t("No operation notes yet."),
+      body: operations.length ? <OperationSummaryList operations={operations.slice(-3)} /> : <p>{t("Agent notes will appear as operations are recorded.")}</p>
     }
   ];
 
@@ -962,12 +1065,150 @@ function buildRunWorkpadSections({
 
 function workpadSignalSummary(sections: WorkpadSection[]): string {
   const blocker = sections.find((section) => section.id === "blockers" && section.tone === "warning");
-  const retry = sections.find((section) => section.id === "retry" && !/No retry/i.test(section.title));
-  const feedback = sections.find((section) => section.id === "feedback" && !/No feedback/i.test(section.title));
+  const retry = sections.find((section) => section.id === "retry" && !/No retry|无需重试/i.test(section.title));
+  const feedback = sections.find((section) => section.id === "feedback" && !/No feedback|暂无反馈/i.test(section.title));
   if (blocker) return blocker.title;
   if (retry) return retry.title;
   if (feedback) return feedback.title;
   return `${sections.length} signals`;
+}
+
+type PlanProgressItem = {
+  label: string;
+  status: string;
+  detail: string;
+  tone: "pending" | "running" | "captured";
+};
+
+function buildPlanProgress({
+  actionPlan,
+  pipeline,
+  planArtifacts,
+  t
+}: {
+  actionPlan?: AttemptActionPlanInfo | null;
+  pipeline?: PipelineRecordInfo;
+  planArtifacts: DetailProofCard[];
+  t: (key: string, params?: Record<string, string | number>) => string;
+}): { title: string; preview: string; tone?: "success"; items: PlanProgressItem[] } {
+  const actions = arrayRecords(actionPlan?.actions);
+  const architectureAction = actions.find((action) => /architecture_handoff|architect|plan/i.test(`${recordString(action, "id")} ${recordString(action, "type")}`));
+  const reviewAction = actions.find((action) => /review/i.test(`${recordString(action, "id")} ${recordString(action, "type")}`));
+  const architectureStage = pipeline?.run?.stages?.find((stage) => /in_progress|architect|implementation/i.test(`${recordString(stage, "id")} ${recordString(stage, "title")}`));
+  const architectureStatus = recordString(architectureAction, "status") || recordString(architectureStage, "status");
+  const outputArtifacts = artifactNamesFromValue(architectureAction?.outputArtifacts);
+  const artifactNames = new Set([
+    ...outputArtifacts,
+    ...planArtifacts.flatMap((artifact) => [artifact.label, artifact.path ?? ""])
+  ].map((value) => value.toLowerCase()));
+  const hasPlan = hasAnyArtifact(artifactNames, [/technical-plan/, /solution-plan/, /\bplan\b/]) || planArtifacts.length > 0;
+  const hasFunctionalTodo = hasAnyArtifact(artifactNames, [/functional-todo-list/, /functional.*todo/, /solution-plan/]);
+  const hasProjectTodo = hasAnyArtifact(artifactNames, [/project-todo-list/, /project.*todo/, /solution-plan/]);
+  const reviewStatus = recordString(reviewAction, "status");
+  const reviewReady = Boolean(reviewAction || hasPlan || hasFunctionalTodo || hasProjectTodo);
+  const architectureTone = progressTone(architectureStatus, hasPlan);
+  const capturedCount = [hasPlan, hasFunctionalTodo, hasProjectTodo, reviewReady].filter(Boolean).length;
+
+  return {
+    title: capturedCount >= 3 ? t("Plan and TODO captured") : architectureTone === "running" ? t("Planning in progress") : t("Plan pending"),
+    preview: capturedCount >= 3
+      ? t("Functional TODO, project TODO, and review alignment are visible.")
+      : t("Planning progress will appear as the architect action runs."),
+    tone: capturedCount >= 3 ? "success" : undefined,
+    items: [
+      {
+        label: t("Plan stage"),
+        status: progressStatusLabel(architectureStatus, hasPlan, t),
+        detail: recordString(architectureAction, "id") || recordString(architectureAction, "type") || t("Architect action has not started."),
+        tone: architectureTone
+      },
+      {
+        label: t("Functional TODO"),
+        status: hasFunctionalTodo ? t("Captured") : t("Pending"),
+        detail: hasFunctionalTodo ? t("Feature checklist is part of the plan artifacts.") : t("Waiting for the architecture handoff output."),
+        tone: hasFunctionalTodo ? "captured" : "pending"
+      },
+      {
+        label: t("Project TODO"),
+        status: hasProjectTodo ? t("Captured") : t("Pending"),
+        detail: hasProjectTodo ? t("Project file checklist is part of the plan artifacts.") : t("Waiting for the architecture handoff output."),
+        tone: hasProjectTodo ? "captured" : "pending"
+      },
+      {
+        label: t("Review alignment"),
+        status: reviewReady ? (reviewStatus ? progressStatusLabel(reviewStatus, true, t) : t("Ready")) : t("Pending"),
+        detail: reviewReady ? t("Review checks implementation against the plan and TODO list.") : t("Review will use the plan after it is captured."),
+        tone: reviewReady ? "captured" : "pending"
+      }
+    ]
+  };
+}
+
+function progressTone(status: string, captured: boolean): PlanProgressItem["tone"] {
+  if (captured || /passed|done|success|completed/i.test(status)) return "captured";
+  if (/running|in_progress|active/i.test(status)) return "running";
+  return "pending";
+}
+
+function progressStatusLabel(status: string, captured: boolean, t: (key: string, params?: Record<string, string | number>) => string): string {
+  if (/running|in_progress|active/i.test(status)) return t("Running");
+  if (captured || /passed|done|success|completed/i.test(status)) return t("Captured");
+  if (status) return status;
+  return t("Pending");
+}
+
+function hasAnyArtifact(names: Set<string>, patterns: RegExp[]): boolean {
+  return [...names].some((name) => patterns.some((pattern) => pattern.test(name)));
+}
+
+function artifactNamesFromValue(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => {
+      if (typeof entry === "string") return [entry];
+      const record = recordValue(entry);
+      return record ? [recordString(record, "id"), recordString(record, "name"), recordString(record, "label"), recordString(record, "path")] : [];
+    }).filter(Boolean);
+  }
+  if (typeof value === "string") return [value];
+  return [];
+}
+
+function PlanProgressPanel({
+  artifactCount,
+  artifactHint,
+  artifactSummary,
+  fallback,
+  items,
+  title
+}: {
+  artifactCount: number;
+  artifactHint: string;
+  artifactSummary: string;
+  fallback: string;
+  items: PlanProgressItem[];
+  title: string;
+}) {
+  return (
+    <div className="workpad-plan-progress" aria-label={title}>
+      <ul className="plan-progress-list">
+        {items.map((item) => (
+          <li key={item.label} className={`plan-progress-${item.tone}`}>
+            <span>{item.label}</span>
+            <strong>{item.status}</strong>
+            <small>{item.detail}</small>
+          </li>
+        ))}
+      </ul>
+      {artifactCount ? (
+        <div className="plan-progress-artifacts">
+          <strong>{artifactSummary}</strong>
+          <small>{artifactHint}</small>
+        </div>
+      ) : (
+        <p>{fallback}</p>
+      )}
+    </div>
+  );
 }
 
 function ArtifactList({ artifacts }: { artifacts: DetailProofCard[] }) {
@@ -1193,6 +1434,24 @@ function checkpointTime(checkpoint: CheckpointRecordInfo): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function displayCheckpointForCurrentRun(
+  checkpoint: CheckpointRecordInfo | undefined,
+  pipeline: PipelineRecordInfo | undefined,
+  attempt: AttemptRecordInfo | undefined
+): CheckpointRecordInfo | undefined {
+  if (!checkpoint || checkpoint.status !== "pending") return checkpoint;
+  const humanReviewStage = pipeline?.run?.stages?.find((stage) => recordString(stage, "id") === "human_review");
+  const humanReviewPassed = recordString(humanReviewStage, "status") === "passed";
+  const runCompleted = pipeline?.status === "done" || attempt?.status === "done";
+  if (!humanReviewPassed || !runCompleted) return checkpoint;
+  const reviewer = recordString(humanReviewStage, "approvedBy") || "human";
+  return {
+    ...checkpoint,
+    status: "approved",
+    decisionNote: checkpoint.decisionNote || `approved by ${reviewer}`
+  };
+}
+
 function recordBool(value: unknown, key: string): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   return (value as Record<string, unknown>)[key] === true;
@@ -1278,6 +1537,103 @@ function operationsForWorkItem({
       Boolean(operation.prompt?.includes(workItem.key))
     )
     .sort((left, right) => (left.createdAt ?? left.updatedAt ?? "").localeCompare(right.createdAt ?? right.updatedAt ?? ""));
+}
+
+function summarizeStageAgentRuns({
+  agentShortLabel,
+  attempt,
+  operations,
+  pipeline
+}: {
+  agentShortLabel: (agentId: string) => string;
+  attempt?: AttemptRecordInfo;
+  operations: OperationRecordInfo[];
+  pipeline?: PipelineRecordInfo;
+}): Map<string, StageAgentRunSummary> {
+  const summaries = new Map<string, StageAgentRunSummary>();
+  const operationStageAgents = new Set<string>();
+  const seenRuns = new Set<string>();
+
+  const ensure = (stageId: string) => {
+    const existing = summaries.get(stageId);
+    if (existing) return existing;
+    const created: StageAgentRunSummary = { launchedCount: 0, agents: [], details: [] };
+    summaries.set(stageId, created);
+    return created;
+  };
+
+  const addRun = (input: {
+    id: string;
+    stageId: string;
+    agentId?: string;
+    runner?: string;
+    model?: string;
+    provider?: string;
+    fromOperation?: boolean;
+  }) => {
+    const stageId = input.stageId.trim();
+    if (!stageId || seenRuns.has(input.id)) return;
+    seenRuns.add(input.id);
+    const summary = ensure(stageId);
+    summary.launchedCount += 1;
+    const agentLabel = input.agentId ? agentShortLabel(input.agentId) : input.runner || "Agent";
+    if (!summary.agents.includes(agentLabel)) summary.agents.push(agentLabel);
+    const runtime = stageAgentRuntimeDetail(agentLabel, input.runner, input.model, input.provider);
+    if (runtime && !summary.details.includes(runtime)) summary.details.push(runtime);
+    if (input.fromOperation && input.agentId) operationStageAgents.add(`${stageId}:${input.agentId}`);
+  };
+
+  for (const operation of operations) {
+    const parsed = parseAgentOperationId(operation.id);
+    const stageId = operation.stageId || parsed.stageId;
+    if (!stageId) continue;
+    const agentId = operation.agentId || parsed.agentId;
+    const runner = operation.runnerProcess?.runner;
+    const model = operation.runnerProcess?.model;
+    const provider = operation.runnerProcess?.provider;
+    addRun({
+      id: `operation:${operation.id}`,
+      stageId,
+      agentId,
+      runner,
+      model,
+      provider,
+      fromOperation: true
+    });
+  }
+
+  const eventSources = [
+    ...(attempt?.events ?? []),
+    ...(pipeline?.run?.events ?? []).map((event) => ({ ...event, createdAt: event.timestamp }))
+  ];
+  for (const event of eventSources) {
+    const eventRecord = event as Record<string, unknown>;
+    const type = recordString(eventRecord, "type");
+    if (!type.startsWith("agent.")) continue;
+    const stageId = recordString(eventRecord, "stageId");
+    const agentId = recordString(eventRecord, "agentId");
+    if (!stageId) continue;
+    if (agentId && operationStageAgents.has(`${stageId}:${agentId}`)) continue;
+    addRun({
+      id: `event:${stageId}:${agentId || "agent"}:${type}:${recordString(eventRecord, "createdAt")}`,
+      stageId,
+      agentId
+    });
+  }
+
+  return summaries;
+}
+
+function parseAgentOperationId(id: string): { stageId?: string; agentId?: string } {
+  const match = id.match(/:agent:([^:]+):([^:]+)/);
+  if (!match) return {};
+  return { stageId: match[1], agentId: match[2] };
+}
+
+function stageAgentRuntimeDetail(agentLabel: string, runner?: string, model?: string, provider?: string): string {
+  const runtimeParts = [runner, provider, model].map((value) => value?.trim()).filter(Boolean);
+  if (!runtimeParts.length) return agentLabel;
+  return `${agentLabel} (${runtimeParts.join(" · ")})`;
 }
 
 function proofCardsForWorkItem({

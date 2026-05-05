@@ -16,26 +16,17 @@ func (server *Server) attemptTimeline(response http.ResponseWriter, request *htt
 	if limit <= 0 {
 		limit = 120
 	}
-	database, err := server.Repo.Load(request.Context())
+	database, attempt, pipeline, err := server.loadAttemptTimelineContext(request.Context(), attemptID)
 	if err != nil {
 		writeJSON(response, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	attemptIndex := findByID(database.Tables.Attempts, attemptID)
-	if attemptIndex < 0 {
+	if attempt == nil {
 		writeJSON(response, http.StatusNotFound, map[string]any{"error": "attempt not found"})
 		return
 	}
 
-	attempt := cloneMap(database.Tables.Attempts[attemptIndex])
-	pipeline := map[string]any(nil)
-	if pipelineID := text(attempt, "pipelineId"); pipelineID != "" {
-		if index := findByID(database.Tables.Pipelines, pipelineID); index >= 0 {
-			pipeline = cloneMap(database.Tables.Pipelines[index])
-		}
-	}
-
-	items, err := server.buildAttemptTimelineItems(request.Context(), *database, attempt, pipeline)
+	items, err := server.buildAttemptTimelineItems(request.Context(), database, attempt, pipeline)
 	if err != nil {
 		writeJSON(response, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -49,6 +40,93 @@ func (server *Server) attemptTimeline(response http.ResponseWriter, request *htt
 		Items:       items,
 		GeneratedAt: nowISO(),
 	})
+}
+
+func (server *Server) loadAttemptTimelineContext(ctx context.Context, attemptID string) (WorkspaceDatabase, map[string]any, map[string]any, error) {
+	attempts, err := server.Repo.ListAttempts(ctx, map[string]string{"id": attemptID, "limit": "1"})
+	if err != nil {
+		return WorkspaceDatabase{}, nil, nil, err
+	}
+	if len(attempts) == 0 {
+		return WorkspaceDatabase{}, nil, nil, nil
+	}
+	attempt := cloneMap(attempts[0])
+	pipelineID := text(attempt, "pipelineId")
+	workItemID := text(attempt, "itemId")
+	database := WorkspaceDatabase{SchemaVersion: 1, SavedAt: nowISO()}
+	database.Tables.Attempts = []map[string]any{attempt}
+
+	var pipeline map[string]any
+	if pipelineID != "" {
+		pipelines, err := server.Repo.ListPipelines(ctx, map[string]string{"id": pipelineID, "limit": "1"})
+		if err != nil {
+			return WorkspaceDatabase{}, nil, nil, err
+		}
+		if len(pipelines) > 0 {
+			pipeline = cloneMap(pipelines[0])
+			database.Tables.Pipelines = []map[string]any{pipeline}
+		}
+	}
+
+	if pipelineID != "" || workItemID != "" {
+		operationFilters := map[string]string{"limit": "320"}
+		proofFilters := map[string]string{"limit": "320"}
+		if pipelineID != "" {
+			operationFilters["pipelineId"] = pipelineID
+			proofFilters["pipelineId"] = pipelineID
+		} else {
+			operationFilters["workItemId"] = workItemID
+			proofFilters["workItemId"] = workItemID
+		}
+		operations, err := server.Repo.ListOperations(ctx, operationFilters)
+		if err != nil {
+			return WorkspaceDatabase{}, nil, nil, err
+		}
+		proofs, err := server.Repo.ListProofRecords(ctx, proofFilters)
+		if err != nil {
+			return WorkspaceDatabase{}, nil, nil, err
+		}
+		database.Tables.Operations = operations
+		database.Tables.ProofRecords = proofs
+	}
+
+	checkpoints := []map[string]any{}
+	if pipelineID != "" {
+		rows, err := server.Repo.ListCheckpoints(ctx, map[string]string{"pipelineId": pipelineID, "limit": "160"})
+		if err != nil {
+			return WorkspaceDatabase{}, nil, nil, err
+		}
+		checkpoints = appendUniqueTimelineMaps(checkpoints, rows)
+	}
+	if attemptID != "" {
+		rows, err := server.Repo.ListCheckpoints(ctx, map[string]string{"attemptId": attemptID, "limit": "160"})
+		if err != nil {
+			return WorkspaceDatabase{}, nil, nil, err
+		}
+		checkpoints = appendUniqueTimelineMaps(checkpoints, rows)
+	}
+	database.Tables.Checkpoints = checkpoints
+	return database, attempt, pipeline, nil
+}
+
+func appendUniqueTimelineMaps(current []map[string]any, next []map[string]any) []map[string]any {
+	seen := map[string]bool{}
+	for _, record := range current {
+		if id := text(record, "id"); id != "" {
+			seen[id] = true
+		}
+	}
+	for _, record := range next {
+		id := text(record, "id")
+		if id != "" && seen[id] {
+			continue
+		}
+		if id != "" {
+			seen[id] = true
+		}
+		current = append(current, record)
+	}
+	return current
 }
 
 func intValueFromString(value string) int {

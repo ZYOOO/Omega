@@ -1,7 +1,10 @@
 package omegalocal
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -120,15 +123,15 @@ func workflowTemplatesResponse(database *WorkspaceDatabase, projectID, repositor
 func (server *Server) listWorkflowTemplates(response http.ResponseWriter, request *http.Request) {
 	projectID := request.URL.Query().Get("projectId")
 	repositoryTargetID := request.URL.Query().Get("repositoryTargetId")
-	database, err := server.Repo.Load(request.Context())
-	if err != nil {
+	database, err := server.loadWorkflowTemplateState(request.Context())
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeJSON(response, http.StatusOK, workflowTemplatesResponse(nil, projectID, repositoryTargetID))
 		return
 	}
 	if projectID == "" {
-		projectID = firstProjectIDFromDatabase(*database)
+		projectID = firstProjectIDFromDatabase(database)
 	}
-	writeJSON(response, http.StatusOK, workflowTemplatesResponse(database, projectID, repositoryTargetID))
+	writeJSON(response, http.StatusOK, workflowTemplatesResponse(&database, projectID, repositoryTargetID))
 }
 
 func (server *Server) validateWorkflowTemplate(response http.ResponseWriter, request *http.Request) {
@@ -148,8 +151,8 @@ func (server *Server) putWorkflowTemplate(response http.ResponseWriter, request 
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
-	database, err := mustLoad(server, request.Context())
-	if err != nil {
+	database, err := server.loadWorkflowTemplateState(request.Context())
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -177,19 +180,24 @@ func (server *Server) putWorkflowTemplate(response http.ResponseWriter, request 
 		"parsedTemplateName": template.Name,
 	}
 	database = upsertWorkflowTemplateRecord(database, record)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	saved := workflowTemplateOverride(database, projectID, text(payload, "repositoryTargetId"), templateID)
+	if saved == nil {
+		writeError(response, http.StatusInternalServerError, errors.New("workflow template record was not persisted"))
+		return
+	}
+	if err := server.Repo.UpsertWorkflowTemplate(request.Context(), saved); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(response, http.StatusOK, workflowTemplateOverride(database, projectID, text(payload, "repositoryTargetId"), templateID))
+	writeJSON(response, http.StatusOK, saved)
 }
 
 func (server *Server) restoreWorkflowTemplateDefault(response http.ResponseWriter, request *http.Request) {
 	id := strings.Trim(strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/workflow-templates/"), "/restore-default"), "/")
 	var payload map[string]any
 	_ = json.NewDecoder(request.Body).Decode(&payload)
-	database, err := mustLoad(server, request.Context())
-	if err != nil {
+	database, err := server.loadWorkflowTemplateState(request.Context())
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
@@ -215,9 +223,33 @@ func (server *Server) restoreWorkflowTemplateDefault(response http.ResponseWrite
 		"validation":         workflowTemplateValidationMap(validation),
 	}
 	database = upsertWorkflowTemplateRecord(database, record)
-	if err := server.Repo.Save(request.Context(), database); err != nil {
+	saved := workflowTemplateOverride(database, projectID, repositoryTargetID, templateID)
+	if saved == nil {
+		writeError(response, http.StatusInternalServerError, errors.New("workflow template record was not persisted"))
+		return
+	}
+	if err := server.Repo.UpsertWorkflowTemplate(request.Context(), saved); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(response, http.StatusOK, workflowTemplateOverride(database, projectID, repositoryTargetID, templateID))
+	writeJSON(response, http.StatusOK, saved)
+}
+
+func (server *Server) loadWorkflowTemplateState(ctx context.Context) (WorkspaceDatabase, error) {
+	databasePtr, err := server.Repo.LoadWorkspaceSession(ctx)
+	var database WorkspaceDatabase
+	if errors.Is(err, sql.ErrNoRows) {
+		database = defaultWorkspaceDatabase()
+	} else if err == nil {
+		database = *databasePtr
+	} else {
+		return WorkspaceDatabase{}, err
+	}
+	templates, err := server.Repo.ListWorkflowTemplates(ctx, nil)
+	if err != nil {
+		return WorkspaceDatabase{}, err
+	}
+	database.Tables.WorkflowTemplates = templates
+	ensureTables(&database)
+	return database, nil
 }

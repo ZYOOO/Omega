@@ -15,6 +15,7 @@ describe("App operator view", () => {
     vi.restoreAllMocks();
     vi.resetModules();
     localStorage.clear();
+    delete (window as Window & { omegaDesktop?: unknown }).omegaDesktop;
     window.location.hash = "";
   });
 
@@ -23,18 +24,24 @@ describe("App operator view", () => {
     const { default: App } = await import("../App");
     render(<App />);
 
+    expect(await screen.findByText("Welcome back to Omega")).toBeInTheDocument();
+    expect(screen.getByText("AI DevFlow Workbench")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Open Workboard" }).length).toBeGreaterThan(0);
+
+    fireEvent.change(screen.getByLabelText("Switch language"), { target: { value: "zh-CN" } });
     expect(await screen.findByText("张涌，欢迎回到 Omega")).toBeInTheDocument();
     expect(screen.getByText("AI DevFlow 工作台")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "进入 Workboard" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "打开 Workboard" }).length).toBeGreaterThan(0);
   });
 
   it("creates manual work items with a local repository target path", async () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    fireEvent.change(await screen.findByPlaceholderText("Work item title"), { target: { value: "Implement demo writing" } });
+    fireEvent.click(await screen.findByRole("button", { name: "New requirement" }));
+    fireEvent.change(await screen.findByPlaceholderText("Title"), { target: { value: "Implement demo writing" } });
     fireEvent.change(screen.getByPlaceholderText("Local repository path or GitHub repo URL"), { target: { value: "/Users/demo/Omega" } });
-    fireEvent.click(screen.getByRole("button", { name: "Create item" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
     await waitFor(() => expect(screen.getByDisplayValue("/Users/demo/Omega")).toBeInTheDocument());
   });
@@ -61,7 +68,7 @@ describe("App operator view", () => {
         proofRecords: []
       }
     });
-    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = vi.fn(function projectPageFetchMock(input: RequestInfo | URL, init?: RequestInit) {
       const url = String(input);
       if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse({ error: "workspace not found" }, 404));
@@ -77,13 +84,14 @@ describe("App operator view", () => {
         return Promise.resolve(jsonResponse(workspaceDatabase([])));
       }
       return Promise.resolve(jsonResponse({}, 404));
-    }) as unknown as typeof fetch;
+    });
     vi.stubGlobal("fetch", fetchMock);
     const { default: App } = await import("../App");
     render(<App />);
 
-    fireEvent.change(await screen.findByPlaceholderText("Work item title"), { target: { value: "Remove stale requirement" } });
-    fireEvent.click(screen.getByRole("button", { name: "Create item" }));
+    fireEvent.click(await screen.findByRole("button", { name: "New requirement" }));
+    fireEvent.change(await screen.findByPlaceholderText("Title"), { target: { value: "Remove stale requirement" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
     expect(await screen.findByRole("button", { name: "Delete Remove stale requirement" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Delete Remove stale requirement" }));
@@ -165,7 +173,7 @@ describe("App operator view", () => {
         ]));
       }
       return Promise.resolve(jsonResponse({}, 404));
-    }) as unknown as typeof fetch;
+    });
 
     vi.stubGlobal("fetch", fetchMock);
     const { default: App } = await import("../App");
@@ -183,8 +191,14 @@ describe("App operator view", () => {
     expect(screen.getByText("git")).toBeInTheDocument();
     expect(screen.getByText("lark-cli")).toBeInTheDocument();
     expect(screen.getAllByText("Agents").length).toBeGreaterThan(0);
-    expect(screen.getByRole("button", { name: "Runner: Codex" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Profiles:/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Codex: ready" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Claude Code: ready" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "opencode: ready" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Trae Agent: missing" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Trae Agent: missing" }));
+    expect(screen.getByRole("button", { name: "Agent access" })).toBeInTheDocument();
+    expect(screen.getByText("EP ID / model")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Discover models" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Projects/ }));
     fireEvent.click(screen.getByRole("button", { name: "Project config" }));
@@ -195,6 +209,7 @@ describe("App operator view", () => {
     const editProfileButton = screen.queryByRole("button", { name: "Edit workspace defaults" });
     if (editProfileButton) fireEvent.click(editProfileButton);
     expect(screen.getByRole("button", { name: "Workflow" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Workflow" }));
     expect(screen.getByLabelText("Workflow graph")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Prompts" }));
     expect(screen.getByLabelText("Prompt sections")).toBeInTheDocument();
@@ -345,13 +360,19 @@ describe("App operator view", () => {
         return Promise.resolve(jsonResponse({ available: true, authenticated: true, output: "", account: "ZYOOO", oauthConfigured: false, oauthAuthenticated: false }));
       }
       return Promise.resolve(jsonResponse({}, 404));
-    }) as unknown as typeof fetch;
+    });
 
     vi.stubGlobal("fetch", fetchMock);
     const { default: App } = await import("../App");
     render(<App />);
 
-    await screen.findByText("Create your first work item");
+    const workflow = await screen.findByRole("region", { name: "Work items" });
+    expect(within(workflow).getAllByText("Not Started").length).toBeGreaterThan(0);
+    expect(within(workflow).getAllByText("Running").length).toBeGreaterThan(0);
+    expect(within(workflow).getAllByText("Human Review").length).toBeGreaterThan(0);
+    expect(within(workflow).getAllByText("Blocked").length).toBeGreaterThan(0);
+    expect(within(workflow).getAllByText("Done").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Create your first work item")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Views/ }));
 
     await waitFor(() => expect(screen.getByText("Execution locks")).toBeInTheDocument());
@@ -478,7 +499,7 @@ describe("App operator view", () => {
         return Promise.resolve(jsonResponse([]));
       }
       return Promise.resolve(jsonResponse({}, 404));
-    }) as unknown as typeof fetch;
+    });
 
     vi.stubGlobal("fetch", fetchMock);
     const { default: App } = await import("../App");
@@ -702,7 +723,7 @@ describe("App operator view", () => {
         return Promise.resolve(jsonResponse([]));
       }
       return Promise.resolve(jsonResponse({}, 404));
-    }) as unknown as typeof fetch;
+    });
 
     vi.stubGlobal("fetch", fetchMock);
     const { default: App } = await import("../App");
@@ -798,6 +819,12 @@ describe("App operator view", () => {
 
     expect(await screen.findByRole("heading", { name: "Projects" })).toBeInTheDocument();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:3888/workspace?scope=session"));
+    const fetchCalls = () => (fetchMock as unknown as { mock: { calls: Array<[unknown, ...unknown[]]> } }).mock.calls;
+    await waitFor(() =>
+      expect(fetchCalls().filter(([input]) => String(input).endsWith("/github/repositories"))).toHaveLength(1)
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    expect(fetchCalls().filter(([input]) => String(input).endsWith("/github/repositories"))).toHaveLength(1);
     expect(screen.queryByRole("heading", { name: "Work items" })).not.toBeInTheDocument();
     expect(window.location.hash).toBe("#projects");
   });
@@ -1073,7 +1100,7 @@ describe("App operator view", () => {
     await waitFor(() => expect(screen.getAllByText("acme/demo").length).toBeGreaterThan(0));
     expect(screen.queryByRole("button", { name: "Sync issues" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Run ready issue now" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Create workspace" }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Create workspace" })[0]);
     await waitFor(() => expect(screen.getByRole("heading", { name: "Work items" })).toBeInTheDocument());
     const workspaceNavigation = screen.getByRole("navigation", { name: "Project workspaces" });
     expect(within(workspaceNavigation).getByRole("button", { name: "acme/demo 0" })).toBeInTheDocument();
@@ -1101,14 +1128,103 @@ describe("App operator view", () => {
     expect(screen.getByText("1 item")).toBeInTheDocument();
 
     fireEvent.click(within(workspaceNavigation).getByRole("button", { name: "Configure acme/demo" }));
+    const localCleanupCheckbox = await screen.findByRole("checkbox", { name: "Also delete local attempt workspaces" });
+    expect(localCleanupCheckbox).not.toBeChecked();
+    fireEvent.click(localCleanupCheckbox);
     fireEvent.click(await screen.findByRole("button", { name: "Delete workspace" }));
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        "http://127.0.0.1:3888/github/repository-targets/repo_acme_demo",
+        "http://127.0.0.1:3888/github/repository-targets/repo_acme_demo?deleteLocalWorkspaces=true",
         expect.objectContaining({ method: "DELETE" })
       )
     );
     await waitFor(() => expect(screen.queryByText("Imported issue")).not.toBeInTheDocument());
+  });
+
+  it("creates a local repository workspace from a selected project directory", async () => {
+    vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
+    const now = new Date().toISOString();
+    const emptyWorkspace = {
+      schemaVersion: 1,
+      savedAt: now,
+      tables: {
+        projects: [{ id: "project_omega", name: "Omega", description: "", team: "Omega", status: "Active", labels: [], repositoryTargets: [], createdAt: now, updatedAt: now }],
+        requirements: [],
+        workItems: [],
+        missionControlStates: [{ runId: "run_req_omega_001", projectId: "project_omega", workItems: [], events: [], syncIntents: [], updatedAt: now }],
+        missionEvents: [],
+        syncIntents: [],
+        connections: [],
+        uiPreferences: [{ id: "default", activeNav: "Projects", selectedProviderId: "github", selectedWorkItemId: "", inspectorOpen: false, activeInspectorPanel: "properties", runnerPreset: "local-proof", statusFilter: "All", assigneeFilter: "All", sortDirection: "desc", collapsedGroups: [] }],
+        pipelines: [],
+        attempts: [],
+        checkpoints: [],
+        missions: [],
+        operations: [],
+        proofRecords: [],
+        runWorkpads: []
+      }
+    };
+    const localWorkspace = {
+      ...emptyWorkspace,
+      tables: {
+        ...emptyWorkspace.tables,
+        projects: [{
+          ...emptyWorkspace.tables.projects[0],
+          repositoryTargets: [{ id: "repo_local_App_1234abcd", kind: "local", path: "/Users/demo/App", defaultBranch: "main" }],
+          defaultRepositoryTargetId: "repo_local_App_1234abcd"
+        }]
+      }
+    };
+    (window as Window & { omegaDesktop?: unknown }).omegaDesktop = {
+      selectDirectory: vi.fn().mockResolvedValue("/Users/demo/App")
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
+        return Promise.resolve(jsonResponse(emptyWorkspace));
+      }
+      if (url.endsWith("/repository-targets/local")) {
+        expect(init).toMatchObject({ method: "POST" });
+        expect(JSON.parse(String(init?.body))).toMatchObject({ projectId: "project_omega", path: "/Users/demo/App" });
+        return Promise.resolve(jsonResponse(localWorkspace));
+      }
+      if (url.endsWith("/requirements")) return Promise.resolve(jsonResponse([]));
+      if (url.includes("/observability")) {
+        return Promise.resolve(jsonResponse({
+          counts: { workItems: 0, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
+          pipelineStatus: {},
+          checkpointStatus: {},
+          operationStatus: {},
+          workItemStatus: {},
+          attention: { waitingHuman: 0, failed: 0, blocked: 0 }
+        }));
+      }
+      if (url.endsWith("/llm-provider-selection")) return Promise.resolve(jsonResponse({ providerId: "openai", model: "gpt-5.4-mini", reasoningEffort: "medium" }));
+      if (url.endsWith("/github/oauth/config")) return Promise.resolve(jsonResponse({ configured: false, clientId: "", redirectUri: "", tokenUrl: "", secretConfigured: false, source: "empty" }));
+      if (url.endsWith("/github/repositories") || url.endsWith("/llm-providers") || url.endsWith("/pipeline-templates") || url.endsWith("/agent-definitions") || url.endsWith("/pipelines") || url.endsWith("/checkpoints") || url.endsWith("/local-capabilities")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    vi.stubGlobal("fetch", fetchMock);
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Attach project directory" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+    await waitFor(() => expect(screen.getByDisplayValue("/Users/demo/App")).toBeInTheDocument());
+    const createButtons = screen.getAllByRole("button", { name: "Create workspace" });
+    fireEvent.click(createButtons[createButtons.length - 1]);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:3888/repository-targets/local",
+        expect.objectContaining({ method: "POST" })
+      )
+    );
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Work items" })).toBeInTheDocument());
+    expect(within(screen.getByRole("navigation", { name: "Project workspaces" })).getByRole("button", { name: "/Users/demo/App 0" })).toBeInTheDocument();
   });
 
   it("defaults work items to the only repository workspace and keeps legacy unscoped items out of that view", async () => {
@@ -1308,6 +1424,32 @@ describe("App operator view", () => {
       if ((url.endsWith("/workspace") || url.endsWith("/workspace?scope=session")) && !init) {
         return Promise.resolve(jsonResponse(workspaceSnapshot));
       }
+      if (url.endsWith("/orchestrator/watchers") && !init) {
+        return Promise.resolve(jsonResponse([{
+          id: "orchestrator-watcher:repo_acme_demo",
+          repositoryTargetId: "repo_acme_demo",
+          status: "active",
+          intervalSeconds: 60,
+          limit: "20",
+          autoRun: true,
+          autoApproveHuman: false,
+          autoMerge: false
+        }]));
+      }
+      if (url.endsWith("/orchestrator/tick") && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          repositoryTargetId: "repo_acme_demo",
+          autoRun: true
+        });
+        return Promise.resolve(jsonResponse({
+          status: "accepted-ready-work",
+          repositoryTargetId: "repo_acme_demo",
+          readyWork: {
+            acceptedReadyRuns: 1,
+            acceptedRunAttempts: [{ workItemId: "item_manual_2", pipelineId: "pipeline_item_manual_2", attemptId: "attempt_item_manual_2" }]
+          }
+        }));
+      }
       if (url.endsWith("/workspace") && init?.method === "PUT") {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
@@ -1433,6 +1575,12 @@ describe("App operator view", () => {
 
     await waitFor(() => expect(screen.queryByRole("button", { name: "Creating..." })).not.toBeInTheDocument());
     expect(workItemPostCount).toBe(1);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:3888/orchestrator/tick",
+        expect.objectContaining({ method: "POST" })
+      )
+    );
     const shell = document.querySelector("main.product-shell");
     expect(shell?.className).toContain("inspector-collapsed");
 
@@ -1952,6 +2100,26 @@ describe("App operator view", () => {
             updatedAt: now
           },
           {
+            id: "item_review_approved",
+            key: "OMG-3",
+            projectId: "project_req_omega_001",
+            title: "Approved review still delivering",
+            description: "Human review has passed and delivery is continuing",
+            status: "In Review",
+            priority: "High",
+            assignee: "delivery",
+            labels: ["manual"],
+            team: "Omega",
+            stageId: "delivery",
+            target: "https://github.com/ZYOOO/TestRepo",
+            source: "manual",
+            repositoryTargetId: "repo_ZYOOO_TestRepo",
+            acceptanceCriteria: [],
+            blockedByItemIds: [],
+            createdAt: now,
+            updatedAt: now
+          },
+          {
             id: "item_page_pilot_waiting",
             key: "PP-3",
             projectId: "project_req_omega_001",
@@ -2004,6 +2172,23 @@ describe("App operator view", () => {
                 { id: "requirement", title: "Requirement intake", status: "passed", agentIds: ["master", "requirement"] },
                 { id: "implementation", title: "Implementation and PR", status: "passed", agentIds: ["coding", "testing"] },
                 { id: "review", title: "Review gate", status: "passed", agentIds: ["review", "delivery"] }
+              ]
+            }
+          },
+          {
+            id: "pipeline_item_review_approved",
+            workItemId: "item_review_approved",
+            runId: "run_item_review_approved",
+            status: "running",
+            templateId: "devflow-pr",
+            run: {
+              stages: [
+                { id: "todo", title: "Todo intake", status: "passed", agentIds: ["requirement"] },
+                { id: "in_progress", title: "Implementation and PR", status: "passed", agentIds: ["coding", "testing"] },
+                { id: "code_review_round_1", title: "Code Review Round 1", status: "passed", agentIds: ["review"] },
+                { id: "human_review", title: "Human Review", status: "passed", agentIds: ["human"], approvedBy: "feishu-task" },
+                { id: "merging", title: "Merging", status: "waiting", agentIds: ["delivery"] },
+                { id: "done", title: "Done", status: "waiting", agentIds: ["delivery"] }
               ]
             }
           },
@@ -2080,9 +2265,9 @@ describe("App operator view", () => {
       }
       if (url.includes("/observability")) {
         return Promise.resolve(jsonResponse({
-          counts: { workItems: 3, pipelines: 2, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
-          pipelineStatus: { done: 1, "waiting-human": 1 },
-          checkpointStatus: {},
+          counts: { workItems: 4, pipelines: 3, checkpoints: 1, missions: 0, operations: 0, proofRecords: 0, events: 0 },
+          pipelineStatus: { done: 1, running: 1, "waiting-human": 1 },
+          checkpointStatus: { pending: 1 },
           operationStatus: {},
           workItemStatus: {},
           attention: { waitingHuman: 0, failed: 0, blocked: 0 }
@@ -2092,7 +2277,18 @@ describe("App operator view", () => {
       if (url.endsWith("/github/status")) return Promise.resolve(jsonResponse({ available: true, authenticated: true, output: "", account: "ZYOOO", oauthConfigured: false, oauthAuthenticated: false }));
       if (url.endsWith("/local-workspace-root")) return Promise.resolve(jsonResponse({ workspaceRoot: "/Users/zyong/Omega/workspaces" }));
       if (url.endsWith("/proof-records")) return Promise.resolve(jsonResponse(workspace.tables.proofRecords));
-      if (url.endsWith("/llm-providers") || url.endsWith("/agent-definitions") || url.endsWith("/local-capabilities") || url.endsWith("/pipeline-templates") || url.endsWith("/checkpoints") || url.endsWith("/operations") || url.endsWith("/execution-locks")) {
+      if (url.endsWith("/checkpoints")) {
+        return Promise.resolve(jsonResponse([
+          {
+            id: "pipeline_item_review_approved:human_review",
+            pipelineId: "pipeline_item_review_approved",
+            stageId: "human_review",
+            status: "pending",
+            title: "Human Review"
+          }
+        ]));
+      }
+      if (url.endsWith("/llm-providers") || url.endsWith("/agent-definitions") || url.endsWith("/local-capabilities") || url.endsWith("/pipeline-templates") || url.endsWith("/operations") || url.endsWith("/execution-locks")) {
         return Promise.resolve(jsonResponse([]));
       }
       return Promise.resolve(jsonResponse({}, 404));
@@ -2103,9 +2299,11 @@ describe("App operator view", () => {
     render(<App />);
 
     await screen.findAllByText("Fresh requirement");
-    expect(screen.getAllByText("Not started").length).toBeGreaterThan(1);
+    expect(screen.getAllByText("Not Started").length).toBeGreaterThan(1);
     expect(screen.getByLabelText(/current progress Review \+ Delivery/)).toBeInTheDocument();
     expect(screen.getAllByText("Review + Delivery")).toHaveLength(1);
+    expect(screen.getByLabelText(/OMG-3 current progress Merging/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Human review" })).not.toBeInTheDocument();
     expect(screen.getByText("Page Pilot: kept for review")).toBeInTheDocument();
     expect(screen.getByText("Page Pilot #3")).toBeInTheDocument();
     expect(screen.getByLabelText(/PP-3 current progress Confirm \/ PR/)).toBeInTheDocument();
@@ -2119,11 +2317,11 @@ describe("App operator view", () => {
     expect(screen.getAllByText("implementation-summary.md").length).toBeGreaterThan(0);
     expect(screen.getByText("Attempt history")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /ZYOOO\/TestRepo 3/ }));
+    fireEvent.click(screen.getByRole("button", { name: /ZYOOO\/TestRepo 4/ }));
     expect(screen.queryByRole("button", { name: "Run ready issue now" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Configure ZYOOO/TestRepo" }));
-    fireEvent.click(await screen.findByRole("switch", { name: "Auto scan ready GitHub issues" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Auto run Not Started work items" }));
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
         "http://127.0.0.1:3888/orchestrator/watchers/repo_ZYOOO_TestRepo",
@@ -2376,5 +2574,126 @@ describe("App operator view", () => {
       "http://127.0.0.1:3888/workspace",
       expect.objectContaining({ method: "PUT" })
     );
+  });
+
+  it("ignores stale local workspace cache when the Go runtime is connected", async () => {
+    vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
+    window.location.hash = "#workboard";
+
+    const now = new Date().toISOString();
+    localStorage.setItem("omega.workspace.run_req_omega_001.v1", JSON.stringify({
+      schemaVersion: 1,
+      savedAt: now,
+      tables: {
+        projects: [{ id: "project_omega", name: "Omega", description: "", team: "Omega", status: "Active", labels: [], createdAt: now, updatedAt: now }],
+        requirements: [],
+        workItems: Array.from({ length: 27 }, (_, index) => ({
+          id: `stale_${index}`,
+          projectId: "project_omega",
+          key: `OLD-${index}`,
+          title: `Stale cached item ${index}`,
+          description: "",
+          status: "Ready",
+          priority: "Medium",
+          assignee: "requirement",
+          labels: [],
+          team: "Omega",
+          stageId: "intake",
+          target: "No target",
+          createdAt: now,
+          updatedAt: now
+        })),
+        missionControlStates: [],
+        missionEvents: [],
+        syncIntents: [],
+        connections: [],
+        uiPreferences: [],
+        pipelines: [],
+        attempts: [],
+        checkpoints: [],
+        missions: [],
+        operations: [],
+        proofRecords: []
+      }
+    }));
+
+    const runtimeWorkspace = {
+      schemaVersion: 1,
+      savedAt: now,
+      tables: {
+        projects: [{
+          id: "project_omega",
+          name: "Omega",
+          description: "",
+          team: "Omega",
+          status: "Active",
+          labels: [],
+          repositoryTargets: [{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }],
+          defaultRepositoryTargetId: "repo_test",
+          createdAt: now,
+          updatedAt: now
+        }],
+        requirements: [],
+        workItems: [{
+          id: "runtime_item_1",
+          projectId: "project_omega",
+          repositoryTargetId: "repo_test",
+          key: "OMG-2",
+          title: "Current backend item",
+          description: "",
+          status: "Ready",
+          priority: "Medium",
+          assignee: "requirement",
+          labels: [],
+          team: "Omega",
+          stageId: "intake",
+          target: "ZYOOO/TestRepo",
+          createdAt: now,
+          updatedAt: now
+        }],
+        missionControlStates: [],
+        missionEvents: [],
+        syncIntents: [],
+        connections: [],
+        uiPreferences: [],
+        pipelines: [],
+        attempts: [],
+        checkpoints: [],
+        missions: [],
+        operations: [],
+        proofRecords: []
+      }
+    };
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/workspace?scope=session")) return Promise.resolve(jsonResponse(runtimeWorkspace));
+      if (url.includes("/observability")) {
+        return Promise.resolve(jsonResponse({
+          counts: { workItems: 1, pipelines: 0, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
+          pipelineStatus: {},
+          checkpointStatus: {},
+          operationStatus: {},
+          workItemStatus: { Ready: 1 },
+          attention: { waitingHuman: 0, failed: 0, blocked: 0 }
+        }));
+      }
+      if (url.endsWith("/llm-provider-selection")) {
+        return Promise.resolve(jsonResponse({ providerId: "openai", model: "gpt-5.4-mini", reasoningEffort: "medium" }));
+      }
+      if (url.endsWith("/llm-providers") || url.endsWith("/pipeline-templates") || url.endsWith("/agent-definitions") || url.endsWith("/requirements") || url.endsWith("/pipelines") || url.endsWith("/attempts") || url.endsWith("/proof-records") || url.endsWith("/run-workpads") || url.endsWith("/checkpoints") || url.endsWith("/operations") || url.includes("/runtime-logs") || url.endsWith("/runner-credentials") || url.endsWith("/execution-locks") || url.endsWith("/orchestrator/watchers") || url.endsWith("/local-capabilities")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    vi.stubGlobal("fetch", fetchMock);
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    expect(screen.queryByText("Stale cached item 26")).not.toBeInTheDocument();
+    expect((await screen.findAllByText("Current backend item")).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Stale cached item 26")).not.toBeInTheDocument();
+    expect(screen.queryByText("27 items")).not.toBeInTheDocument();
   });
 });

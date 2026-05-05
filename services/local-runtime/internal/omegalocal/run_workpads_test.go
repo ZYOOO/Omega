@@ -155,6 +155,55 @@ func TestPatchRunWorkpadPersistsFieldPatchesAcrossRefresh(t *testing.T) {
 	}
 }
 
+func TestPatchRunWorkpadUsesNormalizedTableWhenSnapshotIsCorrupt(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	item := map[string]any{
+		"id": "item_workpad_patch_snapshot_free", "projectId": "project_omega", "repositoryTargetId": "repo_test", "key": "OMG-22",
+		"title": "Patchable workpad without snapshot", "description": "Keep notes.", "status": "In Review",
+		"priority": "High", "assignee": "coding", "labels": []any{"manual"}, "team": "Omega", "stageId": "coding", "target": "Repo",
+	}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["status"] = "waiting-human"
+
+	database, err := repo.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load workspace: %v", err)
+	}
+	database.Tables.WorkItems = append(database.Tables.WorkItems, item)
+	database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
+	database.Tables.Attempts = append(database.Tables.Attempts, attempt)
+	upsertRunWorkpad(database, text(attempt, "id"))
+	if err := repo.Save(context.Background(), *database); err != nil {
+		t.Fatalf("save workspace: %v", err)
+	}
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
+
+	recordID := text(attempt, "id") + ":workpad"
+	var patched map[string]any
+	decode(t, requestJSON(t, http.MethodPatch, api.URL+"/run-workpads/"+recordID, map[string]any{
+		"updatedBy": "operator",
+		"reason":    "manual note",
+		"workpad": map[string]any{
+			"notes": []any{"Snapshot-free patch"},
+		},
+	}), &patched)
+	if notes := strings.Join(stringSlice(mapValue(patched["workpad"])["notes"]), "\n"); !strings.Contains(notes, "Snapshot-free patch") {
+		t.Fatalf("patched notes = %+v", patched)
+	}
+	workpads, err := repo.ListRunWorkpads(context.Background(), map[string]string{"id": recordID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workpads) != 1 || len(arrayMaps(workpads[0]["fieldPatchHistory"])) != 1 {
+		t.Fatalf("normalized workpad patch missing: %+v", workpads)
+	}
+}
+
 func TestPatchRunWorkpadRejectsDisallowedActorFields(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)

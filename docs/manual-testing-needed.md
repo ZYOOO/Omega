@@ -50,6 +50,7 @@
 - 服务端 run conversation 是否和目标页浮层显示一致，尤其是多批注提交后的主目标、批注数量和 Confirm / Discard 终态。
 - Preview Runtime Profile 是否对应本次实际打开的目标项目，而不是上一次选择的仓库或旧 URL。
 - GitHub delivery preflight 如果权限不足，应在运行前失败，而不是等到 PR 创建、Human Review approve 或 merge 时才失败。
+- 对带 GitHub Actions 的测试仓库跑一次 DevFlow：PR 创建后应生成 `ci-checks.md`，Review Packet / Workpad 应显示 CI 状态；人为制造失败 check 时，失败 log 应进入 Rework Checklist。
 
 ### 自动化已覆盖
 

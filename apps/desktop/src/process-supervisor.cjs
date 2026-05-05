@@ -1,4 +1,4 @@
-const { spawn } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const https = require("node:https");
@@ -64,6 +64,14 @@ async function waitForHttp(url, options = {}) {
   const startedAt = Date.now();
   let last = { ok: false, status: 0, error: "not-started" };
   while (Date.now() - startedAt < timeoutMs) {
+    if (options.child && ["failed", "exited"].includes(options.child.status)) {
+      return {
+        ok: false,
+        url,
+        status: last.status,
+        error: options.child.error || `process exited${options.child.exitCode !== undefined ? ` with ${options.child.exitCode}` : ""}`,
+      };
+    }
     last = await httpGetStatus(url, options.requestTimeoutMs ?? 1200);
     if (last.ok) return { ok: true, url, status: last.status };
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
@@ -683,12 +691,15 @@ async function ensureService(service, plan, options = {}) {
     }
   }
   if (!plan.command) return { service, status: "skipped", reason: plan.reason || "no command", plan };
+  if (service === "preview-runtime") {
+    stopStalePreviewRuntimeListeners(plan, url);
+  }
   const child = spawnManagedProcess(service, plan.command, plan.args || [], {
     cwd: plan.repoRoot || plan.repoPath,
     shell: plan.shell,
   });
   if (!url) return { service, status: "started", child, plan };
-  const ready = await waitForHttp(url, { timeoutMs: options.timeoutMs ?? 30000 });
+  const ready = await waitForHttp(url, { timeoutMs: options.timeoutMs ?? 30000, child });
   if (!ready.ok) {
     child.status = "failed";
     child.error = ready.error || "health check failed";
@@ -698,6 +709,59 @@ async function ensureService(service, plan, options = {}) {
   child.status = "running";
   logService(service, "ready", url);
   return { service, status: "running", url, child, plan };
+}
+
+function stopStalePreviewRuntimeListeners(plan, rawUrl) {
+  const repoPath = plan.repoRoot || plan.repoPath;
+  if (!repoPath || !rawUrl) return;
+  let port = "";
+  let hostname = "";
+  try {
+    const parsed = new URL(rawUrl);
+    port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    hostname = parsed.hostname;
+  } catch (_error) {
+    return;
+  }
+  if (!port || !["127.0.0.1", "localhost", "::1"].includes(hostname)) return;
+  let output = "";
+  try {
+    output = execFileSync("lsof", ["-nP", `-tiTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+  } catch (_error) {
+    return;
+  }
+  for (const rawPid of output.split(/\s+/).filter(Boolean)) {
+    const pid = Number(rawPid);
+    if (!Number.isInteger(pid) || pid <= 0 || !previewRuntimeProcessOwnsWorkspace(pid, repoPath)) continue;
+    try {
+      process.kill(pid, "SIGTERM");
+      logService("preview-runtime", "stopped stale listener", `pid=${pid} port=${port}`);
+    } catch (_error) {
+      // Best-effort cleanup. The following spawn attempt will surface any remaining port conflict.
+    }
+  }
+}
+
+function previewRuntimeProcessOwnsWorkspace(pid, repoPath) {
+  let output = "";
+  try {
+    output = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { encoding: "utf8" });
+  } catch (_error) {
+    return false;
+  }
+  const line = output.split(/\r?\n/).find((entry) => entry.startsWith("n"));
+  if (!line) return false;
+  const cwd = line.slice(1).trim();
+  if (!cwd) return false;
+  return normalizeComparablePath(cwd) === normalizeComparablePath(repoPath);
+}
+
+function normalizeComparablePath(value) {
+  try {
+    return fs.realpathSync(value);
+  } catch (_error) {
+    return path.resolve(value);
+  }
 }
 
 async function startDesktopServices(app, env = process.env) {

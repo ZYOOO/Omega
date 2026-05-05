@@ -7,12 +7,12 @@ import (
 
 func (server *Server) attemptActionPlan(response http.ResponseWriter, request *http.Request) {
 	attemptID := strings.TrimSuffix(pathID(request.URL.Path), "/action-plan")
-	database, err := mustLoad(server, request.Context())
+	database, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if err != nil {
 		writeJSON(response, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	plan, status := buildAttemptActionPlan(database, attemptID)
+	plan, status := buildAttemptActionPlan(*database, attemptID)
 	writeJSON(response, status, plan)
 }
 

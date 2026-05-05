@@ -140,41 +140,112 @@ func feishuReviewTokenAllowed(request *http.Request, payload map[string]any) boo
 }
 
 func (server *Server) sendFeishuReviewForPipelineIfConfigured(ctx context.Context, pipelineID string) {
-	taskOptions := server.mergeFeishuReviewOptions(ctx, feishuReviewSendOptions{})
-	database, err := mustLoad(server, ctx)
-	if err != nil {
-		server.logError(ctx, "feishu.review.load_failed", err.Error(), map[string]any{"pipelineId": pipelineID})
+	if feishuAutoDeliveryDisabled() {
+		server.logDebug(ctx, "feishu.review.auto_delivery_disabled", "Feishu automatic review delivery is disabled.", map[string]any{"pipelineId": pipelineID})
 		return
 	}
-	for _, checkpoint := range database.Tables.Checkpoints {
-		if text(checkpoint, "pipelineId") == pipelineID && text(checkpoint, "status") == "pending" && text(checkpoint, "stageId") == "human_review" {
-			if taskOptions.ChatID == "" && taskOptions.WebhookURL == "" && taskOptions.DirectUserID == "" && !feishuReviewTaskModeEnabled(taskOptions) {
-				server.logInfo(ctx, "feishu.review.needs_target", "Feishu review notification needs a chat, task assignee, tasklist, webhook target, or current-user lark-cli auth.", map[string]any{"pipelineId": pipelineID, "checkpointId": text(checkpoint, "id")})
+	taskOptions := server.mergeFeishuReviewOptions(ctx, feishuReviewSendOptions{})
+	checkpoints, err := server.Repo.ListCheckpoints(ctx, map[string]string{
+		"pipelineId": pipelineID,
+		"stageId":    "human_review",
+		"status":     "pending",
+		"limit":      "1",
+	})
+	if err != nil {
+		server.logError(ctx, "feishu.review.checkpoint_lookup_failed", err.Error(), map[string]any{"pipelineId": pipelineID})
+		return
+	}
+	if len(checkpoints) == 0 {
+		return
+	}
+	checkpoint := checkpoints[0]
+	if checkpointFeishuReviewAlreadySent(checkpoint) {
+		server.logInfo(ctx, "feishu.review.skipped_already_sent", "Feishu review notification was already recorded for this checkpoint.", map[string]any{"checkpointId": text(checkpoint, "id"), "pipelineId": pipelineID, "format": text(mapValue(checkpoint["feishuReview"]), "format")})
+		return
+	}
+	if taskOptions.ChatID == "" && taskOptions.WebhookURL == "" && taskOptions.DirectUserID == "" && !feishuReviewTaskModeEnabled(taskOptions) {
+		server.logInfo(ctx, "feishu.review.needs_target", "Feishu review notification needs a chat, task assignee, tasklist, webhook target, or current-user lark-cli auth.", map[string]any{"pipelineId": pipelineID, "checkpointId": text(checkpoint, "id")})
+	}
+	_, _, _ = server.sendFeishuReviewForCheckpointWithOptions(ctx, text(checkpoint, "id"), taskOptions, false)
+}
+
+func checkpointFeishuReviewAlreadySent(checkpoint map[string]any) bool {
+	review := mapValue(checkpoint["feishuReview"])
+	if feishuReviewAlreadySent(review) {
+		return true
+	}
+	status := strings.ToLower(strings.TrimSpace(text(checkpoint, "feishuReviewStatus")))
+	if status == "sent" {
+		return true
+	}
+	if status == "failed" || status == "needs-configuration" || status == "skipped" {
+		return false
+	}
+	return firstNonEmpty(text(checkpoint, "feishuTaskGuid"), text(checkpoint, "feishuTaskId"), text(checkpoint, "feishuMessageId")) != ""
+}
+
+func checkpointFeishuReviewSentResult(checkpoint map[string]any) map[string]any {
+	result := cloneMap(mapValue(checkpoint["feishuReview"]))
+	for key, value := range map[string]string{
+		"status":    "feishuReviewStatus",
+		"taskGuid":  "feishuTaskGuid",
+		"taskId":    "feishuTaskId",
+		"messageId": "feishuMessageId",
+	} {
+		if strings.TrimSpace(text(result, key)) == "" {
+			if candidate := text(checkpoint, value); candidate != "" {
+				result[key] = candidate
 			}
-			_, _, _ = server.sendFeishuReviewForCheckpointWithOptions(ctx, text(checkpoint, "id"), taskOptions, false)
-			return
 		}
 	}
+	result["status"] = stringOr(text(result, "status"), "sent")
+	result["skippedReason"] = "already-sent"
+	return result
 }
 
 func (server *Server) sendFeishuAttemptFailureIfConfigured(ctx context.Context, pipelineID string, attemptID string) {
-	database, err := mustLoad(server, ctx)
+	if feishuAutoDeliveryDisabled() {
+		server.logDebug(ctx, "feishu.failure.auto_delivery_disabled", "Feishu automatic failure delivery is disabled.", map[string]any{"pipelineId": pipelineID, "attemptId": attemptID})
+		return
+	}
+	attempts, err := server.Repo.ListAttempts(ctx, map[string]string{"id": attemptID, "limit": "1"})
+	if err != nil {
+		server.logError(ctx, "feishu.failure.attempt_lookup_failed", err.Error(), map[string]any{"pipelineId": pipelineID, "attemptId": attemptID})
+		return
+	}
+	if len(attempts) == 0 {
+		return
+	}
+	if attemptFeishuFailureAlreadySent(attempts[0]) {
+		return
+	}
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		server.logError(ctx, "feishu.failure.load_failed", err.Error(), map[string]any{"pipelineId": pipelineID, "attemptId": attemptID})
 		return
 	}
+	database := *databasePtr
 	attemptIndex := findByID(database.Tables.Attempts, attemptID)
 	if attemptIndex < 0 {
 		return
 	}
 	attempt := database.Tables.Attempts[attemptIndex]
-	if text(attempt, "feishuFailureNotifiedAt") != "" {
+	if attemptFeishuFailureAlreadySent(attempt) {
 		return
 	}
 	pipeline := pipelineByID(database, pipelineID)
 	item := findWorkItem(database, text(attempt, "itemId"))
+	requirement := workpadRequirement(database, item)
+	repositoryTargetID := firstNonEmpty(text(attempt, "repositoryTargetId"), text(item, "repositoryTargetId"))
+	repositoryTarget := findRepositoryTarget(database, repositoryTargetID)
 	options := server.mergeFeishuReviewOptions(ctx, feishuReviewSendOptions{})
-	result, err := sendFeishuFailurePacket(ctx, map[string]any{"pipeline": pipeline, "attempt": attempt, "item": item}, options)
+	result, err := sendFeishuFailurePacket(ctx, map[string]any{
+		"pipeline":         pipeline,
+		"attempt":          attempt,
+		"item":             item,
+		"requirement":      requirement,
+		"repositoryTarget": repositoryTarget,
+	}, options)
 	if err != nil {
 		server.logError(ctx, "feishu.failure.send_failed", err.Error(), map[string]any{"pipelineId": pipelineID, "attemptId": attemptID, "workItemId": text(attempt, "itemId")})
 		return
@@ -186,7 +257,7 @@ func (server *Server) sendFeishuAttemptFailureIfConfigured(ctx context.Context, 
 		delete(nextAttempt, "feishuFailureNotifyPending")
 		database.Tables.Attempts[attemptIndex] = nextAttempt
 		touch(&database)
-		_ = server.Repo.Save(ctx, database)
+		_ = server.Repo.SaveSupervisorExecutionState(ctx, database)
 	}
 	server.logInfo(ctx, "feishu.failure.synced", "Feishu failure notification state recorded.", map[string]any{
 		"pipelineId": pipelineID,
@@ -197,6 +268,21 @@ func (server *Server) sendFeishuAttemptFailureIfConfigured(ctx context.Context, 
 		"route":      text(result, "route"),
 		"messageId":  text(result, "messageId"),
 	})
+}
+
+func attemptFeishuFailureAlreadySent(attempt map[string]any) bool {
+	if text(attempt, "feishuFailureNotifiedAt") != "" {
+		return true
+	}
+	failure := mapValue(attempt["feishuFailure"])
+	status := strings.ToLower(strings.TrimSpace(firstNonEmpty(text(attempt, "feishuFailureStatus"), text(failure, "status"))))
+	if status == "sent" {
+		return true
+	}
+	if status == "failed" || status == "needs-configuration" || status == "skipped" {
+		return false
+	}
+	return firstNonEmpty(text(attempt, "feishuFailureMessageId"), text(failure, "messageId")) != ""
 }
 
 func (server *Server) sendFeishuReviewForCheckpoint(ctx context.Context, checkpointID string, chatID string, manual bool) (map[string]any, int, error) {
@@ -216,6 +302,12 @@ type feishuReviewSendOptions struct {
 	ReviewToken    string
 	CreateDoc      bool
 	DocFolderToken string
+	Language       string
+}
+
+func feishuAutoDeliveryDisabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("OMEGA_FEISHU_AUTO_DELIVERY_DISABLED")))
+	return value == "1" || value == "true" || value == "yes"
 }
 
 func (server *Server) sendFeishuReviewForCheckpointWithOptions(ctx context.Context, checkpointID string, options feishuReviewSendOptions, manual bool) (map[string]any, int, error) {
@@ -223,15 +315,38 @@ func (server *Server) sendFeishuReviewForCheckpointWithOptions(ctx context.Conte
 	if checkpointID == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("checkpointId is required")
 	}
-	database, err := mustLoad(server, ctx)
+	if !manual {
+		if receipt, ok := server.sentFeishuReviewDeliveryReceipt(ctx, checkpointID); ok {
+			server.logInfo(ctx, "feishu.review.skipped_already_sent", "Feishu review delivery receipt already exists for this checkpoint.", map[string]any{"checkpointId": checkpointID, "pipelineId": text(receipt, "pipelineId"), "format": text(receipt, "format")})
+			return feishuReviewSentResultFromReceipt(receipt), http.StatusOK, nil
+		}
+		checkpoints, err := server.Repo.ListCheckpoints(ctx, map[string]string{"id": checkpointID, "limit": "1"})
+		if err == nil && len(checkpoints) > 0 && checkpointFeishuReviewAlreadySent(checkpoints[0]) {
+			existing := checkpointFeishuReviewSentResult(checkpoints[0])
+			server.logInfo(ctx, "feishu.review.skipped_already_sent", "Feishu review notification was already recorded for this checkpoint.", map[string]any{"checkpointId": checkpointID, "pipelineId": text(checkpoints[0], "pipelineId"), "format": text(existing, "format")})
+			return existing, http.StatusOK, nil
+		}
+		if err != nil {
+			server.logError(ctx, "feishu.review.checkpoint_lookup_failed", err.Error(), map[string]any{"checkpointId": checkpointID})
+		}
+	}
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return nil, http.StatusNotFound, err
 	}
+	database := *databasePtr
 	checkpointIndex := findByID(database.Tables.Checkpoints, checkpointID)
 	if checkpointIndex < 0 {
 		return nil, http.StatusNotFound, fmt.Errorf("checkpoint not found")
 	}
 	checkpoint := cloneMap(database.Tables.Checkpoints[checkpointIndex])
+	if !manual {
+		if checkpointFeishuReviewAlreadySent(checkpoint) {
+			existing := checkpointFeishuReviewSentResult(checkpoint)
+			server.logInfo(ctx, "feishu.review.skipped_already_sent", "Feishu review notification was already recorded for this checkpoint.", map[string]any{"checkpointId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "format": text(existing, "format")})
+			return existing, http.StatusOK, nil
+		}
+	}
 	pipeline := map[string]any{}
 	if index := findByID(database.Tables.Pipelines, text(checkpoint, "pipelineId")); index >= 0 {
 		pipeline = cloneMap(database.Tables.Pipelines[index])
@@ -252,11 +367,12 @@ func (server *Server) sendFeishuReviewForCheckpointWithOptions(ctx context.Conte
 	if result == nil {
 		result = map[string]any{"status": "skipped"}
 	}
+	server.recordFeishuReviewDeliveryReceipt(ctx, checkpointID, result, checkpoint, pipeline, item, attempt)
 	checkpoint["feishuReview"] = result
 	checkpoint["updatedAt"] = nowISO()
 	database.Tables.Checkpoints[checkpointIndex] = checkpoint
 	touch(&database)
-	if saveErr := server.Repo.Save(ctx, database); saveErr != nil {
+	if saveErr := server.Repo.SaveSupervisorExecutionState(ctx, database); saveErr != nil {
 		return result, http.StatusInternalServerError, saveErr
 	}
 	server.logInfo(ctx, "feishu.review.synced", "Feishu review notification state recorded.", map[string]any{
@@ -270,6 +386,87 @@ func (server *Server) sendFeishuReviewForCheckpointWithOptions(ctx context.Conte
 		return result, http.StatusAccepted, nil
 	}
 	return result, http.StatusOK, err
+}
+
+func feishuReviewDeliveryKey(checkpointID string) string {
+	return "human_review:" + strings.TrimSpace(checkpointID)
+}
+
+func (server *Server) sentFeishuReviewDeliveryReceipt(ctx context.Context, checkpointID string) (map[string]any, bool) {
+	receipt, err := server.Repo.GetFeishuDeliveryReceipt(ctx, feishuReviewDeliveryKey(checkpointID))
+	if err != nil {
+		return nil, false
+	}
+	status := strings.ToLower(strings.TrimSpace(text(receipt, "status")))
+	if status != "sent" {
+		return nil, false
+	}
+	return receipt, true
+}
+
+func feishuReviewSentResultFromReceipt(receipt map[string]any) map[string]any {
+	result := cloneMap(mapValue(receipt["payload"]))
+	if len(result) == 0 {
+		result = map[string]any{}
+	}
+	for key, value := range map[string]string{
+		"status":       "status",
+		"provider":     "provider",
+		"format":       "format",
+		"route":        "route",
+		"taskGuid":     "taskGuid",
+		"taskId":       "taskId",
+		"messageId":    "messageId",
+		"checkpointId": "entityId",
+		"attemptId":    "attemptId",
+	} {
+		if strings.TrimSpace(text(result, key)) == "" {
+			if candidate := text(receipt, value); candidate != "" {
+				result[key] = candidate
+			}
+		}
+	}
+	result["status"] = "sent"
+	result["provider"] = stringOr(text(result, "provider"), "feishu")
+	result["skippedReason"] = "delivery-receipt-already-sent"
+	return result
+}
+
+func (server *Server) recordFeishuReviewDeliveryReceipt(ctx context.Context, checkpointID string, result map[string]any, checkpoint map[string]any, pipeline map[string]any, item map[string]any, attempt map[string]any) {
+	if strings.ToLower(strings.TrimSpace(text(result, "status"))) != "sent" {
+		return
+	}
+	receipt := map[string]any{
+		"dedupeKey":  feishuReviewDeliveryKey(checkpointID),
+		"provider":   stringOr(text(result, "provider"), "feishu"),
+		"kind":       "human_review",
+		"entityId":   checkpointID,
+		"pipelineId": firstNonEmpty(text(pipeline, "id"), text(checkpoint, "pipelineId")),
+		"attemptId":  firstNonEmpty(text(attempt, "id"), text(checkpoint, "attemptId")),
+		"workItemId": firstNonEmpty(text(item, "id"), text(pipeline, "workItemId")),
+		"status":     "sent",
+		"route":      text(result, "route"),
+		"format":     text(result, "format"),
+		"taskGuid":   text(result, "taskGuid"),
+		"taskId":     text(result, "taskId"),
+		"messageId":  text(result, "messageId"),
+		"payload":    result,
+		"createdAt":  nowISO(),
+	}
+	if err := server.Repo.UpsertFeishuDeliveryReceipt(ctx, receipt); err != nil {
+		server.logError(ctx, "feishu.review.delivery_receipt_failed", err.Error(), map[string]any{"checkpointId": checkpointID})
+	}
+}
+
+func feishuReviewAlreadySent(review map[string]any) bool {
+	status := strings.ToLower(strings.TrimSpace(text(review, "status")))
+	if status == "sent" {
+		return true
+	}
+	if status == "failed" || status == "needs-configuration" || status == "skipped" {
+		return false
+	}
+	return firstNonEmpty(text(review, "taskGuid"), text(review, "taskId"), text(review, "messageId")) != ""
 }
 
 func (server *Server) mergeFeishuReviewOptions(ctx context.Context, options feishuReviewSendOptions) feishuReviewSendOptions {
@@ -306,6 +503,9 @@ func (server *Server) mergeFeishuReviewOptions(ctx context.Context, options feis
 	}
 	if strings.TrimSpace(options.DocFolderToken) == "" {
 		options.DocFolderToken = config.DocFolderToken
+	}
+	if strings.TrimSpace(options.Language) == "" {
+		options.Language = server.currentUILanguage(ctx)
 	}
 	if strings.TrimSpace(options.DirectUserID) == "" && !feishuReviewTaskModeEnabled(options) && !feishuCardCallbackReady() {
 		options.DirectUserID = server.currentFeishuUserID(ctx)
@@ -368,7 +568,7 @@ func feishuReviewPacketFromRecords(database WorkspaceDatabase, checkpoint map[st
 
 func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
 	card := buildFeishuReviewCardWithOptions(packet, options)
-	docMarkdown := buildFeishuReviewDocMarkdown(packet)
+	docMarkdown := buildFeishuReviewDocMarkdown(packet, options.Language)
 	callbackReady := feishuCardCallbackReady()
 	webhook := strings.TrimSpace(options.WebhookURL)
 	if webhook == "" {
@@ -412,7 +612,7 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 	chatID := strings.TrimSpace(options.ChatID)
 	if chatID != "" {
 		if !callbackReady {
-			result, err := sendFeishuText(ctx, chatID, renderFeishuReviewText(packet))
+			result, err := sendFeishuText(ctx, chatID, renderFeishuReviewText(packet, options.Language))
 			if result != nil {
 				result["format"] = "text-fallback"
 				result["docMode"] = "text-summary"
@@ -427,7 +627,7 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 			result["docPreview"] = truncateForProof(docMarkdown, 1200)
 			return result, cardErr
 		}
-		result, err := sendFeishuText(ctx, chatID, renderFeishuReviewText(packet))
+		result, err := sendFeishuText(ctx, chatID, renderFeishuReviewText(packet, options.Language))
 		if result != nil {
 			result["format"] = "text-fallback"
 			result["docMode"] = "text-summary"
@@ -471,7 +671,7 @@ func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options 
 			result["fallback"] = "current-user"
 			return result, cardErr
 		}
-		result, err := sendFeishuTextToUser(ctx, directUserID, renderFeishuReviewText(packet))
+		result, err := sendFeishuTextToUser(ctx, directUserID, renderFeishuReviewText(packet, options.Language))
 		if result != nil {
 			result["format"] = "text-fallback"
 			result["docMode"] = "text-summary"
@@ -507,13 +707,17 @@ func feishuCardCallbackReady() bool {
 }
 
 func sendFeishuFailurePacket(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
-	message := renderFeishuFailureText(packet)
+	message := renderFeishuFailureText(packet, options.Language)
+	title := "Omega run needs attention"
+	if normalizeUILanguage(options.Language) == "zh-CN" {
+		title = "Omega 运行需要处理"
+	}
 	if webhook := strings.TrimSpace(firstNonEmpty(options.WebhookURL, os.Getenv("OMEGA_FEISHU_WEBHOOK_URL"), os.Getenv("FEISHU_BOT_WEBHOOK"))); webhook != "" {
 		card := map[string]any{
 			"config": map[string]any{"wide_screen_mode": true},
 			"header": map[string]any{
 				"template": "red",
-				"title":    map[string]any{"tag": "plain_text", "content": "Omega run needs attention"},
+				"title":    map[string]any{"tag": "plain_text", "content": title},
 			},
 			"elements": []any{
 				map[string]any{"tag": "markdown", "content": message},
@@ -542,24 +746,201 @@ func sendFeishuFailurePacket(ctx context.Context, packet map[string]any, options
 	}, nil
 }
 
-func renderFeishuFailureText(packet map[string]any) string {
+func renderFeishuFailureText(packet map[string]any, language ...string) string {
+	lang := normalizeUILanguage(firstNonEmpty(append(language, "zh-CN")...))
 	item := mapValue(packet["item"])
 	attempt := mapValue(packet["attempt"])
 	pipeline := mapValue(packet["pipeline"])
+	requirement := mapValue(packet["requirement"])
+	repositoryTarget := mapValue(packet["repositoryTarget"])
 	reason := firstNonEmpty(text(attempt, "failureReason"), text(attempt, "statusReason"), text(attempt, "errorMessage"), "Run failed or stalled.")
 	detail := firstNonEmpty(text(attempt, "failureDetail"), text(attempt, "stderrSummary"))
-	lines := []string{
-		"**Omega 运行需要处理**",
-		fmt.Sprintf("- Work Item: %s %s", firstNonEmpty(text(item, "key"), text(item, "id")), text(item, "title")),
-		fmt.Sprintf("- Pipeline: %s", text(pipeline, "id")),
-		fmt.Sprintf("- Attempt: %s", text(attempt, "id")),
-		fmt.Sprintf("- Stage: %s", firstNonEmpty(text(attempt, "failureStageId"), text(attempt, "currentStageId"))),
-		fmt.Sprintf("- Reason: %s", reason),
+	stageID := firstNonEmpty(text(attempt, "failureStageId"), text(attempt, "currentStageId"), text(item, "stageId"))
+	publicAppURL := strings.TrimRight(strings.TrimSpace(os.Getenv("OMEGA_PUBLIC_APP_URL")), "/")
+	lines := []string{}
+	if lang == "zh-CN" {
+		lines = append(lines,
+			"🚨 Omega 运行需要处理",
+			fmt.Sprintf("类型: %s", feishuFailureAlertType(attempt, lang)),
+			fmt.Sprintf("工作项: %s (%s) · %s", firstNonEmpty(text(item, "key"), text(item, "id"), "unknown"), stringOr(text(item, "id"), "unknown"), stringOr(text(item, "title"), "Untitled work item")),
+		)
+	} else {
+		lines = append(lines,
+			"🚨 Omega run needs attention",
+			fmt.Sprintf("Type: %s", feishuFailureAlertType(attempt, lang)),
+			fmt.Sprintf("Work item: %s (%s) · %s", firstNonEmpty(text(item, "key"), text(item, "id"), "unknown"), stringOr(text(item, "id"), "unknown"), stringOr(text(item, "title"), "Untitled work item")),
+		)
+	}
+	if requirementLine := feishuFailureRequirementLine(requirement, item); requirementLine != "" {
+		lines = append(lines, fmt.Sprintf("%s: %s", feishuLabel(lang, "Requirement", "需求"), requirementLine))
+	}
+	if contextLine := feishuFailureItemContextLine(item); contextLine != "" {
+		lines = append(lines, fmt.Sprintf("%s: %s", feishuLabel(lang, "Context", "上下文"), contextLine))
+	}
+	if repositoryLine := feishuFailureRepositoryLine(repositoryTarget, item, attempt); repositoryLine != "" {
+		lines = append(lines, fmt.Sprintf("%s: %s", feishuLabel(lang, "Repository", "仓库"), repositoryLine))
+	}
+	lines = append(lines,
+		fmt.Sprintf("Pipeline: %s · %s · %s", stringOr(text(pipeline, "id"), "unknown"), stringOr(firstNonEmpty(text(pipeline, "templateId"), text(pipeline, "kind")), "unknown"), stringOr(text(pipeline, "status"), "unknown")),
+		fmt.Sprintf("Attempt: %s · %s", stringOr(text(attempt, "id"), "unknown"), feishuFailureRunnerLine(attempt)),
+		fmt.Sprintf("%s: %s", feishuLabel(lang, "Stage", "阶段"), feishuFailureStageLine(pipeline, attempt, stageID)),
+	)
+	if lastSeenAt := firstNonEmpty(text(attempt, "lastSeenAt"), text(attempt, "updatedAt")); lastSeenAt != "" {
+		lines = append(lines, fmt.Sprintf("%s: %s", feishuLabel(lang, "Last heartbeat", "最后心跳"), lastSeenAt))
+	}
+	lines = append(lines,
+		fmt.Sprintf("%s: %s", feishuLabel(lang, "Reason", "原因"), reason),
+		"",
+		feishuLabel(lang, "📦 Delivery context", "📦 交付上下文"),
+		fmt.Sprintf("PR: %s", stringOr(text(attempt, "pullRequestUrl"), "not created")),
+		fmt.Sprintf("Branch: %s", stringOr(text(attempt, "branchName"), "not recorded")),
+		fmt.Sprintf("Workspace: %s", stringOr(text(attempt, "workspacePath"), "not recorded")),
+		"",
+		feishuLabel(lang, "🛠️ Suggested action", "🛠️ 建议处理"),
+		feishuLabel(lang, "Open Omega, inspect the attempt logs, then Retry, Cancel, or recover the runner.", "打开 Omega 查看 attempt 日志，然后 Retry、Cancel，或恢复对应 runner。"),
+	)
+	if publicAppURL != "" && text(item, "id") != "" {
+		lines = append(lines, fmt.Sprintf("%s: %s/#/work-items/%s", feishuLabel(lang, "Open", "打开"), publicAppURL, text(item, "id")))
 	}
 	if detail != "" {
-		lines = append(lines, "", truncateForProof(detail, 900))
+		lines = append(lines, "", "🧾 Runner detail", truncateForProof(detail, 900))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func feishuFailureAlertType(attempt map[string]any, language ...string) string {
+	switch strings.ToLower(strings.TrimSpace(text(attempt, "status"))) {
+	case "stalled":
+		return "Stalled attempt"
+	case "failed":
+		return "Failed attempt"
+	case "canceled", "cancelled":
+		return "Canceled attempt"
+	case "timed_out", "timeout":
+		return "Timed out attempt"
+	default:
+		return "Run attention required"
+	}
+}
+
+func feishuLabel(language string, english string, chinese string) string {
+	if normalizeUILanguage(language) == "zh-CN" {
+		return chinese
+	}
+	return english
+}
+
+func feishuFailureRequirementLine(requirement map[string]any, item map[string]any) string {
+	title := firstNonEmpty(text(requirement, "title"), text(item, "title"))
+	description := firstNonEmpty(text(requirement, "description"), text(requirement, "rawText"), text(item, "description"))
+	if title == "" {
+		return truncateForProof(oneLine(description), 220)
+	}
+	if description == "" || strings.EqualFold(strings.TrimSpace(title), strings.TrimSpace(description)) {
+		return title
+	}
+	return title + " — " + truncateForProof(oneLine(description), 220)
+}
+
+func feishuFailureItemContextLine(item map[string]any) string {
+	parts := []string{}
+	for _, part := range []string{
+		labelValue("source", text(item, "source")),
+		labelValue("status", text(item, "status")),
+		labelValue("priority", text(item, "priority")),
+		labelValue("assignee", text(item, "assignee")),
+	} {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	if labels := joinAnyStrings(item["labels"]); labels != "" {
+		parts = append(parts, "labels "+labels)
+	}
+	return strings.Join(parts, " · ")
+}
+
+func feishuFailureRepositoryLine(target map[string]any, item map[string]any, attempt map[string]any) string {
+	if label := strings.TrimSpace(repositoryTargetLabel(target)); label != "" {
+		if targetID := text(target, "id"); targetID != "" {
+			return fmt.Sprintf("%s (%s)", label, targetID)
+		}
+		return label
+	}
+	return firstNonEmpty(text(item, "repositoryTargetLabel"), text(attempt, "repositoryTargetLabel"), text(item, "target"), text(attempt, "repositoryTargetId"), text(item, "repositoryTargetId"))
+}
+
+func feishuFailureRunnerLine(attempt map[string]any) string {
+	runner := firstNonEmpty(text(attempt, "runner"), text(attempt, "agent"), text(attempt, "profileId"))
+	model := text(attempt, "model")
+	switch {
+	case runner != "" && model != "":
+		return fmt.Sprintf("runner %s · model %s", runner, model)
+	case runner != "":
+		return fmt.Sprintf("runner %s", runner)
+	case model != "":
+		return fmt.Sprintf("model %s", model)
+	default:
+		return "runner not recorded"
+	}
+}
+
+func feishuFailureStageLine(pipeline map[string]any, attempt map[string]any, stageID string) string {
+	title := feishuFailureStageTitle(pipeline, attempt, stageID)
+	if stageID == "" {
+		return stringOr(title, "not recorded")
+	}
+	if title == "" || title == stageID {
+		return stageID
+	}
+	return fmt.Sprintf("%s (%s)", title, stageID)
+}
+
+func feishuFailureStageTitle(pipeline map[string]any, attempt map[string]any, stageID string) string {
+	if stageID == "" {
+		return ""
+	}
+	for _, stage := range arrayMaps(mapValue(pipeline["run"])["stages"]) {
+		if text(stage, "id") == stageID {
+			return firstNonEmpty(text(stage, "title"), text(stage, "name"))
+		}
+	}
+	for _, stage := range arrayMaps(attempt["stages"]) {
+		if text(stage, "id") == stageID {
+			return firstNonEmpty(text(stage, "title"), text(stage, "name"))
+		}
+	}
+	return ""
+}
+
+func labelValue(label string, value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return label + " " + value
+}
+
+func joinAnyStrings(value any) string {
+	values := []string{}
+	switch typed := value.(type) {
+	case []any:
+		for _, entry := range typed {
+			if label := strings.TrimSpace(fmt.Sprint(entry)); label != "" {
+				values = append(values, label)
+			}
+		}
+	case []string:
+		for _, entry := range typed {
+			if label := strings.TrimSpace(entry); label != "" {
+				values = append(values, label)
+			}
+		}
+	}
+	return strings.Join(values, ", ")
+}
+
+func oneLine(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func buildFeishuReviewCard(packet map[string]any) map[string]any {
@@ -567,6 +948,7 @@ func buildFeishuReviewCard(packet map[string]any) map[string]any {
 }
 
 func buildFeishuReviewCardWithOptions(packet map[string]any, options feishuReviewSendOptions) map[string]any {
+	lang := normalizeUILanguage(options.Language)
 	checkpoint := mapValue(packet["checkpoint"])
 	item := mapValue(packet["item"])
 	attempt := mapValue(packet["attempt"])
@@ -594,35 +976,43 @@ func buildFeishuReviewCardWithOptions(packet map[string]any, options feishuRevie
 		risk = "pending"
 	}
 	elements := []any{
-		map[string]any{"tag": "markdown", "content": fmt.Sprintf("**Work item**: `%s` %s\n**Status**: waiting for human review\n**Risk**: `%s`", stringOr(text(item, "key"), text(item, "id")), title, risk)},
+		map[string]any{"tag": "markdown", "content": fmt.Sprintf("**%s**: `%s` %s\n**%s**: %s\n**%s**: `%s`",
+			feishuLabel(lang, "Work item", "工作项"),
+			stringOr(text(item, "key"), text(item, "id")),
+			title,
+			feishuLabel(lang, "Status", "状态"),
+			feishuLabel(lang, "waiting for human review", "等待人工审核"),
+			feishuLabel(lang, "Risk", "风险"),
+			risk,
+		)},
 		map[string]any{"tag": "hr"},
-		map[string]any{"tag": "markdown", "content": "**Requirement**\n" + truncateForProof(requirementText, 900)},
+		map[string]any{"tag": "markdown", "content": "**" + feishuLabel(lang, "Requirement", "需求") + "**\n" + truncateForProof(requirementText, 900)},
 	}
 	if prURL := text(attempt, "pullRequestUrl"); prURL != "" {
 		elements = append(elements, map[string]any{"tag": "markdown", "content": "**Pull request**\n" + prURL})
 	}
 	if summary := text(reviewPacket, "summary"); summary != "" {
-		elements = append(elements, map[string]any{"tag": "markdown", "content": "**Review packet**\n" + truncateForProof(summary, 900)})
+		elements = append(elements, map[string]any{"tag": "markdown", "content": "**" + feishuLabel(lang, "Review packet", "审核包") + "**\n" + truncateForProof(summary, 900)})
 	}
 	actions := []any{}
 	if reviewURL != "" {
-		actions = append(actions, map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Open review"}, "type": "default", "url": reviewURL})
+		actions = append(actions, map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": feishuLabel(lang, "Open review", "打开审核")}, "type": "default", "url": reviewURL})
 	}
 	if feishuCardCallbackReady() {
 		approveValue := map[string]any{"action": "approve", "checkpointId": checkpointID, "token": token}
 		requestChangesValue := map[string]any{"action": "request_changes", "checkpointId": checkpointID, "token": token}
 		actions = append(actions,
-			map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Approve"}, "type": "primary", "value": approveValue},
-			map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Request changes"}, "type": "danger", "value": requestChangesValue},
+			map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": feishuLabel(lang, "Approve", "通过")}, "type": "primary", "value": approveValue},
+			map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": feishuLabel(lang, "Request changes", "要求修改")}, "type": "danger", "value": requestChangesValue},
 		)
 		if callbackURL != "" {
-			elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "plain_text", "content": "Card buttons require Feishu Card Request URL to point to " + callbackURL}}})
+			elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "plain_text", "content": feishuLabel(lang, "Card buttons require Feishu Card Request URL to point to ", "卡片按钮需要 Feishu Card Request URL 指向 ") + callbackURL}}})
 		}
 	} else {
-		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "plain_text", "content": "Card buttons are disabled until a public Feishu Card Request URL is configured. Omega will prefer Task review when a reviewer is available."}}})
+		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "plain_text", "content": feishuLabel(lang, "Card buttons are disabled until a public Feishu Card Request URL is configured. Omega will prefer Task review when a reviewer is available.", "配置公开 Feishu Card Request URL 前，卡片按钮不可用；如果有审核人，Omega 会优先使用任务审核。")}}})
 	}
 	if len(actions) == 0 {
-		actions = append(actions, map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": "Open Omega"}, "type": "default", "url": firstNonEmpty(reviewURL, publicAppURL)})
+		actions = append(actions, map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": feishuLabel(lang, "Open Omega", "打开 Omega")}, "type": "default", "url": firstNonEmpty(reviewURL, publicAppURL)})
 	}
 	if firstNonEmpty(reviewURL, publicAppURL) != "" {
 		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
@@ -630,14 +1020,15 @@ func buildFeishuReviewCardWithOptions(packet map[string]any, options feishuRevie
 	return map[string]any{
 		"config": map[string]any{"wide_screen_mode": true},
 		"header": map[string]any{
-			"title":    map[string]any{"tag": "plain_text", "content": "Omega Human Review"},
+			"title":    map[string]any{"tag": "plain_text", "content": feishuLabel(lang, "Omega Human Review", "Omega 人工审核")},
 			"template": "orange",
 		},
 		"elements": elements,
 	}
 }
 
-func buildFeishuReviewDocMarkdown(packet map[string]any) string {
+func buildFeishuReviewDocMarkdown(packet map[string]any, language ...string) string {
+	lang := normalizeUILanguage(firstNonEmpty(language...))
 	item := mapValue(packet["item"])
 	attempt := mapValue(packet["attempt"])
 	reviewPacket := mapValue(packet["reviewPacket"])
@@ -647,46 +1038,69 @@ func buildFeishuReviewDocMarkdown(packet map[string]any) string {
 		description = text(item, "description")
 	}
 	lines := []string{
-		"# Omega Human Review",
+		"# " + feishuLabel(lang, "Omega Human Review", "Omega 人工审核"),
 		"",
-		fmt.Sprintf("- Work item: `%s` %s", stringOr(text(item, "key"), text(item, "id")), text(item, "title")),
+		fmt.Sprintf("- %s: `%s` %s", feishuLabel(lang, "Work item", "工作项"), stringOr(text(item, "key"), text(item, "id")), text(item, "title")),
 		fmt.Sprintf("- PR: %s", stringOr(text(attempt, "pullRequestUrl"), "not created")),
 		fmt.Sprintf("- Branch: `%s`", text(attempt, "branchName")),
 		"",
-		"## Requirement",
+		"## " + feishuLabel(lang, "Requirement", "需求"),
 		"",
 		description,
 	}
 	if summary := text(reviewPacket, "summary"); summary != "" {
-		lines = append(lines, "", "## Review packet", "", summary)
+		lines = append(lines, "", "## "+feishuLabel(lang, "Review packet", "审核包"), "", summary)
 	}
 	if risk := mapValue(reviewPacket["risk"]); len(risk) > 0 {
-		lines = append(lines, "", "## Risk", "", "- Level: `"+text(risk, "level")+"`")
+		lines = append(lines, "", "## "+feishuLabel(lang, "Risk", "风险"), "", "- "+feishuLabel(lang, "Level", "等级")+": `"+text(risk, "level")+"`")
 		for _, reason := range stringSlice(risk["reasons"]) {
 			lines = append(lines, "- "+reason)
 		}
 	}
 	if diff := mapValue(reviewPacket["diffPreview"]); len(diff) > 0 {
-		lines = append(lines, "", "## Diff preview", "", "```diff", truncateForProof(text(diff, "patchExcerpt"), 5000), "```")
+		lines = append(lines, "", "## "+feishuLabel(lang, "Diff preview", "Diff 预览"), "", "```diff", truncateForProof(text(diff, "patchExcerpt"), 5000), "```")
 	}
 	return strings.Join(lines, "\n")
 }
 
-func renderFeishuReviewText(packet map[string]any) string {
+func renderFeishuReviewText(packet map[string]any, language ...string) string {
+	lang := normalizeUILanguage(firstNonEmpty(append(language, "zh-CN")...))
 	item := mapValue(packet["item"])
 	attempt := mapValue(packet["attempt"])
 	reviewPacket := mapValue(packet["reviewPacket"])
-	lines := []string{
-		"Omega Human Review",
-		fmt.Sprintf("Work item: %s %s", stringOr(text(item, "key"), text(item, "id")), text(item, "title")),
-		"Status: waiting for human review",
+	requirement := mapValue(packet["requirement"])
+	risk := text(mapValue(reviewPacket["risk"]), "level")
+	requirementText := firstNonEmpty(text(requirement, "description"), text(requirement, "rawText"), text(item, "description"))
+	lines := []string{}
+	if lang == "zh-CN" {
+		lines = append(lines,
+			"✅ Omega 人工审核",
+			fmt.Sprintf("工作项: %s (%s) · %s", stringOr(text(item, "key"), text(item, "id")), stringOr(text(item, "id"), "unknown"), text(item, "title")),
+			"状态: 等待人工审核",
+		)
+	} else {
+		lines = append(lines,
+			"✅ Omega human review",
+			fmt.Sprintf("Work item: %s (%s) · %s", stringOr(text(item, "key"), text(item, "id")), stringOr(text(item, "id"), "unknown"), text(item, "title")),
+			"Status: waiting for human review",
+		)
+	}
+	if risk != "" {
+		lines = append(lines, feishuLabel(lang, "Risk", "风险")+": "+risk)
 	}
 	if prURL := text(attempt, "pullRequestUrl"); prURL != "" {
 		lines = append(lines, "PR: "+prURL)
 	}
-	if summary := text(reviewPacket, "summary"); summary != "" {
-		lines = append(lines, "Review packet: "+truncateForProof(summary, 500))
+	if branch := text(attempt, "branchName"); branch != "" {
+		lines = append(lines, "Branch: "+branch)
 	}
+	if requirementText != "" {
+		lines = append(lines, "", feishuLabel(lang, "📋 Requirement summary", "📋 需求摘要"), truncateForProof(oneLine(requirementText), 700))
+	}
+	if summary := text(reviewPacket, "summary"); summary != "" {
+		lines = append(lines, "", feishuLabel(lang, "🧾 Review packet", "🧾 Review packet"), truncateForProof(summary, 700))
+	}
+	lines = append(lines, "", feishuLabel(lang, "🛠️ Review actions", "🛠️ 审核动作"), feishuLabel(lang, "Approve or Request changes in Omega. In Feishu task mode, completing the task approves delivery; comments with requested changes route to rework.", "在 Omega 中 Approve 或 Request changes；如果是飞书任务模式，完成任务表示审核通过；评论修改意见会进入 rework。"))
 	return strings.Join(lines, "\n")
 }
 

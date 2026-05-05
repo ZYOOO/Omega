@@ -3,10 +3,10 @@ import {
   buildAuthorizeUrl,
   connectionProviders,
   createActivityFeed,
+  createInitialWorkspaceSession,
   createSampleRun,
   createManualWorkItem,
   createWorkboardView,
-  groupWorkItemsByStatus,
   grantProviderConnection,
   loadWorkspaceSession,
   revokeProviderConnection,
@@ -22,6 +22,7 @@ import { ObservabilityDashboard } from "./components/ObservabilityDashboard";
 import { PortalHome } from "./components/PortalHome";
 import { ProjectSurface } from "./components/ProjectSurface";
 import { RequirementComposer } from "./components/RequirementComposer";
+import { GlobalAgentAccessPanel } from "./components/GlobalAgentAccessPanel";
 import { WorkspaceChrome, type AgentAccessSidebarItem, type PrimaryNav, type UiTheme } from "./components/WorkspaceChrome";
 import { WorkspaceAgentStudio } from "./components/WorkspaceAgentStudio";
 import { WorkItemDetailPage } from "./components/WorkItemDetailPage";
@@ -32,12 +33,14 @@ import {
   approveCheckpoint,
   createPipelineFromTemplate,
   deliverPagePilotChange,
+  discoverRunnerModels,
   discardPagePilotRun,
   fetchAttempts,
   fetchAttemptActionPlan,
   fetchAttemptTimeline,
   fetchExecutionLocks,
   fetchFeishuConfig,
+  fetchUiLanguagePreference,
   fetchCheckpoints,
   fetchAgentDefinitions,
   fetchGitHubOAuthConfig,
@@ -68,6 +71,7 @@ import {
   retryAttempt,
   runCurrentPipelineStage,
   runDevFlowCycle,
+  runOrchestratorTick,
   searchFeishuUsers,
   sendFeishuNotification,
   startGitHubCliLogin,
@@ -77,6 +81,7 @@ import {
   testFeishuConfig,
   updateFeishuConfig,
   updateGitHubOAuthConfig,
+  updateUiLanguagePreference,
   updateLocalWorkspaceRoot,
   updateLlmProviderSelection,
   updateOrchestratorWatcher,
@@ -111,9 +116,12 @@ import {
   type RequirementRecordInfo,
   type RunWorkpadRecordInfo,
   type RuntimeLogRecordInfo,
-  type RunnerCredentialInfo
+  type RunnerCredentialInfo,
+  type RunnerModelDiscoveryResult
 } from "./omegaControlApiClient";
+import { I18nProvider, initialUiLanguage, translateUi, uiLanguageStorageKey, type UiLanguage } from "./i18n";
 import {
+  bindLocalRepositoryTargetViaApi,
   bindGitHubRepositoryTargetViaApi,
   createProjectViaApi,
   createWorkItemViaApi,
@@ -124,15 +132,61 @@ import {
   importGitHubIssuesViaApi,
   patchWorkItemViaApi,
   runOperationViaWorkspaceApi,
-  saveWorkspaceSessionViaApi
 } from "./workspaceApiClient";
 import type { ConnectionProvider, ConnectionState, ProjectRecord, ProviderId, WorkItem, WorkItemPriority, WorkItemStatus, WorkboardViewSort } from "./core";
 import "./styles.css";
 
-type InspectorPanel = "properties" | "provider";
+type InspectorPanel = "properties" | "provider" | "agents";
+type GlobalAgentRunnerId = "codex" | "claude-code" | "opencode" | "trae-agent";
 type AppSurface = "home" | "workboard";
 type AgentConfigTab = "workflow" | "prompts" | "agents" | "runtime";
 type RuntimeConfigTab = "omega" | "codex" | "opencode" | "claude" | "trae";
+type WorkItemFlowLaneDefinition = {
+  id: string;
+  label: string;
+  statuses: WorkItemStatus[];
+  visualStatus: WorkItemStatus;
+  emptyCopy: string;
+};
+
+const workItemFlowLaneDefinitions: WorkItemFlowLaneDefinition[] = [
+  {
+    id: "not-started",
+    label: "Not Started",
+    statuses: ["Ready", "Backlog"],
+    visualStatus: "Ready",
+    emptyCopy: "New requirements land here before an agent run starts."
+  },
+  {
+    id: "running",
+    label: "Running",
+    statuses: ["Planning", "In Review"],
+    visualStatus: "In Review",
+    emptyCopy: "Active DevFlow work will appear in this lane."
+  },
+  {
+    id: "human-review",
+    label: "Human Review",
+    statuses: ["Human Review"],
+    visualStatus: "Human Review",
+    emptyCopy: "Checkpoints waiting for approval show up here."
+  },
+  {
+    id: "blocked",
+    label: "Blocked",
+    statuses: ["Blocked"],
+    visualStatus: "Blocked",
+    emptyCopy: "Stalled, failed, or blocked work is collected here."
+  },
+  {
+    id: "done",
+    label: "Done",
+    statuses: ["Done"],
+    visualStatus: "Done",
+    emptyCopy: "Completed and proof-backed work closes here."
+  }
+];
+
 type AgentProfileDraft = {
   id: string;
   label: string;
@@ -194,6 +248,12 @@ const RECENT_PROOF_RECORD_LIMIT = 80;
 const DETAIL_OPERATION_LIMIT = 240;
 const DETAIL_PROOF_RECORD_LIMIT = 320;
 
+type ExecutionRefreshScope = {
+  workItemId?: string;
+  pipelineId?: string;
+  repositoryTargetId?: string;
+};
+
 function mergeExecutionRecords<T extends { id: string; createdAt?: string; updatedAt?: string }>(
   current: T[],
   next: T[],
@@ -205,6 +265,90 @@ function mergeExecutionRecords<T extends { id: string; createdAt?: string; updat
   return [...byId.values()]
     .sort((left, right) => (right.updatedAt ?? right.createdAt ?? "").localeCompare(left.updatedAt ?? left.createdAt ?? ""))
     .slice(0, limit);
+}
+
+function uniqueExecutionRecords<T extends { id: string }>(records: T[]): T[] {
+  const byID = new Map<string, T>();
+  for (const record of records) {
+    byID.set(record.id, record);
+  }
+  return [...byID.values()];
+}
+
+function hasExecutionRefreshScope(scope: ExecutionRefreshScope | undefined): boolean {
+  return Boolean(scope?.workItemId || scope?.pipelineId || scope?.repositoryTargetId);
+}
+
+function executionRefreshScopeKey(scope: ExecutionRefreshScope): string {
+  return [scope.repositoryTargetId ?? "", scope.workItemId ?? "", scope.pipelineId ?? ""].join("|");
+}
+
+async function fetchPipelinesForExecutionScope(
+  apiUrl: string,
+  scope: ExecutionRefreshScope,
+  workItems: WorkItem[],
+  attempts: AttemptRecordInfo[],
+  runWorkpads: RunWorkpadRecordInfo[]
+): Promise<PipelineRecordInfo[]> {
+  if (scope.pipelineId) {
+    return fetchPipelines(apiUrl, { id: scope.pipelineId, limit: 1 }).catch(() => []);
+  }
+  if (scope.workItemId) {
+    return fetchPipelines(apiUrl, { workItemId: scope.workItemId }).catch(() => []);
+  }
+  if (scope.repositoryTargetId) {
+    const workItemIDs = new Set<string>();
+    for (const item of workItems) {
+      if (item.repositoryTargetId === scope.repositoryTargetId) {
+        workItemIDs.add(item.id);
+      }
+    }
+    for (const attempt of attempts) {
+      if (attempt.repositoryTargetId === scope.repositoryTargetId && attempt.itemId) {
+        workItemIDs.add(attempt.itemId);
+      }
+    }
+    for (const workpad of runWorkpads) {
+      if (workpad.repositoryTargetId === scope.repositoryTargetId && workpad.workItemId) {
+        workItemIDs.add(workpad.workItemId);
+      }
+    }
+    const pipelineBatches = await Promise.all(
+      [...workItemIDs].slice(0, 80).map((workItemId) => fetchPipelines(apiUrl, { workItemId }).catch(() => []))
+    );
+    return uniqueExecutionRecords(pipelineBatches.flat());
+  }
+  return fetchPipelines(apiUrl, { limit: 500 }).catch(() => []);
+}
+
+async function fetchCheckpointsForExecutionScope(
+  apiUrl: string,
+  scope: ExecutionRefreshScope,
+  pipelines: PipelineRecordInfo[],
+  attempts: AttemptRecordInfo[]
+): Promise<CheckpointRecordInfo[]> {
+  if (!hasExecutionRefreshScope(scope)) {
+    return fetchCheckpoints(apiUrl, { limit: 300 }).catch(() => []);
+  }
+  const batches: Array<Promise<CheckpointRecordInfo[]>> = [];
+  const pipelineIDs = new Set<string>();
+  const attemptIDs = new Set<string>();
+  if (scope.pipelineId) pipelineIDs.add(scope.pipelineId);
+  for (const pipeline of pipelines) {
+    if (pipeline.id) pipelineIDs.add(pipeline.id);
+  }
+  for (const attempt of attempts) {
+    if (attempt.pipelineId) pipelineIDs.add(attempt.pipelineId);
+    if (attempt.id) attemptIDs.add(attempt.id);
+  }
+  for (const pipelineId of [...pipelineIDs].slice(0, 40)) {
+    batches.push(fetchCheckpoints(apiUrl, { pipelineId, limit: 120 }).catch(() => []));
+  }
+  for (const attemptId of [...attemptIDs].slice(0, 40)) {
+    batches.push(fetchCheckpoints(apiUrl, { attemptId, limit: 120 }).catch(() => []));
+  }
+  if (batches.length === 0) return [];
+  return uniqueExecutionRecords((await Promise.all(batches)).flat());
 }
 
 function initialAppSurface(): AppSurface {
@@ -293,8 +437,8 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     label: "Requirement",
     runner: "codex",
     model: "gpt-5.4-mini",
-    skills: "github:github\nbrowser-use",
-    mcp: "github\nfilesystem:repository-workspace",
+    skills: "bb-browser\nopenai-docs",
+    mcp: "omega-filesystem\nomega-memory\nomega-sequential-thinking",
     stageNotes: "Clarify acceptance criteria, repository target, risks, and suggested work items before planning.",
     codexPolicy: "read requirement source, inspect repository context, write requirement artifact only",
     claudePolicy: "focus on ambiguity, acceptance criteria, and handoff clarity"
@@ -304,8 +448,8 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     label: "Architect",
     runner: "codex",
     model: "gpt-5.4-mini",
-    skills: "github:github",
-    mcp: "filesystem:repository-workspace",
+    skills: "security-threat-model\nopenai-docs",
+    mcp: "omega-filesystem\nomega-sequential-thinking",
     stageNotes: "Map affected files, data flow, integration risks, and verification plan.",
     codexPolicy: "prefer read-only analysis, generate solution-plan.md, no source edits unless explicitly allowed",
     claudePolicy: "produce concise architecture notes with file-level impact"
@@ -315,8 +459,8 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     label: "Coding",
     runner: "codex",
     model: "gpt-5.4-mini",
-    skills: "github:gh-fix-ci\nbrowser-use",
-    mcp: "filesystem:repository-workspace\nbrowser:localhost-preview",
+    skills: "playwright\nsecurity-best-practices",
+    mcp: "omega-filesystem\nomega-git\nomega-puppeteer",
     stageNotes: "Implement inside the locked repository workspace and keep changes scoped to the Work Item.",
     codexPolicy: "workspace-write only, never write outside repositoryTarget workspace, emit diff and summary",
     claudePolicy: "apply code edits conservatively and preserve existing project style"
@@ -326,8 +470,8 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     label: "Testing",
     runner: "codex",
     model: "gpt-5.4-mini",
-    skills: "browser-use",
-    mcp: "filesystem:repository-workspace\nbrowser:localhost-preview",
+    skills: "playwright\ngh-fix-ci",
+    mcp: "omega-filesystem\nomega-puppeteer\nomega-git",
     stageNotes: "Run focused tests first, then broader checks when shared contracts changed.",
     codexPolicy: "run configured validation commands, capture test-report.md and failure traces",
     claudePolicy: "summarize validation evidence and remaining risk"
@@ -337,8 +481,8 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     label: "Review",
     runner: "codex",
     model: "gpt-5.4-mini",
-    skills: "github:github\ngithub:gh-fix-ci",
-    mcp: "github\nfilesystem:repository-workspace",
+    skills: "gh-address-comments\ngh-fix-ci\nsecurity-best-practices",
+    mcp: "omega-git\nomega-filesystem",
     stageNotes: "Review correctness, safety, tests, and contract drift. Changes requested routes to Rework.",
     codexPolicy: "read diff and artifacts, write review report, do not mark attempt failed for changes_requested",
     claudePolicy: "return clear verdict, required fixes, and evidence"
@@ -348,8 +492,8 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     label: "Delivery",
     runner: "codex",
     model: "gpt-5.4-mini",
-    skills: "github:yeet\ngithub:github",
-    mcp: "github\nfilesystem:repository-workspace",
+    skills: "yeet\ngh-address-comments",
+    mcp: "omega-git\nomega-filesystem",
     stageNotes: "After human approval, prepare PR or delivery proof and final handoff bundle.",
     codexPolicy: "require human gate approval before merge or delivery action",
     claudePolicy: "summarize shipped changes, verification, and caveats"
@@ -361,8 +505,9 @@ const defaultAgentConfigurationDraft: AgentConfigurationDraft = {
   workflowTemplate: "devflow-pr",
   workflowMarkdown: defaultWorkflowMarkdown,
   stagePolicy: defaultStagePolicy,
-  skillAllowlist: "browser-use\ngithub:github\ngithub:gh-fix-ci\ngithub:yeet",
-  mcpAllowlist: "github\nfilesystem:repository-workspace\nbrowser:localhost-preview",
+  skillAllowlist:
+    "bb-browser\nplaywright\ngh-address-comments\ngh-fix-ci\nyeet\nsecurity-best-practices\nsecurity-threat-model\nopenai-docs",
+  mcpAllowlist: "omega-filesystem\nomega-git\nomega-puppeteer\nomega-memory\nomega-sequential-thinking\nx-mcp",
   codexPolicy:
     "sandbox: workspace-write\napproval: never inside automated stage\nrepo-scope: require repositoryTargetId match\nartifacts: requirement, solution, diff, test-report, review-report, handoff-bundle",
   claudePolicy:
@@ -507,7 +652,7 @@ function statusClassName(status: WorkItemStatus): string {
 }
 
 function workItemStatusLabel(status: WorkItemStatus): string {
-  if (status === "Ready") return "Not started";
+  if (status === "Ready") return "Not Started";
   if (status === "In Review") return "Running";
   return status;
 }
@@ -605,10 +750,20 @@ function isPagePilotWorkItem(item: WorkItem): boolean {
 
 function runtimeStatusForWorkItem(item: WorkItem, pipeline?: PipelineRecordInfo): WorkItemStatus {
   if (pipeline?.status === "waiting-human") return "Human Review";
-  if (!isPagePilotWorkItem(item)) return item.status;
-  if (pipeline?.status === "discarded" || pipeline?.status === "failed") return "Blocked";
+  if (pipeline?.status === "discarded" || pipeline?.status === "failed" || pipeline?.status === "stalled") return "Blocked";
   if (pipeline?.status === "delivered" || pipeline?.status === "done") return "Done";
+  if (pipeline?.status === "running") return item.status === "Human Review" ? "Human Review" : "In Review";
   return item.status;
+}
+
+function pendingCheckpointForPipeline(checkpoints: CheckpointRecordInfo[], pipeline?: PipelineRecordInfo): CheckpointRecordInfo | undefined {
+  if (!pipeline) return undefined;
+  const pending = checkpoints.find((checkpoint) => checkpoint.pipelineId === pipeline.id && checkpoint.status === "pending");
+  if (!pending) return undefined;
+  const humanReviewStage = pipeline.run?.stages?.find((stage) => stage.id === "human_review");
+  const humanReviewComplete = humanReviewStage?.status === "passed" || humanReviewStage?.status === "done";
+  const pipelineComplete = pipeline.status === "done" || pipeline.status === "delivered";
+  return humanReviewComplete || pipelineComplete ? undefined : pending;
 }
 
 function applyRuntimeWorkItemStatus(item: WorkItem, pipeline?: PipelineRecordInfo): WorkItem {
@@ -644,9 +799,7 @@ function summarizePipelineProgress(
     };
   }
 
-  const activeIndex = stages.findIndex((stage) =>
-    ["running", "needs-human", "changes-requested", "failed", "blocked", "ready"].includes(stage.status)
-  );
+  const activeIndex = stages.findIndex((stage) => !["passed", "done", "skipped"].includes(stage.status));
   const safeIndex = activeIndex >= 0 ? activeIndex : stages.length - 1;
   const currentStage = stages[safeIndex];
   const passedCount = stages.filter((stage) => stage.status === "passed" || stage.status === "done").length;
@@ -868,14 +1021,19 @@ function formatShortTimestamp(value?: string): string {
 
 function App() {
   const run = useMemo(() => createSampleRun(), []);
-  const persistedSession = useMemo(() => loadWorkspaceSession(run), [run.id]);
+  const persistedSession = useMemo(
+    () => (missionControlApiUrl ? createInitialWorkspaceSession(run) : loadWorkspaceSession(run)),
+    [run.id]
+  );
   const [appSurface, setAppSurface] = useState<AppSurface>(() => initialAppSurface());
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => initialUiTheme());
+  const [uiLanguage, setUiLanguage] = useState<UiLanguage>(() => initialUiLanguage());
   const [activeNav, setActiveNav] = useState<PrimaryNav>(() => initialActiveNav(persistedSession.activeNav));
   const [connections, setConnections] = useState(persistedSession.connections);
   const [selectedProviderId, setSelectedProviderId] = useState<ProviderId>(persistedSession.selectedProviderId);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeInspectorPanel, setActiveInspectorPanel] = useState<InspectorPanel>(persistedSession.activeInspectorPanel);
+  const [selectedGlobalAgentRunnerId, setSelectedGlobalAgentRunnerId] = useState<GlobalAgentRunnerId>("opencode");
   const [projects, setProjects] = useState<ProjectRecord[]>(persistedSession.projects);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectDescription, setNewProjectDescription] = useState("");
@@ -900,8 +1058,11 @@ function App() {
   const [sortDirection, setSortDirection] = useState<WorkboardViewSort["direction"]>(persistedSession.sortDirection);
   const [missionState, setMissionState] = useState(persistedSession.missionState);
   const [collapsedGroups, setCollapsedGroups] = useState<WorkItemStatus[]>(persistedSession.collapsedGroups);
+  const [collapsedWorkItemLanes, setCollapsedWorkItemLanes] = useState<string[]>([]);
+  const [expandedEmptyWorkItemLanes, setExpandedEmptyWorkItemLanes] = useState<string[]>([]);
   const [githubIssuesCollapsed, setGithubIssuesCollapsed] = useState(false);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(!missionControlApiUrl);
+  const [workspaceLoadError, setWorkspaceLoadError] = useState("");
   const [observability, setObservability] = useState<ObservabilitySummary>(() => emptyObservability());
   const [observabilityWindowDays, setObservabilityWindowDays] = useState(14);
   const [observabilityGroupBy, setObservabilityGroupBy] = useState("stage");
@@ -922,7 +1083,13 @@ function App() {
   const [operations, setOperations] = useState<OperationRecordInfo[]>([]);
   const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogRecordInfo[]>([]);
   const [runnerCredentials, setRunnerCredentials] = useState<RunnerCredentialInfo[]>([]);
+  const [runnerModelDiscoveryResults, setRunnerModelDiscoveryResults] = useState<Record<string, RunnerModelDiscoveryResult>>({});
+  const [discoveringRunnerModelsKey, setDiscoveringRunnerModelsKey] = useState("");
   const [executionLocks, setExecutionLocks] = useState<ExecutionLockInfo[]>([]);
+  const t = (key: string, params?: Record<string, string | number>) => translateUi(uiLanguage, key, params);
+  const localizedWorkItemStatusLabel = (status: WorkItemStatus) => t(workItemStatusLabel(status));
+  const localizedPipelineStageLabel = (status: string) => t(pipelineStageLabel(status));
+  const localizedAttemptStatusLabel = (status: string) => t(attemptStatusLabel(status));
   const [orchestratorWatchers, setOrchestratorWatchers] = useState<OrchestratorWatcherInfo[]>([]);
   const [localCapabilities, setLocalCapabilities] = useState<LocalCapabilityInfo[]>([]);
   const [localWorkspaceRoot, setLocalWorkspaceRoot] = useState("");
@@ -957,10 +1124,14 @@ function App() {
   const [githubRepositories, setGitHubRepositories] = useState<GitHubRepositoryInfo[]>([]);
   const [githubRepositoryQuery, setGitHubRepositoryQuery] = useState("");
   const [githubRepositoriesLoading, setGitHubRepositoriesLoading] = useState(false);
+  const [githubRepositoriesLoaded, setGitHubRepositoriesLoaded] = useState(false);
   const [activeRepositoryWorkspaceTargetId, setActiveRepositoryWorkspaceTargetId] = useState("");
+  const [localRepositoryPath, setLocalRepositoryPath] = useState("");
+  const [localRepositoryMessage, setLocalRepositoryMessage] = useState("");
   const [syncingRepositoryKey, setSyncingRepositoryKey] = useState("");
   const [runningWorkItemId, setRunningWorkItemId] = useState("");
   const [repositorySyncMessage, setRepositorySyncMessage] = useState("");
+  const [deleteLocalWorkspacesOnRepositoryDelete, setDeleteLocalWorkspacesOnRepositoryDelete] = useState(false);
   const [feishuChatId, setFeishuChatId] = useState("");
   const [agentConfigOpen, setAgentConfigOpen] = useState(false);
   const [agentConfigSavedMessage, setAgentConfigSavedMessage] = useState("");
@@ -970,6 +1141,8 @@ function App() {
   const [runtimeConfigTab, setRuntimeConfigTab] = useState<RuntimeConfigTab>("omega");
   const [agentPreflightResults, setAgentPreflightResults] = useState<Record<string, AgentRunnerPreflightResult>>({});
   const [testingAgentProfileId, setTestingAgentProfileId] = useState("");
+  const [globalRunnerPreflightResults, setGlobalRunnerPreflightResults] = useState<Record<string, AgentRunnerPreflightResult>>({});
+  const [testingGlobalRunnerId, setTestingGlobalRunnerId] = useState("");
   const [workspaceFolderPickerMessage, setWorkspaceFolderPickerMessage] = useState("");
   const [workspaceSectionOpen, setWorkspaceSectionOpen] = useState(true);
   const [connectionsSectionOpen, setConnectionsSectionOpen] = useState(true);
@@ -1084,7 +1257,14 @@ function App() {
     );
   }, [searchQuery, workboardView.items]);
 
-  const groupedItems = useMemo(() => groupWorkItemsByStatus(filteredItems), [filteredItems]);
+  const workItemFlowLanes = useMemo(
+    () =>
+      workItemFlowLaneDefinitions.map((lane) => ({
+        ...lane,
+        items: filteredItems.filter((item) => lane.statuses.includes(item.status))
+      })),
+    [filteredItems]
+  );
   const selectedWorkItem = scopedWorkItems.find((item) => item.id === selectedWorkItemId) ?? scopedWorkItems[0] ?? displayWorkItems[0];
   const activeWorkItemDetail = activeNav === "Issues"
     ? displayWorkItems.find((item) => item.id === activeWorkItemDetailId)
@@ -1133,6 +1313,10 @@ function App() {
     : "";
   const selectedRepositoryTarget = repositoryTargets.find((target) => target.id === selectedRepositoryTargetId);
   const selectedRepositoryBound = Boolean(selectedRepositoryTarget);
+  const selectedLocalRepositoryTarget = repositoryTargets.find((target) =>
+    target.kind === "local" && target.path === localRepositoryPath.trim()
+  );
+  const selectedLocalRepositoryBound = Boolean(selectedLocalRepositoryTarget);
   const activeRepositoryWorkspacePipelines = activeRepositoryWorkspace
     ? pipelines.filter((pipeline) =>
         displayWorkItems.some((item) => item.id === pipeline.workItemId && item.repositoryTargetId === activeRepositoryWorkspace.id)
@@ -1343,11 +1527,11 @@ function App() {
       fetchPipelineTemplates(missionControlApiUrl),
       fetchAgentDefinitions(missionControlApiUrl),
       fetchRequirements(missionControlApiUrl).catch(() => []),
-      fetchPipelines(missionControlApiUrl),
-      fetchAttempts(missionControlApiUrl).catch(() => []),
+      fetchPipelines(missionControlApiUrl, { limit: 500 }),
+      fetchAttempts(missionControlApiUrl, { limit: 200 }).catch(() => []),
       fetchProofRecords(missionControlApiUrl, { limit: RECENT_PROOF_RECORD_LIMIT }).catch(() => []),
-      fetchRunWorkpads(missionControlApiUrl).catch(() => []),
-      fetchCheckpoints(missionControlApiUrl, { status: "pending", limit: 100 }),
+      fetchRunWorkpads(missionControlApiUrl, { limit: 200 }).catch(() => []),
+      fetchCheckpoints(missionControlApiUrl, { limit: 300 }),
       fetchOperations(missionControlApiUrl, { limit: RECENT_OPERATION_LIMIT }).catch(() => []),
       fetchRuntimeLogs(missionControlApiUrl, { limit: 80 }).catch(() => []),
       fetchRunnerCredentials(missionControlApiUrl).catch(() => []),
@@ -1466,21 +1650,18 @@ function App() {
     }
   }
 
-  async function refreshExecutionState(options: { includeArtifacts?: boolean } = {}) {
+  async function refreshExecutionState(options: { includeArtifacts?: boolean; scope?: ExecutionRefreshScope } = {}) {
     if (!missionControlApiUrl) return;
-    const [
-      session,
-      nextPipelines,
-      nextAttempts,
-      nextRunWorkpads,
-      nextCheckpoints
-    ] = await Promise.all([
+    const scope = options.scope ?? {};
+    const scoped = hasExecutionRefreshScope(scope);
+    const [session, nextAttempts, nextRunWorkpads] = await Promise.all([
       fetchWorkspaceSession(missionControlApiUrl, run).catch(() => null),
-      fetchPipelines(missionControlApiUrl),
-      fetchAttempts(missionControlApiUrl).catch(() => []),
-      fetchRunWorkpads(missionControlApiUrl).catch(() => []),
-      fetchCheckpoints(missionControlApiUrl, { status: "pending", limit: 100 })
+      fetchAttempts(missionControlApiUrl, scoped ? { ...scope, limit: 120 } : { limit: 200 }).catch(() => []),
+      fetchRunWorkpads(missionControlApiUrl, scoped ? { ...scope, limit: 120 } : { limit: 200 }).catch(() => [])
     ]);
+    const sessionWorkItems = session?.workItems ?? workItems;
+    const nextPipelines = await fetchPipelinesForExecutionScope(missionControlApiUrl, scope, sessionWorkItems, nextAttempts, nextRunWorkpads);
+    const nextCheckpoints = await fetchCheckpointsForExecutionScope(missionControlApiUrl, scope, nextPipelines, nextAttempts);
     if (session) {
       setProjects(session.projects);
       setRequirements(session.requirements);
@@ -1488,9 +1669,15 @@ function App() {
       setMissionState(session.missionState);
       setConnections(session.connections);
     }
-    setPipelines(nextPipelines);
-    setAttempts(nextAttempts);
-    setRunWorkpads(nextRunWorkpads);
+    if (scoped) {
+      setPipelines((current) => mergeExecutionRecords(current, nextPipelines, 500));
+      setAttempts((current) => mergeExecutionRecords(current, nextAttempts, 500));
+      setRunWorkpads((current) => mergeExecutionRecords(current, nextRunWorkpads, 500));
+    } else {
+      setPipelines(nextPipelines);
+      setAttempts(nextAttempts);
+      setRunWorkpads(nextRunWorkpads);
+    }
     setCheckpoints((current) => mergeExecutionRecords(current, nextCheckpoints, 300));
     if (options.includeArtifacts) {
       const artifactFilters = activeWorkItemDetail && activeDetailPipeline
@@ -1520,34 +1707,70 @@ function App() {
     pipelines.some((pipeline) => pipeline.status === "running" || pipeline.status === "waiting-human") ||
     attempts.some((attempt) => attempt.status === "running" || attempt.status === "waiting-human");
 
+  const liveExecutionScope = useMemo<ExecutionRefreshScope>(() => {
+    if (activeWorkItemDetail) {
+      return {
+        workItemId: activeWorkItemDetail.id,
+        pipelineId: activeDetailPipeline?.id,
+        repositoryTargetId: activeWorkItemDetail.repositoryTargetId
+      };
+    }
+    if (activeRepositoryWorkspace?.id) {
+      return { repositoryTargetId: activeRepositoryWorkspace.id };
+    }
+    return {};
+  }, [activeDetailPipeline?.id, activeRepositoryWorkspace?.id, activeWorkItemDetail?.id, activeWorkItemDetail?.repositoryTargetId]);
+  const liveExecutionScopeToken = executionRefreshScopeKey(liveExecutionScope);
+  const activeDetailHasLiveExecution =
+    Boolean(activeDetailPipeline && (activeDetailPipeline.status === "running" || activeDetailPipeline.status === "waiting-human")) ||
+    activeDetailAttempts.some((attempt) => attempt.status === "running" || attempt.status === "waiting-human");
+  const liveExecutionPollIntervalMs = activeDetailHasLiveExecution ? 2500 : 5000;
+
   useEffect(() => {
     if (!missionControlApiUrl || !hasLiveExecution) return;
     let cancelled = false;
+    let inFlight = false;
     const pollExecutionState = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        await refreshExecutionState();
+        await refreshExecutionState({ scope: liveExecutionScope });
         if (cancelled) return;
       } catch (error) {
         console.warn("Live execution refresh failed", error);
+      } finally {
+        inFlight = false;
       }
     };
     void pollExecutionState();
     const timer = window.setInterval(() => {
       void pollExecutionState();
-    }, 2500);
+    }, liveExecutionPollIntervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [missionControlApiUrl, hasLiveExecution, run.id]);
+  }, [missionControlApiUrl, hasLiveExecution, run.id, liveExecutionPollIntervalMs, liveExecutionScopeToken]);
 
   useEffect(() => {
     if (!missionControlApiUrl) return;
 
+    fetchUiLanguagePreference(missionControlApiUrl)
+      .then((preference) => {
+        if (preference.language) {
+          setUiLanguage(preference.language);
+          window.localStorage.setItem(uiLanguageStorageKey, preference.language);
+        }
+      })
+      .catch((error) => {
+        console.warn("UI language preference load failed", error);
+      });
+
     let cancelled = false;
     fetchWorkspaceSession(missionControlApiUrl, run)
-      .then(async (session) => {
+      .then((session) => {
         if (cancelled) return;
+        setWorkspaceLoadError("");
         if (session) {
           setProjects(session.projects);
           setRequirements(session.requirements);
@@ -1564,28 +1787,15 @@ function App() {
           setAssigneeFilter(session.assigneeFilter);
           setSortDirection(session.sortDirection);
           setCollapsedGroups(session.collapsedGroups);
-        } else {
-          await saveWorkspaceSessionViaApi(missionControlApiUrl, run, {
-            projects,
-            requirements,
-            workItems,
-            missionState: { ...missionState, workItems },
-            connections,
-            activeNav: activeNav === "Settings" ? "Projects" : activeNav,
-            selectedProviderId,
-            selectedWorkItemId,
-            inspectorOpen,
-            activeInspectorPanel,
-            runnerPreset,
-            statusFilter,
-            assigneeFilter,
-            sortDirection,
-            collapsedGroups
-          });
+          return;
         }
+        setWorkspaceLoadError("No workspace session was found in the local runtime.");
       })
       .catch((error) => {
         console.warn("Initial workspace load failed", error);
+        if (!cancelled) {
+          setWorkspaceLoadError(error instanceof Error ? error.message : "Workspace failed to load.");
+        }
       })
       .finally(() => {
         if (!cancelled) setWorkspaceLoaded(true);
@@ -1635,9 +1845,9 @@ function App() {
   }, [connections.github.status, githubDeviceLoginUrl]);
 
   useEffect(() => {
-    if (activeNav !== "Projects" || !missionControlApiUrl || githubRepositories.length > 0 || githubRepositoriesLoading) return;
+    if (activeNav !== "Projects" || !missionControlApiUrl || githubRepositoriesLoaded || githubRepositoriesLoading) return;
     void loadGitHubRepositories();
-  }, [activeNav, githubRepositories.length, githubRepositoriesLoading]);
+  }, [activeNav, githubRepositoriesLoaded, githubRepositoriesLoading, missionControlApiUrl]);
 
   async function createItem() {
     if (creatingItemRef.current) return;
@@ -1681,6 +1891,20 @@ function App() {
       setRunnerMessage(`Created requirement ${title}.`);
       setActiveNav("Issues");
       window.history.replaceState(null, "", "#workboard");
+      const targetWatcher = activeRepositoryWorkspace?.id ? watcherByRepositoryTargetId.get(activeRepositoryWorkspace.id) : undefined;
+      if (activeRepositoryWorkspace?.id && targetWatcher?.status === "active" && targetWatcher.autoRun !== false) {
+        setRunnerMessage(`Created requirement ${title}. Auto run is starting it now...`);
+        await runOrchestratorTick(apiUrl, {
+          repositoryTargetId: activeRepositoryWorkspace.id,
+          autoRun: true,
+          autoApproveHuman: targetWatcher.autoApproveHuman === true,
+          autoMerge: targetWatcher.autoMerge === true,
+          limit: targetWatcher.limit || "20"
+        });
+        await refreshWorkspaceState().catch((error) => {
+          console.warn("Workspace refresh after auto-running created requirement failed", error);
+        });
+      }
       void refreshControlPlane().catch((error) => {
         console.warn("Control plane refresh after work item create failed", error);
       });
@@ -1736,6 +1960,7 @@ function App() {
   function clearWorkspaceMessages() {
     setRunnerMessage("");
     setRepositorySyncMessage("");
+    setLocalRepositoryMessage("");
   }
 
   async function runItem(item: WorkItem, options: { force?: boolean } = {}) {
@@ -1853,9 +2078,15 @@ function App() {
     }
   }
 
-  function toggleGroup(status: WorkItemStatus) {
-    setCollapsedGroups((current) =>
-      current.includes(status) ? current.filter((candidate) => candidate !== status) : [...current, status]
+  function toggleWorkItemLane(laneId: string, itemCount: number) {
+    if (itemCount === 0) {
+      setExpandedEmptyWorkItemLanes((current) =>
+        current.includes(laneId) ? current.filter((candidate) => candidate !== laneId) : [...current, laneId]
+      );
+      return;
+    }
+    setCollapsedWorkItemLanes((current) =>
+      current.includes(laneId) ? current.filter((candidate) => candidate !== laneId) : [...current, laneId]
     );
   }
 
@@ -2121,6 +2352,7 @@ function App() {
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "GitHub repository list failed.");
     } finally {
+      setGitHubRepositoriesLoaded(true);
       setGitHubRepositoriesLoading(false);
     }
   }
@@ -2166,18 +2398,63 @@ function App() {
     }
   }
 
+  async function openSelectedLocalRepositoryWorkspace() {
+    if (!missionControlApiUrl) return;
+    const path = localRepositoryPath.trim();
+    if (!path) {
+      setLocalRepositoryMessage("Choose or paste a local git project directory first.");
+      return;
+    }
+    if (selectedLocalRepositoryTarget) {
+      setActiveRepositoryWorkspaceTargetId(selectedLocalRepositoryTarget.id);
+      setActiveNav("Issues");
+      window.history.replaceState(null, "", "#workboard");
+      const selectedPath =
+        selectedLocalRepositoryTarget.kind === "local"
+          ? selectedLocalRepositoryTarget.path
+          : `${selectedLocalRepositoryTarget.owner}/${selectedLocalRepositoryTarget.repo}`;
+      setLocalRepositoryMessage(`${selectedPath} workspace is open.`);
+      return;
+    }
+    try {
+      const session = await bindLocalRepositoryTargetViaApi(missionControlApiUrl, run, {
+        projectId: primaryProject?.id,
+        path
+      });
+      setProjects(session.projects);
+      setRequirements(session.requirements);
+      setWorkItems(session.workItems);
+      setMissionState(session.missionState);
+      setConnections(session.connections);
+      const localTargets = session.projects[0]?.repositoryTargets.filter((target) => target.kind === "local") ?? [];
+      const createdTarget = localTargets.find((target) => target.path === path) ?? localTargets[localTargets.length - 1];
+      setActiveRepositoryWorkspaceTargetId(createdTarget?.id ?? "");
+      setActiveNav("Issues");
+      window.history.replaceState(null, "", "#workboard");
+      setLocalRepositoryPath(createdTarget?.path ?? path);
+      setLocalRepositoryMessage(`${createdTarget?.path ?? path} workspace was created under ${session.projects[0]?.name ?? "the current project"}.`);
+    } catch (error) {
+      setLocalRepositoryMessage(error instanceof Error ? error.message : "Local repository workspace creation failed.");
+    }
+  }
+
   async function deleteRepositoryWorkspace(targetId: string) {
     if (!missionControlApiUrl) return;
     const target = repositoryTargets.find((candidate) => candidate.id === targetId);
     if (!target) return;
     const label = target.kind === "github" ? `${target.owner}/${target.repo}` : target.path;
     const itemCount = workItems.filter((item) => item.repositoryTargetId === targetId).length;
+    const localWorkspaceCopy = deleteLocalWorkspacesOnRepositoryDelete
+      ? "\n\nThe checked option will also remove local attempt workspace folders recorded for those runs."
+      : "";
     const confirmed = window.confirm(
-      `Delete ${label} from Omega?\n\nThis removes the repository workspace and ${itemCount} linked work item${itemCount === 1 ? "" : "s"} from this app. It does not delete the GitHub repository.`
+      `Delete ${label} from Omega?\n\nThis removes the repository workspace and ${itemCount} linked work item${itemCount === 1 ? "" : "s"} from this app. It does not delete the GitHub repository.${localWorkspaceCopy}`
     );
     if (!confirmed) return;
     try {
-      const session = await deleteRepositoryTargetViaApi(missionControlApiUrl, run, targetId);
+      const session = await deleteRepositoryTargetViaApi(missionControlApiUrl, run, targetId, {
+        deleteLocalWorkspaces: deleteLocalWorkspacesOnRepositoryDelete
+      });
       setProjects(session.projects);
       setRequirements(session.requirements);
       setWorkItems(session.workItems);
@@ -2189,7 +2466,7 @@ function App() {
         setSelectedWorkItemId(session.workItems[0]?.id ?? "");
         setActiveNav("Projects");
         window.history.replaceState(null, "", "#projects");
-        setRunnerMessage(`${label} was removed from Omega.`);
+        setRunnerMessage(`${label} was removed from Omega.${deleteLocalWorkspacesOnRepositoryDelete ? " Local attempt workspaces were cleaned when safely inside the configured workspace root." : ""}`);
       } else {
         setRunnerMessage("");
       }
@@ -2252,11 +2529,11 @@ function App() {
     const current = watcherByRepositoryTargetId.get(targetId);
     const nextStatus = current?.status === "active" ? "paused" : "active";
     setSyncingRepositoryKey(label);
-    setRepositorySyncMessage(
-      nextStatus === "active"
-        ? `Auto processing enabled for ${label}. Omega will scan ready GitHub issues every 60 seconds.`
-        : `Auto processing paused for ${label}.`
-    );
+	    setRepositorySyncMessage(
+	      nextStatus === "active"
+	        ? `Auto processing enabled for ${label}. Omega will start Not Started work items and scan ready GitHub issues when available.`
+	        : `Auto processing paused for ${label}.`
+	    );
     try {
       const watcher = await updateOrchestratorWatcher(missionControlApiUrl, targetId, {
         status: nextStatus,
@@ -2269,6 +2546,9 @@ function App() {
       setOrchestratorWatchers((currentWatchers) => {
         const rest = currentWatchers.filter((candidate) => candidate.repositoryTargetId !== targetId);
         return [...rest, watcher];
+      });
+      await refreshWorkspaceState().catch((error) => {
+        console.warn("Workspace refresh after watcher update failed", error);
       });
       await refreshControlPlane().catch((error) => {
         console.warn("Control plane refresh after watcher update failed", error);
@@ -2430,6 +2710,42 @@ function App() {
     }
   }
 
+  async function runGlobalRunnerPreflight(input: {
+    runner: GlobalAgentRunnerId;
+    provider?: string;
+    model?: string;
+    baseUrl?: string;
+    secret?: string;
+  }) {
+    if (!missionControlApiUrl) {
+      setAgentConfigSavedMessage("Agent preflight requires the local runtime.");
+      return;
+    }
+    const label = agentRunnerOptions.find((option) => option.value === input.runner)?.label ?? input.runner;
+    setTestingGlobalRunnerId(input.runner);
+    try {
+      const result = await testAgentRunner(missionControlApiUrl, {
+        agentId: `global-${input.runner}`,
+        label,
+        runner: input.runner,
+        provider: input.provider,
+        model: input.model,
+        baseUrl: input.baseUrl,
+        secret: input.secret
+      });
+      setGlobalRunnerPreflightResults((current) => ({ ...current, [input.runner]: result }));
+      setAgentConfigSavedMessage(
+        result.status === "ready"
+          ? `${label} runner is ready.`
+          : `${label} runner needs attention: ${result.message ?? "preflight failed."}`
+      );
+    } catch (error) {
+      setAgentConfigSavedMessage(error instanceof Error ? error.message : "Agent preflight failed.");
+    } finally {
+      setTestingGlobalRunnerId("");
+    }
+  }
+
   async function approvePendingCheckpoint(checkpointId: string) {
     if (!missionControlApiUrl) return;
     try {
@@ -2481,57 +2797,30 @@ function App() {
     return grantProviderConnection(connections, "feishu", feishuConnectionIdentity(feishuConfig));
   }, [connections, feishuConfig]);
   const agentAccessItems = useMemo<AgentAccessSidebarItem[]>(() => {
-    const selectedRunner = runnerOptionFor(agentConfigDraft.runner);
-    const selectedRunnerReady = capabilityAvailable(localCapabilities, selectedRunner?.capabilityId);
-    const readyProfiles = agentConfigDraft.agentProfiles.filter((profile) => {
-      const option = runnerOptionFor(profile.runner);
-      return option ? capabilityAvailable(localCapabilities, option.capabilityId) : false;
-    }).length;
-    const totalProfiles = agentConfigDraft.agentProfiles.length;
-    const savedAccounts = runnerCredentials.filter((credential) => credential.secretConfigured).length;
-    const selectedRunnerUsesLocalCliAuth = agentConfigDraft.runner === "codex" || agentConfigDraft.runner === "claude-code";
-    const accountsReady = savedAccounts > 0 || (selectedRunnerUsesLocalCliAuth && selectedRunnerReady);
-    const selectedModel = agentConfigDraft.agentProfiles.find((profile) => profile.id === selectedAgentProfileId)?.model || llmSelection.model;
-    return [
-      {
-        id: "runner",
-        label: "Runner",
-        value: selectedRunner?.label ?? agentConfigDraft.runner,
-        status: selectedRunnerReady ? "ready" : "setup",
-        targetTab: "agents"
-      },
-      {
-        id: "model",
-        label: "Model",
-        value: selectedModel || "not set",
-        status: selectedModel ? "ready" : "setup",
-        targetTab: "agents"
-      },
-      {
-        id: "profiles",
-        label: "Profiles",
-        value: `${readyProfiles}/${totalProfiles || 0}`,
-        status: totalProfiles > 0 && readyProfiles === totalProfiles ? "ready" : readyProfiles > 0 ? "partial" : "setup",
-        targetTab: "agents"
-      },
-      {
-        id: "accounts",
-        label: "Accounts",
-        value: savedAccounts > 0 ? `${savedAccounts} saved` : accountsReady ? "local auth" : "setup",
-        status: accountsReady ? "ready" : "setup",
-        targetTab: "runtime"
-      }
+    const runnerRows: Array<{ id: string; label: string; capabilityId: string }> = [
+      { id: "codex", label: "Codex", capabilityId: "codex" },
+      { id: "claude-code", label: "Claude Code", capabilityId: "claude-code" },
+      { id: "opencode", label: "opencode", capabilityId: "opencode" },
+      { id: "trae-agent", label: "Trae Agent", capabilityId: "trae-agent" }
     ];
-  }, [agentConfigDraft, llmSelection.model, localCapabilities, runnerCredentials, selectedAgentProfileId]);
+    return runnerRows.map((runner) => {
+      const ready = capabilityAvailable(localCapabilities, runner.capabilityId);
+      return {
+        id: runner.id,
+        label: runner.label,
+        value: ready ? "ready" : "missing",
+        status: ready ? "ready" : "setup"
+      };
+    });
+  }, [localCapabilities]);
 
-  function openAgentAccess(targetTab: AgentConfigTab = "agents") {
-    setAppSurface("workboard");
-    setActiveNav("Settings");
-    setActiveWorkItemDetailId("");
-    setAgentConfigOpen(true);
-    setAgentConfigTab(targetTab);
-    if (targetTab === "runtime") setRuntimeConfigTab("omega");
-    window.history.replaceState(null, "", "#settings");
+  function openAgentAccess(item: AgentAccessSidebarItem) {
+    const runner = ["codex", "claude-code", "opencode", "trae-agent"].includes(item.id)
+      ? (item.id as GlobalAgentRunnerId)
+      : "opencode";
+    setSelectedGlobalAgentRunnerId(runner);
+    setActiveInspectorPanel("agents");
+    setInspectorOpen(true);
     clearWorkspaceMessages();
   }
 
@@ -2591,6 +2880,16 @@ function App() {
       window.localStorage.setItem("omega-ui-theme", next);
       return next;
     });
+  }
+
+  function changeUiLanguage(language: UiLanguage) {
+    setUiLanguage(language);
+    window.localStorage.setItem(uiLanguageStorageKey, language);
+    if (missionControlApiUrl) {
+      updateUiLanguagePreference(missionControlApiUrl, language).catch((error) => {
+        console.warn("UI language preference save failed", error);
+      });
+    }
   }
 
   async function applyPagePilotChange(instruction: string, selection: PagePilotSelectionContext) {
@@ -2709,9 +3008,41 @@ function App() {
         const next = current.filter((credential) => credential.id !== saved.id);
         return [saved, ...next];
       });
-      setAgentConfigSavedMessage(`${saved.label || saved.runner} account saved. Future runs will inject it only at runner start.`);
+      setAgentConfigSavedMessage(
+        input.runner === "codex"
+          ? `${saved.label || saved.runner} model saved. Future Codex runs will use it when a stage has no explicit model.`
+          : `${saved.label || saved.runner} account saved. Future runs will inject it only at runner start.`
+      );
     } catch (error) {
       setAgentConfigSavedMessage(error instanceof Error ? error.message : "Runner account save failed.");
+    }
+  }
+
+  async function discoverRunnerAccountModels(input: {
+    runner: string;
+    provider: string;
+    model?: string;
+    baseUrl?: string;
+    secret?: string;
+  }) {
+    if (!missionControlApiUrl) {
+      setAgentConfigSavedMessage("Runner model discovery requires the local runtime.");
+      return;
+    }
+    const key = `${input.runner}:${input.provider}`;
+    setDiscoveringRunnerModelsKey(key);
+    try {
+      const result = await discoverRunnerModels(missionControlApiUrl, input);
+      setRunnerModelDiscoveryResults((current) => ({ ...current, [key]: result }));
+      setAgentConfigSavedMessage(
+        result.status === "ready"
+          ? `Discovered ${result.models.length} ${input.provider} model(s).`
+          : result.message ?? "Runner model discovery failed."
+      );
+    } catch (error) {
+      setAgentConfigSavedMessage(error instanceof Error ? error.message : "Runner model discovery failed.");
+    } finally {
+      setDiscoveringRunnerModelsKey("");
     }
   }
 
@@ -2721,10 +3052,14 @@ function App() {
       omegaDesktop?: { selectDirectory?: () => Promise<string | undefined> };
     }).omegaDesktop;
     if (desktopBridge?.selectDirectory) {
-      const selectedPath = await desktopBridge.selectDirectory();
-      if (selectedPath) {
-        setLocalWorkspaceRootDraft(selectedPath);
-        setWorkspaceFolderPickerMessage("Folder selected from desktop picker.");
+      try {
+        const selectedPath = await desktopBridge.selectDirectory();
+        if (selectedPath) {
+          setLocalWorkspaceRootDraft(selectedPath);
+          setWorkspaceFolderPickerMessage("Folder selected from desktop picker.");
+        }
+      } catch (error) {
+        setWorkspaceFolderPickerMessage(error instanceof Error ? error.message : "Desktop folder picker failed. Restart Omega Desktop and try again.");
       }
       return;
     }
@@ -2748,11 +3083,77 @@ function App() {
     setWorkspaceFolderPickerMessage("Folder picker is not available in this browser. Paste the absolute path or use the desktop shell picker.");
   }
 
-  if (appSurface === "home") {
-    return <PortalHome onOpenWorkboard={openWorkboard} onOpenPagePilot={openPagePilot} onToggleTheme={toggleUiTheme} uiTheme={uiTheme} />;
+  async function chooseLocalRepositoryFolder() {
+    setLocalRepositoryMessage("");
+    const desktopBridge = (window as Window & {
+      omegaDesktop?: { selectDirectory?: () => Promise<string | undefined> };
+    }).omegaDesktop;
+    if (desktopBridge?.selectDirectory) {
+      try {
+        const selectedPath = await desktopBridge.selectDirectory();
+        if (selectedPath) {
+          setLocalRepositoryPath(selectedPath);
+          setLocalRepositoryMessage("Project directory selected from desktop picker.");
+        }
+      } catch (error) {
+        setLocalRepositoryMessage(error instanceof Error ? error.message : "Desktop project directory picker failed. Restart Omega Desktop and try again.");
+      }
+      return;
+    }
+
+    const browserPicker = (window as Window & {
+      showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<{ name: string }>;
+    }).showDirectoryPicker;
+    if (browserPicker) {
+      try {
+        const handle = await browserPicker({ mode: "readwrite" });
+        setLocalRepositoryMessage(
+          `Selected "${handle.name}". Browser mode cannot expose the absolute local path yet, so paste the project path before creating the workspace.`
+        );
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setLocalRepositoryMessage(error instanceof Error ? error.message : "Project directory picker failed.");
+      }
+      return;
+    }
+
+    setLocalRepositoryMessage("Project directory picker is not available in this browser. Paste the absolute path or use the desktop shell picker.");
   }
 
+  if (appSurface === "home") {
+    return (
+      <I18nProvider language={uiLanguage}>
+        <PortalHome
+          onOpenWorkboard={openWorkboard}
+          onOpenPagePilot={openPagePilot}
+          onToggleTheme={toggleUiTheme}
+          onLanguageChange={changeUiLanguage}
+          uiTheme={uiTheme}
+          uiLanguage={uiLanguage}
+        />
+      </I18nProvider>
+    );
+  }
+
+  const detailHasFailedRun = activeWorkItemDetail ? isFailedWork(activeWorkItemDetail, activeDetailPipeline) : false;
+  const detailRunVisible = activeWorkItemDetail
+    ? runningWorkItemId === activeWorkItemDetail.id ||
+      (!activeDetailCompleted &&
+        !detailHasFailedRun &&
+        activeWorkItemDetail.status !== "Planning" &&
+        activeWorkItemDetail.status !== "In Review" &&
+        activeWorkItemDetail.status !== "Human Review")
+    : true;
+  const detailRunLabel = !activeWorkItemDetail
+    ? t("Run")
+    : runningWorkItemId === activeWorkItemDetail.id
+      ? t("Running...")
+      : activeWorkItemDetail.status === "Planning"
+        ? t("Planning...")
+        : t("Run");
+
   return (
+    <I18nProvider language={uiLanguage}>
     <main className={shellClassName}>
       <WorkspaceChrome
         activeNav={activeNav}
@@ -2766,22 +3167,12 @@ function App() {
               activeWorkItemDetail.status === "In Review"
             : false
         }
-        detailRunLabel={
-          !activeWorkItemDetail
-            ? "Run"
-            : activeDetailCompleted
-              ? "Rerun"
-              : runningWorkItemId === activeWorkItemDetail.id
-                ? "Running..."
-                : activeWorkItemDetail.status === "Planning"
-                  ? "Planning..."
-                  : isFailedWork(activeWorkItemDetail, activeDetailPipeline)
-                    ? "Retry"
-                    : "Run"
-        }
+        detailRunLabel={detailRunLabel}
+        detailRunVisible={detailRunVisible}
         runnerMessage={runnerMessage}
         searchQuery={searchQuery}
         uiTheme={uiTheme}
+        uiLanguage={uiLanguage}
         repositoryTargets={repositoryTargets}
         workItems={workItems}
         activeRepositoryWorkspaceTargetId={activeRepositoryWorkspaceTargetId}
@@ -2818,6 +3209,7 @@ function App() {
         }}
         onSearchChange={setSearchQuery}
         onToggleTheme={toggleUiTheme}
+        onLanguageChange={changeUiLanguage}
         onToggleWorkspaceSection={setWorkspaceSectionOpen}
         onToggleConnectionsSection={setConnectionsSectionOpen}
         onToggleAgentAccessSection={setAgentAccessSectionOpen}
@@ -2838,7 +3230,7 @@ function App() {
           clearWorkspaceMessages();
         }}
         onProviderClick={handleProviderRowClick}
-        onAgentAccessClick={(item) => openAgentAccess(item.targetTab)}
+        onAgentAccessClick={openAgentAccess}
         onNewRequirement={() => {
           setShowInlineCreate((current) => !current);
           setCreateComposerExpanded(true);
@@ -2867,6 +3259,9 @@ function App() {
             githubRepoOwner={githubRepoOwner}
             githubRepoName={githubRepoName}
             selectedRepositoryBound={selectedRepositoryBound}
+            localRepositoryPath={localRepositoryPath}
+            localRepositoryMessage={localRepositoryMessage}
+            selectedLocalRepositoryBound={selectedLocalRepositoryBound}
             filteredGitHubRepositories={filteredGitHubRepositories}
             githubRepoInfo={githubRepoInfo}
             onOpenProjectConfig={() => {
@@ -2892,6 +3287,12 @@ function App() {
             onRepositoryQueryChange={setGitHubRepositoryQuery}
             onCreateOrOpenWorkspace={openSelectedRepositoryWorkspace}
             onSelectGitHubRepository={selectGitHubRepository}
+            onLocalRepositoryPathChange={(value) => {
+              setLocalRepositoryPath(value);
+              setLocalRepositoryMessage("");
+            }}
+            onChooseLocalRepositoryFolder={chooseLocalRepositoryFolder}
+            onCreateOrOpenLocalWorkspace={openSelectedLocalRepositoryWorkspace}
           />
         ) : null}
 
@@ -3301,7 +3702,7 @@ function App() {
             <section className="operator-section">
               <div className="operator-section-heading">
                 <div>
-                  <span className="section-label">Workspace config</span>
+                  <span className="section-label">{t("Workspace config")}</span>
                   <h2>{activeRepositoryWorkspaceLabel || primaryProject?.name || "Omega Project"}</h2>
                 </div>
                 {activeRepositoryWorkspace ? (
@@ -3313,7 +3714,7 @@ function App() {
                       window.history.replaceState(null, "", "#workboard");
                     }}
                   >
-                    Open work items
+                    {t("Open work items")}
                   </button>
                 ) : null}
               </div>
@@ -3321,19 +3722,19 @@ function App() {
                 <article className="control-card workspace-location-card">
                   <div className="control-card-header">
                     <div>
-                      <span className="section-label">Local runtime</span>
-                      <h2>Workspace folder</h2>
+                      <span className="section-label">{t("Local runtime")}</span>
+                      <h2>{t("Workspace folder")}</h2>
                     </div>
                     <details className="info-popover">
-                      <summary aria-label="About workspace folder">
+                      <summary aria-label={t("Workspace folder")}>
                         <InfoIcon />
                       </summary>
-                      <p>Omega creates isolated runner workspaces under this folder before dispatching Agent stages.</p>
+                      <p>{t("Omega creates isolated runner workspaces under this folder before dispatching Agent stages.")}</p>
                     </details>
                   </div>
                   <div className="folder-picker">
                     <label>
-                      <span>Folder path</span>
+                      <span>{t("Folder path")}</span>
                       <input
                         value={localWorkspaceRootDraft}
                         onChange={(event) => {
@@ -3345,22 +3746,22 @@ function App() {
                     </label>
                     <div className="folder-picker-actions">
                       <button type="button" onClick={chooseLocalWorkspaceFolder}>
-                        Choose folder
+                        {t("Choose folder")}
                       </button>
                       <button
                         type="button"
                         onClick={() => {
                           setLocalWorkspaceRootDraft("~/Omega/workspaces");
-                          setWorkspaceFolderPickerMessage("Default Omega workspace folder selected.");
+                          setWorkspaceFolderPickerMessage(t("Default Omega workspace folder selected."));
                         }}
                       >
-                        Use default
+                        {t("Use default")}
                       </button>
                       <button type="button" className="primary-action" onClick={saveLocalWorkspaceRoot}>
-                        Save
+                        {t("Save")}
                       </button>
                     </div>
-                    {localWorkspaceRoot ? <small>Current: {localWorkspaceRoot}</small> : null}
+                    {localWorkspaceRoot ? <small>{t("Current: {value}", { value: localWorkspaceRoot })}</small> : null}
                     {workspaceFolderPickerMessage ? <p role="status">{workspaceFolderPickerMessage}</p> : null}
                   </div>
                 </article>
@@ -3368,32 +3769,32 @@ function App() {
                 <article className="control-card agent-config-map">
                   <div className="control-card-header">
                     <div>
-                      <span className="section-label">Scope</span>
-                      <h2>{activeRepositoryWorkspaceLabel ? "Repository" : "Project default"}</h2>
+                      <span className="section-label">{t("Scope")}</span>
+                      <h2>{activeRepositoryWorkspaceLabel ? t("Repository") : t("Project default")}</h2>
                     </div>
                     <details className="info-popover">
                       <summary aria-label="About config scope">
                         <InfoIcon />
                       </summary>
-                      <p>These settings are resolved before a Pipeline starts and are written into each Agent runner's runtime spec.</p>
+                      <p>{t("These settings are resolved before a Pipeline starts and are written into each Agent runner's runtime spec.")}</p>
                     </details>
                   </div>
                   <div className="agent-config-chip-row">
                     <span>
-                      <small>Template</small>
+                      <small>{t("Template")}</small>
                       <strong>{agentConfigDraft.workflowTemplate}</strong>
                     </span>
                     <span>
-                      <small>Default runner</small>
+                      <small>{t("Default runner")}</small>
                       <strong>{agentConfigDraft.runner}</strong>
                     </span>
                     <span>
-                      <small>Agent contracts</small>
+                      <small>{t("Agent contracts")}</small>
                       <strong>{agentDefinitions.length}</strong>
                     </span>
                     <span>
-                      <small>Editor</small>
-                      <strong>{agentConfigOpen ? "Open below" : "Collapsed"}</strong>
+                      <small>{t("Editor")}</small>
+                      <strong>{agentConfigOpen ? t("Open below") : t("Collapsed")}</strong>
                     </span>
                   </div>
                 </article>
@@ -3403,35 +3804,35 @@ function App() {
                 <article className="control-card workspace-management-card">
                   <div className="control-card-header">
                     <div>
-                      <span className="section-label">Operations</span>
-                      <h2>Workspace controls</h2>
+                      <span className="section-label">{t("Operations")}</span>
+                      <h2>{t("Workspace controls")}</h2>
                     </div>
                     <details className="info-popover align-right">
                       <summary aria-label="About workspace controls">
                         <InfoIcon />
                       </summary>
-                      <p>These controls apply only to {activeRepositoryWorkspaceLabel}. Deleting removes Omega's workspace target, not the GitHub repository.</p>
+                      <p>{t("These controls apply only to")} {activeRepositoryWorkspaceLabel}. {t("Deleting removes Omega's workspace target, not the GitHub repository.")}</p>
                     </details>
                   </div>
                   <div className="workspace-management-grid">
                     <div className="workspace-management-row">
                       <span>
-                        <strong>Auto scan</strong>
-                        <small>
-                          {activeRepositoryWorkspace.kind === "github"
-                            ? activeRepositoryWatcherActive
-                              ? "On · ready issues can start"
-                              : "Off · manual run only"
-                            : "GitHub workspace only"}
-                        </small>
-                      </span>
+	                        <strong>{t("Auto run")}</strong>
+	                        <small>
+	                          {activeRepositoryWatcherActive
+	                            ? activeRepositoryWorkspace.kind === "github"
+	                              ? t("On · Not Started and ready issues can run")
+	                              : t("On · Not Started items can run")
+	                            : t("Off · manual run only")}
+	                        </small>
+	                      </span>
                       <button
                         type="button"
                         role="switch"
                         aria-checked={activeRepositoryWatcherActive}
-                        aria-label="Auto scan ready GitHub issues"
-                        className={activeRepositoryWatcherActive ? "workspace-switch active" : "workspace-switch"}
-                        disabled={activeRepositoryWorkspace.kind !== "github" || syncingRepositoryKey === activeRepositoryWorkspaceKey}
+	                        aria-label="Auto run Not Started work items"
+	                        className={activeRepositoryWatcherActive ? "workspace-switch active" : "workspace-switch"}
+	                        disabled={syncingRepositoryKey === activeRepositoryWorkspaceKey}
                         onClick={() => {
                           void toggleRepositoryAutoProcessing(activeRepositoryWorkspace.id);
                         }}
@@ -3441,8 +3842,16 @@ function App() {
                     </div>
                     <div className="workspace-management-row danger-zone">
                       <span>
-                        <strong>Delete workspace</strong>
-                        <small>Remove from Omega only</small>
+                        <strong>{t("Delete workspace")}</strong>
+                        <small>{deleteLocalWorkspacesOnRepositoryDelete ? t("Remove from Omega and delete local attempt folders") : t("Remove from Omega only")}</small>
+                        <label className="workspace-delete-checkbox">
+                          <input
+                            type="checkbox"
+                            checked={deleteLocalWorkspacesOnRepositoryDelete}
+                            onChange={(event) => setDeleteLocalWorkspacesOnRepositoryDelete(event.currentTarget.checked)}
+                          />
+                          <span>{t("Also delete local attempt workspaces")}</span>
+                        </label>
                       </span>
                       <button
                         type="button"
@@ -3451,7 +3860,7 @@ function App() {
                           void deleteRepositoryWorkspace(activeRepositoryWorkspace.id);
                         }}
                       >
-                        Delete workspace
+                        {t("Delete workspace")}
                       </button>
                     </div>
                   </div>
@@ -3476,7 +3885,6 @@ function App() {
               selectedAgentProfileId={selectedAgentProfileId}
               onSave={saveAgentConfigurationDraft}
               onSelectAgentProfile={setSelectedAgentProfileId}
-              onSaveRunnerCredential={saveRunnerAccountCredential}
               onImportTemplate={importWorkspaceAgentTemplate}
               onTestAgentProfile={runAgentProfilePreflight}
               onSetAgentConfigOpen={setAgentConfigOpen}
@@ -3536,7 +3944,7 @@ function App() {
               <WorkItemDetailPage
                 agentShortLabel={agentShortLabel}
                 attemptActionPlan={activeAttemptActionPlan}
-                attemptStatusLabel={attemptStatusLabel}
+                attemptStatusLabel={localizedAttemptStatusLabel}
                 attemptTimeline={activeAttemptTimeline}
                 attempts={activeDetailAttempts}
                 checkpoints={checkpoints}
@@ -3544,7 +3952,7 @@ function App() {
                 operationStatusLabel={operationStatusLabel}
                 pipeline={activeDetailPipeline}
                 pipelineStageClassName={pipelineStageClassName}
-                pipelineStageLabel={pipelineStageLabel}
+                pipelineStageLabel={localizedPipelineStageLabel}
                 proofRecords={proofRecords}
                 pullRequestStatus={activePullRequestStatus}
                 repositoryLabel={activeDetailRepositoryLabel}
@@ -3555,7 +3963,7 @@ function App() {
                 statusClassName={statusClassName}
                 workItem={activeWorkItemDetail}
                 workItems={displayWorkItems}
-                workItemStatusLabel={workItemStatusLabel}
+                workItemStatusLabel={localizedWorkItemStatusLabel}
                 onOpenPagePilot={() => openPagePilotForRepository(activeWorkItemDetail.repositoryTargetId)}
                 onApproveCheckpoint={(checkpointId) => void approvePendingCheckpoint(checkpointId)}
                 onFetchProofPreview={(proofId) => fetchProofPreview(missionControlApiUrl, proofId)}
@@ -3564,15 +3972,22 @@ function App() {
                 onRetryAttempt={(attemptId) => void retryWorkItemAttempt(attemptId)}
               />
             ) : activeDetailRoutePending ? (
-              <section className="issue-detail-view work-item-detail-page" aria-label="Work item detail loading">
-                <article className="issue-detail-document detail-loading-card">
-                  <span className="section-label">Work item</span>
-                  <h2>{workspaceLoaded ? "Work item not found" : "Loading work item..."}</h2>
+              <section className="issue-detail-view work-item-detail-page" aria-label={t("Work item")}>
+                <article className={`issue-detail-document detail-loading-card ${workspaceLoadError ? "detail-error-card" : ""}`}>
+                  <span className="section-label">{t("Work item")}</span>
+                  <h2>{workspaceLoadError ? t("Workspace could not be loaded") : workspaceLoaded ? t("Work item not found") : t("Loading work item...")}</h2>
                   <p className="muted-copy">
-                    {workspaceLoaded
-                      ? "This detail route does not match a loaded work item."
-                      : "Omega is loading the workspace before opening the detail view."}
+                    {workspaceLoadError
+                      ? workspaceLoadError
+                      : workspaceLoaded
+                      ? t("This detail route does not match a loaded work item.")
+                      : t("Omega is loading the workspace before opening the detail view.")}
                   </p>
+                  {workspaceLoadError ? (
+                    <p className="detail-error-hint">
+                      {t("Check the local runtime, then reload Omega. The UI is not using cached work item data as a fallback.")}
+                    </p>
+                  ) : null}
                 </article>
               </section>
             ) : (
@@ -3593,7 +4008,7 @@ function App() {
                   newItemDescription.trim() ? (
                     <div className="markdown-content">{renderMarkdown(newItemDescription)}</div>
                   ) : (
-                    <p className="muted-copy">Nothing to preview yet.</p>
+                    <p className="muted-copy">{t("Nothing to preview yet.")}</p>
                   )
                 }
                 onTitleChange={setNewItemTitle}
@@ -3610,8 +4025,8 @@ function App() {
               <>
                 <p className="workspace-context" role="status">
                   <strong>{activeRepositoryWorkspaceLabel}</strong>
-                  <span>{activeRepositoryWorkspaceItems.length} work items</span>
-                  <span>Agent runs are locked to this repository target.</span>
+                  <span>{t("{count} work items", { count: activeRepositoryWorkspaceItems.length })}</span>
+                  <span>{t("Agent runs are locked to this repository target.")}</span>
                 </p>
                 {runnerMessage ? (
                   <p className="runner-status list-runner-status" role="status">
@@ -3627,28 +4042,28 @@ function App() {
 
             <section className="view-controls">
               <label>
-                <span>Status</span>
+                <span>{t("Status")}</span>
                 <select value={statusFilter} onChange={(event) => setStatusFilter(event.currentTarget.value as "All" | WorkItemStatus)}>
                   {["All", "Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Done"].map((status) => (
                     <option key={status} value={status}>
-                      {status === "All" ? "All" : workItemStatusLabel(status as WorkItemStatus)}
+                      {status === "All" ? t("All") : localizedWorkItemStatusLabel(status as WorkItemStatus)}
                     </option>
                   ))}
                 </select>
               </label>
               <label>
-                <span>Assignee</span>
+                <span>{t("Assignee")}</span>
                 <select value={assigneeFilter} onChange={(event) => setAssigneeFilter(event.currentTarget.value)}>
                   {assigneeOptions.map((assignee) => (
-                    <option key={assignee}>{assignee}</option>
+                    <option key={assignee}>{assignee === "All" ? t("All") : assignee}</option>
                   ))}
                 </select>
               </label>
               <label>
-                <span>Priority</span>
+                <span>{t("Priority")}</span>
                 <select value={sortDirection} onChange={(event) => setSortDirection(event.currentTarget.value as WorkboardViewSort["direction"])}>
-                  <option value="desc">High first</option>
-                  <option value="asc">Low first</option>
+                  <option value="desc">{t("High first")}</option>
+                  <option value="asc">{t("Low first")}</option>
                 </select>
               </label>
             </section>
@@ -3659,21 +4074,21 @@ function App() {
                   <button
                     type="button"
                     className="group-chevron"
-                    aria-label={githubIssuesCollapsed ? "Expand GitHub issues" : "Collapse GitHub issues"}
+                    aria-label={githubIssuesCollapsed ? t("Expand GitHub issues") : t("Collapse GitHub issues")}
                     onClick={() => setGithubIssuesCollapsed((current) => !current)}
                   >
                     {githubIssuesCollapsed ? "›" : "⌄"}
                   </button>
                   <span className="issue-state github-source-state" aria-hidden="true" />
-                  <strong>GitHub Issues</strong>
+                  <strong>{t("GitHub Issues")}</strong>
                   <span>{activeRepositoryGitHubItems.length}</span>
                   <div className="github-issues-actions">
-                    <small>{activeRepositoryGitHubItems.length} synced</small>
+                    <small>{t("{count} synced", { count: activeRepositoryGitHubItems.length })}</small>
                     <button
                       type="button"
                       className="icon-action"
-                      aria-label="Sync GitHub issues"
-                      title="Sync GitHub issues"
+                      aria-label={t("Sync GitHub issues")}
+                      title={t("Sync GitHub issues")}
                       disabled={syncingRepositoryKey === activeRepositoryWorkspaceKey}
                       onClick={() => {
                         void importGitHubIssues(activeRepositoryWorkspace.owner, activeRepositoryWorkspace.repo);
@@ -3700,62 +4115,40 @@ function App() {
                           </div>
                           <small>{visibleExternalReference(item.sourceExternalRef) || item.target}</small>
                           <span className={`status-pill ${statusClassName(item.status)}`}>
-                            {workItemStatusLabel(item.status)}
+                            {localizedWorkItemStatusLabel(item.status)}
                           </span>
                         </article>
                       ))
                     ) : (
-                      <p className="github-issues-empty">No GitHub issues synced yet.</p>
+                      <p className="github-issues-empty">{t("No GitHub issues synced yet.")}</p>
                     )}
                   </div>
                 )}
               </section>
             ) : null}
 
-            {workItems.length === 0 ? (
-              <section className="empty-view embedded-empty">
-                <div className="empty-icon" aria-hidden="true">
-                  <span />
-                  <span />
-                  <span />
-                </div>
-                <RequirementComposer
-                  variant="empty"
-                  title={newItemTitle}
-                  description={newItemDescription}
-                  assignee={newItemAssignee}
-                  target={newItemTarget}
-                  hasRepositoryWorkspace={Boolean(activeRepositoryWorkspace)}
-                  repositoryWorkspaceLabel={activeRepositoryWorkspaceLabel}
-                  isExpanded={createComposerExpanded}
-                  descriptionMode={createDescriptionMode}
-                  isCreating={isCreatingItem}
-                  descriptionPreview={null}
-                  onTitleChange={setNewItemTitle}
-                  onDescriptionChange={setNewItemDescription}
-                  onAssigneeChange={setNewItemAssignee}
-                  onTargetChange={setNewItemTarget}
-                  onTitleFocus={() => setCreateComposerExpanded(true)}
-                  onDescriptionModeChange={setCreateDescriptionMode}
-                  onCreate={createItem}
-                />
-              </section>
-            ) : (
-            <>
-            <section className="issue-table" aria-label="Work items">
-              {groupedItems.map((group) => (
-                <div key={group.status} className="issue-group">
-                  <div className="group-row active">
-                    <button className="group-chevron" onClick={() => toggleGroup(group.status)}>
-                      {collapsedGroups.includes(group.status) ? "›" : "⌄"}
-                    </button>
-                    <span className={`issue-state ${statusClassName(group.status)}`} aria-hidden="true" />
-                    <strong>{workItemStatusLabel(group.status)}</strong>
-                    <span>{group.items.length}</span>
-                  </div>
-                  {collapsedGroups.includes(group.status)
-                    ? null
-                    : group.items.map((item) => {
+            <section className="issue-table workboard-flow-table" aria-label={t("Work items")}>
+              {workItemFlowLanes.map((group) => {
+                const laneCollapsed =
+                  collapsedWorkItemLanes.includes(group.id) ||
+                  (group.items.length === 0 && !expandedEmptyWorkItemLanes.includes(group.id));
+                return (
+                  <div key={group.id} className="issue-group">
+                    <div className="group-row active">
+                      <button className="group-chevron" onClick={() => toggleWorkItemLane(group.id, group.items.length)}>
+                        {laneCollapsed ? "›" : "⌄"}
+                      </button>
+                      <span className={`issue-state ${statusClassName(group.visualStatus)}`} aria-hidden="true" />
+                      <strong>{t(group.label)}</strong>
+                      <span>{group.items.length}</span>
+                    </div>
+                    {laneCollapsed ? null : group.items.length === 0 ? (
+                      <div className="issue-lane-empty">
+                        <strong>{t("No items")}</strong>
+                        <span>{t(group.emptyCopy)}</span>
+                      </div>
+                    ) : (
+                      group.items.map((item) => {
                         const repositoryTarget = item.repositoryTargetId
                           ? repositoryTargets.find((target) => target.id === item.repositoryTargetId)
                           : undefined;
@@ -3766,11 +4159,7 @@ function App() {
                         const itemPipeline = pipelinesByWorkItemId.get(item.id);
                         const pipelineStages = itemPipeline?.run?.stages ?? [];
                         const metaParts = workItemMetaParts(item, repositoryLabel);
-                        const itemPendingCheckpoint = itemPipeline
-                          ? checkpoints.find((checkpoint) =>
-                              checkpoint.pipelineId === itemPipeline.id && checkpoint.status === "pending"
-                            )
-                          : undefined;
+                        const itemPendingCheckpoint = pendingCheckpointForPipeline(checkpoints, itemPipeline);
                         const completed = isCompletedWork(item, itemPipeline);
                         const failed = isFailedWork(item, itemPipeline);
                         const runDisabled =
@@ -3790,7 +4179,7 @@ function App() {
                                   type="button"
                                   className="issue-delete-button"
                                   aria-label={`Delete ${item.title}`}
-                                  title="Delete not-started item"
+                                  title={t("Delete not-started item")}
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     void deleteWorkItem(item);
@@ -3823,10 +4212,10 @@ function App() {
                               {hasProgress ? (
                                 <div
                                   className={`issue-progress-track ${pipelineStageClassName(progress.status)}`}
-                                  aria-label={`${item.key} current progress ${progress.label}`}
+                                  aria-label={`${item.key} ${t("current progress")} ${t(progress.label)}`}
                                 >
                                   <div className="issue-progress-copy">
-                                    <strong>{progress.label}</strong>
+                                    <strong>{t(progress.label)}</strong>
                                   </div>
                                   <div className="issue-progress-rail" aria-hidden="true">
                                     <span style={{ width: `${progress.percent}%` }} />
@@ -3835,7 +4224,9 @@ function App() {
                               ) : null}
                             </div>
                             <div className="issue-trailing">
-                              {itemPendingCheckpoint ? (
+                              {completed ? (
+                                <span className="status-pill status-done">{t("Done")}</span>
+                              ) : itemPendingCheckpoint ? (
                                 <button
                                   type="button"
                                   className="review-inline"
@@ -3846,9 +4237,9 @@ function App() {
                                     setInspectorOpen(false);
                                   }}
                                 >
-                                  Human review
+                                  {t("Human review")}
                                 </button>
-                              ) : !completed && failed ? (
+                              ) : failed ? (
                                 <button
                                   className="run-inline"
                                   onClick={(event) => {
@@ -3856,9 +4247,9 @@ function App() {
                                     void runItem(item);
                                   }}
                                 >
-                                  Retry
+                                  {t("Retry")}
                                 </button>
-                              ) : !completed && !hasProgress && item.status !== "Planning" && item.status !== "In Review" && item.status !== "Human Review" ? (
+                              ) : !hasProgress && item.status !== "Planning" && item.status !== "In Review" && item.status !== "Human Review" ? (
                                 <button
                                   className="run-inline"
                                   disabled={runDisabled}
@@ -3867,22 +4258,20 @@ function App() {
                                     void runItem(item);
                                   }}
                                 >
-                                  {runningWorkItemId === item.id ? "Running..." : "Run"}
+                                  {runningWorkItemId === item.id ? t("Running...") : t("Run")}
                                 </button>
-                              ) : completed ? (
-                                <span className="status-pill status-done">Done</span>
                               ) : (
-                                <span className={`status-pill ${statusClassName(item.status)}`}>{workItemStatusLabel(item.status)}</span>
+                                <span className={`status-pill ${statusClassName(item.status)}`}>{localizedWorkItemStatusLabel(item.status)}</span>
                               )}
                             </div>
                           </article>
                         );
-                      })}
-                </div>
-              ))}
+                      })
+                    )}
+                  </div>
+                );
+              })}
             </section>
-            </>
-            )}
             </>
             )}
           </>
@@ -3891,7 +4280,7 @@ function App() {
 
       {inspectorAvailable ? (
         <>
-        <aside className="inspector-panel" aria-label="Properties">
+        <aside className="inspector-panel" aria-label={t("Properties")}>
           {selectedWorkItem ? (
           <details
             className="inspector-block"
@@ -3901,12 +4290,12 @@ function App() {
             }}
           >
             <summary>
-              <span className="section-label">Properties</span>
+              <span className="section-label">{t("Properties")}</span>
               <small>{selectedWorkItem.key}</small>
             </summary>
             <div className="properties-grid">
               <label>
-                <span>Status</span>
+                <span>{t("Status")}</span>
                 <select
                   value={selectedWorkItem.status}
                   onChange={async (event) => {
@@ -3928,13 +4317,13 @@ function App() {
                 >
                   {["Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Done"].map((status) => (
                     <option key={status} value={status}>
-                      {workItemStatusLabel(status as WorkItemStatus)}
+                      {localizedWorkItemStatusLabel(status as WorkItemStatus)}
                     </option>
                   ))}
                 </select>
               </label>
               <label>
-                <span>Priority</span>
+                <span>{t("Priority")}</span>
                 <select
                   value={selectedWorkItem.priority}
                   onChange={async (event) => {
@@ -3955,28 +4344,28 @@ function App() {
                   }}
                 >
                   {["No priority", "Low", "Medium", "High", "Urgent"].map((priority) => (
-                    <option key={priority}>{priority}</option>
+                    <option key={priority}>{t(priority)}</option>
                   ))}
                 </select>
               </label>
               <label>
-                <span>Assignee</span>
+                <span>{t("Assignee")}</span>
                 <input value={selectedWorkItem.assignee} readOnly />
               </label>
               <label>
-                <span>Target</span>
+                <span>{t("Target")}</span>
                 <input value={selectedWorkItem.target} readOnly />
               </label>
             </div>
             <div className="property-copy">
-              <span>Requirement</span>
+              <span>{t("Requirement")}</span>
               <p>{selectedRequirement?.title ?? selectedWorkItem.title}</p>
               {visibleExternalReference(selectedRequirement?.sourceExternalRef) ? (
                 <small>{visibleExternalReference(selectedRequirement?.sourceExternalRef)}</small>
               ) : null}
             </div>
             <div className="property-copy">
-              <span>Item description</span>
+              <span>{t("Item description")}</span>
               <p>{displayText(selectedWorkItem.description)}</p>
             </div>
             <div className="label-stack">
@@ -3995,7 +4384,7 @@ function App() {
             }}
           >
             <summary>
-              <span className="section-label">Provider access</span>
+              <span className="section-label">{t("Provider access")}</span>
               <small>{selectedProvider?.name}</small>
             </summary>
             {visibleConnectionProviders
@@ -4003,19 +4392,19 @@ function App() {
               .map((provider) => (
                 <div key={provider.id} className="provider-panel">
                   <h2>{provider.name}</h2>
-                  <p>{provider.description}</p>
+                  <p>{t(provider.description)}</p>
                   <div className="provider-status">
                     <span className={effectiveConnections[provider.id].status === "connected" ? "dot online" : "dot"} />
-                    <span>{effectiveConnections[provider.id].status}</span>
+                    <span>{t(effectiveConnections[provider.id].status)}</span>
                     <small>
                       {provider.id === "feishu"
                         ? feishuConnectionDetail(feishuConfig)
                         : canUseLocalGitHubOAuth(provider)
                         ? githubOAuthConfig.configured
-                          ? `oauth ready (${githubOAuthConfig.source})`
-                          : "oauth setup"
+                          ? t("oauth ready ({source})", { source: githubOAuthConfig.source })
+                          : t("oauth setup")
                         : provider.authMethod === "oauth" && !providerClientIds[provider.id]
-                        ? "client id required"
+                        ? t("client id required")
                         : provider.authMethod}
                     </small>
                   </div>
@@ -4025,10 +4414,10 @@ function App() {
                       {provider.id === "github" && githubDeviceLoginUrl ? (
                         <div className="provider-feedback-actions">
                           <button onClick={() => openExternalUrlInNewTab(githubDeviceLoginUrl)}>
-                            Open device page
+                            {t("Open device page")}
                           </button>
                           <button onClick={refreshGitHubConnectionStatus}>
-                            Check GitHub status
+                            {t("Check GitHub status")}
                           </button>
                         </div>
                       ) : null}
@@ -4038,8 +4427,8 @@ function App() {
                     <>
                       {!githubOAuthConfig.configured ? (
                         <div className="provider-setup-note">
-                          <strong>GitHub sign-in needs one local OAuth app setup.</strong>
-                          <span>After that, this row will open GitHub authorization directly.</span>
+                          <strong>{t("GitHub sign-in needs one local OAuth app setup.")}</strong>
+                          <span>{t("After that, this row will open GitHub authorization directly.")}</span>
                         </div>
                       ) : null}
                       <details
@@ -4047,10 +4436,10 @@ function App() {
                         open={githubOAuthSetupOpen}
                         onToggle={(event) => setGitHubOAuthSetupOpen(event.currentTarget.open)}
                       >
-                        <summary>OAuth app setup</summary>
+                        <summary>{t("OAuth app setup")}</summary>
                         <div className="provider-config-grid">
                           <label>
-                            <span>Client ID</span>
+                            <span>{t("Client ID")}</span>
                             <input
                               value={githubOAuthDraft.clientId}
                               onChange={(event) => {
@@ -4061,7 +4450,7 @@ function App() {
                             />
                           </label>
                           <label>
-                            <span>Client secret</span>
+                            <span>{t("Client secret")}</span>
                             <input
                               type="password"
                               value={githubOAuthDraft.clientSecret}
@@ -4069,11 +4458,11 @@ function App() {
                                 const value = event.currentTarget.value;
                                 setGitHubOAuthDraft((current) => ({ ...current, clientSecret: value }));
                               }}
-                              placeholder={githubOAuthConfig.secretConfigured ? "Saved secret" : "GitHub OAuth app secret"}
+                              placeholder={githubOAuthConfig.secretConfigured ? t("Saved secret") : "GitHub OAuth app secret"}
                             />
                           </label>
                           <label>
-                            <span>Callback URL</span>
+                            <span>{t("Callback URL")}</span>
                             <input
                               value={githubOAuthDraft.redirectUri}
                               onChange={(event) => {
@@ -4082,7 +4471,7 @@ function App() {
                               }}
                             />
                           </label>
-                          <button onClick={saveGitHubOAuthConfig}>Save OAuth app</button>
+                          <button onClick={saveGitHubOAuthConfig}>{t("Save OAuth app")}</button>
                         </div>
                       </details>
                     </>
@@ -4090,30 +4479,30 @@ function App() {
                   {provider.id === "feishu" ? (
                     <div className="feishu-cli-panel">
                       <div className={feishuConfig.larkCliAvailable ? "provider-tool-status ready" : "provider-tool-status missing"}>
-                        <strong>{feishuConfig.larkCliAvailable ? "lark-cli ready" : "lark-cli missing"}</strong>
-                        <span>{feishuConfig.larkCliVersion || "Run lark-cli config init first."}</span>
+                        <strong>{feishuConfig.larkCliAvailable ? t("lark-cli ready") : t("lark-cli missing")}</strong>
+                        <span>{feishuConfig.larkCliVersion || t("Run lark-cli config init first.")}</span>
                       </div>
                       <button type="button" className="primary-action" disabled={testingFeishuConfig} onClick={runFeishuAccessTest}>
-                        {testingFeishuConfig ? "Testing..." : "Test Feishu connection"}
+                        {testingFeishuConfig ? t("Testing...") : t("Test Feishu connection")}
                       </button>
                       <div className="feishu-reviewer-lookup">
                         <div>
-                          <span className="section-label">Reviewer</span>
-                          <strong>{feishuConfigDraft.assigneeLabel || feishuConfigDraft.assigneeId || "Not selected"}</strong>
-                          <small>Search by name after lark-cli user login, or by enterprise email/mobile with app contact permissions.</small>
+                          <span className="section-label">{t("Reviewer")}</span>
+                          <strong>{feishuConfigDraft.assigneeLabel || feishuConfigDraft.assigneeId || t("Not selected")}</strong>
+                          <small>{t("Search by name after lark-cli user login, or by enterprise email/mobile with app contact permissions.")}</small>
                         </div>
                         <div className="feishu-reviewer-search">
                           <input
                             value={feishuReviewerQuery}
                             onChange={(event) => setFeishuReviewerQuery(event.currentTarget.value)}
-                            placeholder="Name, email, or mobile"
-                            aria-label="Feishu reviewer search"
+                            placeholder={t("Name, email, or mobile")}
+                            aria-label={t("Reviewer")}
                           />
                           <button type="button" disabled={searchingFeishuReviewer} onClick={searchFeishuReviewer}>
-                            {searchingFeishuReviewer ? "Searching..." : "Search"}
+                            {searchingFeishuReviewer ? t("Searching...") : t("Search")}
                           </button>
                           <button type="button" disabled={searchingFeishuReviewer} onClick={useCurrentFeishuReviewer}>
-                            Use current user
+                            {t("Use current user")}
                           </button>
                         </div>
                         {feishuReviewerMessage ? <p className="provider-inline-message">{feishuReviewerMessage}</p> : null}
@@ -4133,28 +4522,28 @@ function App() {
                           </div>
                         ) : null}
                         <button type="button" className="primary-action" onClick={saveFeishuAccessConfig}>
-                          Save Feishu binding
+                          {t("Save Feishu binding")}
                         </button>
                       </div>
                       <details className="provider-advanced feishu-routing-advanced">
-                        <summary>Advanced delivery overrides</summary>
+                        <summary>{t("Advanced delivery overrides")}</summary>
                         <div className="provider-config-grid feishu-binding-form">
                           <label>
-                            <span>Review channel</span>
+                            <span>{t("Review channel")}</span>
                             <select
                               value={feishuConfigDraft.mode}
                               onChange={(event) =>
                                 setFeishuConfigDraft((current) => ({ ...current, mode: event.currentTarget.value }))
                               }
-                              aria-label="Feishu review channel"
+                              aria-label={t("Review channel")}
                             >
-                              <option value="chat">Chat message</option>
-                              <option value="task">Task review</option>
-                              <option value="webhook">Bot webhook</option>
+                              <option value="chat">{t("Chat message")}</option>
+                              <option value="task">{t("Task review")}</option>
+                              <option value="webhook">{t("Bot webhook")}</option>
                             </select>
                           </label>
                           <label>
-                            <span>Chat ID</span>
+                            <span>{t("Chat ID")}</span>
                             <input
                               value={feishuConfigDraft.chatId}
                               onChange={(event) =>
@@ -4164,7 +4553,7 @@ function App() {
                             />
                           </label>
                           <label>
-                            <span>Task assignee</span>
+                            <span>{t("Task assignee")}</span>
                             <input
                               value={feishuConfigDraft.assigneeId}
                               onChange={(event) =>
@@ -4174,7 +4563,7 @@ function App() {
                             />
                           </label>
                           <label>
-                            <span>Task assignee label</span>
+                            <span>{t("Task assignee label")}</span>
                             <input
                               value={feishuConfigDraft.assigneeLabel ?? ""}
                               onChange={(event) =>
@@ -4184,7 +4573,7 @@ function App() {
                             />
                           </label>
                           <label>
-                            <span>Tasklist ID</span>
+                            <span>{t("Tasklist ID")}</span>
                             <input
                               value={feishuConfigDraft.tasklistId}
                               onChange={(event) =>
@@ -4194,7 +4583,7 @@ function App() {
                             />
                           </label>
                           <label>
-                            <span>Bot webhook URL</span>
+                            <span>{t("Bot webhook URL")}</span>
                             <input
                               value={feishuConfigDraft.webhookUrl}
                               onChange={(event) =>
@@ -4204,7 +4593,7 @@ function App() {
                             />
                           </label>
                           <label className="secret-input-field">
-                            <span>Webhook secret</span>
+                            <span>{t("Webhook secret")}</span>
                             <span className="secret-input-shell">
                               <input
                                 type={feishuWebhookSecretVisible ? "text" : "password"}
@@ -4223,7 +4612,7 @@ function App() {
                             </span>
                           </label>
                           <label className="secret-input-field">
-                            <span>Review token</span>
+                            <span>{t("Review token")}</span>
                             <span className="secret-input-shell">
                               <input
                                 type={feishuReviewTokenVisible ? "text" : "password"}
@@ -4249,7 +4638,7 @@ function App() {
                                 setFeishuConfigDraft((current) => ({ ...current, createDoc: event.currentTarget.checked }))
                               }
                             />
-                            <span>Create review doc for long packets</span>
+                            <span>{t("Create review doc for long packets")}</span>
                           </label>
                           <label className="provider-check-field">
                             <input
@@ -4259,10 +4648,10 @@ function App() {
                                 setFeishuConfigDraft((current) => ({ ...current, taskBridgeEnabled: event.currentTarget.checked }))
                               }
                             />
-                            <span>Enable local task bridge sync</span>
+                            <span>{t("Enable local task bridge sync")}</span>
                           </label>
                           <label>
-                            <span>Doc folder token</span>
+                            <span>{t("Doc folder token")}</span>
                             <input
                               value={feishuConfigDraft.docFolderToken}
                               onChange={(event) =>
@@ -4299,29 +4688,62 @@ function App() {
                         onClick={() => connectProvider(provider)}
                       >
                         {provider.id === "github"
-                          ? "Continue with GitHub"
+                          ? t("Continue with GitHub")
                           : provider.authMethod === "oauth"
-                          ? "Open OAuth"
-                          : "Connect"}
+                          ? t("Open OAuth")
+                          : t("Connect")}
                       </button>
                       <button
                         disabled={effectiveConnections[provider.id].status !== "connected"}
                         onClick={() => disconnectProvider(provider.id)}
                       >
-                        Disconnect
+                        {t("Disconnect")}
                       </button>
                     </div>
                   ) : null}
                 </div>
               ))}
           </details>
+          <details
+            className="inspector-block"
+            open={activeInspectorPanel === "agents"}
+            onToggle={(event) => {
+              if (event.currentTarget.open) setActiveInspectorPanel("agents");
+            }}
+          >
+            <summary>
+              <span className="section-label">{t("Agent access")}</span>
+              <small>
+                {selectedGlobalAgentRunnerId === "claude-code"
+                  ? "Claude Code"
+                  : selectedGlobalAgentRunnerId === "trae-agent"
+                    ? "Trae Agent"
+                    : selectedGlobalAgentRunnerId === "opencode"
+                      ? "opencode"
+                      : "Codex"}
+              </small>
+            </summary>
+            <GlobalAgentAccessPanel
+              selectedRunnerId={selectedGlobalAgentRunnerId}
+              localCapabilities={localCapabilities}
+              runnerCredentials={runnerCredentials}
+              runnerModelDiscoveryResults={runnerModelDiscoveryResults}
+              runnerPreflightResults={globalRunnerPreflightResults}
+              discoveringRunnerModelsKey={discoveringRunnerModelsKey}
+              testingRunnerId={testingGlobalRunnerId}
+              onSelectRunner={setSelectedGlobalAgentRunnerId}
+              onSaveRunnerCredential={saveRunnerAccountCredential}
+              onDiscoverRunnerModels={discoverRunnerAccountModels}
+              onTestRunner={runGlobalRunnerPreflight}
+            />
+          </details>
         </aside>
         <aside className="inspector-rail" aria-label="Inspector panels">
           <button
             className="rail-button layout-button"
-            aria-label={inspectorOpen ? "Collapse inspector" : "Expand inspector"}
+            aria-label={inspectorOpen ? t("Collapse inspector") : t("Expand inspector")}
             onClick={() => setInspectorOpen((current) => !current)}
-            title={inspectorOpen ? "Collapse inspector" : "Expand inspector"}
+            title={inspectorOpen ? t("Collapse inspector") : t("Expand inspector")}
           >
             <span className="layout-icon" aria-hidden="true">
               <span />
@@ -4330,24 +4752,33 @@ function App() {
           </button>
           <button
             className={activeInspectorPanel === "properties" ? "rail-button active" : "rail-button"}
-            aria-label="Properties"
-            title="Properties"
+            aria-label={t("Properties")}
+            title={t("Properties")}
             onClick={() => openInspectorPanel("properties")}
           >
             <span className="rail-icon info-icon" aria-hidden="true">i</span>
           </button>
           <button
             className={activeInspectorPanel === "provider" ? "rail-button active" : "rail-button"}
-            aria-label="Provider access"
-            title="Provider access"
+            aria-label={t("Provider access")}
+            title={t("Provider access")}
             onClick={() => openInspectorPanel("provider")}
           >
             <span className="rail-icon link-icon" aria-hidden="true" />
+          </button>
+          <button
+            className={activeInspectorPanel === "agents" ? "rail-button active" : "rail-button"}
+            aria-label={t("Agent access")}
+            title={t("Agent access")}
+            onClick={() => openInspectorPanel("agents")}
+          >
+            <span className="rail-icon info-icon" aria-hidden="true">A</span>
           </button>
         </aside>
         </>
       ) : null}
     </main>
+    </I18nProvider>
   );
 }
 

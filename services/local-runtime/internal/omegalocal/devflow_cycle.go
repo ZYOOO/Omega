@@ -113,7 +113,7 @@ func (server *Server) startDevFlowCycleJob(pipelineID string, attemptID string, 
 			_ = saveExecutionLock(context.Background(), server, nextLock)
 		}
 
-		database, err := mustLoad(server, context.Background())
+		database, err := server.Repo.LoadSupervisorExecutionState(context.Background())
 		if err != nil {
 			server.logError(context.Background(), "devflow.job.load_failed", err.Error(), map[string]any{"pipelineId": pipelineID, "attemptId": attemptID})
 			_ = server.failDevFlowCycleJob(context.Background(), pipelineID, attemptID, err)
@@ -140,19 +140,19 @@ func (server *Server) startDevFlowCycleJob(pipelineID string, attemptID string, 
 			_ = saveExecutionLock(context.Background(), server, lock)
 		}
 		server.markAttemptWorkerHost(context.Background(), pipelineID, attemptID, workerHost)
-		item := findWorkItem(database, text(pipeline, "workItemId"))
+		item := findWorkItem(*database, text(pipeline, "workItemId"))
 		if item == nil {
 			_ = server.failDevFlowCycleJob(context.Background(), pipelineID, attemptID, fmt.Errorf("work item not found"))
 			releaseLock("failed")
 			return
 		}
-		stageItem, err := resolveWorkItemRepositoryTarget(database, item)
+		stageItem, err := resolveWorkItemRepositoryTarget(*database, item)
 		if err != nil {
 			_ = server.failDevFlowCycleJob(context.Background(), pipelineID, attemptID, err)
 			releaseLock("failed")
 			return
 		}
-		target := findRepositoryTarget(database, text(stageItem, "repositoryTargetId"))
+		target := findRepositoryTarget(*database, text(stageItem, "repositoryTargetId"))
 		if target == nil {
 			_ = server.failDevFlowCycleJob(context.Background(), pipelineID, attemptID, fmt.Errorf("work item %s has no repository workspace", text(stageItem, "key")))
 			releaseLock("failed")
@@ -177,6 +177,14 @@ func (server *Server) startDevFlowCycleJob(pipelineID string, attemptID string, 
 			releaseLock("failed")
 			return
 		}
+		if autoApproveHuman && text(result, "status") == "waiting-human" {
+			if err := server.autoApproveDevFlowHumanCheckpoint(context.Background(), pipelineID); err != nil {
+				server.logError(context.Background(), "devflow.job.auto_approve_failed", err.Error(), map[string]any{"pipelineId": pipelineID, "attemptId": attemptID, "workItemId": text(stageItem, "id")})
+				_ = server.failDevFlowCycleJob(context.Background(), pipelineID, attemptID, err)
+				releaseLock("failed")
+				return
+			}
+		}
 		server.logInfo(context.Background(), "devflow.job.completed", "DevFlow background job completed.", map[string]any{
 			"entityType": "attempt",
 			"entityId":   attemptID,
@@ -189,22 +197,39 @@ func (server *Server) startDevFlowCycleJob(pipelineID string, attemptID string, 
 	}()
 }
 
+func (server *Server) autoApproveDevFlowHumanCheckpoint(ctx context.Context, pipelineID string) error {
+	checkpoints, err := server.Repo.ListCheckpoints(ctx, map[string]string{"pipelineId": pipelineID, "status": "pending"})
+	if err != nil {
+		return err
+	}
+	for _, checkpoint := range checkpoints {
+		if text(checkpoint, "stageId") != "human_review" {
+			continue
+		}
+		_, _, err := server.applyCheckpointDecision(ctx, text(checkpoint, "id"), "approved", map[string]any{
+			"reviewer": "auto-approve",
+		})
+		return err
+	}
+	return fmt.Errorf("pending human review checkpoint not found for pipeline %s", pipelineID)
+}
+
 func (server *Server) failDevFlowCycleJob(ctx context.Context, pipelineID string, attemptID string, failure error) error {
 	return server.failDevFlowCycleJobWithResult(ctx, pipelineID, attemptID, failure, nil)
 }
 
 func (server *Server) cancelDevFlowCycleJob(ctx context.Context, pipelineID string, attemptID string, reason string) error {
-	database, err := mustLoad(server, ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return err
 	}
-	database, _ = markAttemptCanceled(database, attemptID, stringOr(reason, "Attempt canceled."))
-	touch(&database)
-	return server.Repo.Save(context.Background(), database)
+	next, _ := markAttemptCanceled(*database, attemptID, stringOr(reason, "Attempt canceled."))
+	touch(&next)
+	return server.Repo.SaveSupervisorExecutionState(context.Background(), next)
 }
 
 func (server *Server) failDevFlowCycleJobWithResult(ctx context.Context, pipelineID string, attemptID string, failure error, result map[string]any) error {
-	database, err := mustLoad(server, ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return err
 	}
@@ -216,21 +241,22 @@ func (server *Server) failDevFlowCycleJobWithResult(ctx context.Context, pipelin
 	pipeline["status"] = "failed"
 	pipeline["updatedAt"] = nowISO()
 	database.Tables.Pipelines[pipelineIndex] = pipeline
-	if item := findWorkItem(database, text(pipeline, "workItemId")); item != nil {
-		database = updateWorkItem(database, text(item, "id"), map[string]any{"status": "Blocked"})
+	if item := findWorkItem(*database, text(pipeline, "workItemId")); item != nil {
+		*database = updateWorkItem(*database, text(item, "id"), map[string]any{"status": "Blocked"})
 	}
 	if findByID(database.Tables.Attempts, attemptID) < 0 {
-		if item := findWorkItem(database, text(pipeline, "workItemId")); item != nil {
+		if item := findWorkItem(*database, text(pipeline, "workItemId")); item != nil {
 			server.logError(ctx, "devflow.attempt.missing_backfilled", "Missing attempt was backfilled during failure handling.", map[string]any{"pipelineId": pipelineID, "attemptId": attemptID, "workItemId": text(item, "id")})
 			attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", firstRunnableStageID(pipeline))
 			attempt["id"] = attemptID
 			database.Tables.Attempts = appendOrReplace(database.Tables.Attempts, attempt)
 		}
 	}
-	database, _ = failAttemptRecord(database, attemptID, pipeline, failure.Error(), result)
-	upsertRunWorkpad(&database, attemptID)
-	touch(&database)
-	if err := server.Repo.Save(context.Background(), database); err != nil {
+	next, _ := failAttemptRecord(*database, attemptID, pipeline, failure.Error(), result)
+	database = &next
+	upsertRunWorkpad(database, attemptID)
+	touch(database)
+	if err := server.Repo.SaveSupervisorExecutionState(context.Background(), *database); err != nil {
 		return err
 	}
 	server.sendFeishuAttemptFailureIfConfigured(ctx, pipelineID, attemptID)
@@ -238,7 +264,7 @@ func (server *Server) failDevFlowCycleJobWithResult(ctx context.Context, pipelin
 }
 
 func (server *Server) completeDevFlowCycleJob(ctx context.Context, pipelineID string, attemptID string, result map[string]any) (map[string]any, map[string]any, error) {
-	database, err := mustLoad(server, ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -247,7 +273,7 @@ func (server *Server) completeDevFlowCycleJob(ctx context.Context, pipelineID st
 		return nil, nil, fmt.Errorf("pipeline not found")
 	}
 	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
-	item := findWorkItem(database, text(pipeline, "workItemId"))
+	item := findWorkItem(*database, text(pipeline, "workItemId"))
 	if item == nil {
 		return nil, nil, fmt.Errorf("work item not found")
 	}
@@ -260,11 +286,12 @@ func (server *Server) completeDevFlowCycleJob(ctx context.Context, pipelineID st
 		attempt["pullRequestUrl"] = stringOr(result["pullRequestUrl"], text(attempt, "pullRequestUrl"))
 		database.Tables.Attempts = appendOrReplace(database.Tables.Attempts, attempt)
 	}
-	database, pipeline, item = applyDevFlowCycleResult(database, pipelineIndex, item, result)
-	database, _ = completeAttemptRecord(database, attemptID, pipeline, result)
-	upsertRunWorkpad(&database, attemptID)
-	touch(&database)
-	if err := server.Repo.Save(context.Background(), database); err != nil {
+	next, pipeline, item := applyDevFlowCycleResult(*database, pipelineIndex, item, result)
+	next, _ = completeAttemptRecord(next, attemptID, pipeline, result)
+	database = &next
+	upsertRunWorkpad(database, attemptID)
+	touch(database)
+	if err := server.Repo.SaveSupervisorExecutionState(context.Background(), *database); err != nil {
 		return nil, nil, err
 	}
 	if text(result, "status") == "waiting-human" {
@@ -462,7 +489,7 @@ func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelin
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	database, err := server.Repo.Load(ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		defaultDatabase := defaultWorkspaceDatabase()
 		database = &defaultDatabase
@@ -595,7 +622,7 @@ func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelin
 		})
 	}
 	touch(database)
-	return server.Repo.Save(context.Background(), *database)
+	return server.Repo.SaveSupervisorExecutionState(context.Background(), *database)
 }
 
 func (server *Server) runnerHeartbeatRecorder(pipelineID string, itemID string, attemptID string, stageID string, agentID string, runnerID string) func(SupervisedCommandEvent) {
@@ -612,7 +639,7 @@ func (server *Server) recordAttemptRunnerHeartbeat(ctx context.Context, pipeline
 		return
 	}
 	timestamp := stringOr(event.CreatedAt, nowISO())
-	database, err := mustLoad(server, ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err == nil {
 		if attemptIndex := findByID(database.Tables.Attempts, attemptID); attemptIndex >= 0 {
 			attempt := cloneMap(database.Tables.Attempts[attemptIndex])
@@ -635,7 +662,7 @@ func (server *Server) recordAttemptRunnerHeartbeat(ctx context.Context, pipeline
 			}
 			attempt["events"] = events
 			database.Tables.Attempts[attemptIndex] = attempt
-			_ = server.Repo.Save(ctx, database)
+			_ = server.Repo.SaveSupervisorExecutionState(ctx, *database)
 		}
 	}
 	message := "Runner heartbeat."
@@ -1066,7 +1093,7 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 	baseBranch := stringOr(text(target, "defaultBranch"), "main")
 	currentAttempt := map[string]any{}
 	profile := server.resolveAgentProfile(ctx, WorkspaceDatabase{}, item, target)
-	if database, err := server.Repo.Load(ctx); err == nil {
+	if database, err := server.Repo.LoadSupervisorExecutionState(ctx); err == nil {
 		profile = server.resolveAgentProfile(ctx, *database, item, target)
 		if attemptIndex := findByID(database.Tables.Attempts, attemptID); attemptIndex >= 0 {
 			currentAttempt = cloneMap(database.Tables.Attempts[attemptIndex])
@@ -1318,7 +1345,7 @@ Rules:
 			OutputPath:        notePath,
 			Sandbox:           "workspace-write",
 			Model:             reworkModel,
-			Env:               reworkEnv,
+			Env:               mergeEnvMaps(agentCapabilityEnv(profile, "coding"), reworkEnv),
 			HeartbeatInterval: runnerHeartbeatInterval,
 			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "rework", "coding", codingRunnerID),
 		})
@@ -1396,9 +1423,17 @@ Rules:
 			server.logInfo(ctx, "github.pr.description_updated", "Pull request description updated after fast rework.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output, 1200)})
 		}
 		prDiff, _ := runCommand(repoWorkspace, "gh", "pr", "diff", prURL)
-		checksOutput, _ := runCommand(repoWorkspace, "gh", "pr", "checks", prURL)
 		pullRequestFeedback = githubPullRequestFeedback(ctx, repoWorkspace, prURL, repoSlug)
-		checkLogFeedback = githubPullRequestCheckLogFeedback(ctx, repoWorkspace, prURL, repoSlug, nil)
+		ciResult := collectDevFlowGitHubActionsCI(ctx, repoWorkspace, repoSlug, prURL, template.Runtime.RequiredChecks, proofDir, "ci-checks-human-rework.md")
+		checksOutput := ciResult.ChecksOutput
+		checkLogFeedback = ciResult.CheckLogFeedback
+		ciArtifact := ""
+		ciProofFiles := []string{}
+		if strings.TrimSpace(ciResult.ReportPath) != "" {
+			ciArtifact = filepath.Base(ciResult.ReportPath)
+			ciProofFiles = append(ciProofFiles, ciResult.ReportPath)
+		}
+		recordAgent("rework", "testing", "passed", "Collect GitHub Actions CI checks and failed check logs after human-requested fast rework.", ciArtifact, ciResult.Summary, ciProofFiles, map[string]any{"runner": "github-actions", "status": ciResult.Status, "checkSummary": ciResult.CheckSummary, "checkLogFeedback": ciResult.CheckLogFeedback})
 
 		reviewRounds := devFlowReviewRoundsFromContract(template)
 		reviewApproved := true
@@ -1423,10 +1458,11 @@ Rules:
 			reviewVariables["changedFiles"] = strings.Join(changedFiles, ", ")
 			reviewVariables["testOutput"] = testOutput
 			reviewVariables["checksOutput"] = reviewChecks
+			reviewVariables["planOutput"] = "Fast rework reused the previous solution plan; review the current diff against the latest requirement and rework checklist."
 			reviewVariables["reviewFocus"] = reviewRound.Focus
 			reviewVariables["reviewFeedback"] = combinedFeedback(reworkFeedbackInput)
 			reviewVariables["diff"] = reviewDiff
-			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(reworkFeedbackInput))
+			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(reworkFeedbackInput), reviewVariables["planOutput"])
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
 			reviewModel, reviewEnv := server.runnerCredentialModelAndEnv(ctx, reviewRunnerID, reviewProfile.Model)
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
@@ -1439,7 +1475,7 @@ Rules:
 				Sandbox:           "read-only",
 				Model:             reviewModel,
 				Effort:            "medium",
-				Env:               reviewEnv,
+				Env:               mergeEnvMaps(agentCapabilityEnv(profile, "review"), reviewEnv),
 				HeartbeatInterval: runnerHeartbeatInterval,
 				OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "review", reviewRunnerID),
 			})
@@ -1571,6 +1607,7 @@ Rules:
 		changedFiles       []string
 		testOutput         string
 		testErr            error
+		architecturePlan   string
 		prTitle            string
 		prBody             string
 		prURL              string
@@ -1634,8 +1671,19 @@ Rules:
 			"4. Testing runs repository validation against the new commit.\n"+
 			"5. Review reads the PR diff and CI/check state before delivery.\n"+
 			"6. Human review records the gate decision.\n"+
-			"7. Delivery merges or leaves the PR waiting for manual review.\n",
-			text(item, "key"), repoSlug, baseBranch, branchName)
+			"7. Delivery merges or leaves the PR waiting for manual review.\n\n"+
+			"## Functional TODO List\n\n"+
+			"- [ ] Implement the requested product behavior for `%s`.\n"+
+			"- [ ] Preserve the repository boundary and avoid unrelated product changes.\n"+
+			"- [ ] Confirm acceptance criteria are covered by implementation or documented residual risk.\n\n"+
+			"## Project TODO List\n\n"+
+			"- [ ] Inspect the affected files before editing.\n"+
+			"- [ ] Produce a real git diff on branch `%s`.\n"+
+			"- [ ] Run repository validation and capture `test-report.md`.\n"+
+			"- [ ] Create or update the pull request and collect GitHub Actions CI evidence.\n"+
+			"- [ ] Review the diff against this plan and todo list before Human Review.\n",
+			text(item, "key"), repoSlug, baseBranch, branchName, text(item, "key"), branchName)
+		architecturePlan = solutionPlan
 		if err := os.WriteFile(filepath.Join(proofDir, "solution-plan.md"), []byte(solutionPlan), 0o644); err != nil {
 			return err
 		}
@@ -1682,7 +1730,7 @@ Rules:
 			OutputPath:        filepath.Join(proofDir, "coding-agent-note.md"),
 			Sandbox:           "workspace-write",
 			Model:             codingModel,
-			Env:               codingEnv,
+			Env:               mergeEnvMaps(agentCapabilityEnv(profile, "coding"), codingEnv),
 			HeartbeatInterval: runnerHeartbeatInterval,
 			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, "in_progress", "coding", codingRunnerID),
 		})
@@ -1776,6 +1824,22 @@ Rules:
 		remoteCheckSummary = githubCheckSummaryWithRequired(remoteChecks, template.Runtime.RequiredChecks)
 		return nil
 	}
+	runRemoteCIChecks := func(stageID string, artifactName string) error {
+		ciResult := collectDevFlowGitHubActionsCI(ctx, repoWorkspace, repoSlug, prURL, template.Runtime.RequiredChecks, proofDir, artifactName)
+		checksOutput = ciResult.ChecksOutput
+		remoteChecks = ciResult.RemoteChecks
+		remoteChecksRaw = ciResult.RemoteChecksRaw
+		remoteCheckSummary = ciResult.CheckSummary
+		checkLogFeedback = ciResult.CheckLogFeedback
+		artifact := ""
+		proofFiles := []string{}
+		if strings.TrimSpace(ciResult.ReportPath) != "" {
+			artifact = filepath.Base(ciResult.ReportPath)
+			proofFiles = append(proofFiles, ciResult.ReportPath)
+		}
+		recordAgent(stageID, "testing", "passed", "Collect GitHub Actions CI checks and failed check logs for the pull request.", artifact, ciResult.Summary, proofFiles, map[string]any{"runner": "github-actions", "status": ciResult.Status, "checkSummary": ciResult.CheckSummary, "checkLogFeedback": ciResult.CheckLogFeedback})
+		return nil
+	}
 	if err := runDevFlowContractState(template, "todo", []devFlowContractActionStep{{ID: "capture_requirement", Type: "write_requirement_artifact", Agent: "requirement", Run: writeRequirementArtifact}}); err != nil {
 		return failureResult("todo", "requirement", "Workflow contract requirement action failed.", err.Error(), ""), err
 	}
@@ -1785,6 +1849,7 @@ Rules:
 		{ID: "implement_change", Type: "run_agent", Agent: "coding", Run: runCoding},
 		{ID: "validate_repository", Type: "run_validation", Agent: "testing", Run: runValidation},
 		{ID: "publish_pull_request", Type: "ensure_pr", Agent: "delivery", Run: ensurePullRequest},
+		{ID: "collect_ci_results", Type: "run_ci_checks", Agent: "testing", Run: func() error { return runRemoteCIChecks("in_progress", "ci-checks.md") }},
 	}); err != nil {
 		return failureResult("in_progress", "delivery", "Workflow contract implementation action failed.", err.Error(), ""), err
 	}
@@ -1887,10 +1952,11 @@ Rules:
 			reviewVariables["changedFiles"] = strings.Join(changedFiles, ", ")
 			reviewVariables["testOutput"] = testOutput
 			reviewVariables["checksOutput"] = reviewChecks
+			reviewVariables["planOutput"] = architecturePlan
 			reviewVariables["reviewFocus"] = reviewRound.Focus
 			reviewVariables["diff"] = reviewDiff
 			reviewVariables["reviewFeedback"] = combinedFeedback(stringOr(reviewFeedback, humanChangeRequest))
-			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(stringOr(reviewFeedback, humanChangeRequest)))
+			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(stringOr(reviewFeedback, humanChangeRequest)), architecturePlan)
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
 			reviewModel, reviewEnv := server.runnerCredentialModelAndEnv(ctx, reviewRunnerID, reviewProfile.Model)
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
@@ -1903,7 +1969,7 @@ Rules:
 				Sandbox:           "read-only",
 				Model:             reviewModel,
 				Effort:            "medium",
-				Env:               reviewEnv,
+				Env:               mergeEnvMaps(agentCapabilityEnv(profile, "review"), reviewEnv),
 				HeartbeatInterval: runnerHeartbeatInterval,
 				OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, "review", reviewRunnerID),
 			})

@@ -33,6 +33,11 @@ func (repo *SQLiteRepository) LoadWorkspaceSession(ctx context.Context) (*Worksp
 	if err != nil {
 		return nil, err
 	}
+	states = missionControlStatesWithCanonicalWorkItems(states, workItems)
+	workflowTemplates, err := repo.ListWorkflowTemplates(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
 	connections, err := repo.listSessionConnections(ctx)
 	if err != nil {
 		return nil, err
@@ -52,12 +57,135 @@ func (repo *SQLiteRepository) LoadWorkspaceSession(ctx context.Context) (*Worksp
 			Requirements:         requirements,
 			WorkItems:            workItems,
 			MissionControlStates: states,
+			WorkflowTemplates:    workflowTemplates,
 			Connections:          connections,
 			UIPreferences:        uiPreferences,
 		},
 	}
 	ensureTables(database)
 	return database, nil
+}
+
+func (repo *SQLiteRepository) LoadSupervisorExecutionState(ctx context.Context) (*WorkspaceDatabase, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	savedAt, err := repo.WorkspaceSavedAt(ctx)
+	if err != nil {
+		return nil, err
+	}
+	projects, err := repo.listSessionProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	requirements, err := repo.listSessionRequirements(ctx)
+	if err != nil {
+		return nil, err
+	}
+	workItems, err := repo.listSessionWorkItems(ctx)
+	if err != nil {
+		return nil, err
+	}
+	states, err := repo.listSessionMissionControlStates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	states = missionControlStatesWithCanonicalWorkItems(states, workItems)
+	workflowTemplates, err := repo.ListWorkflowTemplates(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	pipelines, err := repo.ListPipelines(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	attempts, err := repo.ListAttempts(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	checkpoints, err := repo.ListCheckpoints(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	runWorkpads, err := repo.ListRunWorkpads(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	missions, err := repo.ListMissions(ctx, map[string]string{"limit": "500"})
+	if err != nil {
+		return nil, err
+	}
+	operations, err := repo.ListOperations(ctx, map[string]string{"limit": "500"})
+	if err != nil {
+		return nil, err
+	}
+	proofRecords, err := repo.ListProofRecords(ctx, map[string]string{"limit": "500"})
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(savedAt) == "" && len(workItems) == 0 && len(pipelines) == 0 && len(attempts) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	database := &WorkspaceDatabase{
+		SchemaVersion: 1,
+		SavedAt:       savedAt,
+		Tables: WorkspaceTables{
+			Projects:             projects,
+			Requirements:         requirements,
+			WorkItems:            workItems,
+			MissionControlStates: states,
+			WorkflowTemplates:    workflowTemplates,
+			Pipelines:            pipelines,
+			Attempts:             attempts,
+			Checkpoints:          checkpoints,
+			RunWorkpads:          runWorkpads,
+			Missions:             missions,
+			Operations:           operations,
+			ProofRecords:         proofRecords,
+		},
+	}
+	ensureTables(database)
+	return database, nil
+}
+
+func (repo *SQLiteRepository) LoadRepositoryTargetDeleteState(ctx context.Context) (*WorkspaceDatabase, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	session, err := repo.LoadWorkspaceSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pipelines, err := repo.ListPipelines(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	attempts, err := repo.ListAttempts(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	checkpoints, err := repo.ListCheckpoints(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	runWorkpads, err := repo.ListRunWorkpads(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	missions, err := repo.ListMissions(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	database := *session
+	database.Tables.Pipelines = pipelines
+	database.Tables.Attempts = attempts
+	database.Tables.Checkpoints = checkpoints
+	database.Tables.RunWorkpads = runWorkpads
+	database.Tables.Missions = missions
+	database.Tables.Operations = nil
+	database.Tables.ProofRecords = nil
+	ensureTables(&database)
+	return &database, nil
 }
 
 func (repo *SQLiteRepository) listSessionProjects(ctx context.Context) ([]map[string]any, error) {
@@ -104,9 +232,13 @@ ORDER BY project_id ASC, label ASC;
 		}
 	}
 	for _, project := range projects {
-		project["repositoryTargets"] = targetsByProject[text(project, "id")]
+		targets := targetsByProject[text(project, "id")]
+		project["repositoryTargets"] = targets
 		if project["repositoryTargets"] == nil {
 			project["repositoryTargets"] = []any{}
+		}
+		if text(project, "defaultRepositoryTargetId") == "" && len(targets) > 0 {
+			project["defaultRepositoryTargetId"] = text(mapValue(targets[0]), "id")
 		}
 	}
 	return projects, nil
@@ -206,6 +338,23 @@ ORDER BY updated_at DESC, run_id DESC;
 	})
 }
 
+func missionControlStatesWithCanonicalWorkItems(states []map[string]any, workItems []map[string]any) []map[string]any {
+	if len(states) == 0 {
+		return states
+	}
+	canonicalItems := make([]any, 0, len(workItems))
+	for _, item := range workItems {
+		canonicalItems = append(canonicalItems, cloneMap(item))
+	}
+	next := make([]map[string]any, 0, len(states))
+	for _, state := range states {
+		record := cloneMap(state)
+		record["workItems"] = canonicalItems
+		next = append(next, record)
+	}
+	return next
+}
+
 func (repo *SQLiteRepository) listSessionConnections(ctx context.Context) ([]map[string]any, error) {
 	output, err := repo.query(ctx, `.mode json
 SELECT
@@ -273,7 +422,24 @@ ORDER BY updated_at DESC, created_at DESC, id DESC
 	if err != nil {
 		return nil, err
 	}
-	return decodeStructuredRows(output, map[string]string{"run": "runJson"})
+	pipelines, err := decodeStructuredRows(output, map[string]string{"run": "runJson"})
+	if err != nil {
+		return nil, err
+	}
+	for _, pipeline := range pipelines {
+		if text(pipeline, "templateId") != "" {
+			continue
+		}
+		run := mapValue(pipeline["run"])
+		templateID := firstNonEmpty(
+			text(mapValue(run["workflow"]), "id"),
+			text(mapValue(run["orchestrator"]), "templateId"),
+		)
+		if templateID != "" {
+			pipeline["templateId"] = templateID
+		}
+	}
+	return pipelines, nil
 }
 
 func (repo *SQLiteRepository) ListAttempts(ctx context.Context, filters map[string]string) ([]map[string]any, error) {
@@ -281,12 +447,15 @@ func (repo *SQLiteRepository) ListAttempts(ctx context.Context, filters map[stri
 		return nil, err
 	}
 	where := sqlFilterClauses(filters, map[string]string{
-		"id":                 "id",
-		"itemId":             "item_id",
-		"workItemId":         "item_id",
-		"pipelineId":         "pipeline_id",
-		"repositoryTargetId": "repository_target_id",
-		"status":             "status",
+		"id":                      "id",
+		"itemId":                  "item_id",
+		"workItemId":              "item_id",
+		"pipelineId":              "pipeline_id",
+		"repositoryTargetId":      "repository_target_id",
+		"status":                  "status",
+		"feishuFailureStatus":     "feishu_failure_status",
+		"feishuFailureMessageId":  "feishu_failure_message_id",
+		"feishuFailureNotifiedAt": "feishu_failure_notified_at",
 	})
 	output, err := repo.query(ctx, fmt.Sprintf(`.mode json
 SELECT
@@ -309,6 +478,11 @@ SELECT
   stderr_summary AS stderrSummary,
   stages_json AS stagesJson,
   events_json AS eventsJson,
+  feishu_failure_notified_at AS feishuFailureNotifiedAt,
+  feishu_failure_status AS feishuFailureStatus,
+  feishu_failure_message_id AS feishuFailureMessageId,
+  feishu_failure_json AS feishuFailureJson,
+  record_json AS recordJson,
   created_at AS createdAt,
   updated_at AS updatedAt
 FROM attempts
@@ -319,7 +493,29 @@ ORDER BY started_at DESC, created_at DESC, id DESC
 	if err != nil {
 		return nil, err
 	}
-	return decodeStructuredRows(output, map[string]string{"stages": "stagesJson", "events": "eventsJson"})
+	rows, err := decodeStructuredRows(output, map[string]string{"stages": "stagesJson", "events": "eventsJson", "feishuFailure": "feishuFailureJson"})
+	if err != nil {
+		return nil, err
+	}
+	attempts := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		var record map[string]any
+		if raw := strings.TrimSpace(text(row, "recordJson")); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &record)
+		}
+		if record == nil {
+			record = cloneMap(row)
+		}
+		for key, value := range row {
+			if key == "recordJson" {
+				continue
+			}
+			record[key] = value
+		}
+		delete(record, "recordJson")
+		attempts = append(attempts, record)
+	}
+	return attempts, nil
 }
 
 func (repo *SQLiteRepository) ListCheckpoints(ctx context.Context, filters map[string]string) ([]map[string]any, error) {
@@ -327,20 +523,30 @@ func (repo *SQLiteRepository) ListCheckpoints(ctx context.Context, filters map[s
 		return nil, err
 	}
 	where := sqlFilterClauses(filters, map[string]string{
-		"id":         "id",
-		"pipelineId": "pipeline_id",
-		"stageId":    "stage_id",
-		"status":     "status",
+		"id":                 "id",
+		"pipelineId":         "pipeline_id",
+		"attemptId":          "attempt_id",
+		"stageId":            "stage_id",
+		"status":             "status",
+		"feishuReviewStatus": "feishu_review_status",
+		"feishuTaskGuid":     "feishu_task_guid",
+		"feishuTaskId":       "feishu_task_id",
 	})
 	output, err := repo.query(ctx, fmt.Sprintf(`.mode json
 SELECT
   id,
   pipeline_id AS pipelineId,
+  attempt_id AS attemptId,
   stage_id AS stageId,
   status,
   title,
   summary,
   decision_note AS decisionNote,
+  feishu_review_status AS feishuReviewStatus,
+  feishu_task_guid AS feishuTaskGuid,
+  feishu_task_id AS feishuTaskId,
+  feishu_message_id AS feishuMessageId,
+  feishu_review_json AS feishuReviewJson,
   created_at AS createdAt,
   updated_at AS updatedAt
 FROM checkpoints
@@ -351,7 +557,7 @@ ORDER BY updated_at DESC, created_at DESC, id DESC
 	if err != nil {
 		return nil, err
 	}
-	return decodeStructuredRows(output, nil)
+	return decodeStructuredRows(output, map[string]string{"feishuReview": "feishuReviewJson"})
 }
 
 func (repo *SQLiteRepository) ListOperations(ctx context.Context, filters map[string]string) ([]map[string]any, error) {
@@ -382,6 +588,7 @@ SELECT
   status,
   prompt,
   required_proof_json AS requiredProofJson,
+  record_json AS recordJson,
   created_at AS createdAt,
   updated_at AS updatedAt
 FROM operations
@@ -392,7 +599,60 @@ ORDER BY updated_at DESC, created_at DESC, id DESC
 	if err != nil {
 		return nil, err
 	}
-	return decodeStructuredRows(output, map[string]string{"requiredProof": "requiredProofJson"})
+	rows, err := decodeStructuredRows(output, map[string]string{"requiredProof": "requiredProofJson"})
+	if err != nil {
+		return nil, err
+	}
+	operations := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		var record map[string]any
+		if raw := strings.TrimSpace(text(row, "recordJson")); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &record)
+		}
+		if record == nil {
+			record = cloneMap(row)
+		}
+		for key, value := range row {
+			if key == "recordJson" {
+				continue
+			}
+			record[key] = value
+		}
+		delete(record, "recordJson")
+		operations = append(operations, record)
+	}
+	return operations, nil
+}
+
+func (repo *SQLiteRepository) ListMissions(ctx context.Context, filters map[string]string) ([]map[string]any, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	where := sqlFilterClauses(filters, map[string]string{
+		"id":         "id",
+		"pipelineId": "pipeline_id",
+		"workItemId": "work_item_id",
+		"status":     "status",
+	})
+	output, err := repo.query(ctx, fmt.Sprintf(`.mode json
+SELECT
+  id,
+  pipeline_id AS pipelineId,
+  work_item_id AS workItemId,
+  title,
+  status,
+  mission_json AS missionJson,
+  created_at AS createdAt,
+  updated_at AS updatedAt
+FROM missions
+WHERE %s
+ORDER BY updated_at DESC, created_at DESC, id DESC
+%s;
+`, strings.Join(where, " AND "), sqlLimitClause(filters)))
+	if err != nil {
+		return nil, err
+	}
+	return decodeStructuredRows(output, map[string]string{"mission": "missionJson"})
 }
 
 func (repo *SQLiteRepository) ListProofRecords(ctx context.Context, filters map[string]string) ([]map[string]any, error) {
@@ -429,6 +689,47 @@ ORDER BY created_at DESC, id DESC
 	return decodeStructuredRows(output, nil)
 }
 
+func (repo *SQLiteRepository) ListWorkflowTemplates(ctx context.Context, filters map[string]string) ([]map[string]any, error) {
+	if err := repo.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	where := sqlFilterClauses(filters, map[string]string{
+		"id":                 "id",
+		"projectId":          "project_id",
+		"repositoryTargetId": "repository_target_id",
+		"templateId":         "template_id",
+		"scope":              "scope",
+	})
+	output, err := repo.query(ctx, fmt.Sprintf(`.mode json
+SELECT
+  id,
+  scope,
+  project_id AS projectId,
+  repository_target_id AS repositoryTargetId,
+  template_id AS templateId,
+  source,
+  version,
+  markdown,
+  validation_json AS validationJson,
+  created_at AS createdAt,
+  updated_at AS updatedAt
+FROM workflow_templates
+WHERE %s
+ORDER BY updated_at DESC, id DESC;
+`, strings.Join(where, " AND ")))
+	if err != nil {
+		return nil, err
+	}
+	records, err := decodeStructuredRows(output, map[string]string{"validation": "validationJson"})
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		record["workflowMarkdown"] = text(record, "markdown")
+	}
+	return records, nil
+}
+
 func (repo *SQLiteRepository) ListRunWorkpads(ctx context.Context, filters map[string]string) ([]map[string]any, error) {
 	if err := repo.Initialize(ctx); err != nil {
 		return nil, err
@@ -450,6 +751,7 @@ SELECT
   repository_target_id AS repositoryTargetId,
   status,
   workpad_json AS workpadJson,
+  record_json AS recordJson,
   created_at AS createdAt,
   updated_at AS updatedAt
 FROM run_workpads
@@ -460,7 +762,29 @@ ORDER BY updated_at DESC, created_at DESC, id DESC
 	if err != nil {
 		return nil, err
 	}
-	return decodeStructuredRows(output, map[string]string{"workpad": "workpadJson"})
+	rows, err := decodeStructuredRows(output, map[string]string{"workpad": "workpadJson"})
+	if err != nil {
+		return nil, err
+	}
+	workpads := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		var record map[string]any
+		if raw := strings.TrimSpace(text(row, "recordJson")); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &record)
+		}
+		if record == nil {
+			record = cloneMap(row)
+		}
+		for key, value := range row {
+			if key == "recordJson" {
+				continue
+			}
+			record[key] = value
+		}
+		delete(record, "recordJson")
+		workpads = append(workpads, record)
+	}
+	return workpads, nil
 }
 
 func tableListFilters(query map[string][]string) map[string]string {

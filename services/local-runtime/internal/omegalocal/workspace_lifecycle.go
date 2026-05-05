@@ -177,18 +177,18 @@ func (server *Server) cleanupWorkspaces(response http.ResponseWriter, request *h
 		Limit            int  `json:"limit"`
 	}
 	_ = json.NewDecoder(request.Body).Decode(&payload)
-	database, err := mustLoad(server, request.Context())
+	database, err := server.Repo.LoadSupervisorExecutionState(request.Context())
 	if err != nil {
 		writeError(response, http.StatusNotFound, err)
 		return
 	}
-	summary := server.scanWorkspaceCleanup(request.Context(), &database, workspaceCleanupOptions{
+	summary := server.scanWorkspaceCleanup(request.Context(), database, workspaceCleanupOptions{
 		AutoCleanupWorkspaces:     payload.Apply,
 		WorkspaceRetentionSeconds: payload.RetentionSeconds,
 		Limit:                     payload.Limit,
 	})
 	if intValue(summary["changed"]) > 0 {
-		if err := server.Repo.Save(request.Context(), database); err != nil {
+		if err := server.Repo.SaveSupervisorExecutionState(request.Context(), *database); err != nil {
 			writeError(response, http.StatusInternalServerError, err)
 			return
 		}

@@ -65,71 +65,29 @@ const defaultStagePolicyHints: Record<string, string> = {
   delivery: "after approval, run merge/check actions separately and record PR/check/proof output in the Run Workpad."
 };
 
-const modelPresetsByRunner: Record<string, string[]> = {
-  codex: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
-  opencode: ["gpt-5.4-mini", "qwen-plus", "qwen-coder-plus", "deepseek-chat", "deepseek-reasoner"],
-  "claude-code": ["claude-sonnet-4.5", "claude-opus-4.1", "claude-haiku-4.5"],
-  "trae-agent": ["trae-default", "doubao-seed-1.6", "deepseek-v3", "deepseek-r1"]
-};
+const legacyInheritedModel = "gpt-5.4-mini";
 
 const skillOptions = [
-  { value: "browser-use", label: "Browser" },
-  { value: "github:github", label: "GitHub" },
-  { value: "github:gh-fix-ci", label: "Fix CI" },
-  { value: "github:gh-address-comments", label: "PR comments" },
-  { value: "github:yeet", label: "Publish PR" },
+  { value: "bb-browser", label: "Browser" },
+  { value: "playwright", label: "Playwright" },
+  { value: "gh-address-comments", label: "PR comments" },
+  { value: "gh-fix-ci", label: "Fix CI" },
+  { value: "yeet", label: "Publish PR" },
+  { value: "security-best-practices", label: "Security" },
+  { value: "security-threat-model", label: "Threat model" },
   { value: "openai-docs", label: "OpenAI docs" }
 ];
 
 const mcpOptions = [
-  { value: "github", label: "GitHub" },
-  { value: "filesystem:repository-workspace", label: "Repo files" },
-  { value: "browser:localhost-preview", label: "Preview browser" },
+  { value: "omega-filesystem", label: "Repo files" },
+  { value: "omega-git", label: "Git" },
+  { value: "omega-puppeteer", label: "Preview browser" },
+  { value: "omega-memory", label: "Memory" },
+  { value: "omega-sequential-thinking", label: "Planning" },
+  { value: "x-mcp", label: "x-mcp" },
   { value: "runtime-logs", label: "Runtime logs" },
   { value: "feishu", label: "Feishu" }
 ];
-
-type RunnerCredentialDraft = {
-  runner: string;
-  provider: string;
-  label: string;
-  model: string;
-  baseUrl: string;
-  secret: string;
-};
-
-const defaultCredentialDrafts: Record<string, RunnerCredentialDraft> = {
-  "trae-agent": {
-    runner: "trae-agent",
-    provider: "doubao",
-    label: "Trae Doubao",
-    model: "",
-    baseUrl: "",
-    secret: ""
-  },
-  opencode: {
-    runner: "opencode",
-    provider: "openai",
-    label: "opencode OpenAI",
-    model: "",
-    baseUrl: "",
-    secret: ""
-  }
-};
-
-const providerOptionsByRunner: Record<string, string[]> = {
-  "trae-agent": ["doubao", "openai", "anthropic", "google"],
-  opencode: ["openai", "openrouter", "deepseek", "qwen"]
-};
-
-function EyeIcon({ open }: { open: boolean }) {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" />
-      {open ? <circle cx="12" cy="12" r="3" /> : <path d="M4 4l16 16" />}
-    </svg>
-  );
-}
 
 type WorkspaceAgentStudioProps = {
   activeRepositoryWorkspaceLabel: string;
@@ -149,15 +107,6 @@ type WorkspaceAgentStudioProps = {
   onSave: () => void;
   onImportTemplate: (source: "fixtures" | "repository") => void;
   onSelectAgentProfile: (profileId: string) => void;
-  onSaveRunnerCredential: (input: {
-    id?: string;
-    runner: string;
-    provider: string;
-    label?: string;
-    model?: string;
-    baseUrl?: string;
-    secret?: string;
-  }) => void;
   onTestAgentProfile: (profile: AgentProfileDraft) => void;
   onSetAgentConfigOpen: (open: boolean) => void;
   onSetAgentConfigTab: (tab: AgentConfigTab) => void;
@@ -289,6 +238,17 @@ function runnerAvailabilityLabel(runner: string, options: AgentRunnerOption[], c
   return option.setupHint ?? `${option.label} is not available.`;
 }
 
+function modelOverrideValue(model: string) {
+  return model === legacyInheritedModel ? "" : model;
+}
+
+function inheritedModelLabel(runner: string, runnerCredentials: RunnerCredentialInfo[]) {
+  const credential = runnerCredentials.find((item) => item.runner === runner && item.model.trim());
+  if (credential?.model) return credential.model;
+  if (runner === "claude-code") return "Claude CLI default";
+  return "Global runner default";
+}
+
 function lines(value: string) {
   return value.split("\n").map((line) => line.trim()).filter(Boolean);
 }
@@ -356,7 +316,6 @@ export function WorkspaceAgentStudio({
   onSave,
   onImportTemplate,
   onSelectAgentProfile,
-  onSaveRunnerCredential,
   onTestAgentProfile,
   onSetAgentConfigOpen,
   onSetAgentConfigTab,
@@ -375,9 +334,6 @@ export function WorkspaceAgentStudio({
   );
   const [selectedWorkflowItem, setSelectedWorkflowItem] = useState<WorkflowEditorSelection>("template");
   const [selectedWorkflowPromptId, setSelectedWorkflowPromptId] = useState(promptSections[0]?.id ?? "");
-  const [credentialRunner, setCredentialRunner] = useState<"trae-agent" | "opencode">("trae-agent");
-  const [credentialDraft, setCredentialDraft] = useState<RunnerCredentialDraft>(defaultCredentialDrafts["trae-agent"]);
-  const [credentialSecretVisible, setCredentialSecretVisible] = useState(false);
   const selectedWorkflowStageId = selectedWorkflowItem.startsWith("stage:")
     ? selectedWorkflowItem.slice("stage:".length)
     : "";
@@ -463,35 +419,10 @@ export function WorkspaceAgentStudio({
     selectedStagePolicyDefaultHint && selectedStagePolicyRawBody === selectedStagePolicyDefaultHint
       ? ""
       : selectedStagePolicyRawBody;
-  const selectedModelPresets = selectedAgentProfile
-    ? modelPresetsByRunner[selectedAgentProfile.runner] ?? modelPresetsByRunner.codex
-    : modelPresetsByRunner.codex;
-  const selectedModelOptions = selectedAgentProfile && !selectedModelPresets.includes(selectedAgentProfile.model)
-    ? [selectedAgentProfile.model, ...selectedModelPresets].filter(Boolean)
-    : selectedModelPresets;
-  const selectedRunnerCredential = runnerCredentials.find(
-    (credential) => credential.runner === credentialRunner && credential.provider === credentialDraft.provider
-  );
-  const updateCredentialRunner = (runner: "trae-agent" | "opencode") => {
-    const stored = runnerCredentials.find((credential) => credential.runner === runner);
-    setCredentialRunner(runner);
-    setCredentialDraft({
-      ...defaultCredentialDrafts[runner],
-      ...(stored
-        ? {
-            provider: stored.provider,
-            label: stored.label,
-            model: stored.model,
-            baseUrl: stored.baseUrl,
-            secret: ""
-          }
-        : {})
-    });
-    setCredentialSecretVisible(false);
-  };
-  const updateCredentialDraft = (patch: Partial<RunnerCredentialDraft>) => {
-    setCredentialDraft((current) => ({ ...current, ...patch }));
-  };
+  const selectedModelOverride = selectedAgentProfile ? modelOverrideValue(selectedAgentProfile.model) : "";
+  const selectedInheritedModel = selectedAgentProfile
+    ? inheritedModelLabel(selectedAgentProfile.runner, runnerCredentials)
+    : "Global runner default";
   const updateSelectedStagePolicy = (body: string) => {
     if (!selectedWorkflowStage) return;
     const bodyToSave = body.trim() ? body : selectedStagePolicyDefaultHint;
@@ -893,11 +824,11 @@ export function WorkspaceAgentStudio({
                     <label className="agent-setting-field">
                       <span>Runner</span>
                       <select
+                        aria-label="Runner"
                         value={selectedAgentProfile.runner}
                         onChange={(event) => {
                           const runner = event.currentTarget.value;
-                          const nextModel = modelPresetsByRunner[runner]?.[0] ?? selectedAgentProfile.model;
-                          onUpdateAgentProfile(selectedAgentProfile.id, { runner, model: nextModel });
+                          onUpdateAgentProfile(selectedAgentProfile.id, { runner });
                         }}
                       >
                         {agentRunnerOptions.map((option) => (
@@ -926,14 +857,17 @@ export function WorkspaceAgentStudio({
                     </label>
                     <label className="agent-setting-field">
                       <span>Model</span>
-                      <select
-                        value={selectedAgentProfile.model}
-                        onChange={(event) => onUpdateAgentProfile(selectedAgentProfile.id, { model: event.currentTarget.value })}
-                      >
-                        {selectedModelOptions.map((model) => (
-                          <option key={model} value={model}>{model}</option>
-                        ))}
-                      </select>
+                      <input
+                        aria-label="Model"
+                        value={selectedModelOverride}
+                        placeholder={`Inherit: ${selectedInheritedModel}`}
+                        onChange={(event) => onUpdateAgentProfile(selectedAgentProfile.id, { model: event.currentTarget.value.trim() })}
+                      />
+                      <small className="agent-model-inheritance">
+                        {selectedModelOverride
+                          ? `Override for this stage. Clear to inherit ${selectedInheritedModel}.`
+                          : `Inheriting ${selectedInheritedModel}.`}
+                      </small>
                     </label>
                   </div>
                   <div className="agent-picker-section">
@@ -1003,11 +937,7 @@ export function WorkspaceAgentStudio({
                       key={tab}
                       type="button"
                       className={runtimeConfigTab === tab ? "active" : ""}
-                      onClick={() => {
-                        onSetRuntimeConfigTab(tab);
-                        if (tab === "trae") updateCredentialRunner("trae-agent");
-                        if (tab === "opencode") updateCredentialRunner("opencode");
-                      }}
+                      onClick={() => onSetRuntimeConfigTab(tab)}
                     >
                       {tab === "omega"
                         ? ".omega/agent-runtime.json"
@@ -1021,102 +951,6 @@ export function WorkspaceAgentStudio({
                     </button>
                   ))}
                 </div>
-                {runtimeConfigTab === "trae" || runtimeConfigTab === "opencode" ? (
-                  <div className="runner-account-panel">
-                    <div className="runner-account-heading">
-                      <div>
-                        <span className="section-label">Runner account</span>
-                        <strong>{credentialRunner === "trae-agent" ? "Trae Agent" : "opencode"}</strong>
-                      </div>
-                      <span className={selectedRunnerCredential?.secretConfigured ? "runner-availability ready" : "runner-availability missing"}>
-                        {selectedRunnerCredential?.secretConfigured ? "Key saved" : "Key not configured"}
-                      </span>
-                    </div>
-                    <div className="runner-account-grid">
-                      <label>
-                        <span>Provider</span>
-                        <select
-                          value={credentialDraft.provider}
-                          onChange={(event) => {
-                            const provider = event.currentTarget.value;
-                            const stored = runnerCredentials.find(
-                              (credential) => credential.runner === credentialRunner && credential.provider === provider
-                            );
-                            updateCredentialDraft({
-                              provider,
-                              label: stored?.label ?? `${credentialRunner === "trae-agent" ? "Trae" : "opencode"} ${provider}`,
-                              model: stored?.model ?? "",
-                              baseUrl: stored?.baseUrl ?? "",
-                              secret: ""
-                            });
-                          }}
-                        >
-                          {providerOptionsByRunner[credentialRunner].map((provider) => (
-                            <option key={provider} value={provider}>{provider}</option>
-                          ))}
-                        </select>
-                      </label>
-                      <label>
-                        <span>{credentialRunner === "trae-agent" ? "EP ID / model" : "Model"}</span>
-                        <input
-                          value={credentialDraft.model}
-                          placeholder={credentialRunner === "trae-agent" ? "ep-..." : "model name"}
-                          onChange={(event) => updateCredentialDraft({ model: event.currentTarget.value })}
-                        />
-                      </label>
-                      <label>
-                        <span>Base URL</span>
-                        <input
-                          value={credentialDraft.baseUrl}
-                          placeholder="Optional provider base URL"
-                          onChange={(event) => updateCredentialDraft({ baseUrl: event.currentTarget.value })}
-                        />
-                      </label>
-                      <label className="secret-input-field">
-                        <span>API key</span>
-                        <span className="secret-input-shell">
-                          <input
-                            type={credentialSecretVisible ? "text" : "password"}
-                            value={credentialDraft.secret}
-                            placeholder={selectedRunnerCredential?.secretConfigured ? selectedRunnerCredential.secretMasked ?? "********" : "Paste API key"}
-                            onChange={(event) => updateCredentialDraft({ secret: event.currentTarget.value })}
-                            autoComplete="off"
-                          />
-                          <button
-                            type="button"
-                            className="secret-toggle-button"
-                            aria-label={credentialSecretVisible ? "Hide API key" : "Show API key"}
-                            onClick={() => setCredentialSecretVisible((open) => !open)}
-                          >
-                            <EyeIcon open={credentialSecretVisible} />
-                          </button>
-                        </span>
-                      </label>
-                    </div>
-                    <div className="runner-account-actions">
-                      <button
-                        type="button"
-                        className="primary-action"
-                        onClick={() => {
-                          onSaveRunnerCredential({
-                            id: selectedRunnerCredential?.id,
-                            runner: credentialRunner,
-                            provider: credentialDraft.provider,
-                            label: credentialDraft.label,
-                            model: credentialDraft.model,
-                            baseUrl: credentialDraft.baseUrl,
-                            secret: credentialDraft.secret
-                          });
-                          setCredentialDraft((current) => ({ ...current, secret: "" }));
-                          setCredentialSecretVisible(false);
-                        }}
-                      >
-                        Save account
-                      </button>
-                      <small>Stored locally as encrypted ciphertext. The key is decrypted only when the runner process starts.</small>
-                    </div>
-                  </div>
-                ) : null}
                 <div className="control-form runtime-policy-editor">
                   <label>
                     <span>Runner policy</span>

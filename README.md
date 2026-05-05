@@ -242,6 +242,8 @@ ZYOOO/TestRepo
 - `docs/architecture.md`：当前架构。
 - `docs/development-plan.md`：开发思路与路线。
 - `docs/development-log.md`：开发日志。
+- `docs/agent-skills-and-mcp.md`：Agent Skills / MCP 的本机安装位置、stage 映射和验证方式。
+- `docs/github-actions-ci-chain.md`：GitHub Actions CI 在 DevFlow 中的采集、rework 和报告链路。
 - `docs/competition-requirements-matrix.md`：赛题要求对照。
 - `docs/manual-testing-guide.md`：手动测试指南。
 - `docs/todo.md`：任务清单。

@@ -32,6 +32,9 @@ func TestDevFlowRemoteGateFeedbackUsesFailedChecksAndLogs(t *testing.T) {
 func TestWorkflowTemplateFirstClassAPIValidateSaveRestore(t *testing.T) {
 	api, repo := newTestAPI(t)
 	seedWorkspace(t, repo)
+	if err := repo.exec(context.Background(), "UPDATE workspace_snapshots SET database_json = 'not-json' WHERE id = 'default';"); err != nil {
+		t.Fatal(err)
+	}
 	defaultTemplate := findPipelineTemplate("devflow-pr")
 	if defaultTemplate == nil || strings.TrimSpace(defaultTemplate.WorkflowMarkdown) == "" {
 		t.Fatal("default workflow markdown missing")
@@ -56,12 +59,12 @@ func TestWorkflowTemplateFirstClassAPIValidateSaveRestore(t *testing.T) {
 		t.Fatalf("saved workflow template = %+v", saved)
 	}
 
-	database, err := repo.Load(context.Background())
+	templates, err := repo.ListWorkflowTemplates(context.Background(), map[string]string{"projectId": "project_omega"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(database.Tables.WorkflowTemplates) != 1 {
-		t.Fatalf("workflow template records = %+v", database.Tables.WorkflowTemplates)
+	if len(templates) != 1 {
+		t.Fatalf("workflow template records = %+v", templates)
 	}
 
 	var restored map[string]any

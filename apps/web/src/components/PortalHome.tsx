@@ -1,3 +1,5 @@
+import { LanguageToggle, useI18n, type UiLanguage } from "../i18n";
+
 const portalApps = [
   ["Req", "需求问答"],
   ["Plan", "方案设计"],
@@ -26,41 +28,47 @@ type PortalHomeProps = {
   onOpenWorkboard: () => void;
   onOpenPagePilot: () => void;
   onToggleTheme: () => void;
+  onLanguageChange: (language: UiLanguage) => void;
   uiTheme: "light" | "dark";
+  uiLanguage: UiLanguage;
 };
 
-export function PortalHome({ onOpenWorkboard, onOpenPagePilot, onToggleTheme, uiTheme }: PortalHomeProps) {
+export function PortalHome({ onOpenWorkboard, onOpenPagePilot, onToggleTheme, onLanguageChange, uiTheme, uiLanguage }: PortalHomeProps) {
+  const { language, t } = useI18n();
+  const isZh = language === "zh-CN";
+  const navItems = isZh ? ["我的首页", "需求", "Pipeline", "Agent 运行", "GitHub", "Proof", "Workflow", "设置"] : ["Home", "Requirements", "Pipeline", "Agent Runs", "GitHub", "Proof", "Workflow", "Settings"];
   return (
     <main className={`site-shell portal-shell theme-${uiTheme}`}>
       <header className="portal-topbar">
-        <button type="button" className="portal-brand" onClick={onOpenWorkboard} aria-label="Open Omega Workboard">
+        <button type="button" className="portal-brand" onClick={onOpenWorkboard} aria-label={t("Open Omega Workboard")}>
           <img src="/omega-logo.png" alt="Omega AI DevFlow Engine" />
         </button>
-        <nav className="portal-nav" aria-label="Omega portal navigation">
-          <a href="#templates">案例与方案</a>
-          <a href="#apps">产品功能</a>
+        <nav className="portal-nav" aria-label={t("Omega portal navigation")}>
+          <a href="#templates">{isZh ? "案例与方案" : "Templates"}</a>
+          <a href="#apps">{isZh ? "产品功能" : "Product"}</a>
           <a href="#agent">Omega AI</a>
-          <a href="#support">合作与支持</a>
-          <a href="#pricing">定价</a>
+          <a href="#support">{isZh ? "合作与支持" : "Support"}</a>
+          <a href="#pricing">{isZh ? "定价" : "Pricing"}</a>
         </nav>
         <div className="portal-top-actions">
           <span className="portal-user">张涌</span>
-          <button type="button" className="theme-toggle" onClick={onToggleTheme} aria-label={`Switch to ${uiTheme === "light" ? "night" : "day"} mode`}>
+          <LanguageToggle language={uiLanguage} onLanguageChange={onLanguageChange} />
+          <button type="button" className="theme-toggle" onClick={onToggleTheme} aria-label={t(uiTheme === "light" ? "Switch to night mode" : "Switch to day mode")}>
             <span aria-hidden="true">{uiTheme === "light" ? "☾" : "☼"}</span>
-            {uiTheme === "light" ? "Night" : "Day"}
+            {t(uiTheme === "light" ? "Night" : "Day")}
           </button>
           <button type="button" className="portal-outline" onClick={onOpenWorkboard}>
-            联系团队
+            {isZh ? "联系团队" : "Contact team"}
           </button>
           <button type="button" className="portal-primary" onClick={onOpenWorkboard} data-omega-source="apps/web/src/components/PortalHome.tsx:primary-workboard-button">
-            进入 Workboard
+            {isZh ? "进入 Workboard" : "Open Workboard"}
           </button>
         </div>
       </header>
 
       <div className="portal-body">
-        <aside className="portal-sidebar" aria-label="Omega home navigation">
-          {["我的首页", "需求", "Pipeline", "Agent Runs", "GitHub", "Proof", "Workflow", "设置"].map((item, index) => (
+        <aside className="portal-sidebar" aria-label={t("Omega home navigation")}>
+          {navItems.map((item, index) => (
             <button
               key={item}
               type="button"
@@ -78,23 +86,23 @@ export function PortalHome({ onOpenWorkboard, onOpenPagePilot, onToggleTheme, ui
             <article className="portal-card portal-welcome">
               <img className="portal-hero-logo" src="/omega-logo.png" alt="Omega AI DevFlow Engine" />
               <span className="portal-avatar">张涌</span>
-              <h1 data-omega-source="apps/web/src/components/PortalHome.tsx:headline">张涌，欢迎回到 Omega</h1>
-              <p data-omega-source="apps/web/src/components/PortalHome.tsx:welcome-copy">把需求、Agent 编排、GitHub PR 和人工审核放进同一个可追踪工作台。</p>
+              <h1 data-omega-source="apps/web/src/components/PortalHome.tsx:headline">{isZh ? "张涌，欢迎回到 Omega" : "Welcome back to Omega"}</h1>
+              <p data-omega-source="apps/web/src/components/PortalHome.tsx:welcome-copy">{isZh ? "把需求、Agent 编排、GitHub PR 和人工审核放进同一个可追踪工作台。" : "Bring requirements, Agent orchestration, GitHub PRs, and human review into one traceable workbench."}</p>
               <div className="portal-button-row">
                 <button type="button" className="portal-outline" onClick={onOpenWorkboard} data-omega-source="apps/web/src/components/PortalHome.tsx:open-workboard-button">
-                  打开 Workboard
+                  {isZh ? "打开 Workboard" : "Open Workboard"}
                 </button>
                 <button type="button" className="portal-primary" onClick={onOpenPagePilot} data-omega-source="apps/web/src/components/PortalHome.tsx:open-page-pilot-button">
-                  打开 Page Pilot
+                  {isZh ? "打开 Page Pilot" : "Open Page Pilot"}
                 </button>
               </div>
             </article>
 
             <article className="portal-card portal-apps">
-              {portalApps.map(([token, label]) => (
+              {portalApps.map(([token, label], index) => (
                 <button key={label} type="button" onClick={onOpenWorkboard}>
                   <span>{token}</span>
-                  {label}
+                  {isZh ? label : ["Requirement Q&A", "Planning", "Coding", "Test generation", "Code review", "Human gate", "GitHub PR", "Proof Center", "Workflow templates", "Agent Registry", "Operations", "Local settings"][index]}
                 </button>
               ))}
             </article>
@@ -102,9 +110,9 @@ export function PortalHome({ onOpenWorkboard, onOpenPagePilot, onToggleTheme, ui
 
           <section className="portal-card portal-templates" id="templates">
             <div className="portal-section-heading">
-              <h2>最新模板推荐</h2>
+              <h2>{isZh ? "最新模板推荐" : "Recommended templates"}</h2>
               <button type="button" onClick={onOpenWorkboard}>
-                模板中心
+                {isZh ? "模板中心" : "Template center"}
               </button>
             </div>
             <div className="portal-template-grid">
@@ -116,37 +124,37 @@ export function PortalHome({ onOpenWorkboard, onOpenPagePilot, onToggleTheme, ui
                     <i />
                     <b />
                   </span>
-                  <strong data-omega-source={`apps/web/src/components/PortalHome.tsx:template-card-${index}`}>{title}</strong>
-                  <small>{index % 2 === 0 ? "需求到 PR 的完整链路" : "评审、返工、人工确认可复用"}</small>
+                  <strong data-omega-source={`apps/web/src/components/PortalHome.tsx:template-card-${index}`}>{isZh ? title : ["Feature delivery flow", "Bug fix loop", "Frontend iteration", "Code review and rework", "GitHub Issue automation", "Human review release"][index]}</strong>
+                  <small>{isZh ? (index % 2 === 0 ? "需求到 PR 的完整链路" : "评审、返工、人工确认可复用") : (index % 2 === 0 ? "Requirement-to-PR delivery path" : "Reusable review, rework, and human gate")}</small>
                 </button>
               ))}
             </div>
           </section>
         </section>
 
-        <aside className="portal-right" aria-label="Omega highlights">
+        <aside className="portal-right" aria-label={t("Omega highlights")}>
           <article className="portal-card portal-spotlight">
             <span>Omega</span>
-            <h2>AI DevFlow 工作台</h2>
-            <p>Pipeline 是骨架，Agent 是执行者，人类负责关键决策。</p>
+            <h2>{isZh ? "AI DevFlow 工作台" : "AI DevFlow Workbench"}</h2>
+            <p>{isZh ? "Pipeline 是骨架，Agent 是执行者，人类负责关键决策。" : "Pipeline provides the structure, Agents execute the work, and humans own key decisions."}</p>
             <button type="button" onClick={onOpenWorkboard}>
-              开始演示
+              {isZh ? "开始演示" : "Start demo"}
             </button>
           </article>
           <article className="portal-card portal-news">
-            <span>赛题能力</span>
-            <h3>功能一 v0Beta 已接入本地运行时</h3>
-            <p>支持 Requirement、Agent trace、Human gate、GitHub PR 与 proof 记录。</p>
+            <span>{isZh ? "赛题能力" : "Capability"}</span>
+            <h3>{isZh ? "功能一 v0Beta 已接入本地运行时" : "DevFlow v0Beta is connected to the local runtime"}</h3>
+            <p>{isZh ? "支持 Requirement、Agent trace、Human gate、GitHub PR 与 proof 记录。" : "Supports Requirement, Agent trace, Human gate, GitHub PR, and proof records."}</p>
           </article>
           <article className="portal-card portal-course">
-            <h3>下一阶段</h3>
+            <h3>{isZh ? "下一阶段" : "Next stage"}</h3>
             <div className="portal-mini-list">
-              <span>页面圈选</span>
-              <span>热更新预览</span>
-              <span>MR 摘要</span>
+              <span>{isZh ? "页面圈选" : "Element selection"}</span>
+              <span>{isZh ? "热更新预览" : "Live preview"}</span>
+              <span>{isZh ? "MR 摘要" : "PR summary"}</span>
             </div>
             <button type="button" className="portal-card-action" onClick={onOpenPagePilot}>
-              启动 Page Pilot
+              {isZh ? "启动 Page Pilot" : "Start Page Pilot"}
             </button>
           </article>
         </aside>

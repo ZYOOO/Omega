@@ -79,7 +79,10 @@ Current UI shape:
 - The Home page is implemented in `apps/web/src/components/PortalHome.tsx`.
 - Workboard keeps the existing execution features but now uses the same light blue / white visual system as the portal: repository workspace, GitHub Issues, Work item groups, runner status, and right-side rail are visually aligned.
 - Workspace Config contains a workspace-level Agent Studio for shared workflow orchestration, prompt policy, Agent runner/model selection, Skills/MCP bindings, and runtime file preview.
-- Workspace Agent Studio 的 runner 编排保留 Codex、opencode、Claude Code 和 Trae Agent，其中 Codex 是默认优先 runner。页面内账号 / Key 配置只面向 opencode 和 Trae Agent；Codex / Claude Code 按本机已登录 CLI 处理。opencode / Trae Agent 的 API Key 会本地加密落库，运行时只在启动子进程前解密并注入环境变量，不进入命令参数或 API 回包。
+- Workspace Agent Studio 的 runner 编排保留 Codex、opencode、Claude Code 和 Trae Agent，其中 Codex 是默认优先 runner。页面内账号 / Key 配置只面向 opencode 和 Trae Agent；Codex / Claude Code 按本机已登录 CLI 处理。opencode / Trae Agent 的 API Key 会本地加密落库，运行时只在启动子进程前解密并注入环境变量，不进入命令参数或 API 回包。opencode 会生成 attempt-scoped `OPENCODE_CONFIG` 以支持 custom provider；Trae Agent 会生成 attempt-scoped `trae_config.yaml` 并传 `--config-file`，不能与 opencode / Codex 共用启动模板。
+- Stage 级 Skills / MCP 不是单纯 UI 配置。runner 启动前会写入 `.omega/agent-capabilities.json`、`.omega/agent-capabilities.md`、`.codex/OMEGA.md` 和 `.claude/CLAUDE.md`，并注入 `OMEGA_AGENT_SKILLS` / `OMEGA_AGENT_MCP` 环境变量；默认映射和本机安装位置见 `docs/agent-skills-and-mcp.md`。
+- DevFlow PR 默认把 GitHub Actions CI 作为 review 前的一等 action：PR 创建/更新后采集 `gh pr checks` 和失败 run log，写入 CI proof、Review Packet、Run Workpad 和 Rework Checklist。设计与权限说明见 `docs/github-actions-ci-chain.md`。
+- DevFlow 的 Architect 阶段承担 Plan 角色：默认模板要求输出技术方案、功能 todo list 和项目 todo list，Review 会把这份清单作为核对依据，帮助用户更直观看到“计划了什么、完成了什么、还缺什么”。
 
 ### 3.2 What the system does
 

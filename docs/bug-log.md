@@ -2,6 +2,374 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-06: Work Item 详情页加载后仍然卡顿
+
+### 现象
+
+Work Item 详情页首屏加载完成后仍会感觉不流畅。浏览器控制台可看到 `Live execution refresh failed` 等轮询日志；本地接口测量显示单个 Work Item 相关的 `operations` / `run-workpads` / `attempts` payload 已经达到数百 KB 到 1 MB 级别。
+
+### 根因
+
+- 详情页只要系统中存在任意运行中的 Work Item，就会每 2.5 秒执行一次全局 `refreshExecutionState()`。
+- 该刷新会读取 session、全部 pipelines、全部 attempts、全部 run workpads、全部 checkpoints，再触发 React state merge 和重渲染。
+- Attempt Timeline handler 仍通过完整 supervisor execution snapshot 查找 attempt；当历史执行态或旧 JSON payload 变大时，错误 attempt id 也会走慢路径。
+
+### 修复
+
+- live refresh 支持 `ExecutionRefreshScope`，在详情页按当前 Work Item / Pipeline / Repository Workspace 拉取执行记录。
+- 当前详情本身在运行时维持 2.5 秒刷新；只是其他 Work Item 在运行时降为 5 秒刷新，减少后台噪声。
+- `GET /attempts/{id}/timeline` 改为按 attempt id 读取规范化表中的 attempt、pipeline、operation、proof、checkpoint 和 runtime log，不再先加载完整 supervisor snapshot。
+- `run-workpads` 前端读取支持 `limit`，control plane 默认限制近期记录。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run TestAttemptTimeline -count=1 -timeout=60s
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx -t "renders a workpad-first detail page" --testTimeout=60000
+```
+
+## 2026-05-05: `/workspace` 仍读取兼容 snapshot 导致 proof/状态回退
+
+### 现象
+
+DevFlow 端到端测试中，approve 后 pipeline 已完成，但 `GET /workspace` 返回的 `proofRecords` 为空；实际规范化表中 proof 已写入。用户侧也可能在刷新后看到旧 work item 数量或旧状态。
+
+### 根因
+
+`SQLiteRepository.Load()` 仍直接反序列化 `workspace_snapshots.database_json`。而 snapshot mirror 为了避免大 JSON 膨胀，已经刻意不再镜像 `missions` / `operations` / `proofRecords`，这让 `/workspace` 的兼容读取变成不完整且可能陈旧的数据源。
+
+### 修复
+
+- `Load()` 改为优先从 SQLite 规范化表组装完整 read model，包括 pipelines、attempts、checkpoints、operations、proofRecords、connections 和 UI preferences。
+- 只有在结构化表没有可用数据时，才 fallback 旧 snapshot，保留迁移兼容。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof' -count=1
+```
+
+## 2026-05-05: 飞书未完成 Task 被误同步为 Human Review approve
+
+### 现象
+
+用户没有在 Omega 或飞书审核动作中点击 Approve，但 Work Item 进入 Merging / Done。数据库中 `checkpoint.decisionNote` 显示 `approved by feishu-task`，对应 checkpoint 绑定了飞书 task guid。
+
+### 根因
+
+`syncFeishuReviewTasks` / Feishu review task bridge 允许“飞书 Task 完成”同步为 `applyCheckpointDecision(..., "approved")`，但完成判断过宽：飞书未完成任务会返回 `status=todo` 且 `completed_at="0"`，旧逻辑只要 `completed_at` 非空就视为完成，导致 bridge tick 在用户没有完成 Task 时误批准。
+
+另外，异步 delivery queued 阶段会把 `approvedBy` 硬编码成 `human`，导致 UI 看起来像本地人工 approve，掩盖了真实来源。
+
+### 修复
+
+- 飞书 Task sync / bridge tick 优先信任 `status`：只有 `done` / `completed` 才 approve；`todo` 等其他状态保持 pending。
+- 只有在 `status` 缺失时才用 `completed_at` / `completedAt` 兜底，并且 `""` / `"0"` / `"null"` 不算有效完成时间。
+- 飞书审核消息文案继续说明“完成任务表示审核通过”，但实际同步必须满足真实完成状态。
+- Pipeline stage 的 `approvedBy` 改为使用真实 reviewer，避免把 `feishu-task` / `feishu-user` 误显示成 `human`。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewTaskSyncApprovesCompletedTask|TestFeishuReviewTaskSyncDoesNotApproveTodoTaskWithZeroCompletedAt|TestFeishuReviewTaskCommentRequestsChanges|TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath' -count=1
+```
+
+## 2026-05-05: Workboard 列表显示 Done/Running/Human Review 不一致
+
+### 现象
+
+Human Review 已在飞书 approve，Work Item 详情页也显示 approved，但 Workboard 列表外层仍可能留在 Running，右侧仍显示可点的“Human review”；另一个场景中，pipeline 还在 Merging / Delivery 后续阶段，列表进度条却显示成“Done / 已完成”。
+
+### 根因
+
+- Workboard 进度摘要只把 `running` / `needs-human` / `ready` 等状态当作当前阶段，忽略了 `waiting`。当 Human Review 已 passed、Merging 和 Done 还在 waiting 时，列表会退到最后一个 stage，于是把当前阶段误显示为 Done。
+- Workboard 的 checkpoint 缓存只刷新 pending checkpoint。Approve 后如果后端已经返回 approved，但前端列表只拉 pending，旧 pending 记录会继续留在本地 merge cache，直到用户点进详情页触发按 pipeline 拉取才被纠正。
+- `/workspace?scope=session` 的 read model 虽然使用规范化 `work_items`，但兼容字段 `missionControlStates[].workItems` 仍可能返回旧状态，调试和部分兼容路径会看到两份不同来源。
+
+### 修复
+
+- Workboard 进度摘要改为选择第一个非 `passed` / `done` / `skipped` 的阶段，waiting 的 Merging / Delivery 会正确作为当前阶段展示。
+- Workboard 列表判断待审核按钮时会结合 pipeline 的 Human Review stage；如果 human_review 已 passed 或 pipeline 已 done，不再把 stale pending checkpoint 当成可操作。
+- `refreshControlPlane` 和 `refreshExecutionState` 改为拉取完整 checkpoint 列表，让 approved/rejected 状态覆盖前端缓存里的旧 pending。
+- `/workspace?scope=session` 后端 read model 会把 `missionControlStates[].workItems` 同步为规范化 `work_items`，避免兼容层返回旧状态。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestWorkspaceSessionScopeOmitsExecutionHeavyTables' -count=1
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
+```
+
+## 2026-05-05: Repository Workspace 删除按钮看似无反应
+
+### 现象
+
+在 Workspace controls 中点击 `Delete workspace` 后，UI 长时间没有完成删除；勾选 `Also delete local attempt workspaces` 也无法让 `ZYOOO/TestRepo` 从侧栏移除。
+
+### 原因
+
+删除 repository target 的后端 handler 仍使用 `LoadSupervisorExecutionState` 读取完整执行状态，连带加载 operations / proof records。当前本地数据库中存在旧版本写入的超大 operation 字段和约数百 MB 的 legacy `workspace_snapshots`，删除这样一个轻量操作会被旧数据反序列化拖住。`DeleteRepositoryTargetState` 还会尝试把删除结果同步回 legacy full snapshot，进一步放大卡顿。
+
+这不是前端按钮未绑定，也不是 GitHub 权限问题；旧的 stale execution lock 会在 repository target 删除时一起清理，但不是卡住的主要原因。
+
+### 修复
+
+- Repository target 删除改用 `LoadRepositoryTargetDeleteState`，只读取 session read model 与删除决策所需的 pipelines / attempts / checkpoints / run workpads / missions。
+- 删除路径不再加载 operations / proof records 到内存；SQL 层按 mission / operation 关系直接清理 linked operations 与 proof records。
+- 删除 repository target 时不再同步写 legacy full workspace snapshot，避免重新触发大 JSON 读写。
+- 回归测试覆盖 legacy snapshot 损坏、operation 字段膨胀、Page Pilot 记录清理、本地 attempt workspace 勾选删除等场景。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords|TestGitHubDeleteRepositoryTargetCanRemoveLocalWorkspacesWhenRequested|TestGitHubDeleteRepositoryTargetRemovesPagePilotRecordsAndWorkspaces' -count=1
+```
+
+### 2026-05-05 追加处理
+
+真实本地库复查发现 `ZYOOO/TestRepo` 仍未落库删除，前端看到的“已删除”只是局部状态/刷新时序；后端 DELETE 仍超过 20 秒。进一步定位到旧 `operations` 表只有 15 行但占用约 1.23GB，其中 `created_at` / `updated_at` 被旧版本写入了大块 JSON/日志文本；`workspace_snapshots` 仍约 496MB。因此当前 2 个 Work Item 并不是 470MB 的来源，体积来自历史 snapshot 和旧 operation 行。
+
+已离线备份并清理本地数据库：
+
+- 备份：`.omega/backups/omega-before-db-clean-20260505T104730Z.db.gz`
+- 删除 `repo_ZYOOO_TestRepo`、2 个 Work Item、Requirements、Pipelines、Attempts、Missions、Operations、Proof Records、Page Pilot runs、execution locks 和 legacy full snapshot。
+- `VACUUM` 后 `.omega/omega.db` 从约 2.1GB 收缩到约 9.1MB。
+- 为 pipeline / attempt / mission / operation / proof 的删除路径补充索引，避免后续 repository target 删除扫大表。
+
+## 2026-05-05: Auto run 开关显示开启但不会自动启动 Not Started item
+
+### 现象
+
+清理数据库并重新创建 `ZYOOO/TestRepo` 后，Workspace controls 里 `Auto run` 显示开启，但 Workboard 中 Not Started item 没有自动进入 Running。
+
+### 原因
+
+`Auto run` UI 读取的是 `orchestrator-watcher:{repositoryTargetId}` setting。旧删除/清理流程没有删除对应 watcher setting，导致新建同 id 的 repository target 后复用了旧的 `status=active` 状态，UI 看起来是开启的。与此同时，runtime 重启后 active watcher loop 没有从 setting 自动恢复；JobSupervisor 虽然能扫描到 `runnableItems=1`，但全局 `job-supervisor-auto-run-ready` 默认是 false，所以只报告可运行，不会直接启动。
+
+### 修复
+
+- Repository Workspace 删除时同步删除 `orchestrator-watcher:{targetId}`，避免旧 Auto 状态污染新 workspace。
+- Local runtime 启动时恢复 orchestrator watcher loop；用户明确开启 Auto 后，后端同步执行一次 watcher tick，相当于立即点了一次自动处理。
+- 前端开启/关闭 Auto 后刷新 workspace 和 control plane，让 Not Started / Running 状态更快同步。
+- 前端创建新需求后，如果当前 Repository Workspace 的 Auto 已开启，会立即调用一次 orchestrator tick，优先启动刚创建的 Not Started work item，而不是等后台轮询。
+- 当前本地库已清理旧 `orchestrator-watcher:*` setting，Auto 默认回到关闭。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestOrchestratorTickAutoRunsExistingNotStartedWorkItem|TestActiveOrchestratorWatcherRunsAfterRuntimeStart|TestGitHubDeleteRepositoryTargetRemovesPagePilotRecordsAndWorkspaces|TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords' -count=1
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
+```
+
+追加验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestOrchestratorTickAutoRunsExistingNotStartedWorkItem|TestActiveOrchestratorWatcherRunsAfterRuntimeStart|TestSaveSupervisorExecutionStateUsesOperationColumnNamesForLegacySchema' -count=1
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=30000
+git diff --check
+```
+
+## 2026-05-05: Recent event 文本被多重转义且 runtime/sqlite3 内存暴涨
+
+### 现象
+
+Run / Recent event 中出现大量 `\\\\n`、嵌套 JSON 和重复的 Requirement prompt。macOS Activity Monitor 显示 `omega-local-runtime`、Electron Helper 和多个 `sqlite3` 子进程占用数 GB 到数十 GB 压缩内存。
+
+### 原因
+
+`operations` 表经历过旧 schema 迁移：`record_json` 是后续 `ALTER TABLE` 追加的列，因此真实列顺序是 `created_at, updated_at, record_json`。代码写 operation 时使用了无列名的 `INSERT OR REPLACE INTO operations VALUES (...)`，但新代码假设列顺序是 `record_json, created_at, updated_at`。
+
+结果是整段 operation JSON 被写进 `created_at`，时间戳写进错误列；下一轮 `ListOperations` / `SaveSupervisorExecutionState` 再把这段 JSON 当时间戳和 record 继续序列化，形成指数级转义放大。`compatSnapshotMirrorSQL` 又把 execution-heavy operations 镜像进 legacy `workspace_snapshots`，导致 snapshot 也迅速膨胀。
+
+### 修复
+
+- operation 写入改为显式列名，兼容新建表和历史迁移表的不同列顺序。
+- operation `record_json` 写入前规范化 `createdAt` / `updatedAt`，防止已有污染字段继续嵌套放大。
+- `SaveSupervisorExecutionState` 不再把 missions / operations / proof records 镜像进 legacy full workspace snapshot。
+- 增加回归测试 `TestSaveSupervisorExecutionStateUsesOperationColumnNamesForLegacySchema`，模拟旧列顺序并确认 `created_at` / `updated_at` 不再错位，legacy snapshot 不再包含 operation record。
+- 本地 `.omega/omega.db` 已重建：保留 `feishu-config`、`local_workspace_root`、`ui_language` 和连接状态；清空 workspace、repository targets、work items、pipelines、attempts、operations、runtime logs、locks 和 watchers。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestSaveSupervisorExecutionStateUsesOperationColumnNamesForLegacySchema|TestListOperationsSupportsFilteredFastPath|TestOrchestratorTickAutoRunsExistingNotStartedWorkItem|TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords' -count=1
+git diff --check
+```
+
+## 2026-05-05: Desktop 刷新后短暂回到旧 Work Items 且偶发白屏
+
+### 现象
+
+删除/清理 workspace 后，UI 偶尔先显示历史的 27 个 Work Item，随后才刷新成 Go runtime 中真实的 2 个。Electron 桌面窗口还会偶发整屏白屏，用户只能手动刷新；刷新后又可能先看到旧缓存数据。Blocked Work Item 详情页也缺少明显的阻塞原因提示。
+
+### 原因
+
+前端在 App 初始化时仍从浏览器 `localStorage` 读取完整 workspace session，包括旧的 Work Items / Projects / Mission state。连接 Go local runtime 时，这些本地缓存不应该再作为业务数据源；它们只是在 `/workspace?scope=session` 返回前短暂污染首屏。初始 session 404 时，旧逻辑还会把当前前端初始态 PUT 到 `/workspace`，存在重新写入 full snapshot 的风险。
+
+白屏侧，macOS Electron renderer crash 日志显示 `SharedImageManager::ProduceOverlay` / `Invalid mailbox`，属于 GPU compositor 相关的 renderer 崩溃。此前主进程没有 `render-process-gone` 恢复页，窗口会停留在空白。
+
+### 修复
+
+- 连接 Go runtime 时，App 首屏只使用空初始 session，不再读取 `localStorage` 里的 workspace/work items。
+- 初始加载 `/workspace?scope=session` 返回 404 时，不再调用 `PUT /workspace` 写回前端初始态，避免把旧 full snapshot 路径重新接回热路径。
+- 详情路由加载失败时显示明确错误卡片，说明 UI 没有使用缓存 Work Item 兜底。
+- Blocked Work Item 详情页新增 `Blocked reason` callout，优先展示 Run Workpad blockers / retry reason / attempt failure reason。
+- Electron Desktop 默认禁用 GPU compositing，并监听 `render-process-gone`，renderer 崩溃时显示恢复页并自动重新打开 Omega，避免长时间白屏。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+npm run lint
+node --check apps/desktop/src/main.cjs
+git diff --check
+```
+
+## 2026-05-05: Page Pilot 打开预览长时间停在 Opening
+
+### 现象
+
+Page Pilot 选择 `Dev server by Agent` 后按钮一直显示 `Opening...`，状态停在 `Preview Runtime Agent is starting the dev server...`。
+
+### 原因
+
+Electron desktop Preview Runtime Agent 识别当前仓库为静态 `index.html` 项目，尝试启动 `python3 -m http.server 3009 --bind 127.0.0.1`。但 3009 已有旧的 `python3` 监听进程，占用目录为 `/Users/zyong/Omega/workspaces/page-pilot/ZYOOO_TestRepo`。新进程立即报 `OSError: [Errno 48] Address already in use`，而 desktop supervisor 没有像 Go runtime 一样清理同 workspace 的陈旧监听进程；子进程失败后仍等待 health check 超时，导致前端一直显示 Opening。
+
+### 修复
+
+- Desktop `process-supervisor.cjs` 在启动 `preview-runtime` 前检查本地 preview 端口。
+- 如果端口监听进程的 cwd 与当前 preview workspace 一致，则先 best-effort 停止该旧进程。
+- `waitForHttp` 增加 child process 状态检查；子进程 `failed/exited` 后立刻返回错误，不再等满 timeout。
+- Page Pilot 启动状态增加 `info / success / error` 分层；Preview Runtime Agent、Electron bridge 或超时失败会显示错误提示并恢复按钮，不再用泛化文案覆盖真实错误。
+- 手动清理当前残留的 3009 stale listener 后，重新启动 desktop 使用新 supervisor。
+
+### 验证
+
+```bash
+node -c apps/desktop/src/process-supervisor.cjs
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=30000
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=30000
+git diff --check
+```
+
+## 2026-05-05: 删除 Repository Workspace 后 Page Pilot 历史仍残留
+
+### 现象
+
+用户删除 `ZYOOO/TestRepo` Repository Workspace，并勾选删除本地 workspace 目录后，Page Pilot 页面仍展示该仓库的历史 sessions。部分 session 指向 Omega 管理的 Page Pilot 隔离目录，目录可能已经被删除或应该被删除，导致 UI 残留失效记录。
+
+### 原因
+
+Repository Workspace 删除链路只清理 workspace snapshot 中的 Work Item / Pipeline / Attempt / Run Workpad / Checkpoint / Mission / Operation / Proof。Page Pilot run 已经是一等 SQLite 表 `page_pilot_runs`，Preview Runtime profile 和 live execution lock 也在 `omega_settings` 中单独持久化，旧删除逻辑没有同步清理这些表和 setting。
+
+### 修复
+
+- 删除 repository target 后同步删除 `page_pilot_runs` 中同 `repositoryTargetId` 的记录。
+- 同步删除旧版 `page-pilot-run:*` setting、`page-pilot-preview-runtime:{targetId}` setting，以及同仓库的 `execution-lock:*`。
+- 勾选 `deleteLocalWorkspaces=true` 时，把 Page Pilot run 的 `repositoryPath`、`isolation.workspacePath`、`previewRuntimeProfile.workingDirectory` 纳入本地 workspace 清理候选；仍通过 workspace root 安全校验，避免误删用户原始本地仓库。
+- 删除时停止当前进程内该 repository target 的 Preview Runtime session，避免继续占用待清理目录。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestGitHubDeleteRepositoryTargetRemovesWorkspaceRecords|TestGitHubDeleteRepositoryTargetCanRemoveLocalWorkspacesWhenRequested|TestGitHubDeleteRepositoryTargetRemovesPagePilotRecordsAndWorkspaces' -count=1
+```
+
+## 2026-05-05: 飞书运行异常通知缺少可判断上下文
+
+### 现象
+
+JobSupervisor 发现 attempt 长时间没有 heartbeat 后，会发送“Omega 运行需要处理”飞书消息，但消息只列出 Work Item、Pipeline、Attempt、Stage 和 Reason。用户无法从消息里直接判断是哪个需求、什么来源/类型、哪个仓库、是否已有 PR、应该下一步做什么。普通飞书文本消息还会原样露出 `**` / 反引号等 Markdown 标记。
+
+### 原因
+
+失败 / 卡住通知的 packet 只传入 `pipeline`、`attempt`、`item`，没有补齐 Requirement 和 Repository Workspace 上下文；渲染函数也偏工程调试格式，直接输出底层 id，缺少产品语义。同时 Feishu 普通 text / task comment 不支持 Markdown 渲染，旧文案把 Markdown 当成普通文本发出。
+
+### 修复
+
+- `sendFeishuAttemptFailureIfConfigured` 发送前补齐 `requirement` 和 `repositoryTarget`。
+- `renderFeishuFailureText` 改为 Feishu 纯文本摘要，使用 emoji + 中文标签，包含事件类型、Work Item key/id/title、Requirement、item source/status/priority/labels、Repository、Pipeline、Attempt runner、阶段标题、last heartbeat、PR、branch、workspace 和处理建议。
+- Human Review 普通 text、Feishu Task description 和初始 comment 也改为纯文本；飞书文档内容继续使用 Markdown。
+- 新增回归测试 `TestRenderFeishuFailureTextIncludesReadableContext` / `TestRenderFeishuReviewTextUsesPlainFeishuText`，同时防止 Work Item 行重复和 Markdown 标记外露。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRenderFeishuFailureTextIncludesReadableContext|TestRenderFeishuReviewTextUsesPlainFeishuText|TestFeishuAutoReviewDoesNotResendAlreadySentCheckpoint|TestJobSupervisorTickMarksStalledRunningAttempt' -count=1
+```
+
+## 2026-05-05: JobSupervisor 恢复历史 Human Review 时可能重复创建飞书 Task
+
+### 现象
+
+飞书任务中心反复出现“审核将你添加为负责人”，包括 `OMG-backfill`、旧 Work Item 或 GitHub issue 的人工审核任务。
+
+### 原因
+
+Go local runtime 默认启动 JobSupervisor，启动时立即 tick，之后约 30 秒 tick 一次。Task bridge tick 只同步已有任务，但 JobSupervisor 在恢复历史 / proof-backed Human Review gate 后会把 pipeline 放入 `feishuReviewPipelines`，随后自动调用飞书审核发送链路。
+
+自动发送链路最初没有先判断 checkpoint 是否已经记录过 `feishuReview.status=sent`。补上 checkpoint 判断后，仍有一个缺口：发送状态绑定在 checkpoint 上，如果用户清理 workspace / checkpoint，或者旧 snapshot 迁移没有保留这条 checkpoint，本地就失去“已发过”的证据；历史 pipeline 再次被恢复到 Human Review 时仍可能调用 `lark-cli task +create`。
+
+### 修复
+
+- 自动发送路径遇到已记录 `status=sent` 的 checkpoint 会直接跳过，并记录 `feishu.review.skipped_already_sent`。
+- 新增 `feishu_delivery_receipts` 独立投递账本，使用 `human_review:<checkpointId>` 作为稳定 dedupe key；自动发送前先查账本，命中 `sent` 即跳过，不依赖 checkpoint 是否仍存在。
+- 迁移 `20260505_007` 会从现有 checkpoint 和 `feishu.review.synced` runtime log 回填可恢复的已发送记录。
+- 手动 `/feishu/review-request` 仍允许显式重发。
+- 新增回归测试 `TestFeishuAutoReviewDoesNotResendAlreadySentCheckpoint` / `TestFeishuAutoReviewDoesNotResendWithDeliveryReceipt`。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewDoesNotResendAlreadySentCheckpoint|TestFeishuAutoReviewDoesNotResendWithDeliveryReceipt|TestFeishuAutoReviewFallsBackToCurrentLarkUser|TestSQLiteCheckpointStoresFeishuReviewJSON' -count=1
+```
+
+### 2026-05-05 追加修复
+
+真实重启复现后发现还有第二条覆盖路径：JobSupervisor proof-backed recovery 会调用 `upsertPendingCheckpoint` 重建 Human Review checkpoint。旧实现用新 checkpoint 整体替换旧 checkpoint，导致旧记录里的 `feishuReview.status=sent` / `taskGuid` 被抹掉；随后自动发送链路看不到已发送状态，又创建新的飞书 Task。
+
+补充修复：
+
+- `upsertPendingCheckpoint` 先 clone 旧 checkpoint，再更新 status/title/summary/attemptId，保留 `feishuReview`、评论、Task 绑定等投递状态。
+- `feishuReviewAlreadySent` 除了识别 `status=sent`，也会把已有 `taskGuid` / `taskId` / `messageId` 的历史记录视为已发送，兼容旧数据。
+- SQLite normalized `checkpoints` 表新增 `feishu_review_json`，避免轻量 read model 或后续迁移路径丢失飞书审核投递状态。
+- 新增回归测试 `TestUpsertPendingCheckpointPreservesFeishuReviewState` 和 `TestSQLiteCheckpointStoresFeishuReviewJSON`。
+
+验证：
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuAutoReviewDoesNotResendAlreadySentCheckpoint|TestUpsertPendingCheckpointPreservesFeishuReviewState|TestSQLiteCheckpointStoresFeishuReviewJSON|TestJobSupervisorRecoversProofBackedHumanReviewAttempt' -count=1
+```
+
+## 2026-05-05: Feishu Task 创建成功但 taskGuid 未写入 checkpoint
+
+### 现象
+
+真实 Task review 测试中，`lark-cli task +create` 已成功创建飞书任务，raw output 里包含 `data.guid` 和 `data.url`，但 Omega checkpoint 的 `feishuReview.taskGuid` / `taskUrl` 为空。结果是 Task bridge dry-run 看不到待同步任务，完成飞书任务后无法自动 approve checkpoint。
+
+### 原因
+
+本机 `lark-cli` 在 JSON 前输出 proxy warning：
+
+```text
+[lark-cli] [WARN] proxy detected: ...
+{ "ok": true, "data": { "guid": "...", "url": "..." } }
+```
+
+旧的 `parseJSONMap` 只接受纯 JSON，遇到 warning 前缀时解析为空，导致 `extractLarkTask` 无法从嵌套 `data.guid` / `data.url` 提取任务信息。单元测试只覆盖了纯 JSON output，没有覆盖真实 CLI 噪声。
+
+### 修复
+
+- `parseJSONMap` 在直接解析失败后，会从输出中截取首个 `{` 到最后一个 `}` 的 JSON object 再解析，兼容 CLI warning / prefix / suffix 文本。
+- 新增回归测试 `TestExtractLarkTaskAcceptsNoisyCLIJSON`，覆盖 `lark-cli` warning 前缀 + `data.guid` / `data.url` 嵌套输出。
+- 用当前 `pipeline_item_manual_33:human_review` 重新触发 review request 后，checkpoint 成功写入 `taskGuid=386be781-03aa-447b-a061-66a1e8034e53` 和 task URL；完成飞书 Task 后，Task bridge 同步为 `approved`，DevFlow 继续 merge 并进入 `done`。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestExtractLarkTaskAcceptsNoisyCLIJSON|TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding|TestFeishuReviewTaskSyncApprovesCompletedTask|TestFeishuReviewTaskBridgeDryRunListsPendingTasks' -count=1
+```
+
 ## 2026-05-04: DevFlow Delivery flow 同时显示多个活动阶段
 
 ### 现象
@@ -1709,3 +2077,66 @@ curl -fsS -o /tmp/omega-workspace-full.json -w 'full HTTP=%{http_code} BYTES=%{s
 ```
 
 本地实测：session 约 464KB / 0.26s，full workspace 约 14.7MB / 0.45s；`TestWorkspaceSessionScopeOmitsExecutionHeavyTables` 会故意破坏 full snapshot JSON，确认 session scope 不依赖完整镜像反序列化。
+
+## 2026-05-06: Work Item 产物 / Agent 操作弹窗 light 模式混入深色 UI
+
+### 现象
+
+Work Item 详情页打开产物预览或 Agent 操作详情时，浅色页面里仍会出现深色弹窗外壳、深色卡片底色或过重的深色边框，视觉上像 raw terminal 面板，不像产品页面里的结构化信息。
+
+### 原因
+
+- `detail-popover` 基础样式默认是深色，后续只局部覆盖了 proof / agent body，导致 light 模式下弹窗 header、边框和正文容器颜色混杂。
+- `proof-preview-document` 基础边框仍使用暗色 token，浅色 Markdown 内容看起来像被黑色输入框包住。
+- Agent trace 卡片基础样式也是深色，依赖局部 theme-light 覆盖，弹窗和卡片状态容易出现主题不一致。
+- Review packet 预览卡片默认深色，放进 light 弹窗时缺少对应 light-first 样式。
+
+### 修复
+
+- 将 `detail-popover`、proof metadata、proof raw preview、Agent trace、Review packet 的基础样式改为 light-first。
+- 增加完整 `.product-shell.theme-dark` 覆盖，保证夜间模式继续使用深色背景、浅色文字和合适边框。
+- 将 Agent 操作弹窗的 Summary / Prompt 文档容器改为随主题切换，保留 stdout/stderr 的日志式容器。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "deletes not-started work items from the workboard|creates app requirements inside the active repository workspace and runs them against that repo" --testTimeout=30000
+git diff --check
+```
+
+浏览器手测：在 `http://127.0.0.1:5173` 打开 Work Item 详情，分别检查 light / dark 下 Agent 操作弹窗；light 模式不再出现黑色弹窗壳和黑色 Markdown 边框，dark 模式保持夜间对比度。
+
+## 2026-05-06: Human Review approve 后 Merging 卡住且阶段动画不连续
+
+### 现象
+
+Work Item 详情页里 Code Review / Merging 阶段经常显示为 `waiting`，随后直接变成 `done`，没有正在进行的动画；部分运行在 Feishu / Human Review approve 后卡在 Merging。排查 OMG-4 时发现 checkpoint 已是 `approved`，但 checkpoint 指向旧 failed attempt；真正带有 `workspacePath` / `pullRequestUrl` 的最新 attempt 没有被 delivery continuation 选中。
+
+### 原因
+
+- Approved delivery continuation 原先优先使用 checkpoint 上的 `attemptId`。如果该 checkpoint 是旧数据恢复或历史重复记录留下的 stale attempt，就会尝试用缺少 workspace / PR proof 的旧 attempt 继续交付。
+- JobSupervisor 的 proof-backed Human Review recovery 没有把 `approved` checkpoint 当作终态保护，可能在重启后把已有审批的 proof 重新恢复成待人审状态。
+- 异步 approve 只把 pipeline run stage 推到 `merging`，没有同步更新 attempt/current stage/work item，列表和详情页会消费到不一致的状态。
+- 前端阶段网格完全相信 stage 的 raw `status`；当后端已有 `startedAt` 且 pipeline 仍 running，但 stage raw status 仍是 `waiting` 时，UI 不会展示 running 动画。
+
+### 修复
+
+- Approved delivery continuation 改为选择“可交付 attempt”：先检查 checkpoint attempt 是否同时具备 `workspacePath` 和 `pullRequestUrl`，否则回退到同 pipeline 最新可交付 attempt。
+- 当 fallback 到新的可交付 attempt 时，同步把 checkpoint 的 `attemptId` 重新绑定到该 attempt，避免后续 UI / 日志继续展示旧 failed attempt。
+- JobSupervisor integrity scan 会为已 approved 的 Human Review checkpoint 做轻量 relink：如果 pipeline 已完成或正在交付，但 checkpoint 仍指旧 attempt，会改指已完成或可交付 attempt。
+- Human Review approve 的异步 queued 状态会同步更新 pipeline、attempt、work item 和 Run Workpad，让 Merging 成为 canonical current stage。
+- JobSupervisor 不再对已有 pending/approved Human Review checkpoint 的 pipeline 执行 proof-backed recovery，避免 approved 被恢复成待审核。
+- JobSupervisor 新增 approved delivery continuation recovery：重启后如果发现 approved human-review checkpoint 仍未完成交付，会重新排队并启动后台 delivery continuation。
+- 后台 approved delivery continuation 增加进程内去重，避免同一 checkpoint 被多个 supervisor tick 重复启动。
+- Work Item 详情页在 pipeline running 且 stage 已 `startedAt`、未 `completedAt` 时，把 raw waiting 渲染为 running，恢复 Merging / Code Review 的进行中样式。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestJobSupervisor(RecoversProofBackedHumanReviewAttempt|DoesNotRecoverProofBackedHumanReviewAfterApproval|QueuesApprovedDevFlowDeliveryContinuation)|TestApproveDevFlowCheckpoint(IgnoresBranchCleanupFailure|UsesLatestDeliverableAttempt|CanContinueDeliveryAsync)|TestMarkApprovedDevFlowDeliveryQueuedUsesLatestDeliverableAttempt' -count=1
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=30000
+```
+
+备注：本轮也跑了 `go test ./services/local-runtime/internal/omegalocal -count=1`，仍有既有 orchestrator/supervisor 异步 settling 用例在本机超时，失败点集中在 job drain / auto-run settle 等长链路等待窗口，需单独收敛测试稳定性。

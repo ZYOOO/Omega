@@ -194,6 +194,7 @@ func TestRunDevFlowContractStateUsesReworkAndMergingActions(t *testing.T) {
 				{ID: "apply_rework", Type: "run_agent", Agent: "coding"},
 				{ID: "validate_rework", Type: "run_validation", Agent: "testing"},
 				{ID: "update_pull_request", Type: "ensure_pr", Agent: "delivery"},
+				{ID: "collect_rework_ci_results", Type: "run_ci_checks", Agent: "testing"},
 			},
 		},
 		{
@@ -215,6 +216,7 @@ func TestRunDevFlowContractStateUsesReworkAndMergingActions(t *testing.T) {
 		{ID: "apply_rework", Type: "run_agent", Agent: "coding", Run: func() error { order = append(order, "apply"); return nil }},
 		{ID: "build_rework_checklist", Type: "build_rework_checklist", Agent: "master", Run: func() error { order = append(order, "checklist"); return nil }},
 		{ID: "update_pull_request", Type: "ensure_pr", Agent: "delivery", Run: func() error { order = append(order, "pr"); return nil }},
+		{ID: "collect_rework_ci_results", Type: "run_ci_checks", Agent: "testing", Run: func() error { order = append(order, "ci"); return nil }},
 		{ID: "validate_rework", Type: "run_validation", Agent: "testing", Run: func() error { order = append(order, "validate"); return nil }},
 	}); err != nil {
 		t.Fatal(err)
@@ -230,8 +232,44 @@ func TestRunDevFlowContractStateUsesReworkAndMergingActions(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(order, ",") != "checklist,apply,validate,pr,refresh,merge,handoff" {
+	if strings.Join(order, ",") != "checklist,apply,validate,pr,ci,refresh,merge,handoff" {
 		t.Fatalf("contract action order = %v", order)
+	}
+}
+
+func TestDefaultDevFlowWorkflowIncludesGitHubActionsCIAction(t *testing.T) {
+	template := findPipelineTemplate("devflow-pr")
+	if template == nil {
+		t.Fatal("devflow-pr template missing")
+	}
+	actions := workflowActionMapsFromTemplate(template, "in_progress")
+	if len(actions) == 0 {
+		t.Fatalf("in_progress actions missing")
+	}
+	found := false
+	for _, action := range actions {
+		if text(action, "id") == "architecture_handoff" {
+			outputs := strings.Join(stringSlice(action["outputArtifacts"]), ",")
+			if !strings.Contains(outputs, "functional-todo-list") || !strings.Contains(outputs, "project-todo-list") {
+				t.Fatalf("architecture handoff should produce todo list artifacts: %+v", action)
+			}
+		}
+		if text(action, "id") == "collect_ci_results" && text(action, "type") == "run_ci_checks" && workflowActionHandlerName(text(action, "type")) == "devflow.github_actions.run_ci_checks" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("default workflow should collect GitHub Actions CI before review: %+v", actions)
+	}
+	reworkActions := workflowActionMapsFromTemplate(template, "rework")
+	found = false
+	for _, action := range reworkActions {
+		if text(action, "id") == "collect_rework_ci_results" && text(action, "type") == "run_ci_checks" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("rework workflow should re-collect GitHub Actions CI: %+v", reworkActions)
 	}
 }
 

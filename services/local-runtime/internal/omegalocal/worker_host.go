@@ -19,7 +19,7 @@ func localWorkerHostRecord(attemptID string) map[string]any {
 }
 
 func (server *Server) markAttemptWorkerHost(ctx context.Context, pipelineID string, attemptID string, worker map[string]any) {
-	database, err := mustLoad(server, ctx)
+	database, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return
 	}
@@ -42,7 +42,7 @@ func (server *Server) markAttemptWorkerHost(ctx context.Context, pipelineID stri
 		pipeline["updatedAt"] = nowISO()
 		database.Tables.Pipelines[pipelineIndex] = pipeline
 	}
-	_ = server.Repo.Save(ctx, database)
+	_ = server.Repo.SaveSupervisorExecutionState(ctx, *database)
 }
 
 func (server *Server) hasRegisteredAttemptJob(attemptID string) bool {

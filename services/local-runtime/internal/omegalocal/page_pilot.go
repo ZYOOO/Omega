@@ -504,10 +504,11 @@ func (server *Server) getPagePilotRun(ctx context.Context, runID string) (map[st
 }
 
 func (server *Server) resolvePagePilotWorkspace(ctx context.Context, projectID string, repositoryTargetID string, sourceFile string) (string, map[string]any, ProjectAgentProfile, error) {
-	database, err := mustLoad(server, ctx)
+	databasePtr, err := server.Repo.LoadWorkspaceSession(ctx)
 	if err != nil {
 		return "", nil, ProjectAgentProfile{}, err
 	}
+	database := *databasePtr
 	target := findRepositoryTarget(database, repositoryTargetID)
 	if target == nil {
 		return "", nil, ProjectAgentProfile{}, fmt.Errorf("repository target %s not found", repositoryTargetID)
@@ -712,10 +713,11 @@ func releasePagePilotExecutionLock(ctx context.Context, server *Server, lock map
 }
 
 func (server *Server) ensurePagePilotWorkItem(ctx context.Context, payload pagePilotApplyRequest, target map[string]any) (map[string]any, error) {
-	database, err := mustLoad(server, ctx)
+	databasePtr, err := server.Repo.LoadWorkspaceSession(ctx)
 	if err != nil {
 		return nil, err
 	}
+	database := *databasePtr
 	timestamp := nowISO()
 	symbol := strings.TrimSpace(payload.Selection.SourceMapping.Symbol)
 	if symbol == "" {
@@ -772,7 +774,10 @@ func (server *Server) ensurePagePilotWorkItem(ctx context.Context, payload pageP
 		database.Tables.Pipelines = append(database.Tables.Pipelines, pipeline)
 	}
 	touch(&database)
-	if err := server.Repo.Save(ctx, database); err != nil {
+	if err := server.Repo.SaveWorkItemsState(ctx, database); err != nil {
+		return nil, err
+	}
+	if err := server.Repo.SaveSupervisorExecutionState(ctx, database); err != nil {
 		return nil, err
 	}
 	return map[string]any{
@@ -856,10 +861,11 @@ func (server *Server) updatePagePilotWorkItemStatus(ctx context.Context, workIte
 	if strings.TrimSpace(workItemID) == "" {
 		return nil
 	}
-	database, err := mustLoad(server, ctx)
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return err
 	}
+	database := *databasePtr
 	database = updateWorkItem(database, workItemID, map[string]any{"status": status})
 	if strings.TrimSpace(pipelineID) != "" {
 		for index, pipeline := range database.Tables.Pipelines {
@@ -875,7 +881,7 @@ func (server *Server) updatePagePilotWorkItemStatus(ctx context.Context, workIte
 			}
 		}
 	}
-	return server.Repo.Save(ctx, database)
+	return server.Repo.SaveSupervisorExecutionState(ctx, database)
 }
 
 func (server *Server) syncPagePilotRunRecords(ctx context.Context, run map[string]any, activeStageID string) error {
@@ -884,10 +890,11 @@ func (server *Server) syncPagePilotRunRecords(ctx context.Context, run map[strin
 	if pipelineID == "" || workItemID == "" {
 		return nil
 	}
-	database, err := mustLoad(server, ctx)
+	databasePtr, err := server.Repo.LoadSupervisorExecutionState(ctx)
 	if err != nil {
 		return err
 	}
+	database := *databasePtr
 	timestamp := nowISO()
 	runID := text(run, "id")
 	missionID := fmt.Sprintf("mission_%s_page_pilot", pipelineID)
@@ -999,7 +1006,7 @@ func (server *Server) syncPagePilotRunRecords(ctx context.Context, run map[strin
 		break
 	}
 	touch(&database)
-	return server.Repo.Save(ctx, database)
+	return server.Repo.SaveSupervisorExecutionState(ctx, database)
 }
 
 func pagePilotPipelineStatus(status string) string {
