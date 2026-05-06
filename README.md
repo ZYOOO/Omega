@@ -1,268 +1,474 @@
 # Omega AI Delivery Engine
 
-Omega 是一个 local-first 的 AI 研发流程引擎。它把需求、任务、流程、Agent、代码仓库和交付证据串成一条可运行、可审计的 DevFlow。
+Omega 是一个 **local-first AI DevFlow 引擎**，用于把一个需求转化为绑定明确代码仓库的可交付工作。它把 Workboard、Workflow Template、多 Agent 编排、隔离 Repository Workspace、GitHub PR / CI、飞书 Human Review、Page Pilot 可视化修改和 proof 证据链串成一条可运行、可审计的交付闭环。
 
-当前 v0Beta 的目标是跑通比赛功能一：
+English version: [README.en.md](README.en.md)
 
-```text
-需求输入
-  -> 需求理解与拆分
-  -> Pipeline 编排
-  -> 多 Agent 协作
-  -> 本地隔离 workspace 执行
-  -> GitHub branch / commit / pull request / checks / review / merge proof
-```
+当前版本为 `v0Beta`，重点面向本地演示、本地开发和单人/小团队试用：代码、凭据、workspace、SQLite runtime database 和 Agent 配置都保留在你的机器上。
 
-## 当前架构
+## 核心能力
 
-```text
-React SPA
-  -> Feishu-style Portal Home
-  -> Workboard
-  -> Go Local Service
-      -> SQLite
-      -> Pipeline / Agent orchestration
-      -> background attempt jobs
-      -> local git / gh / runner
-      -> GitHub delivery proof
-```
+- **功能一：AI DevFlow Workboard**
+  - 从 Requirement 创建 Work Item。
+  - 绑定明确 Repository Workspace，避免 Agent 写错仓库。
+  - 按 Workflow Template 执行 Requirement、Plan / Architect、Coding、Testing、GitHub PR、GitHub Actions CI、Review、Human Review、Rework、Merging、Done。
+  - 在 Work Item 详情页展示 Plan、TODO、Acceptance Criteria、Validation、Review Packet、Blockers、Retry Reason、Notes、PR、Proof 和阶段级 Agent 统计。
 
-主要模块：
+- **功能二：Page Pilot**
+  - 打开真实预览页面。
+  - 圈选真实 DOM 元素并提交修改要求。
+  - Agent 根据 selector、文本快照、页面上下文和仓库边界修改源码。
+  - 支持 Confirm / Discard，并把确认后的修改物化为 Work Item、Pipeline、diff、proof 和 PR 记录。
 
-- 前端 SPA：`apps/web/src/App.tsx`、`apps/web/src/components/PortalHome.tsx`、`apps/web/src/core/*`、`apps/web/src/omegaControlApiClient.ts`、`apps/web/src/workspaceApiClient.ts`
-- Desktop shell：`apps/desktop`
-- 本地服务：`services/local-runtime/cmd/omega-local-runtime`
-- Go 核心：`services/local-runtime/internal/omegalocal`
-- 共享包预留：`packages/shared`
-- 文档：`docs`
-- SQLite：`.omega/omega.db`
+- **GitHub 交付**
+  - 创建 branch / commit / pull request。
+  - 读取 PR diff。
+  - 采集 GitHub Actions checks 和失败日志。
+  - 将 PR、CI、review、merge 结果写入 proof。
 
-仓库结构：
+- **飞书 Human Review**
+  - Human Review checkpoint 可投递到飞书。
+  - 支持飞书 Task 审核：完成任务表示 approve，评论修改意见可同步为 request changes。
+  - Omega UI、飞书 callback、飞书 Task bridge 共用同一条 checkpoint decision path。
 
-```text
-apps/web                  # TS + React SPA，包含门户首页、Workboard、Pipeline、Proof UI
-apps/desktop              # Electron shell 预留，用于最终桌面 App 打包
-services/local-runtime    # Go local runtime，包含 API、SQLite、编排、本地 runner、GitHub 交付
-packages/shared           # 共享类型和 API schema 预留
-docs                      # 架构、开发计划、赛题对照和测试文档
-scripts                   # 兼容脚本和 smoke 工具
-```
+- **可配置 Agent / Workflow**
+  - 支持 Codex、Claude Code、opencode、Trae Agent。
+  - 支持 OpenAI-compatible provider，如 Kimi / Moonshot 等。
+  - `devflow-pr` 和 `saas-launch` 是内置 Workflow Template；模板可定义 stage、agent、action、artifact、transition、review round 和 human gate。
 
-## 核心对象
+## 架构概览
 
 ```text
-Project
-  -> Repository target
-      -> Requirement
-          -> Item
-              -> Pipeline run
-                  -> Attempt
-                      -> Stage
-                          -> Mission / Operation / Proof / Checkpoint
+React Web UI / Electron Desktop
+  -> Go Local Runtime API
+      -> SQLite session / execution read models
+      -> Workflow Contract State Runner
+      -> Action Executor
+      -> Agent Runner Registry
+          -> Codex / Claude Code / opencode / Trae Agent
+      -> Isolated Repository Workspace
+          -> git / gh / GitHub PR / GitHub Actions / merge
+      -> Proof / Runtime Logs / Run Workpads / Checkpoints
 ```
 
-关键语义：
+Go Local Runtime 是事实来源。Web UI、Electron、CLI、Page Pilot、飞书回调和 JobSupervisor 都通过同一套本地 API 工作。
 
-- `Project` 是产品或工程目标，不等于代码仓库。
-- `Repository target` 是真实 GitHub repo 或本地 repo path。
-- `Requirement` 是需求源，可以来自 App 手动输入、GitHub issue、飞书消息或未来共享控制面。
-- `Item` 是 Omega 内部真正可执行、可排期、可审计的工作项。
-- `Pipeline run` 是某个 Item 的一次流程运行。
-- `Attempt` 是一次具体执行记录。点击 Run 后服务端会先创建 Attempt 并立即返回，后端后台 job 继续执行；Attempt 记录 runner、workspace、branch、PR、stage、proof 和错误。
-- `Proof` 是每个阶段的证据，包括 artifact、diff、test report、review report、PR、checks、merge result。
-- 默认 `devflow-pr` 流程定义在 `services/local-runtime/workflows/devflow-pr.md`，Go runtime 会从该 Markdown workflow 编译 stages、agents、artifact 和 review rounds。默认流程可以直接使用，但不是唯一写死流程。
+详细架构见：[docs/architecture.md](docs/architecture.md)。
 
-## 快速启动
+## 仓库结构
 
-安装依赖：
+```text
+apps/web                  React + TypeScript Web UI
+apps/desktop              Electron desktop shell 和 Page Pilot preload
+services/local-runtime    Go local runtime、CLI、workflow executor、SQLite store
+services/local-runtime/workflows
+                          内置 workflow contracts
+docs                      架构、发布、CLI、GitHub、飞书、Page Pilot 文档
+scripts                   构建和发布辅助脚本
+packages/shared           共享包预留目录
+```
+
+## 环境准备
+
+### 必需依赖
+
+推荐开发环境：
+
+- macOS。当前桌面打包和 Page Pilot direct pilot 主要在 macOS 上验证。
+- Node.js 22+。Node 20 可以运行大部分本地开发命令，但 Electron 相关依赖建议 Node 22.12+。
+- npm。
+- Go 1.21+。
+- Git。
+- GitHub CLI `gh`。
+
+本次提交前验证环境：
+
+```text
+macOS arm64
+Node.js v20.19.4
+npm 10.8.2
+Go go1.21.6 darwin/arm64
+Git 2.39.3 (Apple Git-145)
+GitHub CLI 2.88.0
+Electron 41.3.0
+electron-builder 26.8.1
+Vite 7.1.12
+TypeScript 5.9.3
+Vitest 3.2.4
+```
+
+检查命令：
+
+```bash
+node -v
+npm -v
+go version
+git --version
+gh --version
+```
+
+### 可选 Agent Runner
+
+按需要安装：
+
+- Codex CLI：用于 Codex Agent。
+- Claude Code CLI：用于 Claude Code Agent。
+- opencode：用于 opencode Agent。
+- Trae Agent / trae-cli：用于 Trae Agent。
+- lark-cli：用于飞书消息、飞书 Task 和当前用户 fallback。
+
+Codex / Claude Code 通常继承本机 CLI 登录态；opencode / Trae Agent 可以在 Omega 的 Settings / Agent Studio 中配置 provider、model、base URL 和 API key。
+
+## GitHub 配置
+
+Omega 的 GitHub 交付链路依赖本机 `git` 和 `gh`。
+
+登录 GitHub：
+
+```bash
+gh auth login
+gh auth status
+```
+
+推荐 scope：
+
+```text
+repo
+workflow
+read:org（可选，用于组织仓库读取）
+```
+
+如果已经登录但 scope 不足，可以刷新：
+
+```bash
+gh auth refresh -s repo -s workflow -s read:org
+```
+
+演示或首次测试时，建议目标仓库先有一个 `README.md` 初始提交，并确认默认分支是 `main`。空仓库如果第一条推送是 Omega 的功能分支，GitHub 可能会把功能分支设为默认分支，导致后续 PR 创建时 base branch 不存在。
+
+最小演示仓库初始化方式：
+
+```bash
+mkdir DemoRepo
+cd DemoRepo
+git init -b main
+printf '%s\n' '# DemoRepo' '' 'Demo repository for Omega DevFlow.' > README.md
+git add README.md
+git commit -m "Initial README"
+git remote add origin https://github.com/<owner>/<repo>.git
+git push -u origin main
+```
+
+## 飞书配置
+
+Omega 支持三类飞书投递路径：
+
+1. Chat message：机器人向群聊发送审核消息或卡片。
+2. Task review：创建飞书任务，完成任务表示 approve，评论修改意见可同步为 request changes。
+3. Bot webhook：通过群机器人 webhook 发送消息。
+
+推荐优先使用 **自建应用 + lark-cli + Task review**，不需要公网入口，适合本地 demo。
+
+### 1. 在飞书开放平台创建自建应用
+
+进入飞书开放平台：
+
+```text
+https://open.feishu.cn/
+```
+
+操作步骤：
+
+1. 创建企业自建应用。
+2. 在「凭证与基础信息」中复制：
+   - App ID
+   - App Secret
+3. 开启「机器人」能力。
+4. 在「权限管理」中添加所需权限。
+5. 发布应用版本。
+6. 将应用安装到目标租户。
+7. 如果使用群聊消息，把机器人加入目标群。
+
+### 2. 推荐权限
+
+最小消息能力：
+
+```text
+im:message
+im:message:send_as_bot
+im:chat
+```
+
+Task review 推荐权限：
+
+```text
+task:task:read
+task:task:write
+```
+
+如果需要把长 Review Packet 写成飞书文档，可额外开启：
+
+```text
+drive:drive
+space:folder:create
+space:document:retrieve
+docs:document:copy
+```
+
+如果需要按邮箱或手机号解析用户，可能还需要通讯录 / 获取用户 ID 相关权限。不同租户权限名称可能略有差异，以飞书开放平台当前页面为准。
+
+更完整说明见：[docs/feishu-bot-permissions.md](docs/feishu-bot-permissions.md)。
+
+### 3. 安装并配置 lark-cli
+
+安装 `lark-cli` 后初始化 App ID / App Secret：
+
+```bash
+lark-cli config init
+```
+
+按提示填入：
+
+```text
+App ID
+App Secret
+```
+
+检查：
+
+```bash
+lark-cli doctor
+lark-cli auth scopes
+```
+
+如果要使用当前用户 fallback 或 Reviewer lookup，继续登录用户态：
+
+```bash
+lark-cli auth login
+lark-cli contact +get-user --as user --format json
+```
+
+### 4. 在 Omega 中配置飞书
+
+打开 Omega：
+
+```text
+Settings -> Provider access -> Feishu
+```
+
+建议流程：
+
+1. 点击 `Test connection`，确认本机 `lark-cli` 可用。
+2. 选择 Review channel：
+   - `Task review`：推荐本地演示使用。
+   - `Chat message`：发送到群聊。
+   - `Bot webhook`：使用群机器人 webhook。
+3. 如果使用 Task review：
+   - 在 Reviewer 中搜索审核人，或使用 `Use current user`。
+   - 可选填写 Tasklist ID。
+   - 可开启 local task bridge sync。
+4. 如果使用 Chat message：
+   - 填写 Chat ID，例如 `oc_xxx`。
+5. 如果使用 Bot webhook：
+   - 填写 webhook URL。
+   - 可选填写 webhook secret。
+6. 保存配置。
+
+无公网时建议使用 Task review：Omega 本机 runtime 主动通过 `lark-cli` 创建任务，再通过 Task bridge / sync 查询任务完成状态，不需要飞书云端回调你的本机。
+
+## 安装依赖
+
+克隆仓库：
+
+```bash
+git clone <repo-url> omega
+cd omega
+```
+
+安装 Node 依赖：
 
 ```bash
 npm install
 ```
 
-启动 Go local runtime：
+如果你希望使用 CI 风格的可重复安装：
+
+```bash
+npm ci
+```
+
+## 从源码启动
+
+建议开三个终端。
+
+### 终端 1：启动 Go Local Runtime
 
 ```bash
 npm run local-runtime:dev
 ```
 
-启动前端：
-
-```bash
-npm run web:dev
-```
-
-默认访问：
-
-```text
-http://localhost:5173/
-```
-
-默认页面是参考飞书工作台结构的门户首页，功能页入口是首页 CTA 或：
-
-```text
-http://localhost:5173/#workboard
-```
-
-Go local service 默认监听：
+默认地址：
 
 ```text
 http://127.0.0.1:3888
 ```
 
-## GitHub 配置
-
-Omega 支持两种 GitHub 路径：
-
-1. 使用本机 `gh` 登录态读取 repositories、创建 PR、读取 checks。
-2. 在 App 内配置 GitHub OAuth App，并通过本地 callback 完成授权。
-
-OAuth callback：
+默认数据库：
 
 ```text
-http://127.0.0.1:3888/auth/github/callback
+<repo>/.omega/omega.db
 ```
 
-App 内会把 OAuth 配置持久化到 `.omega/omega.db`。`.env` 只作为开发 fallback。
-
-## 本地 workspace
-
-执行代码变更时，Omega 会在配置的 workspace root 下创建隔离 workspace。
-
-默认 root：
+默认 workspace root：
 
 ```text
 ~/Omega/workspaces
 ```
 
-可以在 App 内修改，也可以通过 API：
-
-```text
-GET /local-workspace-root
-PUT /local-workspace-root
-```
-
-每次运行会写入：
-
-```text
-.omega/job.json
-.omega/prompt.md
-.omega/agent-runtime.json
-```
-
-这些文件用于记录 runner、Agent、repo target、workspace path、sandbox policy 和执行上下文。
-
-## 主要 API
-
-```text
-GET  /health
-GET  /workspace
-PUT  /workspace
-GET  /requirements
-POST /requirements/decompose
-POST /work-items
-PATCH /work-items/:id
-GET  /pipelines
-GET  /workflow-templates
-GET  /attempts
-GET  /attempts/:id/timeline
-POST /attempts/:id/retry
-POST /attempts/:id/cancel
-POST /pipelines/from-template
-POST /pipelines/:id/run-devflow-cycle
-GET  /checkpoints
-POST /checkpoints/:id/approve
-POST /checkpoints/:id/request-changes
-GET  /missions
-GET  /operations
-GET  /proof-records
-GET  /execution-locks
-GET  /runtime-logs
-GET  /runtime-logs/export
-POST /job-supervisor/tick
-POST /orchestrator/tick
-GET  /agent-definitions
-GET  /llm-providers
-GET  /observability
-GET  /github/status
-GET  /github/repositories
-POST /github/bind-repository-target
-POST /github/import-issues
-POST /github/create-pr
-POST /github/pr-status
-```
-
-完整 API 文档：
-
-```text
-docs/openapi.yaml
-```
-
-## 开发命令
+也可以手动指定：
 
 ```bash
-npm run lint
-npm run test
-npm run coverage
-npm run build
-npm run go:test
+go run ./services/local-runtime/cmd/omega-local-runtime \
+  --host 127.0.0.1 \
+  --port 3888 \
+  --database .omega/omega.db \
+  --workspace-root "$HOME/Omega/workspaces"
 ```
 
-常用 targeted checks：
+### 终端 2：启动 Web UI
 
 ```bash
-npm test -- --run src/__tests__/App.operatorView.test.tsx
-go test ./services/local-runtime/internal/omegalocal
+npm run web:dev
 ```
 
-## 当前可验证流程
-
-推荐测试仓库：
+打开：
 
 ```text
-ZYOOO/TestRepo
+http://127.0.0.1:5173
 ```
 
-建议手动验证：
+### 终端 3：启动 Electron Desktop
 
-1. 启动 Go local service 和前端。
-2. 打开 App。
-3. 确认 GitHub 连接为 on。
-4. 在 Project 页面选择并绑定 `ZYOOO/TestRepo`。
-5. 进入左侧 `ZYOOO/TestRepo` workspace。
-6. 在 Work items 页面创建 Requirement。
-7. 点击 Run。
-8. Run 请求应立即返回并显示已开始；后端后台 job 会继续执行。
-9. 通过列表轮询和详情页观察 `Planning -> Running -> In Review`、Attempt、Pipeline stages 和 Agent 分配。
-10. 在 Checkpoint / Operator 面板中审核 Human Review：Approve 后才会继续 merge / delivery；Reject 会回退并保留原因。
-11. 检查 GitHub PR、Review Agent proof、human proof 和 merge 状态。
+```bash
+npm run desktop:dev
+```
 
-## 当前文档
+Desktop 会打开 Omega 桌面壳，并支持 Electron direct Page Pilot。
 
-- `docs/architecture.md`：当前架构。
-- `docs/development-plan.md`：开发思路与路线。
-- `docs/development-log.md`：开发日志。
-- `docs/agent-skills-and-mcp.md`：Agent Skills / MCP 的本机安装位置、stage 映射和验证方式。
-- `docs/github-actions-ci-chain.md`：GitHub Actions CI 在 DevFlow 中的采集、rework 和报告链路。
-- `docs/competition-requirements-matrix.md`：赛题要求对照。
-- `docs/manual-testing-guide.md`：手动测试指南。
-- `docs/todo.md`：任务清单。
-- `HANDOFF.md`：当前接手说明、启动方式、验证路径和已知缺口。
+## 本地使用流程
 
-## 当前 UI 状态
+1. 打开 Omega。
+2. 在 `Settings -> Provider access` 检查 GitHub / Feishu / Agent Access。
+3. 在 `Projects` 或 Workboard 中绑定 GitHub repository。
+4. 在 Agent Studio 中选择 workflow template：
+   - `devflow-pr`：通用 requirement-to-PR 流程。
+   - `saas-launch`：SaaS demo / 发布演示流程。
+5. 创建 Requirement。
+6. 转成 Work Item。
+7. 运行 DevFlow。
+8. 在 Work Item 详情页查看：
+   - Plan / TODO
+   - Acceptance Criteria
+   - Validation
+   - Review Packet
+   - Agent statistics
+   - PR / CI / Proof
+9. Human Review 阶段在 Omega 或飞书中 approve / request changes。
+10. 通过后进入 Merging / Done，并生成最终 proof。
 
-- `http://localhost:5173/` 默认进入门户首页。
-- `http://localhost:5173/#workboard` 进入真实功能页。
-- 门户首页已经从 `App.tsx` 拆到 `apps/web/src/components/PortalHome.tsx`。
-- Workboard 保持原功能，但已统一为浅色工作台风格：左侧 workspace、GitHub Issues、Work item 列表、右侧 rail 和状态卡片保持同一视觉体系。
+## Page Pilot 使用流程
 
-## 当前重点缺口
+1. 进入 Page Pilot。
+2. 选择 Repository Workspace。
+3. 对 package 项目，使用 Preview Runtime Agent 启动 dev server；纯静态项目可打开 `index.html`。
+4. 在页面中圈选 DOM 元素。
+5. 输入修改要求。
+6. 选择 Agent runner。
+7. 等待 Agent 修改源码。
+8. 点击 Confirm 将修改物化为 Work Item / Pipeline / proof；或点击 Discard 丢弃本轮修改。
 
-- Pipeline Template 仍需 App 内可编辑。
-- Agent runner registry 已统一 Codex / opencode / Claude Code / demo runner 的基础能力，仍需增强 runner-specific prompt/runtime 模板。
-- `run-devflow-cycle` 已改为默认异步后台 job：Run 立刻返回 `attempt`，前端靠轮询更新状态；`wait: true` 只作为测试和兼容路径。Run Timeline 基础版已按 Attempt 聚合真实运行事件，便于 Human Review 和排障。
-- Human Review 已改为真实阻塞点：Review Agent 通过后停在 checkpoint，必须由用户 Approve 后才继续 merge / delivery。
-- `AgentRunner + JobSupervisor` 已有正式 v1：heartbeat、stalled detection、retry、cancel、contract-driven timeout、workspace lock、workspace cleanup、worker host lease 和 continuation policy metadata 基础版已接入；远端崩溃恢复和 GitHub polling 仍需增强。
-- GitHub issue comment / label 回写仍需完成。
-- PR lifecycle UI 仍需加强。
-- Feishu 审核卡片和回调仍需完成。
+Page Pilot 不会为 package 项目伪造默认 URL。它会尽量启动真实预览运行时，确保圈选、源码修改、diff、PR 和 proof 落到真实数据上。
+
+## CLI
+
+开发期使用：
+
+```bash
+npm run omega -- health
+npm run omega -- work-items list
+npm run omega -- attempts list --limit 20
+npm run omega -- operations list --limit 20
+npm run omega -- workpads list --limit 20
+npm run omega -- proof list --limit 20
+```
+
+构建后的 binary：
+
+```bash
+dist/release/bin/omega --api-url http://127.0.0.1:3888 health
+```
+
+完整命令见：[docs/omega-cli.md](docs/omega-cli.md)。
+
+## 构建桌面应用
+
+构建 Web assets 和 Go binaries：
+
+```bash
+npm run release:prepare
+```
+
+构建 unpacked desktop app：
+
+```bash
+CSC_IDENTITY_AUTO_DISCOVERY=false npm run desktop:pack
+```
+
+构建 macOS `.dmg` 和 `.zip`：
+
+```bash
+CSC_IDENTITY_AUTO_DISCOVERY=false npm run desktop:dist
+```
+
+预期产物：
+
+```text
+dist/desktop/Omega-0.1.0-arm64.dmg
+dist/desktop/Omega-0.1.0-mac-arm64.zip
+dist/release/bin/omega
+dist/release/bin/omega-local-runtime
+```
+
+未签名构建适合内部测试。公开发布 macOS 应用建议配置 Developer ID 签名和 notarization。
+
+更多说明见：[docs/release-packaging.zh-CN.md](docs/release-packaging.zh-CN.md)。
+
+## 未来 TODO
+
+- Workflow Template 可视化编辑：支持 stage 拖拽、连线、版本历史、导入导出和模板市场化。
+- Agent 观测增强：补齐 token、成本、失败率、重试次数、阶段耗时和 Agent 产物质量统计。
+- Page Pilot 源码定位增强：在复杂前端项目里更稳定地从 DOM selector 追踪到组件、样式和数据源。
+- 团队协作：增加多人本地协同、远端同步和共享审核记录。
+- 执行日志长期留存：将 stdout / stderr / runner details 从 SQLite 热库中分层归档，降低本地数据库膨胀风险。
+- 更多交付模板：补充 SaaS Launch、Bug Bash、UI Iteration、Docs Release 等可复用 DevFlow。
+
+## 公开文档
+
+- [当前架构](docs/architecture.md)
+- [产品总结](docs/product.md)
+- [DevFlow Agent 执行边界](docs/devflow-agent-execution-policy.md)
+- [数据模型](docs/data-model.md)
+- [Page Pilot](docs/page-pilot.md)
+- [GitHub Actions CI 链路](docs/github-actions-ci-chain.md)
+- [飞书 Review 链路](docs/feishu-review-chain.md)
+- [飞书应用权限](docs/feishu-bot-permissions.md)
+- [Agent Skills / MCP](docs/agent-skills-and-mcp.md)
+- [CLI 参考](docs/omega-cli.md)
+- [Demo 手册](docs/demo-playbook.md)
+- [发布打包](docs/release-packaging.zh-CN.md)
+- [Release packaging](docs/release-packaging.md)
+- [OpenAPI](docs/openapi.yaml)
+- [TODO](docs/todo.md)
+- [Bug Log](docs/bug-log.md)
+
+开发日志、交接 prompt、临时方案和测试 fixture 笔记已归档到 `docs/internal-dev-notes/`，该目录已加入 `.gitignore`，不作为 GitHub 公开提交内容。`docs/todo.md` 和 `docs/bug-log.md` 保留为公开项目跟踪文档。

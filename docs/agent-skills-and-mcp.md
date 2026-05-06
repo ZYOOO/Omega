@@ -1,6 +1,6 @@
 # Omega Agent Skills 与 MCP 配置说明
 
-> 更新时间：2026-05-05
+> 更新时间：2026-05-06
 
 ## 当前结论
 
@@ -9,17 +9,23 @@ Omega 现在不是只在 UI 上保存 Skills / MCP。每个 stage 的 Agent Prof
 - `.omega/agent-runtime.json`：运行时元数据，包含 Agent Profile 摘要。
 - `.omega/agent-capabilities.json`：机器可读能力清单，包含 stage skills、stage MCP、项目 allowlist、runner、model。
 - `.omega/agent-capabilities.md`：人和 Agent 都容易阅读的能力说明。
+- `.omega/agent-skill-manifest.json`：本次运行实际物化的 skill 文件清单，记录来源是宿主机安装副本还是项目 fallback。
+- `.omega/skills/<skill>/SKILL.md`：项目内置 skill 指令文件。优先复制本机已安装 skill；本机未安装时生成 Omega fallback 指令，保证 runner workspace 里仍有可读的技能契约。
 - `.codex/OMEGA.md`：Codex runner 的阶段策略与能力边界。
 - `.claude/CLAUDE.md`：Claude Code runner 的阶段策略与能力边界。
-- 子进程环境变量：`OMEGA_AGENT_SKILLS`、`OMEGA_AGENT_MCP`、`OMEGA_AGENT_SKILL_ALLOWLIST`、`OMEGA_AGENT_MCP_ALLOWLIST` 等。
+- 子进程环境变量：`OMEGA_AGENT_SKILLS`、`OMEGA_AGENT_SKILL_ROOT`、`OMEGA_AGENT_SKILL_PATHS`、`OMEGA_AGENT_MCP`、`OMEGA_AGENT_SKILL_ALLOWLIST`、`OMEGA_AGENT_MCP_ALLOWLIST` 等。
 
-本轮新增测试会启动 fake `opencode` runner，并让子进程在自己的 cwd 中读取这些文件和环境变量；如果缺少 stage skill / MCP，测试会失败。这样能证明服务启动的 Agent 进程确实拿到了对应能力声明。
+本轮新增测试会启动 fake `opencode` runner，并让子进程在自己的 cwd 中读取这些文件和环境变量；如果缺少 stage skill / MCP、项目 skill 文件、manifest 或 skill path env，测试会失败。这样能证明服务启动的 Agent 进程确实拿到了对应能力声明和项目内置 skill 指令。
+
+> 注意：自动化测试可以证明 runner 进程“能看到并被提示使用”项目内置 skill 文件。是否语义上完全遵循 skill，仍需要真实模型运行、输出和 proof 复核；Omega 通过 policy 文件、prompt 摘要、manifest 和 proof 链路让这件事可审计。
 
 ## 本机安装位置
 
 ### Skills
 
-安装目录：`/Users/zyong/.codex/skills`
+本机安装目录示例：`/Users/zyong/.codex/skills`
+
+本机安装不再是硬依赖。运行时查找顺序包括 `$CODEX_HOME/skills`、`$CODEX_HOME/skills/.system`、`~/.codex/skills`、`~/.codex/skills/.system`、`~/.codex/superpowers/skills`；命中时复制对应 `SKILL.md` 到 `.omega/skills/<skill>/SKILL.md`，未命中时写入项目 fallback。
 
 | Skill | 路径 | 主要 Stage | 用途 |
 | --- | --- | --- | --- |
@@ -45,12 +51,13 @@ Omega 现在不是只在 UI 上保存 Skills / MCP。每个 stage 的 Agent Prof
 | `omega-sequential-thinking` | `/Users/zyong/.nvm/versions/node/v20.19.4/bin/mcp-server-sequential-thinking` | Requirement / Architect | 辅助需求拆解、方案推理和风险梳理。 |
 | `x-mcp` | 既有远端配置 | 按需 | 继续保留已有远端 MCP 能力。 |
 
-> 新安装的 Skills / MCP 需要重启 Codex 或相关 runner 才会被宿主进程重新发现。Omega runtime 写入的 `.omega/agent-capabilities.*` 不依赖重启，但 MCP server 的宿主发现通常需要重启。
+> 新安装的 Skills / MCP 需要重启 Codex 或相关 runner 才会被宿主进程重新发现。Omega runtime 写入的 `.omega/agent-capabilities.*`、`.omega/skills/*/SKILL.md` 不依赖重启，但 MCP server 的宿主发现通常需要重启。
 
 ## 默认 Stage 映射
 
 | Stage | 默认 Skills | 默认 MCP |
 | --- | --- | --- |
+| Master | `bb-browser`, `openai-docs` | `omega-filesystem`, `omega-memory`, `omega-sequential-thinking` |
 | Requirement | `bb-browser`, `openai-docs` | `omega-filesystem`, `omega-memory`, `omega-sequential-thinking` |
 | Architect | `security-threat-model`, `openai-docs` | `omega-filesystem`, `omega-sequential-thinking` |
 | Coding | `playwright`, `security-best-practices` | `omega-filesystem`, `omega-git`, `omega-puppeteer` |
@@ -63,18 +70,20 @@ Omega 现在不是只在 UI 上保存 Skills / MCP。每个 stage 的 Agent Prof
 1. Web 的 Workspace Agent Studio 保存 `ProjectAgentProfile`。
 2. Go local runtime 通过 `/agent-profile` 持久化到 SQLite。
 3. Pipeline / Operation 解析当前 Work Item 的 Project 和 Repository Target，选择项目级或仓库级 Agent Profile。
-4. 启动 runner 前写入 `.omega/agent-runtime.json`、`.omega/agent-capabilities.json`、`.omega/agent-capabilities.md`、`.codex/OMEGA.md`、`.claude/CLAUDE.md`。
-5. 启动 runner 子进程时注入 `OMEGA_AGENT_SKILLS`、`OMEGA_AGENT_MCP` 等环境变量。
-6. 对有明确 repository target 的 DevFlow，能力文件写入隔离 clone 的 repo workspace；无 target 的 operation 写入该 operation 的临时 workspace。
-7. Agent prompt 仍附带 `Omega Agent Profile` 摘要，作为文本层冗余提示；真实可验证边界以 runtime files 和 runner env 为准。
+4. 启动 runner 前查找本机 skill 安装；能找到则复制 `SKILL.md`，找不到则生成项目 fallback。
+5. 同步写入 `.omega/agent-runtime.json`、`.omega/agent-capabilities.json`、`.omega/agent-capabilities.md`、`.omega/agent-skill-manifest.json`、`.omega/skills/<skill>/SKILL.md`、`.codex/OMEGA.md`、`.claude/CLAUDE.md`。
+6. 启动 runner 子进程时注入 `OMEGA_AGENT_SKILLS`、`OMEGA_AGENT_SKILL_ROOT`、`OMEGA_AGENT_SKILL_PATHS`、`OMEGA_AGENT_MCP` 等环境变量。
+7. 对有明确 repository target 的 DevFlow，能力文件写入隔离 clone 的 repo workspace；无 target 的 operation 写入该 operation 的临时 workspace。
+8. Agent prompt 仍附带 `Omega Agent Profile` 摘要，并列出 `project skill files` 路径，提示 Agent 使用 skill 前先读 `.omega/skills/<skill>/SKILL.md`；真实可验证边界以 runtime files 和 runner env 为准。
 
 ## 验证方式
 
 ```bash
-go test ./services/local-runtime/internal/omegalocal -run 'TestProjectAgentProfilePersistsAndFeedsRuntimeBundle|TestProfileRunnerRegistrySelectsConfiguredAgentRunner|TestProfileSkillsAndMCPAreMaterializedForRunnerProcess' -count=1
+go test ./services/local-runtime/internal/omegalocal -run 'TestProjectAgentProfilePersistsAndFeedsRuntimeBundle|TestProfileRunnerRegistrySelectsConfiguredAgentRunner|TestProfileSkillsAndMCPAreMaterializedForRunnerProcess|TestProjectBundledSkillFallbackMaterializesWithoutHostInstall' -count=1
 ```
 
 重点测试：
 
 - `TestProjectAgentProfilePersistsAndFeedsRuntimeBundle`：确认 profile 持久化、runtime bundle、policy files 和 capabilities files 都包含 Skills/MCP。
-- `TestProfileSkillsAndMCPAreMaterializedForRunnerProcess`：启动 fake `opencode`，由 runner 子进程读取 `.omega/agent-capabilities.*`、`.codex/OMEGA.md`、`.claude/CLAUDE.md` 和 `OMEGA_AGENT_*` 环境变量，证明不是 UI-only。
+- `TestProfileSkillsAndMCPAreMaterializedForRunnerProcess`：启动 fake `opencode`，由 runner 子进程读取 `.omega/agent-capabilities.*`、`.omega/skills/*/SKILL.md`、`.omega/agent-skill-manifest.json`、`.codex/OMEGA.md`、`.claude/CLAUDE.md` 和 `OMEGA_AGENT_*` 环境变量，证明不是 UI-only。
+- `TestProjectBundledSkillFallbackMaterializesWithoutHostInstall`：构造一个本机不存在的 skill，确认 Omega 仍会在项目 workspace 生成 fallback `SKILL.md`，并写入 manifest / Codex policy。

@@ -362,7 +362,7 @@ type PipelineTemplate struct {
 }
 
 func isDevFlowPRTemplate(templateID string) bool {
-	return templateID == "devflow-pr"
+	return templateID == "devflow-pr" || templateID == "saas-launch"
 }
 
 func pipelineTemplates() []PipelineTemplate {
@@ -396,6 +396,11 @@ func pipelineTemplates() []PipelineTemplate {
 			ReviewRounds: defaultDevFlowReviewRounds(),
 			Runtime:      WorkflowRuntimeProfile{MaxReviewCycles: 3, RunnerHeartbeatSeconds: 10, AttemptTimeoutMinutes: 30, MaxRetryAttempts: 2, RetryBackoffSeconds: 300, CleanupRetentionSeconds: 86400, MaxContinuationTurns: 2},
 		})
+	}
+	for _, workflowTemplate := range workflowTemplates {
+		if workflowTemplate.ID != "devflow-pr" {
+			templates = append(templates, workflowTemplate)
+		}
 	}
 	templates = append(templates,
 		PipelineTemplate{

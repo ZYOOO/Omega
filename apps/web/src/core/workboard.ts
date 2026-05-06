@@ -1,6 +1,6 @@
 import type { PipelineRun, PipelineStage } from "./types";
 
-export type WorkItemStatus = "Planning" | "Ready" | "In Review" | "Human Review" | "Backlog" | "Blocked" | "Done";
+export type WorkItemStatus = "Planning" | "Ready" | "In Review" | "Human Review" | "Backlog" | "Blocked" | "Canceled" | "Done";
 export type WorkItemPriority = "No priority" | "Low" | "Medium" | "High" | "Urgent";
 export type WorkboardProjectStatus = "Active" | "Paused" | "Completed";
 export type WorkItemSource = "manual" | "github_issue" | "feishu_message" | "ai_generated" | "page_pilot";
@@ -42,7 +42,7 @@ export interface WorkItem {
   assignee: string;
   labels: string[];
   team: string;
-  stageId: PipelineStage["id"];
+  stageId: string;
   target: string;
   source: WorkItemSource;
   requirementId?: string;
@@ -59,7 +59,7 @@ export interface WorkItemGroup {
   items: WorkItem[];
 }
 
-const statusOrder: WorkItemStatus[] = ["Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Done"];
+const statusOrder: WorkItemStatus[] = ["Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Canceled", "Done"];
 
 function workItemStatusFromStage(stage: PipelineStage): WorkItemStatus {
   if (stage.status === "ready" || stage.status === "running" || stage.status === "needs-human") {

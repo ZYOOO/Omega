@@ -14,6 +14,7 @@ type devFlowRunReportInput struct {
 	PullRequestURL      string
 	ChangedFiles        []string
 	DiffText            string
+	PlanOutput          string
 	TestOutput          string
 	ChecksOutput        string
 	PullRequestFeedback []map[string]any
@@ -56,6 +57,7 @@ func writeDevFlowRunReport(proofDir string, input devFlowRunReportInput) (string
 	if len(checkLogLines) == 0 {
 		checkLogLines = append(checkLogLines, "- No failed check log captured.")
 	}
+	todoCompletion := markdownDevFlowTodoCompletion(packet["todoCompletion"])
 	artifactLines := []string{}
 	for _, artifact := range input.StageArtifacts {
 		artifactLines = append(artifactLines, fmt.Sprintf("- `%s` / `%s`: %s", text(artifact, "stageId"), text(artifact, "agentId"), text(artifact, "artifact")))
@@ -113,8 +115,14 @@ func writeDevFlowRunReport(proofDir string, input devFlowRunReportInput) (string
 - Level: %s
 - Reasons:
 %s
+- Basis:
+%s
 
 ## Recommended Actions
+
+%s
+
+## Plan / TODO Completion
 
 %s
 
@@ -152,7 +160,9 @@ func writeDevFlowRunReport(proofDir string, input devFlowRunReportInput) (string
 		text(mapValue(packet["checkPreview"]), "summary"),
 		text(mapValue(packet["risk"]), "level"),
 		markdownAnyList(mapValue(packet["risk"])["reasons"]),
+		markdownDevFlowRiskBasis(mapValue(packet["risk"])["basis"]),
 		markdownPacketActions(packet["recommendedActions"]),
+		todoCompletion,
 		strings.Join(reviewLines, "\n"),
 		strings.Join(prFeedbackLines, "\n"),
 		strings.Join(checkLogLines, "\n"),
@@ -175,13 +185,18 @@ func writeDevFlowReviewPacket(proofDir string, input devFlowRunReportInput) (map
 
 func ensureDevFlowReviewPacket(input devFlowRunReportInput) map[string]any {
 	if len(input.ReviewPacket) > 0 {
-		return cloneMap(input.ReviewPacket)
+		packet := cloneMap(input.ReviewPacket)
+		if _, ok := packet["todoCompletion"]; !ok {
+			packet["todoCompletion"] = devFlowTodoCompletion(input, mapValue(packet["testPreview"]), mapValue(packet["checkPreview"]))
+		}
+		return packet
 	}
 	diffPreview := devFlowDiffPreview(input.ChangedFiles, input.DiffText)
 	testPreview := devFlowTestPreview(input.TestOutput)
 	checkPreview := devFlowCheckPreview(input.ChecksOutput, input.PullRequestFeedback, input.CheckLogFeedback)
 	risk := devFlowRiskSummary(input, testPreview, checkPreview)
 	actions := devFlowRecommendedActions(input, testPreview, checkPreview, risk)
+	todoCompletion := devFlowTodoCompletion(input, testPreview, checkPreview)
 	return map[string]any{
 		"schemaVersion":      1,
 		"generatedAt":        nowISO(),
@@ -195,9 +210,154 @@ func ensureDevFlowReviewPacket(input devFlowRunReportInput) map[string]any {
 		"testPreview":        testPreview,
 		"checkPreview":       checkPreview,
 		"risk":               risk,
+		"todoCompletion":     todoCompletion,
 		"recommendedActions": actions,
 		"reviewFeedback":     devFlowPacketReviewFeedback(input),
 	}
+}
+
+func devFlowTodoCompletion(input devFlowRunReportInput, testPreview map[string]any, checkPreview map[string]any) map[string]any {
+	functional, project := devFlowParsePlanTodos(input.PlanOutput)
+	total := len(functional) + len(project)
+	counts := map[string]any{"total": total, "verified": 0, "pending": 0, "attention": 0}
+	if total == 0 {
+		return map[string]any{
+			"status":     "not_captured",
+			"summary":    "No plan TODO checklist was captured in the solution plan.",
+			"counts":     counts,
+			"functional": []any{},
+			"project":    []any{},
+			"source":     "solution-plan",
+		}
+	}
+	reviewStatus := devFlowLatestReviewStatus(input.AgentInvocations)
+	testStatus := text(testPreview, "status")
+	checkStatus := text(checkPreview, "status")
+	functionalItems, verified, pending, attention := devFlowTodoCompletionItems(functional, reviewStatus, testStatus, checkStatus)
+	counts["verified"] = int(counts["verified"].(int)) + verified
+	counts["pending"] = int(counts["pending"].(int)) + pending
+	counts["attention"] = int(counts["attention"].(int)) + attention
+	projectItems, verified, pending, attention := devFlowTodoCompletionItems(project, reviewStatus, testStatus, checkStatus)
+	counts["verified"] = int(counts["verified"].(int)) + verified
+	counts["pending"] = int(counts["pending"].(int)) + pending
+	counts["attention"] = int(counts["attention"].(int)) + attention
+	status := "verified"
+	if int(counts["attention"].(int)) > 0 {
+		status = "attention"
+	} else if int(counts["pending"].(int)) > 0 {
+		status = "pending"
+	}
+	return map[string]any{
+		"status":       status,
+		"summary":      fmt.Sprintf("%d/%d plan TODO(s) verified for Human Review.", counts["verified"], total),
+		"counts":       counts,
+		"functional":   functionalItems,
+		"project":      projectItems,
+		"source":       "solution-plan + automated-review + validation/check previews",
+		"reviewStatus": reviewStatus,
+		"testStatus":   testStatus,
+		"checkStatus":  checkStatus,
+	}
+}
+
+func devFlowTodoCompletionItems(items []map[string]any, reviewStatus string, testStatus string, checkStatus string) ([]any, int, int, int) {
+	output := make([]any, 0, len(items))
+	verified := 0
+	pending := 0
+	attention := 0
+	for _, item := range items {
+		status, evidence := devFlowTodoItemStatus(item["checked"] == true, reviewStatus, testStatus, checkStatus)
+		switch status {
+		case "verified":
+			verified++
+		case "attention":
+			attention++
+		default:
+			pending++
+		}
+		output = append(output, map[string]any{
+			"text":     text(item, "text"),
+			"status":   status,
+			"evidence": evidence,
+		})
+	}
+	return output, verified, pending, attention
+}
+
+func devFlowTodoItemStatus(checked bool, reviewStatus string, testStatus string, checkStatus string) (string, string) {
+	if checked {
+		return "verified", "The plan checklist item was already marked complete."
+	}
+	reviewStatus = strings.ToLower(strings.TrimSpace(reviewStatus))
+	testStatus = strings.ToLower(strings.TrimSpace(testStatus))
+	checkStatus = strings.ToLower(strings.TrimSpace(checkStatus))
+	if strings.Contains(reviewStatus, "failed") || strings.Contains(reviewStatus, "changes") || strings.Contains(reviewStatus, "needs") || testStatus == "attention" || checkStatus == "attention" {
+		return "attention", "Review, validation, or remote checks recorded an attention signal."
+	}
+	if (reviewStatus == "passed" || reviewStatus == "approved") && testStatus == "passed" && checkStatus == "passed" {
+		return "verified", "Automated review approved the diff and validation/check previews passed."
+	}
+	return "pending", "Waiting for complete review, validation, and check evidence."
+}
+
+func devFlowParsePlanTodos(plan string) ([]map[string]any, []map[string]any) {
+	functional := []map[string]any{}
+	project := []map[string]any{}
+	section := ""
+	for _, line := range strings.Split(plan, "\n") {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "## ") {
+			switch {
+			case strings.Contains(lower, "functional") && strings.Contains(lower, "todo"):
+				section = "functional"
+			case strings.Contains(lower, "project") && strings.Contains(lower, "todo"):
+				section = "project"
+			default:
+				section = ""
+			}
+			continue
+		}
+		checked, label, ok := devFlowMarkdownCheckbox(trimmed)
+		if !ok || label == "" {
+			continue
+		}
+		item := map[string]any{"text": label, "checked": checked}
+		switch section {
+		case "project":
+			project = append(project, item)
+		default:
+			functional = append(functional, item)
+		}
+	}
+	return functional, project
+}
+
+func devFlowMarkdownCheckbox(line string) (bool, string, bool) {
+	if len(line) < 6 {
+		return false, "", false
+	}
+	if !(strings.HasPrefix(line, "- [") || strings.HasPrefix(line, "* [")) || line[4] != ']' {
+		return false, "", false
+	}
+	marker := strings.ToLower(strings.TrimSpace(line[3:4]))
+	if marker != "" && marker != "x" {
+		return false, "", false
+	}
+	return marker == "x", strings.TrimSpace(line[5:]), true
+}
+
+func devFlowLatestReviewStatus(invocations []map[string]any) string {
+	status := ""
+	for _, invocation := range invocations {
+		if text(invocation, "agentId") != "review" {
+			continue
+		}
+		if next := text(invocation, "status"); next != "" {
+			status = next
+		}
+	}
+	return status
 }
 
 func devFlowDiffPreview(changedFiles []string, diffText string) map[string]any {
@@ -266,36 +426,107 @@ func devFlowCheckPreview(checksOutput string, pullRequestFeedback []map[string]a
 }
 
 func devFlowRiskSummary(input devFlowRunReportInput, testPreview map[string]any, checkPreview map[string]any) map[string]any {
-	level := "low"
-	reasons := []any{}
+	signals := []map[string]any{}
 	if len(input.ChangedFiles) == 0 {
-		level = "high"
-		reasons = append(reasons, "No changed files were captured for review.")
+		signals = append(signals, devFlowRiskSignal("high", "No changed files were captured, so the reviewer cannot verify implementation scope.", "changedFiles=0", "diff"))
 	}
 	if len(input.ChangedFiles) >= 8 {
-		level = "medium"
-		reasons = append(reasons, "Large diff footprint; reviewer should inspect changed areas carefully.")
+		signals = append(signals, devFlowRiskSignal("medium", "Large diff footprint; reviewer should inspect changed areas carefully.", fmt.Sprintf("%d changed file(s)", len(input.ChangedFiles)), "diff"))
 	}
-	if status := text(testPreview, "status"); status == "missing" || status == "attention" {
-		level = "high"
-		reasons = append(reasons, "Validation output is missing or needs attention.")
+	if status := text(testPreview, "status"); status == "attention" {
+		signals = append(signals, devFlowRiskSignal("high", "Validation output contains a failure or error signal.", stringOr(text(testPreview, "summary"), "Validation preview status is attention."), "validation"))
+	} else if status == "missing" {
+		signals = append(signals, devFlowRiskSignal("medium", "Validation output is missing; approval should confirm focused tests or documented validation.", stringOr(text(testPreview, "summary"), "No validation output captured."), "validation"))
+	} else if status != "" && status != "passed" {
+		signals = append(signals, devFlowRiskSignal("medium", "Validation output is not fully passed yet.", stringOr(text(testPreview, "summary"), status), "validation"))
 	}
-	if status := text(checkPreview, "status"); status == "missing" || status == "attention" {
-		if level != "high" {
-			level = "medium"
+	if status := text(checkPreview, "status"); status == "attention" {
+		signals = append(signals, devFlowRiskSignal("high", "Remote checks contain a failed or error signal.", stringOr(text(checkPreview, "summary"), "Remote check preview status is attention."), "checks"))
+	} else if status == "missing" {
+		signals = append(signals, devFlowRiskSignal("medium", "Remote check output is missing; CI state has not been confirmed in this packet.", stringOr(text(checkPreview, "summary"), "No remote check output captured."), "checks"))
+	} else if status == "pending" {
+		signals = append(signals, devFlowRiskSignal("medium", "Remote checks are still pending.", stringOr(text(checkPreview, "summary"), "Remote checks pending."), "checks"))
+	}
+	if len(input.CheckLogFeedback) > 0 {
+		signals = append(signals, devFlowRiskSignal("high", "Failed check log feedback was captured.", devFlowRiskFeedbackEvidence(input.CheckLogFeedback), "check-log-feedback"))
+	}
+	if len(input.PullRequestFeedback) > 0 {
+		level := "medium"
+		reason := "PR review or comment feedback exists."
+		if devFlowFeedbackHasBlockingSignal(input.PullRequestFeedback) {
+			level = "high"
+			reason = "PR feedback contains a blocking or requested-changes signal."
 		}
-		reasons = append(reasons, "Remote check output is missing or needs attention.")
+		signals = append(signals, devFlowRiskSignal(level, reason, devFlowRiskFeedbackEvidence(input.PullRequestFeedback), "pull-request-feedback"))
 	}
-	if len(input.CheckLogFeedback) > 0 || len(input.PullRequestFeedback) > 0 {
-		if level != "high" {
-			level = "medium"
-		}
-		reasons = append(reasons, "PR review, comment, or failed check feedback exists.")
-	}
-	if len(reasons) == 0 {
+	level := "low"
+	reasons := []any{}
+	if len(signals) == 0 {
 		reasons = append(reasons, "Diff, validation, and check previews have no blocking signal in local records.")
+		return map[string]any{
+			"level":   level,
+			"reasons": reasons,
+			"basis": []any{
+				devFlowRiskSignal("low", "No blocking risk signal was found.", "changed files, validation preview, and check preview are present in local records.", "review-packet"),
+			},
+			"policy": "High risk requires an explicit blocker such as no reviewable diff, validation failure, failed remote checks, failed check logs, or requested changes. Missing evidence is medium risk.",
+		}
 	}
-	return map[string]any{"level": level, "reasons": reasons}
+	for _, signal := range signals {
+		if text(signal, "level") == "high" {
+			level = "high"
+		} else if level != "high" && text(signal, "level") == "medium" {
+			level = "medium"
+		}
+		reasons = append(reasons, text(signal, "reason"))
+	}
+	return map[string]any{
+		"level":   level,
+		"reasons": reasons,
+		"basis":   anyRiskSignals(signals),
+		"policy":  "High risk requires an explicit blocker such as no reviewable diff, validation failure, failed remote checks, failed check logs, or requested changes. Missing evidence is medium risk.",
+	}
+}
+
+func devFlowRiskSignal(level string, reason string, evidence string, source string) map[string]any {
+	return map[string]any{
+		"level":    level,
+		"reason":   reason,
+		"evidence": truncateForProof(strings.TrimSpace(evidence), 300),
+		"source":   source,
+	}
+}
+
+func anyRiskSignals(signals []map[string]any) []any {
+	output := make([]any, 0, len(signals))
+	for _, signal := range signals {
+		output = append(output, signal)
+	}
+	return output
+}
+
+func devFlowRiskFeedbackEvidence(feedback []map[string]any) string {
+	values := []string{}
+	for _, entry := range feedback {
+		label := strings.TrimSpace(strings.Join([]string{text(entry, "kind"), text(entry, "label"), text(entry, "message")}, " "))
+		if label != "" {
+			values = append(values, label)
+		}
+	}
+	if len(values) == 0 {
+		return "Feedback was captured without a message."
+	}
+	return strings.Join(values, " | ")
+}
+
+func devFlowFeedbackHasBlockingSignal(feedback []map[string]any) bool {
+	for _, entry := range feedback {
+		lower := strings.ToLower(strings.Join([]string{text(entry, "kind"), text(entry, "label"), text(entry, "message"), text(entry, "state"), text(entry, "status")}, " "))
+		if strings.Contains(lower, "request changes") || strings.Contains(lower, "changes requested") || strings.Contains(lower, "requested_changes") || strings.Contains(lower, "block") || strings.Contains(lower, "fail") || strings.Contains(lower, "error") {
+			return true
+		}
+	}
+	return false
 }
 
 func devFlowRecommendedActions(input devFlowRunReportInput, testPreview map[string]any, checkPreview map[string]any, risk map[string]any) []any {
@@ -361,6 +592,71 @@ func markdownPacketActions(value any) string {
 		lines = append(lines, "- "+label)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func markdownDevFlowRiskBasis(value any) string {
+	basis := arrayMaps(value)
+	if len(basis) == 0 {
+		return "- No structured risk basis captured."
+	}
+	lines := []string{}
+	for _, entry := range basis {
+		lines = append(lines, fmt.Sprintf("- `%s` / `%s`: %s Evidence: %s", stringOr(text(entry, "level"), "unknown"), stringOr(text(entry, "source"), "unknown"), text(entry, "reason"), stringOr(text(entry, "evidence"), "not captured")))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func markdownDevFlowTodoCompletion(value any) string {
+	completion := mapValue(value)
+	if len(completion) == 0 {
+		return "- No plan TODO completion data captured."
+	}
+	lines := []string{}
+	if summary := text(completion, "summary"); summary != "" {
+		lines = append(lines, "- Summary: "+summary)
+	}
+	if status := text(completion, "status"); status != "" {
+		lines = append(lines, "- Status: `"+status+"`")
+	}
+	counts := mapValue(completion["counts"])
+	if len(counts) > 0 {
+		lines = append(lines, fmt.Sprintf("- Counts: %s verified / %s total, %s pending, %s attention", text(counts, "verified"), text(counts, "total"), text(counts, "pending"), text(counts, "attention")))
+	}
+	appendGroup := func(title string, entries []map[string]any) {
+		if len(entries) == 0 {
+			return
+		}
+		lines = append(lines, "", "### "+title)
+		for _, entry := range entries {
+			lines = append(lines, fmt.Sprintf("- [%s] (%s) %s — %s", devFlowTodoMarkdownMark(text(entry, "status")), stringOr(text(entry, "status"), "pending"), text(entry, "text"), text(entry, "evidence")))
+		}
+	}
+	appendGroup("Functional TODO", arrayMaps(completion["functional"]))
+	appendGroup("Project TODO", arrayMaps(completion["project"]))
+	if len(lines) == 0 {
+		return "- No plan TODO completion data captured."
+	}
+	return strings.Join(lines, "\n")
+}
+
+func appendDevFlowTodoCompletionSection(markdown string, packet map[string]any) string {
+	section := "## Plan / TODO Verification\n\n" + markdownDevFlowTodoCompletion(packet["todoCompletion"]) + "\n\n"
+	if strings.Contains(markdown, "## Plan / TODO Verification") {
+		return markdown
+	}
+	if strings.Contains(markdown, "\n## Proof") {
+		return strings.Replace(markdown, "\n## Proof", "\n"+section+"## Proof", 1)
+	}
+	return strings.TrimRight(markdown, "\n") + "\n\n" + section
+}
+
+func devFlowTodoMarkdownMark(status string) string {
+	switch status {
+	case "verified":
+		return "x"
+	default:
+		return " "
+	}
 }
 
 func fencedOrFallback(value string, fallback string) string {

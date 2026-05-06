@@ -283,7 +283,6 @@ function ThemeToggle({ uiTheme, onToggleTheme }: { uiTheme: UiTheme; onToggleThe
   return (
     <button type="button" className="theme-toggle" onClick={onToggleTheme} aria-label={t(uiTheme === "light" ? "Switch to night mode" : "Switch to day mode")}>
       <span aria-hidden="true">{uiTheme === "light" ? "☾" : "☼"}</span>
-      {t(uiTheme === "light" ? "Night" : "Day")}
     </button>
   );
 }

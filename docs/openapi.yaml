@@ -13,9 +13,22 @@ paths:
       responses:
         '200':
           description: Local server is running
+  /openapi.yaml:
+    get:
+      summary: Return this OpenAPI document
+      responses:
+        '200':
+          description: OpenAPI YAML returned
   /workspace:
     get:
       summary: Load current workspace snapshot
+      parameters:
+        - in: query
+          name: scope
+          schema:
+            type: string
+            enum: [session]
+          description: Use `session` to return the normalized session read model instead of the legacy full workspace snapshot.
       responses:
         '200':
           description: Workspace database returned
@@ -32,6 +45,39 @@ paths:
       responses:
         '200':
           description: Workspace saved
+  /ui/language:
+    get:
+      summary: Read current UI language preference
+      responses:
+        '200':
+          description: UI language returned
+    put:
+      summary: Persist current UI language preference
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                language:
+                  type: string
+                  enum: [en, zh-CN]
+      responses:
+        '200':
+          description: UI language persisted
+  /projects:
+    post:
+      summary: Create a local Omega project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Workspace updated with the created project
   /events:
     get:
       summary: List mission events
@@ -64,6 +110,24 @@ paths:
       responses:
         '200':
           description: Attempt records returned
+  /attempts/{id}/action-plan:
+    get:
+      summary: Read the canonical action plan for an attempt
+      description: >
+        Returns the workflow-contract action plan for the concrete attempt, including
+        stages, planned agents, current action, completed actions, pending gates, and
+        UI-ready stage detail. This is the canonical source for Work Item detail views.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Attempt action plan returned
+        '404':
+          description: Attempt not found
   /attempts/{id}/timeline:
     get:
       summary: Read an attempt run timeline
@@ -203,6 +267,35 @@ paths:
       responses:
         '200':
           description: Repository target records returned
+  /repository-targets/local:
+    post:
+      summary: Bind a local repository path as a repository target
+      description: >
+        Creates a repository target from a local checkout without requiring a GitHub
+        repository lookup. The path becomes the locked Repository Workspace boundary
+        for Work Items and Page Pilot runs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                projectId:
+                  type: string
+                name:
+                  type: string
+                path:
+                  type: string
+                repositoryPath:
+                  type: string
+                defaultBranch:
+                  type: string
+      responses:
+        '200':
+          description: Workspace updated with the local repository target
+        '400':
+          description: Local repository path is missing or invalid
   /handoff-bundles:
     get:
       summary: List handoff bundle audit records
@@ -734,6 +827,33 @@ paths:
       responses:
         '200':
           description: Agent profile persisted
+  /agent-profile/import-template:
+    post:
+      summary: Import an Agent Profile template
+      description: >
+        Imports a built-in or submitted Agent Profile template into the project or
+        repository-target scope, including workflow markdown, agent overrides,
+        skills/MCP bindings, runtime files, and runner defaults.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                projectId:
+                  type: string
+                repositoryTargetId:
+                  type: string
+                templateId:
+                  type: string
+                profile:
+                  type: object
+      responses:
+        '200':
+          description: Imported Agent Profile and import summary returned
+        '400':
+          description: Template is missing or invalid
   /local-capabilities:
     get:
       summary: Inspect locally available execution tools
@@ -741,6 +861,59 @@ paths:
       responses:
         '200':
           description: Local capability list returned
+  /agent-runner/preflight:
+    post:
+      summary: Test one local Agent runner configuration
+      description: >
+        Runs a bounded preflight for Codex, Claude Code, opencode, or Trae Agent using
+        the selected provider/model/base URL/API key metadata. The response reports
+        command availability, account readiness, effective model, and diagnostic output.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                runner:
+                  type: string
+                  enum: [codex, claude-code, opencode, trae-agent]
+                provider:
+                  type: string
+                model:
+                  type: string
+                baseUrl:
+                  type: string
+      responses:
+        '200':
+          description: Runner preflight result returned
+        '400':
+          description: Runner is missing or unsupported
+  /agent-runner/models:
+    post:
+      summary: Discover available models for a runner/provider
+      description: >
+        Attempts real model discovery through the selected runner/provider integration.
+        When discovery is unavailable, callers may still provide a model manually.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                runner:
+                  type: string
+                  enum: [codex, claude-code, opencode, trae-agent]
+                provider:
+                  type: string
+                baseUrl:
+                  type: string
+      responses:
+        '200':
+          description: Discovered model candidates and diagnostics returned
+        '400':
+          description: Runner or provider is missing or unsupported
   /local-workspace-root:
     get:
       summary: Read the local runner workspace root
@@ -852,6 +1025,61 @@ paths:
           description: Page Pilot changes discarded
         '400':
           description: Run is missing, already delivered, or cannot be reverted
+  /page-pilot/preview-runtime/resolve:
+    post:
+      summary: Resolve the preview runtime for a repository target
+      description: >
+        Determines how Page Pilot should open the target project. Package projects
+        resolve to a Preview Runtime Agent profile; pure static projects may resolve
+        directly to the workspace `index.html`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                projectId:
+                  type: string
+                repositoryTargetId:
+                  type: string
+                workspacePath:
+                  type: string
+      responses:
+        '200':
+          description: Preview runtime resolution returned
+        '400':
+          description: Repository target or workspace cannot be resolved
+  /page-pilot/preview-runtime/start:
+    post:
+      summary: Start the Page Pilot preview runtime
+      description: Starts or reuses a repository-bound preview process and returns its URL, health state, and runtime profile.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Preview runtime started or already running
+        '400':
+          description: Preview runtime cannot be started
+  /page-pilot/preview-runtime/restart:
+    post:
+      summary: Restart the Page Pilot preview runtime
+      description: Stops and starts the repository-bound preview process after source or dependency changes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Preview runtime restarted
+        '400':
+          description: Preview runtime cannot be restarted
   /observability:
     get:
       summary: Return runtime observability summary and dashboard data
@@ -976,6 +1204,33 @@ paths:
           description: Claimed work item and pipeline, or idle status when no eligible issue exists
         '400':
           description: Repository target is missing or invalid
+  /orchestrator/watchers:
+    get:
+      summary: List orchestrator repository watchers
+      description: Returns local watcher records used to monitor GitHub ready issues and Omega Not Started work items.
+      responses:
+        '200':
+          description: Orchestrator watcher records returned
+  /orchestrator/watchers/{id}:
+    put:
+      summary: Create or update an orchestrator repository watcher
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Orchestrator watcher persisted
+        '400':
+          description: Watcher payload is invalid
   /missions/from-work-item:
     post:
       summary: Build a mission from a work item
@@ -1423,6 +1678,62 @@ paths:
           description: Pull request status, checks, check summary, branch sync, delivery gate, recommended actions, and proof records
         '502':
           description: gh pr view or gh pr checks failed
+  /feishu/config:
+    get:
+      summary: Read sanitized Feishu integration configuration
+      description: Returns Feishu app, webhook, task, and lark-cli route metadata without exposing secrets.
+      responses:
+        '200':
+          description: Sanitized Feishu configuration returned
+    put:
+      summary: Persist Feishu integration configuration
+      description: Saves Feishu App ID / secret, callback token, webhook, chat/task defaults, and local lark-cli fallback settings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Sanitized Feishu configuration returned
+        '400':
+          description: Feishu configuration payload is invalid
+  /feishu/config/test:
+    post:
+      summary: Test the current Feishu delivery route
+      description: Verifies the configured webhook, task route, or lark-cli current-user fallback and returns route-specific diagnostics.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Feishu route test result returned
+        '503':
+          description: No usable Feishu delivery route is available
+  /feishu/users/search:
+    post:
+      summary: Search Feishu users
+      description: Uses the configured Feishu credentials or lark-cli bridge to resolve reviewer users for Human Review task assignment.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                limit:
+                  type: integer
+      responses:
+        '200':
+          description: Matching Feishu users returned
+        '503':
+          description: Feishu user search is not configured
   /feishu/notify:
     post:
       summary: Send a Feishu text notification through local lark-cli
@@ -1529,6 +1840,29 @@ paths:
           description: 评论已分类并写入或执行决策
         '404':
           description: 绑定的 checkpoint 不存在
+  /feishu/review-task/bridge/tick:
+    post:
+      summary: Run one Feishu review task bridge tick
+      description: >
+        Polls configured Feishu Task reviews and applies completed or commented
+        decisions through the same backend checkpoint decision path as Omega Web.
+        A task must be truly completed before it can approve a checkpoint.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                checkpointId:
+                  type: string
+                limit:
+                  type: integer
+      responses:
+        '200':
+          description: Feishu task bridge tick summary returned
+        '503':
+          description: Feishu task bridge is not configured
   /feishu/review-callback:
     post:
       summary: Apply a Feishu Human Review decision to a checkpoint

@@ -10,6 +10,14 @@ interface ObservabilityDashboardProps {
   onRefresh: () => void;
 }
 
+type TrendTotals = {
+  activity: number;
+  completed: number;
+  failed: number;
+  prMerged: number;
+  started: number;
+};
+
 export function ObservabilityDashboard({
   groupBy,
   observability,
@@ -23,6 +31,8 @@ export function ObservabilityDashboard({
   const recentFailures = dashboard.recentFailures ?? [];
   const slowStageDrilldown = dashboard.slowStageDrilldown ?? [];
   const trends = dashboard.trends ?? [];
+  const trendTotals = summarizeTrends(trends);
+  const hasTrendSignal = trendTotals.activity > 0;
 
   return (
     <section className="observability-dashboard">
@@ -30,6 +40,7 @@ export function ObservabilityDashboard({
         <div>
           <span className="section-label">Observability</span>
           <h2>Runtime health</h2>
+          <p>Signals from recent attempts, checkpoints, PR proof, and runner operations.</p>
         </div>
         <div className="observability-controls">
           <label>
@@ -58,8 +69,8 @@ export function ObservabilityDashboard({
         <DashboardPanel title={`Grouped by ${dashboard.groupBy ?? groupBy}`} count={groups.length}>
           {groups.length ? (
             <div className="observability-bars">
-              {groups.slice(0, 6).map((group) => (
-                <article key={recordText(group, "key") || recordText(group, "label")}>
+              {groups.slice(0, 6).map((group, index) => (
+                <article key={`${recordText(group, "key") || recordText(group, "label") || "group"}-${index}`}>
                   <span>
                     <strong>{recordText(group, "label") || recordText(group, "key") || "Unknown"}</strong>
                     <small>{recordText(group, "failed")} failed · {recordText(group, "waiting")} waiting</small>
@@ -105,17 +116,43 @@ export function ObservabilityDashboard({
           )}
         </DashboardPanel>
 
-        <DashboardPanel title="Trend" count={trends.length}>
-          {trends.length ? (
-            <div className="observability-trend">
-              {trends.slice(-10).map((trend) => (
-                <span key={recordText(trend, "day") || recordText(trend, "date")} title={`${recordText(trend, "day")}: ${recordText(trend, "total")}`}>
-                  <i style={{ height: `${Math.max(8, Math.min(56, recordNumber(trend, "total") * 8))}px` }} />
-                </span>
-              ))}
+        <DashboardPanel title="Delivery movement" count={trendTotals.activity}>
+          {hasTrendSignal ? (
+            <div className="observability-trend-panel">
+              <div className="observability-trend-summary" aria-label="Delivery movement totals">
+                <span><strong>{trendTotals.started}</strong> started</span>
+                <span><strong>{trendTotals.completed}</strong> completed</span>
+                <span><strong>{trendTotals.failed}</strong> failed</span>
+                <span><strong>{trendTotals.prMerged}</strong> PR merged</span>
+              </div>
+              <div className="observability-trend" aria-label="Daily delivery movement">
+                {trends.slice(-10).map((trend, index) => {
+                  const date = recordText(trend, "date") || recordText(trend, "day");
+                  const started = recordNumber(trend, "attemptsStarted");
+                  const completed = recordNumber(trend, "attemptsCompleted");
+                  const failed = recordNumber(trend, "attemptsFailed");
+                  const prMerged = recordNumber(trend, "pullRequestsMerged");
+                  const total = started + completed + failed + prMerged + recordNumber(trend, "checkpointsResolved");
+                  const height = Math.max(10, Math.min(72, total * 10));
+                  return (
+                    <span
+                      key={`${date || "trend"}-${index}`}
+                      className={failed ? "has-failure" : ""}
+                      title={`${date}: ${started} started, ${completed} completed, ${failed} failed, ${prMerged} PR merged`}
+                    >
+                      <i style={{ height: `${height}px` }} />
+                      <small>{shortDate(date)}</small>
+                    </span>
+                  );
+                })}
+              </div>
+              <div className="observability-trend-legend" aria-label="Trend legend">
+                <span>Height = daily movement</span>
+                <span>Red = failures present</span>
+              </div>
             </div>
           ) : (
-            <p>Trend data will appear after more runtime events.</p>
+            <p>No movement trend in this window yet.</p>
           )}
         </DashboardPanel>
       </div>
@@ -155,10 +192,40 @@ function recordNumber(record: Record<string, unknown>, key: string): number {
   return typeof value === "number" ? value : typeof value === "string" ? Number(value) || 0 : 0;
 }
 
+function summarizeTrends(trends: Record<string, unknown>[]): TrendTotals {
+  return trends.reduce<TrendTotals>(
+    (totals, trend) => {
+      const started = recordNumber(trend, "attemptsStarted");
+      const completed = recordNumber(trend, "attemptsCompleted");
+      const failed = recordNumber(trend, "attemptsFailed");
+      const prMerged = recordNumber(trend, "pullRequestsMerged");
+      const checkpointsResolved = recordNumber(trend, "checkpointsResolved");
+      totals.started += started;
+      totals.completed += completed;
+      totals.failed += failed;
+      totals.prMerged += prMerged;
+      totals.activity += started + completed + failed + prMerged + checkpointsResolved;
+      return totals;
+    },
+    { activity: 0, completed: 0, failed: 0, prMerged: 0, started: 0 }
+  );
+}
+
 function formatDuration(value: number): string {
   if (!value) return "0ms";
   if (value < 1000) return `${Math.round(value)}ms`;
   return `${(value / 1000).toFixed(1)}s`;
+}
+
+function shortDate(value: string): string {
+  if (!value) return "";
+  const date = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return value.slice(5) || value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
 }
 
 function formatTime(value: string): string {

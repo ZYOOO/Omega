@@ -1204,7 +1204,23 @@ func TestRenderFeishuReviewTextUsesPlainFeishuText(t *testing.T) {
 		},
 		"reviewPacket": map[string]any{
 			"summary": "Validation passed.",
-			"risk":    map[string]any{"level": "low"},
+			"risk": map[string]any{
+				"level": "low",
+				"basis": []any{
+					map[string]any{"level": "low", "source": "review-packet", "reason": "No blocking risk signal was found.", "evidence": "Validation and checks passed."},
+				},
+			},
+			"todoCompletion": map[string]any{
+				"status":  "verified",
+				"summary": "2/2 plan TODO(s) verified for Human Review.",
+				"counts":  map[string]any{"total": 2, "verified": 2, "pending": 0, "attention": 0},
+				"functional": []any{
+					map[string]any{"text": "Show a concise summary for reviewers.", "status": "verified", "evidence": "Automated review approved the diff."},
+				},
+				"project": []any{
+					map[string]any{"text": "Run focused validation.", "status": "verified", "evidence": "Validation passed."},
+				},
+			},
 		},
 	})
 
@@ -1212,8 +1228,11 @@ func TestRenderFeishuReviewTextUsesPlainFeishuText(t *testing.T) {
 		"✅ Omega 人工审核",
 		"工作项: OMG-77 (item_review_1) · Review task summary",
 		"风险: low",
+		"风险依据:",
 		"📋 需求摘要",
 		"🧾 Review packet",
+		"✅ Plan / TODO 复核",
+		"2/2 plan TODO(s) verified for Human Review.",
 		"🛠️ 审核动作",
 	} {
 		if !strings.Contains(message, expected) {
@@ -1222,6 +1241,100 @@ func TestRenderFeishuReviewTextUsesPlainFeishuText(t *testing.T) {
 	}
 	if strings.Contains(message, "**") || strings.Contains(message, "`") {
 		t.Fatalf("plain Feishu review message should not expose markdown:\n%s", message)
+	}
+}
+
+func TestDevFlowRiskSummaryUsesEvidenceBasedLevels(t *testing.T) {
+	missingEvidence := ensureDevFlowReviewPacket(devFlowRunReportInput{
+		Item:         map[string]any{"key": "OMG-risk"},
+		Repository:   "ZYOOO/TestRepo",
+		ChangedFiles: []string{"src/App.tsx"},
+		DiffText:     "diff --git a/src/App.tsx b/src/App.tsx\n+change\n",
+	})
+	risk := mapValue(missingEvidence["risk"])
+	if text(risk, "level") != "medium" {
+		t.Fatalf("missing evidence should be medium risk, got %+v", risk)
+	}
+	if reasons := strings.Join(stringSlice(risk["reasons"]), "\n"); !strings.Contains(reasons, "Validation output is missing") || !strings.Contains(reasons, "Remote check output is missing") {
+		t.Fatalf("missing evidence reasons = %+v", risk)
+	}
+	if basis := arrayMaps(risk["basis"]); len(basis) == 0 || text(basis[0], "evidence") == "" {
+		t.Fatalf("risk basis should include evidence: %+v", risk)
+	}
+
+	failedValidation := ensureDevFlowReviewPacket(devFlowRunReportInput{
+		Item:         map[string]any{"key": "OMG-risk"},
+		Repository:   "ZYOOO/TestRepo",
+		ChangedFiles: []string{"src/App.tsx"},
+		DiffText:     "diff --git a/src/App.tsx b/src/App.tsx\n+change\n",
+		TestOutput:   "FAIL focused validation",
+		ChecksOutput: "All checks passed",
+	})
+	risk = mapValue(failedValidation["risk"])
+	if text(risk, "level") != "high" {
+		t.Fatalf("failed validation should be high risk, got %+v", risk)
+	}
+	if reasons := strings.Join(stringSlice(risk["reasons"]), "\n"); !strings.Contains(reasons, "Validation output contains a failure") {
+		t.Fatalf("failed validation reasons = %+v", risk)
+	}
+}
+
+func TestDevFlowReviewPacketIncludesPlanTodoCompletion(t *testing.T) {
+	proofDir := t.TempDir()
+	input := devFlowRunReportInput{
+		Item: map[string]any{
+			"id":          "item_todo_review",
+			"key":         "OMG-88",
+			"title":       "Review TODO completion",
+			"description": "Show TODO verification in human review.",
+		},
+		Repository:     "ZYOOO/TestRepo",
+		BranchName:     "codex/omg-88-todo-review",
+		PullRequestURL: "https://github.com/ZYOOO/TestRepo/pull/88",
+		ChangedFiles:   []string{"src/Review.tsx"},
+		DiffText:       "diff --git a/src/Review.tsx b/src/Review.tsx\n+todo verification\n",
+		PlanOutput: "# Solution Plan\n\n## Functional TODO List\n\n" +
+			"- [ ] Show TODO verification in Human Review.\n" +
+			"- [ ] Preserve repository boundaries.\n\n" +
+			"## Project TODO List\n\n" +
+			"- [ ] Run focused validation.\n",
+		TestOutput:   "PASS focused validation",
+		ChecksOutput: "All checks passed",
+		AgentInvocations: []map[string]any{
+			{"stageId": "code_review", "agentId": "review", "status": "passed", "summary": "Approved."},
+		},
+	}
+	packet, packetPath, err := writeDevFlowReviewPacket(proofDir, input)
+	if err != nil {
+		t.Fatalf("write review packet: %v", err)
+	}
+	completion := mapValue(packet["todoCompletion"])
+	if text(completion, "status") != "verified" || text(completion, "summary") != "3/3 plan TODO(s) verified for Human Review." {
+		t.Fatalf("todo completion = %+v", completion)
+	}
+	if len(arrayMaps(completion["functional"])) != 2 || len(arrayMaps(completion["project"])) != 1 {
+		t.Fatalf("todo groups = %+v", completion)
+	}
+	if packetPath == "" {
+		t.Fatalf("missing packet path")
+	}
+	reportPath, err := writeDevFlowRunReport(proofDir, input)
+	if err != nil {
+		t.Fatalf("write run report: %v", err)
+	}
+	report, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	for _, expected := range []string{
+		"## Plan / TODO Completion",
+		"3/3 plan TODO(s) verified for Human Review.",
+		"Show TODO verification in Human Review.",
+		"Run focused validation.",
+	} {
+		if !strings.Contains(string(report), expected) {
+			t.Fatalf("report missing %q:\n%s", expected, string(report))
+		}
 	}
 }
 
@@ -2754,6 +2867,12 @@ func TestAttemptTimelineAggregatesRunRecords(t *testing.T) {
 			t.Fatalf("timeline missing source %s: %+v", source, timeline.Items)
 		}
 	}
+
+	var limitedTimeline AttemptTimelineResponse
+	decode(t, mustGet(t, api.URL+"/attempts/attempt_timeline/timeline?limit=2"), &limitedTimeline)
+	if len(limitedTimeline.Items) > 2 {
+		t.Fatalf("expected limited timeline to contain at most 2 items, got %d", len(limitedTimeline.Items))
+	}
 }
 
 func TestRunSupervisedCommandContextTimesOutProcess(t *testing.T) {
@@ -2969,6 +3088,52 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
+if printf '%s' "$prompt" | grep -q "You are the Requirement Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Requirement Handoff' '' 'Requirement agent captured repository boundary and acceptance criteria.' > "$output"
+  fi
+  echo "fake requirement agent captured"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Master Orchestrator Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Master Dispatch' '' 'Task class: default' '' 'Route: devflow-pr' > "$output"
+  fi
+  echo "fake master agent dispatched"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -Eq "Write the final plan|Return the final plan"; then
+  if [ -n "$output" ]; then
+    cat > "$output" <<'EOF'
+# Solution Plan
+
+## Functional TODO List
+
+- [ ] Implement the requested behavior.
+
+## Project TODO List
+
+- [ ] Inspect files.
+- [ ] Run validation.
+EOF
+  fi
+  echo "fake architect agent planned"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Local repository validation has already run"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Test Report' '' 'Status: passed' '' 'Testing agent verified local validation output.' > "$output"
+  fi
+  echo "fake testing agent verified"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Delivery Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Delivery Handoff' '' 'Delivery agent prepared the human review handoff.' > "$output"
+  fi
+  echo "fake delivery agent prepared"
+  exit 0
+fi
 if printf '%s' "$prompt" | grep -q "You are the review agent for Omega"; then
   if [ -n "$output" ]; then
     cat > "$output" <<'EOF'
@@ -3011,8 +3176,11 @@ EOF
 cat > test/task-summary.test.mjs <<'EOF'
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-const result = spawnSync(process.execPath, ["scripts/task-summary.mjs", "examples/tasks.md"], { encoding: "utf8" });
-assert.equal(result.status, 0);
+import { fileURLToPath } from "node:url";
+const script = fileURLToPath(new URL("../scripts/task-summary.mjs", import.meta.url));
+const fixture = fileURLToPath(new URL("../examples/tasks.md", import.meta.url));
+const result = spawnSync(process.execPath, [script, fixture], { encoding: "utf8" });
+assert.equal(result.status, 0, result.stderr || result.stdout);
 assert.deepEqual(JSON.parse(result.stdout), { total: 3, done: 2, pending: 1, completionRate: 2 / 3 });
 EOF
 if [ -n "$output" ]; then
@@ -3082,6 +3250,11 @@ echo "fake coding agent completed"
 	}
 	if artifacts := arrayMaps(handoff["artifacts"]); len(artifacts) < 7 {
 		t.Fatalf("handoff artifacts = %+v", artifacts)
+	}
+	for _, changedFile := range stringSlice(result["changedFiles"]) {
+		if strings.HasPrefix(changedFile, ".omega/") || strings.HasPrefix(changedFile, ".codex/") || strings.HasPrefix(changedFile, ".claude/") {
+			t.Fatalf("runtime file should not be committed as repository change: %s", changedFile)
+		}
 	}
 	reviewPacket := mapValue(handoff["reviewPacket"])
 	if text(mapValue(reviewPacket["diffPreview"]), "summary") == "" || text(mapValue(reviewPacket["testPreview"]), "status") == "" || text(mapValue(reviewPacket["risk"]), "level") == "" || len(arrayMaps(reviewPacket["recommendedActions"])) == 0 {
@@ -3176,6 +3349,61 @@ echo "fake coding agent completed"
 	}
 	if len(arrayMaps(attempt["stages"])) < 7 || text(attempt, "branchName") == "" {
 		t.Fatalf("attempt stage/branch evidence missing: %+v", attempt)
+	}
+}
+
+func TestGitHeadDiffHandlesSingleCommitRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required for diff range test")
+	}
+	repo := createDemoGitRepo(t)
+
+	diffText, changedNames, err := gitHeadDiff(repo)
+	if err != nil {
+		t.Fatalf("gitHeadDiff single commit failed: %v", err)
+	}
+	if !strings.Contains(changedNames, "src/existing.ts") {
+		t.Fatalf("changedNames = %q", changedNames)
+	}
+	if !strings.Contains(diffText, "export const existing = true;") {
+		t.Fatalf("diffText = %q", diffText)
+	}
+	validationOutput, err := runRepositoryValidation(repo)
+	if err != nil {
+		t.Fatalf("runRepositoryValidation single commit failed: %v\n%s", err, validationOutput)
+	}
+	if !strings.Contains(validationOutput, gitEmptyTreeObject+"..HEAD") {
+		t.Fatalf("validation output should use empty-tree diff range, got %q", validationOutput)
+	}
+}
+
+func TestGitHeadDiffUsesParentForSubsequentCommits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required for diff range test")
+	}
+	repo := createDemoGitRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "src", "second.ts"), []byte("export const second = true;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "commit", "-m", "second")
+
+	diffText, changedNames, err := gitHeadDiff(repo)
+	if err != nil {
+		t.Fatalf("gitHeadDiff second commit failed: %v", err)
+	}
+	if !strings.Contains(changedNames, "src/second.ts") || strings.Contains(changedNames, "src/existing.ts") {
+		t.Fatalf("changedNames = %q", changedNames)
+	}
+	if !strings.Contains(diffText, "export const second = true;") || strings.Contains(diffText, "export const existing = true;") {
+		t.Fatalf("diffText = %q", diffText)
+	}
+	validationOutput, err := runRepositoryValidation(repo)
+	if err != nil {
+		t.Fatalf("runRepositoryValidation second commit failed: %v\n%s", err, validationOutput)
+	}
+	if !strings.Contains(validationOutput, "HEAD^..HEAD") {
+		t.Fatalf("validation output should use parent diff range, got %q", validationOutput)
 	}
 }
 
@@ -3775,8 +4003,19 @@ func TestListOperationsSupportsFilteredFastPath(t *testing.T) {
 	database.Tables.Operations = []map[string]any{
 		{
 			"id": "pipeline_item_manual_1:agent:todo:requirement", "missionId": "mission_pipeline_item_manual_1_agent_workflow",
-			"stageId": "todo", "agentId": "requirement", "status": "passed", "prompt": "Structure OMG-1.",
+			"stageId": "todo", "agentId": "requirement", "status": "passed", "prompt": "Structure OMG-1. " + strings.Repeat("prompt ", 200),
 			"requiredProof": []any{"plan"}, "createdAt": now, "updatedAt": now,
+			"runnerProcess": map[string]any{
+				"runner":           "codex",
+				"model":            "gpt-5.4-mini",
+				"status":           "passed",
+				"durationMs":       1234,
+				"promptTokens":     30,
+				"completionTokens": 12,
+				"totalTokens":      42,
+				"stdout":           strings.Repeat("large stdout ", 400),
+				"stderr":           strings.Repeat("large stderr ", 400),
+			},
 		},
 		{
 			"id": "pipeline_item_manual_2:agent:todo:requirement", "missionId": "mission_pipeline_item_manual_2_agent_workflow",
@@ -3792,6 +4031,25 @@ func TestListOperationsSupportsFilteredFastPath(t *testing.T) {
 	decode(t, mustGet(t, api.URL+"/operations?pipelineId=pipeline_item_manual_1&limit=1"), &operations)
 	if len(operations) != 1 || text(operations[0], "id") != "pipeline_item_manual_1:agent:todo:requirement" {
 		t.Fatalf("filtered operations = %+v", operations)
+	}
+	if !strings.Contains(text(mapValue(operations[0]["runnerProcess"]), "stdout"), "large stdout") {
+		t.Fatalf("filtered operation should retain full runner output = %+v", operations[0])
+	}
+
+	var compactOperations []map[string]any
+	decode(t, mustGet(t, api.URL+"/operations?pipelineId=pipeline_item_manual_1&limit=1&compact=1"), &compactOperations)
+	if len(compactOperations) != 1 {
+		t.Fatalf("compact operations = %+v", compactOperations)
+	}
+	compactProcess := mapValue(compactOperations[0]["runnerProcess"])
+	if text(compactProcess, "stdout") != "" || text(compactProcess, "stderr") != "" {
+		t.Fatalf("compact operation leaked runner output = %+v", compactOperations[0])
+	}
+	if len(text(compactOperations[0], "prompt")) > 512 {
+		t.Fatalf("compact operation prompt was not capped: %d bytes", len(text(compactOperations[0], "prompt")))
+	}
+	if compactProcess["durationMs"] != float64(1234) || compactProcess["totalTokens"] != float64(42) {
+		t.Fatalf("compact operation missing runner summary = %+v", compactProcess)
 	}
 }
 
@@ -3963,6 +4221,31 @@ func TestMigrationsAndPipelineTemplates(t *testing.T) {
 	}
 	if stages[1]["id"] != "coding" {
 		t.Fatalf("second bugfix stage = %v", stages[1]["id"])
+	}
+}
+
+func TestSaaSLaunchTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
+	template := findPipelineTemplate("saas-launch")
+	if template == nil {
+		t.Fatal("saas-launch template missing")
+	}
+	if template.Source == "" || !strings.HasSuffix(template.Source, filepath.Join("services", "local-runtime", "workflows", "saas-launch.md")) {
+		t.Fatalf("saas-launch should load from workflow markdown, got source=%q", template.Source)
+	}
+	if template.Name != "SaaS Launch Flow" {
+		t.Fatalf("template name = %q", template.Name)
+	}
+	if len(template.StageProfiles) != 8 || template.StageProfiles[1].Title != "Product implementation and CI" {
+		t.Fatalf("saas-launch stages should come from workflow markdown: %+v", template.StageProfiles)
+	}
+	if len(template.StateProfiles) != 8 {
+		t.Fatalf("saas-launch state profiles should come from workflow action graph: %+v", template.StateProfiles)
+	}
+	if !isDevFlowPRTemplate(template.ID) {
+		t.Fatalf("saas-launch should be runnable by the DevFlow executor")
+	}
+	if !validateWorkflowTemplate(*template).ok() || workflowExecutionMode(template) != "contract-action-executor" {
+		t.Fatalf("saas-launch workflow validation/action mode failed: validation=%+v mode=%s", validateWorkflowTemplate(*template), workflowExecutionMode(template))
 	}
 }
 
@@ -4189,6 +4472,41 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
+if printf '%s' "$prompt" | grep -q "You are the Requirement Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Requirement Handoff' '' 'Requirement agent captured repository boundary and acceptance criteria.' > "$output"
+  fi
+  echo "fake requirement agent captured"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Master Orchestrator Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Master Dispatch' '' 'Task class: default' '' 'Route: devflow-pr' > "$output"
+  fi
+  echo "fake master agent dispatched"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Write the final plan"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Solution Plan' '' '## Functional TODO List' '' '- [ ] Implement the requested behavior.' '' '## Project TODO List' '' '- [ ] Inspect files.' '' '- [ ] Run validation.' > "$output"
+  fi
+  echo "fake architect agent planned"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Local repository validation has already run"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Test Report' '' 'Status: passed' '' 'Testing agent verified local validation output.' > "$output"
+  fi
+  echo "fake testing agent verified"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Delivery Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Delivery Handoff' '' 'Delivery agent prepared the human review handoff.' > "$output"
+  fi
+  echo "fake delivery agent prepared"
+  exit 0
+fi
 if printf '%s' "$prompt" | grep -q "You are the review agent for Omega"; then
   if [ -n "$output" ]; then
     printf '%s\n' '# Review' '' 'Verdict: APPROVED' '' 'The change satisfies the requirement.' > "$output"
@@ -4268,6 +4586,41 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
+if printf '%s' "$prompt" | grep -q "You are the Requirement Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Requirement Handoff' '' 'Requirement agent captured repository boundary and acceptance criteria.' > "$output"
+  fi
+  echo "fake requirement agent captured"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Master Orchestrator Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Master Dispatch' '' 'Task class: default' '' 'Route: devflow-pr' > "$output"
+  fi
+  echo "fake master agent dispatched"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Write the final plan"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Solution Plan' '' '## Functional TODO List' '' '- [ ] Implement the requested behavior.' '' '## Project TODO List' '' '- [ ] Inspect files.' '' '- [ ] Run validation.' > "$output"
+  fi
+  echo "fake architect agent planned"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Local repository validation has already run"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Test Report' '' 'Status: passed' '' 'Testing agent verified local validation output.' > "$output"
+  fi
+  echo "fake testing agent verified"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Delivery Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Delivery Handoff' '' 'Delivery agent prepared the human review handoff.' > "$output"
+  fi
+  echo "fake delivery agent prepared"
+  exit 0
+fi
 if printf '%s' "$prompt" | grep -q "You are the review agent for Omega"; then
   if [ -n "$output" ]; then
     printf '%s\n' '# Review' '' 'Verdict: APPROVED' '' 'The change satisfies the requirement.' > "$output"
@@ -4351,6 +4704,41 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
+if printf '%s' "$prompt" | grep -q "You are the Requirement Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Requirement Handoff' '' 'Requirement agent captured repository boundary and acceptance criteria.' > "$output"
+  fi
+  echo "fake requirement agent captured"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Master Orchestrator Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Master Dispatch' '' 'Task class: default' '' 'Route: devflow-pr' > "$output"
+  fi
+  echo "fake master agent dispatched"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Write the final plan"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Solution Plan' '' '## Functional TODO List' '' '- [ ] Implement the requested behavior.' '' '## Project TODO List' '' '- [ ] Inspect files.' '' '- [ ] Run validation.' > "$output"
+  fi
+  echo "fake architect agent planned"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Local repository validation has already run"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Test Report' '' 'Status: passed' '' 'Testing agent verified local validation output.' > "$output"
+  fi
+  echo "fake testing agent verified"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Delivery Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Delivery Handoff' '' 'Delivery agent prepared the human review handoff.' > "$output"
+  fi
+  echo "fake delivery agent prepared"
+  exit 0
+fi
 if printf '%s' "$prompt" | grep -q "You are the review agent for Omega"; then
   if [ -n "$output" ]; then
     printf '%s\n' '# Review' '' 'Verdict: APPROVED' '' 'The change satisfies the requirement.' > "$output"
@@ -4430,6 +4818,41 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
+if printf '%s' "$prompt" | grep -q "You are the Requirement Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Requirement Handoff' '' 'Requirement agent captured repository boundary and acceptance criteria.' > "$output"
+  fi
+  echo "fake requirement agent captured"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Master Orchestrator Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Master Dispatch' '' 'Task class: default' '' 'Route: devflow-pr' > "$output"
+  fi
+  echo "fake master agent dispatched"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Write the final plan"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Solution Plan' '' '## Functional TODO List' '' '- [ ] Implement the requested behavior.' '' '## Project TODO List' '' '- [ ] Inspect files.' '' '- [ ] Run validation.' > "$output"
+  fi
+  echo "fake architect agent planned"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "Local repository validation has already run"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Test Report' '' 'Status: passed' '' 'Testing agent verified local validation output.' > "$output"
+  fi
+  echo "fake testing agent verified"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "You are the Delivery Agent for Omega"; then
+  if [ -n "$output" ]; then
+    printf '%s\n' '# Delivery Handoff' '' 'Delivery agent prepared the human review handoff.' > "$output"
+  fi
+  echo "fake delivery agent prepared"
+  exit 0
+fi
 if printf '%s' "$prompt" | grep -q "You are the review agent for Omega"; then
   if [ -n "$output" ]; then
     printf '%s\n' '# Review' '' 'Verdict: APPROVED' '' 'The change satisfies the requirement.' > "$output"
@@ -5661,7 +6084,7 @@ func TestLocalCapabilitiesReportsInstalledCliTools(t *testing.T) {
 	}
 	for name, output := range tools {
 		path := filepath.Join(bin, name)
-		if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' '"+output+"'\n"), 0o755); err != nil {
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n/bin/echo '"+output+"'\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -5688,6 +6111,49 @@ func TestLocalCapabilitiesReportsInstalledCliTools(t *testing.T) {
 	}
 	if byID["codex"]["available"] != false || byID["opencode"]["available"] != false || byID["trae-agent"]["available"] != false {
 		t.Fatalf("ai cli capabilities = codex:%+v opencode:%+v trae-agent:%+v", byID["codex"], byID["opencode"], byID["trae-agent"])
+	}
+}
+
+func TestLocalCapabilitiesTimesOutSlowVersionCommands(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell scripts use POSIX sh")
+	}
+	api, _ := newTestAPI(t)
+
+	bin := t.TempDir()
+	slow := filepath.Join(bin, "opencode")
+	if err := os.WriteFile(slow, []byte("#!/bin/sh\n/bin/sleep 2\n/bin/echo 'opencode slow'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+
+	started := time.Now()
+	response, err := http.Get(api.URL + "/local-capabilities?refresh=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	var capabilities []map[string]any
+	decode(t, response, &capabilities)
+	byID := map[string]map[string]any{}
+	for _, capability := range capabilities {
+		byID[fmt.Sprint(capability["id"])] = capability
+	}
+	if byID["opencode"]["available"] != true || text(byID["opencode"], "version") != "" {
+		t.Fatalf("slow opencode capability = %+v", byID["opencode"])
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("slow version command blocked local capabilities for %s", elapsed)
+	}
+
+	started = time.Now()
+	response, err = http.Get(api.URL + "/local-capabilities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("cached local capabilities took %s", elapsed)
 	}
 }
 
@@ -5787,7 +6253,7 @@ func TestProjectAgentProfilePersistsAndFeedsRuntimeBundle(t *testing.T) {
 
 	var loaded ProjectAgentProfile
 	decode(t, mustGet(t, api.URL+"/agent-profile?projectId=project_omega"), &loaded)
-	if loaded.Source != "project" || len(loaded.AgentProfiles) != 1 {
+	if loaded.Source != "project" || agentProfileForRole(loaded, "requirement").ID != "requirement" || agentProfileForRole(loaded, "master").ID != "master" {
 		t.Fatalf("loaded profile = %+v", loaded)
 	}
 
@@ -5867,6 +6333,62 @@ func TestProjectAgentProfilePersistsAndFeedsRuntimeBundle(t *testing.T) {
 	}
 }
 
+func TestDefaultAgentProfileLeavesModelUnset(t *testing.T) {
+	profile := defaultAgentProfile("project_omega", "")
+	if len(profile.AgentProfiles) == 0 {
+		t.Fatalf("default profile should include stage agents")
+	}
+	for _, agent := range profile.AgentProfiles {
+		if strings.TrimSpace(agent.Model) != "" {
+			t.Fatalf("default agent model should be empty for %s, got %q", agent.ID, agent.Model)
+		}
+	}
+	normalized := normalizeAgentProfile(ProjectAgentProfile{
+		ProjectID: "project_omega",
+		AgentProfiles: []AgentProfileConfig{{
+			ID:     "coding",
+			Label:  "Coding",
+			Runner: "codex",
+		}},
+	})
+	if normalized.AgentProfiles[0].Model != "" {
+		t.Fatalf("normalization should not invent a model: %+v", normalized.AgentProfiles[0])
+	}
+}
+
+func TestAgentProfileTemplateSelectionReplacesStaleWorkflowMarkdown(t *testing.T) {
+	staleMarkdown := `---
+id: devflow-pr-test
+name: DevFlow PR Test
+---
+
+workflow: devflow-pr-test
+`
+	normalized := normalizeAgentProfile(ProjectAgentProfile{
+		ProjectID:          "project_omega",
+		RepositoryTargetID: "repo_demo",
+		WorkflowTemplate:   "saas-launch",
+		WorkflowMarkdown:   staleMarkdown,
+	})
+	if !strings.Contains(normalized.WorkflowMarkdown, "id: saas-launch") {
+		t.Fatalf("expected saas-launch markdown after template switch, got:\n%s", normalized.WorkflowMarkdown)
+	}
+	if strings.Contains(normalized.WorkflowMarkdown, "devflow-pr-test") {
+		t.Fatalf("stale workflow markdown was not replaced:\n%s", normalized.WorkflowMarkdown)
+	}
+
+	legacyMarkdown := "workflow: devflow-pr\nstages:\n  - requirement: requirement\n"
+	normalized = normalizeAgentProfile(ProjectAgentProfile{
+		ProjectID:          "project_omega",
+		RepositoryTargetID: "repo_demo",
+		WorkflowTemplate:   "saas-launch",
+		WorkflowMarkdown:   legacyMarkdown,
+	})
+	if !strings.Contains(normalized.WorkflowMarkdown, "id: saas-launch") {
+		t.Fatalf("expected legacy markdown to follow selected template, got:\n%s", normalized.WorkflowMarkdown)
+	}
+}
+
 func TestProfileRunnerRegistrySelectsConfiguredAgentRunner(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake opencode script uses POSIX sh")
@@ -5935,11 +6457,18 @@ func TestProfileSkillsAndMCPAreMaterializedForRunnerProcess(t *testing.T) {
 	script := `#!/bin/sh
 test -f .omega/agent-capabilities.json || { echo missing-capabilities-json >&2; exit 17; }
 test -f .omega/agent-capabilities.md || { echo missing-capabilities-md >&2; exit 18; }
+test -f .omega/agent-skill-manifest.json || { echo missing-skill-manifest >&2; exit 25; }
+test -f .omega/skills/playwright/SKILL.md || { echo missing-playwright-skill-file >&2; exit 26; }
+test -f .omega/skills/security-best-practices/SKILL.md || { echo missing-security-skill-file >&2; exit 27; }
 grep -q 'playwright' .omega/agent-capabilities.json || { echo missing-skill-json >&2; exit 19; }
 grep -q 'omega-git' .omega/agent-capabilities.json || { echo missing-mcp-json >&2; exit 20; }
+grep -q 'Project Skill Directory' .omega/agent-capabilities.md || { echo missing-skill-directory-section >&2; exit 28; }
 grep -q 'security-best-practices' .codex/OMEGA.md || { echo missing-codex-skill >&2; exit 21; }
+grep -q '.omega/skills/playwright/SKILL.md' .codex/OMEGA.md || { echo missing-codex-skill-path >&2; exit 29; }
 grep -q 'omega-filesystem' .claude/CLAUDE.md || { echo missing-claude-mcp >&2; exit 22; }
 printf '%s\n' "$OMEGA_AGENT_SKILLS" | grep -q 'playwright' || { echo missing-skill-env >&2; exit 23; }
+printf '%s\n' "$OMEGA_AGENT_SKILL_ROOT" | grep -q '.omega/skills' || { echo missing-skill-root-env >&2; exit 30; }
+printf '%s\n' "$OMEGA_AGENT_SKILL_PATHS" | grep -q '.omega/skills/playwright/SKILL.md' || { echo missing-skill-path-env >&2; exit 31; }
 printf '%s\n' "$OMEGA_AGENT_MCP" | grep -q 'omega-git' || { echo missing-mcp-env >&2; exit 24; }
 printf '%s\n' 'capability manifest visible to runner'
 `
@@ -6004,6 +6533,77 @@ printf '%s\n' 'capability manifest visible to runner'
 	}
 	if strings.Join(stringSlice(capabilities["mcp"]), ",") != "omega-filesystem,omega-git" {
 		t.Fatalf("capability mcp = %+v", capabilities["mcp"])
+	}
+	manifestRaw, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "agent-skill-manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundles []AgentSkillBundle
+	if err := json.Unmarshal(manifestRaw, &bundles); err != nil {
+		t.Fatal(err)
+	}
+	foundPlaywright := false
+	for _, bundle := range bundles {
+		if bundle.ID == "playwright" {
+			foundPlaywright = true
+			if !bundle.Bundled || bundle.WorkspacePath != ".omega/skills/playwright/SKILL.md" {
+				t.Fatalf("playwright bundle = %+v", bundle)
+			}
+		}
+	}
+	if !foundPlaywright {
+		t.Fatalf("skill manifest missing playwright: %+v", bundles)
+	}
+}
+
+func TestProjectBundledSkillFallbackMaterializesWithoutHostInstall(t *testing.T) {
+	root := t.TempDir()
+	profile := normalizeAgentProfile(ProjectAgentProfile{
+		ProjectID:          "project_omega",
+		RepositoryTargetID: "repo_demo",
+		WorkflowTemplate:   "devflow-pr",
+		AgentProfiles: []AgentProfileConfig{{
+			ID:     "coding",
+			Label:  "Coding",
+			Runner: "codex",
+			Skills: "omega-test-skill-that-is-not-installed",
+		}},
+	})
+	if err := writeRunnerPolicyFiles(root, profile, "coding"); err != nil {
+		t.Fatal(err)
+	}
+	skillPath := filepath.Join(root, ".omega", "skills", "omega-test-skill-that-is-not-installed", "SKILL.md")
+	skillRaw, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(skillRaw), "project-bundled Omega skill") || !strings.Contains(string(skillRaw), "omega-test-skill-that-is-not-installed") {
+		t.Fatalf("fallback skill content = %s", skillRaw)
+	}
+	manifestRaw, err := os.ReadFile(filepath.Join(root, ".omega", "agent-skill-manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundles []AgentSkillBundle
+	if err := json.Unmarshal(manifestRaw, &bundles); err != nil {
+		t.Fatal(err)
+	}
+	if len(bundles) != 1 {
+		t.Fatalf("bundles = %+v", bundles)
+	}
+	if bundles[0].Installed || !bundles[0].Bundled || bundles[0].Source != "project-bundled-fallback" {
+		t.Fatalf("fallback bundle = %+v", bundles[0])
+	}
+	codexRaw, err := os.ReadFile(filepath.Join(root, ".codex", "OMEGA.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(codexRaw), ".omega/skills/omega-test-skill-that-is-not-installed/SKILL.md") {
+		t.Fatalf("codex policy missing fallback skill path: %s", codexRaw)
+	}
+	promptBlock := agentPolicyBlock(profile, "coding")
+	if !strings.Contains(promptBlock, "project skill files") || !strings.Contains(promptBlock, ".omega/skills/omega-test-skill-that-is-not-installed/SKILL.md") {
+		t.Fatalf("prompt policy missing fallback skill path: %s", promptBlock)
 	}
 }
 
@@ -6229,7 +6829,7 @@ func TestTraeAgentRunnerUsesTraeCLI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(args), "run Run using Trae Agent.") || !strings.Contains(string(args), "--working-dir") || !strings.Contains(string(args), "--provider doubao") {
+	if !strings.Contains(string(args), "run Run using Trae Agent.") || !strings.Contains(string(args), "--working-dir") || !strings.Contains(string(args), "--provider doubao") || !strings.Contains(string(args), "--model-base-url https://ark.cn-beijing.volces.com/api/v3") {
 		t.Fatalf("trae args = %s", args)
 	}
 	if !strings.Contains(string(args), "--config-file") {
@@ -6328,7 +6928,7 @@ func TestRunnerCredentialEncryptsAndInjectsTraeEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(args), "secret-trae-key") || !strings.Contains(string(args), "--model ep-test-001") {
+	if strings.Contains(string(args), "secret-trae-key") || !strings.Contains(string(args), "--model ep-test-001") || !strings.Contains(string(args), "--model-base-url https://ark.example.test/api/v3") {
 		t.Fatalf("trae args = %s", args)
 	}
 	configRaw, err := os.ReadFile(filepath.Join(result.WorkspacePath, ".omega", "trae-runner-config.yaml"))
@@ -6397,7 +6997,7 @@ func TestRunnerCredentialMapsKimiForTraeThroughOpenAICompatibleConfig(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(args), "--provider openai") || !strings.Contains(string(args), "--model kimi-for-coding") || strings.Contains(string(args), "secret-kimi-key") {
+	if !strings.Contains(string(args), "--provider openai") || !strings.Contains(string(args), "--model kimi-for-coding") || !strings.Contains(string(args), "--model-base-url https://kimi.a7m.com.cn") || strings.Contains(string(args), "secret-kimi-key") {
 		t.Fatalf("trae args = %s", args)
 	}
 	envOutput, err := os.ReadFile(filepath.Join(result.WorkspacePath, "trae-env.txt"))
@@ -7106,6 +7706,9 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if applied["status"] != "applied" || applied["repositoryPath"] != targetRepo {
 		t.Fatalf("applied = %+v", applied)
 	}
+	if text(applied, "runner") != "local-proof" {
+		t.Fatalf("Page Pilot runner should resolve from the selected agent profile: %+v", applied)
+	}
 	runID := text(applied, "id")
 	if runID == "" {
 		t.Fatalf("Page Pilot run id missing: %+v", applied)
@@ -7197,6 +7800,9 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	if visualProof := mapValue(storedRun["visualProof"]); text(visualProof, "kind") != "dom-snapshot" {
 		t.Fatalf("stored run should keep visual proof: %+v", storedRun)
 	}
+	if text(storedRun, "runner") != "local-proof" {
+		t.Fatalf("stored run should keep selected runner: %+v", storedRun)
+	}
 	if report := mapValue(storedRun["sourceMappingReport"]); text(report, "status") != "strong" {
 		t.Fatalf("stored run should keep source mapping report: %+v", storedRun)
 	}
@@ -7215,6 +7821,10 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	pipelineIndex := findByID(linkedDatabase.Tables.Pipelines, text(storedRun, "pipelineId"))
 	if pipelineIndex < 0 || linkedDatabase.Tables.Pipelines[pipelineIndex]["templateId"] != "page-pilot" {
 		t.Fatalf("Page Pilot pipeline missing: %+v", linkedDatabase.Tables.Pipelines)
+	}
+	pipelineRun := mapValue(linkedDatabase.Tables.Pipelines[pipelineIndex]["run"])
+	if artifacts := mapValue(pipelineRun["artifacts"]); text(artifacts, "runner") != "local-proof" {
+		t.Fatalf("Page Pilot pipeline should record selected runner: %+v", pipelineRun)
 	}
 	pagePilotProofs := 0
 	for _, proof := range linkedDatabase.Tables.ProofRecords {
@@ -7238,6 +7848,17 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 	decode(t, mustGet(t, api.URL+"/page-pilot/runs"), &runs)
 	if len(runs) != 1 || runs[0]["id"] != runID || runs[0]["status"] != "applied" {
 		t.Fatalf("runs = %+v", runs)
+	}
+	var compactRuns []map[string]any
+	decode(t, mustGet(t, api.URL+"/page-pilot/runs?repositoryTargetId=repo_local_page&compact=true&limit=1"), &compactRuns)
+	if len(compactRuns) != 1 || compactRuns[0]["id"] != runID || compactRuns[0]["repositoryTargetId"] != "repo_local_page" {
+		t.Fatalf("compact runs = %+v", compactRuns)
+	}
+	if text(compactRuns[0], "workItemId") == "" || text(compactRuns[0], "pipelineId") == "" {
+		t.Fatalf("compact runs should preserve trace links: %+v", compactRuns[0])
+	}
+	if _, ok := compactRuns[0]["conversationBatch"]; ok {
+		t.Fatalf("compact runs should not include heavy conversation payloads: %+v", compactRuns[0])
 	}
 	var discarded map[string]any
 	decode(t, postJSON(t, api.URL+"/page-pilot/runs/"+runID+"/discard", map[string]any{}), &discarded)
@@ -7266,7 +7887,7 @@ func TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	discardedItemIndex := findByID(discardedDatabase.Tables.WorkItems, text(discarded, "workItemId"))
-	if discardedItemIndex < 0 || discardedDatabase.Tables.WorkItems[discardedItemIndex]["status"] != "Blocked" {
+	if discardedItemIndex < 0 || discardedDatabase.Tables.WorkItems[discardedItemIndex]["status"] != "Canceled" {
 		t.Fatalf("discarded Page Pilot work item status = %+v", discardedDatabase.Tables.WorkItems)
 	}
 	discardedPipelineIndex := findByID(discardedDatabase.Tables.Pipelines, text(discarded, "pipelineId"))

@@ -19,6 +19,15 @@ type SQLiteRepository struct {
 	Path string
 }
 
+type PagePilotRunListOptions struct {
+	ID                 string
+	ProjectID          string
+	RepositoryTargetID string
+	Status             string
+	Limit              int
+	Compact            bool
+}
+
 func NewSQLiteRepository(path string) *SQLiteRepository {
 	return &SQLiteRepository{Path: path}
 }
@@ -1592,13 +1601,40 @@ func (repo *SQLiteRepository) GetPagePilotRun(ctx context.Context, id string) (m
 	return run, nil
 }
 
-func (repo *SQLiteRepository) ListPagePilotRuns(ctx context.Context) ([]map[string]any, error) {
+func (repo *SQLiteRepository) ListPagePilotRuns(ctx context.Context, options PagePilotRunListOptions) ([]map[string]any, error) {
 	if err := repo.Initialize(ctx); err != nil {
 		return nil, err
 	}
-	output, err := repo.query(ctx, `.mode json
-SELECT run_json AS runJson FROM page_pilot_runs ORDER BY updated_at DESC, created_at DESC;
-`)
+	where := []string{}
+	if strings.TrimSpace(options.ID) != "" {
+		where = append(where, fmt.Sprintf("id = %s", sqlQuote(strings.TrimSpace(options.ID))))
+	}
+	if strings.TrimSpace(options.ProjectID) != "" {
+		where = append(where, fmt.Sprintf("project_id = %s", sqlQuote(strings.TrimSpace(options.ProjectID))))
+	}
+	if strings.TrimSpace(options.RepositoryTargetID) != "" {
+		where = append(where, fmt.Sprintf("repository_target_id = %s", sqlQuote(strings.TrimSpace(options.RepositoryTargetID))))
+	}
+	if strings.TrimSpace(options.Status) != "" {
+		where = append(where, fmt.Sprintf("status = %s", sqlQuote(strings.TrimSpace(options.Status))))
+	}
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = "WHERE " + strings.Join(where, " AND ")
+	}
+	limitSQL := ""
+	if options.Limit > 0 {
+		if options.Limit > 100 {
+			options.Limit = 100
+		}
+		limitSQL = fmt.Sprintf("LIMIT %d", options.Limit)
+	}
+	if options.Compact {
+		return repo.listPagePilotRunsCompact(ctx, whereSQL, limitSQL)
+	}
+	output, err := repo.query(ctx, fmt.Sprintf(`.mode json
+SELECT run_json AS runJson FROM page_pilot_runs %s ORDER BY updated_at DESC, created_at DESC %s;
+`, whereSQL, limitSQL))
 	if err != nil {
 		return nil, err
 	}
@@ -1618,6 +1654,61 @@ SELECT run_json AS runJson FROM page_pilot_runs ORDER BY updated_at DESC, create
 		if run != nil {
 			runs = append(runs, run)
 		}
+	}
+	return runs, nil
+}
+
+func (repo *SQLiteRepository) listPagePilotRunsCompact(ctx context.Context, whereSQL string, limitSQL string) ([]map[string]any, error) {
+	output, err := repo.query(ctx, fmt.Sprintf(`.mode json
+SELECT
+  id,
+  project_id AS projectId,
+  repository_target_id AS repositoryTargetId,
+  status,
+  runner,
+  repository_path AS repositoryPath,
+  branch_name AS branchName,
+  commit_sha AS commitSha,
+  pull_request_url AS pullRequestUrl,
+  changed_files_json AS changedFilesJson,
+  json_extract(run_json, '$.workItemId') AS workItemId,
+  json_extract(run_json, '$.pipelineId') AS pipelineId,
+  json_extract(run_json, '$.updatedAt') AS runUpdatedAt,
+  created_at AS createdAt,
+  updated_at AS updatedAt
+FROM page_pilot_runs
+%s
+ORDER BY updated_at DESC, created_at DESC
+%s;
+`, whereSQL, limitSQL))
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(output) == "" {
+		return []map[string]any{}, nil
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(output), &rows); err != nil {
+		return nil, err
+	}
+	runs := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		run := map[string]any{}
+		for _, key := range []string{"id", "projectId", "repositoryTargetId", "status", "runner", "repositoryPath", "branchName", "commitSha", "pullRequestUrl", "workItemId", "pipelineId", "createdAt", "updatedAt"} {
+			value := row[key]
+			if value != nil && fmt.Sprint(value) != "" {
+				run[key] = value
+			}
+		}
+		if text(row, "runUpdatedAt") != "" {
+			run["updatedAt"] = text(row, "runUpdatedAt")
+		}
+		var changedFiles []any
+		if raw := text(row, "changedFilesJson"); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &changedFiles)
+		}
+		run["changedFiles"] = changedFiles
+		runs = append(runs, run)
 	}
 	return runs, nil
 }

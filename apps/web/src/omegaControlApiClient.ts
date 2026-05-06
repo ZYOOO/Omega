@@ -309,7 +309,7 @@ export interface LocalCapabilityInfo {
   id: string;
   command: string;
   category: string;
-  description: string;
+  description?: string;
   available: boolean;
   path?: string;
   version?: string;
@@ -515,6 +515,8 @@ export interface PipelineRecordInfo {
       dependsOn?: string[];
       inputArtifacts?: string[];
       outputArtifacts?: string[];
+      startedAt?: string;
+      completedAt?: string;
     }>;
     events?: Array<{
       type: string;
@@ -707,6 +709,19 @@ export interface RunnerProcessInfo {
   model?: string;
   provider?: string;
   effort?: string;
+  usage?: Record<string, unknown>;
+  tokenUsage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+  inputTokens?: number;
+  outputTokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
   command?: string;
   args?: string[];
   cwd?: string;
@@ -976,6 +991,15 @@ export interface PagePilotPreviewRuntimeResult {
 export type PagePilotRunInfo = PagePilotApplyResult & Partial<PagePilotDeliverResult> & {
   discardedAt?: string;
   repositoryStatus?: string;
+};
+
+export type PagePilotRunFilters = {
+  id?: string;
+  projectId?: string;
+  repositoryTargetId?: string;
+  status?: string;
+  limit?: number;
+  compact?: boolean;
 };
 
 async function fetchJson<T>(apiUrl: string, path: string, fetchImpl: typeof fetch): Promise<T> {
@@ -1464,6 +1488,7 @@ type ExecutionRecordFilters = {
   itemId?: string;
   workItemId?: string;
   pipelineId?: string;
+  attemptId?: string;
   repositoryTargetId?: string;
   runId?: string;
   missionId?: string;
@@ -1473,6 +1498,7 @@ type ExecutionRecordFilters = {
   label?: string;
   status?: string;
   limit?: number;
+  compact?: boolean;
 };
 
 function tableQuerySuffix(filters: ExecutionRecordFilters = {}) {
@@ -1532,9 +1558,16 @@ export async function fetchAttempts(
 export async function fetchAttemptTimeline(
   apiUrl: string,
   attemptId: string,
+  optionsOrFetch?: { limit?: number } | typeof fetch,
   fetchImpl: typeof fetch = fetch
 ): Promise<AttemptTimelineInfo> {
-  return fetchJson<AttemptTimelineInfo>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/timeline`, fetchImpl);
+  const selectedFetch = typeof optionsOrFetch === "function" ? optionsOrFetch : fetchImpl;
+  const params = new URLSearchParams();
+  if (typeof optionsOrFetch !== "function" && optionsOrFetch?.limit) {
+    params.set("limit", String(optionsOrFetch.limit));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson<AttemptTimelineInfo>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/timeline${suffix}`, selectedFetch);
 }
 
 export async function fetchAttemptActionPlan(
@@ -1547,13 +1580,13 @@ export async function fetchAttemptActionPlan(
 
 export async function fetchRunWorkpads(
   apiUrl: string,
-  filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string; status?: string; limit?: number } = {},
+  filters: { attemptId?: string; pipelineId?: string; workItemId?: string; repositoryTargetId?: string; status?: string; limit?: number; compact?: boolean } = {},
   fetchImpl: typeof fetch = fetch
 ): Promise<RunWorkpadRecordInfo[]> {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
     if (!value) continue;
-    params.set(key, value);
+    params.set(key, String(value));
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return fetchJson<RunWorkpadRecordInfo[]>(apiUrl, `/run-workpads${suffix}`, fetchImpl);
@@ -1746,9 +1779,20 @@ export async function deliverPagePilotChange(
 
 export async function fetchPagePilotRuns(
   apiUrl: string,
+  filtersOrFetch: PagePilotRunFilters | typeof fetch = {},
   fetchImpl: typeof fetch = fetch
 ): Promise<PagePilotRunInfo[]> {
-  return fetchJson<PagePilotRunInfo[]>(apiUrl, "/page-pilot/runs", fetchImpl);
+  const filters = typeof filtersOrFetch === "function" ? {} : filtersOrFetch;
+  const effectiveFetch = typeof filtersOrFetch === "function" ? filtersOrFetch : fetchImpl;
+  const query = new URLSearchParams();
+  if (filters.id) query.set("id", filters.id);
+  if (filters.projectId) query.set("projectId", filters.projectId);
+  if (filters.repositoryTargetId) query.set("repositoryTargetId", filters.repositoryTargetId);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.limit && filters.limit > 0) query.set("limit", String(filters.limit));
+  if (filters.compact !== undefined) query.set("compact", filters.compact ? "true" : "false");
+  const suffix = query.toString();
+  return fetchJson<PagePilotRunInfo[]>(apiUrl, `/page-pilot/runs${suffix ? `?${suffix}` : ""}`, effectiveFetch);
 }
 
 export async function discardPagePilotRun(

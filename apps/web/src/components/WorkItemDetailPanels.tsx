@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, type ElementType, type ReactNode } from "react";
 import { useI18n } from "../i18n";
 import type {
   AttemptRecordInfo,
@@ -1067,7 +1067,7 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
 
 function renderMarkdownBlock(block: MarkdownBlock, index: number): ReactNode {
   if (block.type === "heading") {
-    const Heading = (`h${Math.min(block.level + 1, 5)}` as keyof JSX.IntrinsicElements);
+    const Heading = `h${Math.min(block.level + 1, 5)}` as ElementType;
     return <Heading key={index}>{renderInlineMarkdown(block.text)}</Heading>;
   }
   if (block.type === "code") {

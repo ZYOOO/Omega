@@ -2,7 +2,7 @@ const { app, BrowserWindow, BrowserView, dialog, ipcMain } = require("electron")
 const path = require("node:path");
 const { refreshPreviewRuntime, resolveRepositoryPreviewTarget, startDesktopServices, startRepositoryPreviewRuntime, stopDesktopServices } = require("./process-supervisor.cjs");
 
-if (process.env.OMEGA_ENABLE_GPU_ACCELERATION !== "1") {
+if (process.env.OMEGA_DISABLE_GPU_ACCELERATION === "1") {
   app.disableHardwareAcceleration();
   app.commandLine.appendSwitch("disable-gpu-compositing");
 }
@@ -202,6 +202,7 @@ ipcMain.handle("omega-preview:open", async (_event, url) => {
 
 ipcMain.handle("omega-preview:reload", async (_event, input = {}) => {
   if (!previewView) return { ok: false, error: "preview is not open" };
+  console.log(`[omega-desktop:preview] reload requested reason=${input?.reason || "unknown"} run=${input?.runId || ""}`);
   const runtime = await refreshPreviewRuntime(previewRuntimeSession, input || {});
   if (!runtime.ok) return sanitizePreviewRuntimeResult(runtime);
   if (runtime.child && desktopServices?.children && !desktopServices.children.includes(runtime.child)) {
@@ -209,6 +210,7 @@ ipcMain.handle("omega-preview:reload", async (_event, input = {}) => {
   }
   if (runtime.child && previewRuntimeSession) previewRuntimeSession.child = runtime.child;
   previewView.webContents.reloadIgnoringCache();
+  console.log(`[omega-desktop:preview] reloaded action=${runtime.action || "browser-reload"} strategy=${runtime.reloadStrategy || ""}`);
   return sanitizePreviewRuntimeResult({ ...runtime, ok: true, browserReload: true });
 });
 
@@ -403,7 +405,7 @@ app.whenReady().then(createWindow).catch((error) => {
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  app.quit();
 });
 
 app.on("before-quit", () => {

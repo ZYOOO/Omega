@@ -87,7 +87,26 @@ describe("WorkItemDetailPage", () => {
               },
               testPreview: { status: "attention", summary: "Lint failed." },
               checkPreview: { status: "missing", summary: "No remote checks captured." },
-              risk: { level: "high", reasons: ["Validation output needs attention."] },
+              risk: {
+                level: "high",
+                reasons: ["Validation output contains a failure or error signal."],
+                basis: [
+                  { level: "high", source: "validation", evidence: "Lint failed." },
+                  { level: "medium", source: "checks", evidence: "No remote checks captured." }
+                ]
+              },
+              todoCompletion: {
+                status: "attention",
+                summary: "1/3 plan TODO(s) verified for Human Review.",
+                counts: { total: 3, verified: 1, pending: 1, attention: 1 },
+                functional: [
+                  { text: "Show user name on the detail page.", status: "verified", evidence: "Automated review approved this behavior." },
+                  { text: "Show loading feedback before merge.", status: "attention", evidence: "Validation output needs attention." }
+                ],
+                project: [
+                  { text: "Run focused validation.", status: "pending", evidence: "Waiting for check evidence." }
+                ]
+              },
               recommendedActions: [{ type: "validation", label: "Run focused validation before approval." }]
             }
           },
@@ -149,7 +168,41 @@ describe("WorkItemDetailPage", () => {
           status: "passed",
           prompt: "Implement user detail page.",
           summary: "Coding agent produced changed files.",
-          runnerProcess: { runner: "codex", model: "gpt-5.4-mini", status: "passed", stdout: "ok" }
+          createdAt: "2026-05-05T10:00:00Z",
+          runnerProcess: {
+            runner: "codex",
+            model: "gpt-5.4-mini",
+            status: "passed",
+            stdout: "ok",
+            durationMs: 42000,
+            tokenUsage: { inputTokens: 1200, outputTokens: 800, totalTokens: 2000 }
+          }
+        }, {
+          id: "pipeline_21:agent:implementation:architect",
+          missionId: "mission_pipeline_21",
+          stageId: "implementation",
+          agentId: "architect",
+          status: "passed",
+          prompt: "Plan the implementation.",
+          summary: "Architect agent wrote the plan and TODO list.",
+          createdAt: "2026-05-05T10:01:00Z",
+          runnerProcess: {
+            runner: "codex",
+            model: "gpt-5.4",
+            status: "passed",
+            durationMs: 18000,
+            usage: { input_tokens: 900, output_tokens: 500, total_tokens: 1400 }
+          }
+        }, {
+          id: "pipeline_21:agent:implementation:testing",
+          missionId: "mission_pipeline_21",
+          stageId: "implementation",
+          agentId: "testing",
+          status: "passed",
+          prompt: "Validate the change.",
+          summary: "Testing agent ran focused validation.",
+          createdAt: "2026-05-05T10:02:00Z",
+          runnerProcess: { runner: "codex", model: "gpt-5.4-mini", status: "passed", durationMs: 10000 }
         }]}
         proofRecords={[{
           id: "proof_1",
@@ -191,6 +244,12 @@ describe("WorkItemDetailPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     fireEvent.click(screen.getByRole("button", { name: /Review packet/i }));
     expect(screen.getByLabelText("Review packet preview")).toBeInTheDocument();
+    expect(screen.getByLabelText("Plan TODO verification")).toBeInTheDocument();
+    expect(screen.getByLabelText("Risk basis")).toBeInTheDocument();
+    expect(screen.getByText(/validation: Lint failed/i)).toBeInTheDocument();
+    expect(screen.getByText("1/3 plan TODO(s) verified for Human Review.")).toBeInTheDocument();
+    expect(screen.getByText("Show user name on the detail page.")).toBeInTheDocument();
+    expect(screen.getByText("Show loading feedback before merge.")).toBeInTheDocument();
     expect(screen.getByText("Run focused validation before approval.")).toBeInTheDocument();
     expect(screen.getByText("src/UserDetail.tsx")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
@@ -207,8 +266,19 @@ describe("WorkItemDetailPage", () => {
     expect(container.querySelector(".requirement-source-scroll")).toBeTruthy();
     expect(container.querySelectorAll(".detail-stage-grid .stage-needs-human")).toHaveLength(1);
     expect(container.querySelectorAll(".detail-stage-grid .stage-running")).toHaveLength(0);
-    expect(screen.getByText("1 agent run(s) · coding (codex · gpt-5.4-mini)")).toBeInTheDocument();
+    expect(screen.getByText(/3 agent run\(s\)/)).toBeInTheDocument();
+    expect(screen.getByText("3 runs")).toBeInTheDocument();
+    expect(screen.getByText(/3\.4k tokens/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /View agents: Implementation and PR/i }));
+    expect(screen.getByLabelText("Stage statistics")).toBeInTheDocument();
+    expect(screen.getAllByText("Architect agent wrote the plan and TODO list.").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Testing agent ran focused validation.").length).toBeGreaterThan(0);
+    expect(screen.getByText(/in 2\.1k tokens/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(screen.getByText("1 planned agent(s) · review")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /View agents: Human Review/i }));
+    expect(screen.getByText("Planned agents: review")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(screen.getByText("Agent operations")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /implementation.*coding/i }));
     expect(screen.getByText("Prompt")).toBeInTheDocument();

@@ -2,9 +2,21 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 const pagePilotTargetProxy = process.env.OMEGA_PAGE_PILOT_TARGET_URL ?? "http://127.0.0.1:3009";
+const testSuite = process.env.OMEGA_TEST_SUITE ?? "current";
+const currentTestInclude = [
+  "src/__tests__/**/*.test.{ts,tsx}",
+  "src/components/__tests__/**/*.test.{ts,tsx}"
+];
+const legacyTestInclude = [
+  "src/core/__tests__/**/*.test.ts",
+  "src/integrations/__tests__/**/*.test.ts",
+  "src/local/__tests__/**/*.test.ts"
+];
+const testInclude = testSuite === "legacy" ? legacyTestInclude : testSuite === "all" ? [...currentTestInclude, ...legacyTestInclude] : currentTestInclude;
 
 export default defineConfig({
   root: "apps/web",
+  base: "./",
   plugins: [react()],
   build: {
     outDir: "../../dist/apps/web",
@@ -26,7 +38,9 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
+    include: testInclude,
     setupFiles: "./vitest.setup.ts",
+    testTimeout: 30000,
     coverage: {
       provider: "v8",
       reporter: ["text", "html"],

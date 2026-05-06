@@ -59,4 +59,4 @@ The development shell loads `OMEGA_WEB_URL` or `http://127.0.0.1:5174/` by defau
 - Go local runtime remains the execution engine and API server.
 - Electron adds desktop-only browser capabilities for Page Pilot preview, selection injection, reload, and future process management.
 
-Packaging will later add platform-specific Go binary builds and an app builder config.
+Packaging now has a first macOS release path. See `docs/release-packaging.md` for environment requirements, build commands, GitHub Release publishing, installation, and usage notes.

@@ -410,11 +410,7 @@ export function GlobalAgentAccessPanel({
       ) : (
         <div className="provider-panel global-agent-local-auth">
           <h2>{runnerLabels[selectedRunnerId]}</h2>
-          <p>
-            {selectedRunnerId === "codex"
-              ? t("Codex uses the local Codex CLI account and model configuration. Workspace Agent Studio only chooses where this runner is used.")
-              : t("Claude Code uses the local Claude CLI account. Workspace Agent Studio only chooses where this runner is used.")}
-          </p>
+          <p>{t("Claude Code uses the local Claude CLI account. Workspace Agent Studio only chooses where this runner is used.")}</p>
         </div>
       )}
     </div>

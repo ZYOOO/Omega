@@ -1,11 +1,16 @@
 node_modules
 dist
 coverage
+.playwright-cli/
+output/
+playwright-report/
+test-results/
 .DS_Store
+*_副本.*
 *.local
 *.tsbuildinfo
 .omega
-# 。/docs
+docs/internal-dev-notes/
 .env
 .history
 .migration-backups

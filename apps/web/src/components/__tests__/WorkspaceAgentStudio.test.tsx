@@ -89,6 +89,8 @@ describe("WorkspaceAgentStudio", () => {
 
     expect(screen.queryByText("qwen-plus")).not.toBeInTheDocument();
     expect(screen.queryByText("deepseek-reasoner")).not.toBeInTheDocument();
+    expect(screen.getByText("opencode · kimi/kimi-for-coding")).toBeInTheDocument();
+    expect(screen.queryByText("opencode · gpt-5.4-mini")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Model")).toHaveValue("");
     expect(screen.getByPlaceholderText("Inherit: kimi/kimi-for-coding")).toBeInTheDocument();
     expect(screen.getByText("Inheriting kimi/kimi-for-coding.")).toBeInTheDocument();

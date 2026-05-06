@@ -69,7 +69,7 @@ type jobSupervisorTickOptions struct {
 }
 
 func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options jobSupervisorTickOptions) (map[string]any, error) {
-	databasePtr, err := server.Repo.LoadSupervisorExecutionState(ctx)
+	databasePtr, err := server.Repo.LoadJobSupervisorState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +77,7 @@ func (server *Server) reconcileAttemptIntegrity(ctx context.Context, options job
 	summary := server.reconcileAttemptIntegrityInDatabase(ctx, &database)
 	mergeSupervisorSummary(summary, server.scanWorkflowContracts(ctx, &database))
 	mergeSupervisorSummary(summary, server.scanRemoteAttemptSignals(ctx, &database, options))
-	if server.feishuReviewTaskBridgeEnabled(ctx) {
+	if server.feishuReviewTaskBridgeEnabled(ctx) && databaseHasPendingFeishuReviewTask(database) {
 		if bridgeResult, _, err := server.tickFeishuReviewTaskBridge(ctx, "", options.Limit, false); err == nil {
 			summary["feishuReviewTaskBridge"] = bridgeResult
 		} else {
@@ -191,6 +191,19 @@ func (server *Server) scanRemoteAttemptSignals(ctx context.Context, database *Wo
 		}
 	}
 	return summary
+}
+
+func databaseHasPendingFeishuReviewTask(database WorkspaceDatabase) bool {
+	for _, checkpoint := range database.Tables.Checkpoints {
+		if text(checkpoint, "status") != "pending" {
+			continue
+		}
+		review := mapValue(checkpoint["feishuReview"])
+		if text(review, "taskGuid") != "" || text(review, "taskId") != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func githubRepoSlugForRepositoryTargetID(database WorkspaceDatabase, targetID string) string {
@@ -1160,19 +1173,31 @@ func (server *Server) refreshDatabaseWhenAttemptChanged(ctx context.Context, dat
 	if database == nil || text(attempt, "id") == "" {
 		return false
 	}
-	fresh, err := server.Repo.LoadSupervisorExecutionState(ctx)
+	attempts, err := server.Repo.ListAttempts(ctx, map[string]string{"id": text(attempt, "id"), "limit": "1"})
 	if err != nil {
 		return false
 	}
-	index := findByID(fresh.Tables.Attempts, text(attempt, "id"))
-	if index < 0 {
+	if len(attempts) == 0 {
 		return false
 	}
-	freshAttempt := fresh.Tables.Attempts[index]
+	freshAttempt := attempts[0]
 	if text(freshAttempt, "status") == text(attempt, "status") && text(freshAttempt, "updatedAt") == text(attempt, "updatedAt") {
 		return false
 	}
-	*database = *fresh
+	if index := findByID(database.Tables.Attempts, text(freshAttempt, "id")); index >= 0 {
+		database.Tables.Attempts[index] = freshAttempt
+	} else {
+		database.Tables.Attempts = append(database.Tables.Attempts, freshAttempt)
+	}
+	if pipelineID := text(freshAttempt, "pipelineId"); pipelineID != "" {
+		if pipelines, err := server.Repo.ListPipelines(ctx, map[string]string{"id": pipelineID, "limit": "1"}); err == nil && len(pipelines) > 0 {
+			if pipelineIndex := findByID(database.Tables.Pipelines, pipelineID); pipelineIndex >= 0 {
+				database.Tables.Pipelines[pipelineIndex] = pipelines[0]
+			} else {
+				database.Tables.Pipelines = append(database.Tables.Pipelines, pipelines[0])
+			}
+		}
+	}
 	return true
 }
 

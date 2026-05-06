@@ -80,8 +80,10 @@ type WorkflowHookProfile struct {
 
 func workflowPipelineTemplates() []PipelineTemplate {
 	templates := []PipelineTemplate{}
-	if template, ok := loadWorkflowPipelineTemplate("devflow-pr"); ok {
-		templates = append(templates, template)
+	for _, templateID := range []string{"devflow-pr", "saas-launch"} {
+		if template, ok := loadWorkflowPipelineTemplate(templateID); ok {
+			templates = append(templates, template)
+		}
 	}
 	return templates
 }

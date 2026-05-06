@@ -30,6 +30,17 @@ const persistedRunKey = `omega-page-pilot-last-run:${storageScope}`;
 const conversationHistoryKey = `omega-page-pilot-conversation-history:${storageScope}`;
 const statusBarDockKey = `omega-page-pilot-status-dock:${storageScope}`;
 const statusBarPositionKey = `omega-page-pilot-status-position:${storageScope}`;
+const runnerStorageKey = `omega-page-pilot-agent-runner:${repositoryTargetId}`;
+const pagePilotRunnerOptions = [
+  { value: "codex", label: "Codex" },
+  { value: "claude-code", label: "Claude Code" },
+  { value: "opencode", label: "opencode" },
+  { value: "trae-agent", label: "Trae Agent" },
+];
+function normalizePagePilotRunner(value) {
+  return pagePilotRunnerOptions.some((option) => option.value === value) ? value : "codex";
+}
+let selectedRunner = normalizePagePilotRunner(pilotConfig.runner || window.localStorage.getItem(runnerStorageKey));
 
 function sourceElementFor(element) {
   const sourceElement = element.closest("[data-omega-source]");
@@ -72,6 +83,8 @@ function candidateRank(element) {
   return 1;
 }
 
+const candidateSelector = "button, a, input, textarea, select, label, [role='button'], [role='status'], [aria-live], .message, .alert, [class*='message'], [class*='toast'], [class*='notice'], [class*='error'], [class*='success'], [data-omega-source], h1, h2, h3, h4, h5, h6, p, small, strong, span, article, section, .card, .hero, [class*='card'], [class*='stat']";
+
 function visibleCandidate(element) {
   if (!(element instanceof Element)) return false;
   if (["HTML", "BODY", "SCRIPT", "STYLE"].includes(element.tagName)) return false;
@@ -86,7 +99,7 @@ function candidateForEvent(event, ignoredRoot) {
   elements.forEach((element, depth) => {
     if (!visibleCandidate(element)) return;
     candidates.push({ element, depth, rank: candidateRank(element) });
-    const nearest = element.closest("button, a, input, textarea, select, label, [role='button'], [role='status'], [aria-live], .message, .alert, [class*='message'], [class*='toast'], [class*='notice'], [class*='error'], [class*='success'], [data-omega-source], h1, h2, h3, h4, h5, h6, p, small, strong, span, article, section, .card, .hero, [class*='card'], [class*='stat']");
+    const nearest = element.closest(candidateSelector);
     if (nearest && visibleCandidate(nearest) && !ignoredRoot?.contains(nearest)) {
       candidates.push({ element: nearest, depth: depth + 0.2, rank: candidateRank(nearest) });
     }
@@ -96,6 +109,15 @@ function candidateForEvent(event, ignoredRoot) {
     return left.depth - right.depth;
   });
   return candidates[0]?.element || null;
+}
+
+function candidateForTarget(rawTarget, ignoredRoot) {
+  if (!(rawTarget instanceof Element) || ignoredRoot?.contains(rawTarget)) return null;
+  if (["HTML", "BODY", "SCRIPT", "STYLE"].includes(rawTarget.tagName)) return null;
+  const nearest = rawTarget.closest(candidateSelector);
+  const candidate = nearest && !ignoredRoot?.contains(nearest) ? nearest : rawTarget;
+  if (["HTML", "BODY", "SCRIPT", "STYLE"].includes(candidate.tagName)) return null;
+  return candidate;
 }
 
 function escapeSelector(value) {
@@ -111,7 +133,11 @@ function selectorFor(element) {
   let cursor = element;
   while (cursor && cursor !== document.body && parts.length < 5) {
     const tag = cursor.tagName.toLowerCase();
-    const className = Array.from(cursor.classList || []).slice(0, 2).map((name) => `.${escapeSelector(name)}`).join("");
+    const className = Array.from(cursor.classList || [])
+      .filter((name) => !name.startsWith("omega-pilot-"))
+      .slice(0, 2)
+      .map((name) => `.${escapeSelector(name)}`)
+      .join("");
     const parent = cursor.parentElement;
     const siblings = parent ? Array.from(parent.children).filter((child) => child.tagName === cursor.tagName) : [];
     const nth = siblings.length > 1 && parent ? `:nth-of-type(${siblings.indexOf(cursor) + 1})` : "";
@@ -152,6 +178,35 @@ function selectionFor(element) {
       rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
     },
     sourceMapping: { source, file, symbol },
+  };
+}
+
+function captureSelectionFor(element) {
+  const hadHighlight = element.classList?.contains("omega-pilot-page-highlighted");
+  if (hadHighlight) element.classList.remove("omega-pilot-page-highlighted");
+  try {
+    return selectionFor(element);
+  } finally {
+    if (hadHighlight) element.classList.add("omega-pilot-page-highlighted");
+  }
+}
+
+function directTextFor(element) {
+  let text = "";
+  element.childNodes.forEach((node) => {
+    if (node.nodeType === Node.TEXT_NODE) text += ` ${node.textContent || ""}`;
+  });
+  return text.trim().replace(/\s+/g, " ").slice(0, 120);
+}
+
+function selectionPreviewFor(element) {
+  const source = sourceFor(element);
+  const textSnapshot = directTextFor(sourceElementFor(element) || element);
+  return {
+    elementKind: kindFor(element),
+    textSnapshot,
+    sourceMapping: { source },
+    label: textSnapshot || source || element.getAttribute("aria-label") || element.tagName.toLowerCase(),
   };
 }
 
@@ -223,6 +278,9 @@ function injectStyles() {
       overflow: hidden;
       text-shadow: 0 1px 10px rgba(9, 20, 42, 0.28);
     }
+    .omega-pilot-fab:focus {
+      outline: none;
+    }
     .omega-pilot-fab::before {
       content: "";
       position: absolute;
@@ -235,8 +293,9 @@ function injectStyles() {
         #38bdf8 244deg,
         transparent 286deg 360deg
       );
-      filter: saturate(1.18);
+      opacity: 0.9;
       animation: omegaPilotRequirementOrbit 3.6s linear infinite;
+      will-change: transform;
       pointer-events: none;
     }
     .omega-pilot-fab::after {
@@ -274,7 +333,6 @@ function injectStyles() {
       font-weight: 900;
       pointer-events: auto;
       cursor: pointer;
-      backdrop-filter: blur(14px);
       overflow: hidden;
       transform: translateY(-50%);
       transition: width 160ms ease, background 160ms ease, box-shadow 160ms ease, color 160ms ease;
@@ -325,21 +383,38 @@ function injectStyles() {
     .omega-pilot-fab:hover:not(:disabled),
     .omega-pilot-fab:focus-visible {
       transform: translateY(-1px);
-      box-shadow: 0 22px 48px rgba(20, 184, 166, 0.28);
+      box-shadow:
+        0 0 0 3px rgba(51, 112, 255, 0.18),
+        0 22px 48px rgba(20, 184, 166, 0.28);
     }
     @keyframes omegaPilotRequirementOrbit {
       to { transform: rotate(1turn); }
     }
     .omega-pilot-highlight {
       position: fixed;
+      left: 0;
+      top: 0;
       border: 2px solid #1d9bf0;
       border-radius: 8px;
       background: rgba(29, 155, 240, 0.14);
-      box-shadow: 0 0 0 9999px rgba(15, 23, 42, 0.34);
+      outline: 3px solid rgba(51, 112, 255, 0.2);
+      box-shadow: 0 8px 22px rgba(15, 23, 42, 0.16);
       pointer-events: none;
+      contain: layout paint style;
+      will-change: transform, width, height;
+    }
+    .omega-pilot-page-highlighted {
+      outline: 2px solid #1d9bf0 !important;
+      outline-offset: 3px !important;
+      box-shadow: 0 0 0 4px rgba(51, 112, 255, 0.18) !important;
+    }
+    html.omega-pilot-selecting body {
+      cursor: crosshair;
     }
     .omega-pilot-tooltip {
       position: fixed;
+      left: 0;
+      top: 0;
       min-width: 230px;
       max-width: 360px;
       padding: 10px 12px;
@@ -348,8 +423,9 @@ function injectStyles() {
       background: var(--omega-feishu-bg);
       color: var(--omega-feishu-text);
       box-shadow: var(--omega-feishu-shadow);
-      backdrop-filter: blur(18px);
       pointer-events: none;
+      contain: layout paint style;
+      will-change: transform;
     }
     .omega-pilot-tooltip strong,
     .omega-pilot-tooltip span,
@@ -400,7 +476,7 @@ function injectStyles() {
       left: 50%;
       bottom: 24px;
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(150px, 190px) 1fr auto;
       gap: 10px 12px;
       align-items: center;
       width: min(820px, calc(100vw - 40px));
@@ -412,7 +488,6 @@ function injectStyles() {
       box-shadow: var(--omega-feishu-shadow);
       transform: translateX(-50%);
       pointer-events: auto;
-      backdrop-filter: blur(18px);
     }
     .omega-pilot-chip-row {
       grid-column: 1 / -1;
@@ -420,6 +495,34 @@ function injectStyles() {
       flex-wrap: wrap;
       gap: 7px;
       align-items: center;
+    }
+    .omega-pilot-runner-field {
+      display: grid;
+      gap: 4px;
+      align-self: stretch;
+      min-width: 0;
+      color: var(--omega-feishu-muted);
+      font-size: 11px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+    .omega-pilot-runner-field select {
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid var(--omega-feishu-border);
+      border-radius: 12px;
+      padding: 0 10px;
+      background: var(--omega-feishu-surface);
+      color: var(--omega-feishu-text);
+      font: inherit;
+      font-size: 14px;
+      font-weight: 850;
+      text-transform: none;
+    }
+    .omega-pilot-runner-field select:focus {
+      border-color: var(--omega-feishu-border-strong);
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(51, 112, 255, 0.12);
     }
     .omega-pilot-chip-row span,
     .omega-pilot-chip-row button.omega-pilot-chip {
@@ -574,7 +677,6 @@ function injectStyles() {
       box-shadow: var(--omega-feishu-shadow);
       transform: translateX(-50%);
       pointer-events: auto;
-      backdrop-filter: blur(18px);
       transition: width 160ms ease, border-radius 160ms ease, transform 160ms ease, opacity 160ms ease;
     }
     .omega-pilot-topbar.is-tucked {
@@ -782,7 +884,6 @@ function injectStyles() {
       box-shadow: var(--omega-feishu-shadow);
       transform: translateX(-50%);
       pointer-events: auto;
-      backdrop-filter: blur(18px);
     }
     .omega-pilot-badge {
       display: grid;
@@ -854,7 +955,6 @@ function injectStyles() {
       background: var(--omega-feishu-bg);
       box-shadow: var(--omega-feishu-shadow);
       pointer-events: auto;
-      backdrop-filter: blur(18px);
     }
     .omega-pilot-choice button {
       width: 42px;
@@ -1027,10 +1127,20 @@ window.addEventListener("DOMContentLoaded", () => {
   let run = null;
   let highlight = null;
   let tooltip = null;
+  let tooltipKind = null;
+  let tooltipText = null;
+  let tooltipSource = null;
   let composer = null;
   let choice = null;
   let status = null;
   let tray = null;
+  let pendingHighlight = null;
+  let highlightFrame = 0;
+  let lastPointerCandidateAt = 0;
+  let lastPointerRawTarget = null;
+  let lastPointerClientX = 24;
+  let lastPointerClientY = 24;
+  let hoverPausedUntil = 0;
   let globalInstruction = "";
   let historyExpanded = false;
   let statusBarExpanded = false;
@@ -1062,32 +1172,55 @@ window.addEventListener("DOMContentLoaded", () => {
       tooltip?.remove();
       highlight = null;
       tooltip = null;
+      tooltipKind = null;
+      tooltipText = null;
+      tooltipSource = null;
       return;
     }
-    const selection = selectionFor(element);
     const rect = element.getBoundingClientRect();
+    if (rect.width <= 1 || rect.height <= 1) {
+      setHighlight(null);
+      return;
+    }
     if (!highlight) {
       highlight = createElement("div", "omega-pilot-highlight");
       root.appendChild(highlight);
     }
     Object.assign(highlight.style, {
-      left: `${rect.left}px`,
-      top: `${rect.top}px`,
-      width: `${rect.width}px`,
-      height: `${rect.height}px`,
+      transform: `translate3d(${Math.round(rect.left)}px, ${Math.round(rect.top)}px, 0)`,
+      width: `${Math.round(rect.width)}px`,
+      height: `${Math.round(rect.height)}px`,
     });
-    if (!tooltip) {
-      tooltip = createElement("div", "omega-pilot-tooltip");
-      root.appendChild(tooltip);
-    }
-    tooltip.innerHTML = "";
-    tooltip.appendChild(createElement("span", "", selection.elementKind));
-    tooltip.appendChild(createElement("strong", "", selection.textSnapshot || selection.stableSelector || element.tagName.toLowerCase()));
-    tooltip.appendChild(createElement("small", "", selection.sourceMapping.source || "DOM context captured"));
-    Object.assign(tooltip.style, {
-      left: `${Math.min(Math.max(12, rect.left), window.innerWidth - 380)}px`,
-      top: `${Math.max(12, rect.top - 96)}px`,
+    tooltip?.remove();
+    tooltip = null;
+    tooltipKind = null;
+    tooltipText = null;
+    tooltipSource = null;
+  }
+
+  function scheduleHighlight(element, clientX, clientY) {
+    if (!element || element === hovered) return;
+    lastPointerClientX = clientX;
+    lastPointerClientY = clientY;
+    pendingHighlight = element;
+    if (highlightFrame) return;
+    highlightFrame = window.requestAnimationFrame(() => {
+      highlightFrame = 0;
+      setHighlight(pendingHighlight);
+      pendingHighlight = null;
     });
+  }
+
+  function scheduleHighlightFromPointer(event) {
+    const now = performance.now();
+    if (now < hoverPausedUntil) return;
+    if (now - lastPointerCandidateAt < 48) return;
+    lastPointerRawTarget = event.target;
+    lastPointerCandidateAt = now;
+    lastPointerClientX = event.clientX;
+    lastPointerClientY = event.clientY;
+    const candidate = candidateForEvent(event, root);
+    if (candidate && !root.contains(candidate)) scheduleHighlight(candidate, event.clientX, event.clientY);
   }
 
   function clearChoice() {
@@ -1107,6 +1240,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   function startSelecting(message = "继续选择下一个元素，或在底部补充整体需求。") {
     selecting = true;
+    document.documentElement.classList.add("omega-pilot-selecting");
     document.body.style.cursor = "crosshair";
     fab.querySelector("span").textContent = "×";
     setStatus(message);
@@ -1114,7 +1248,13 @@ window.addEventListener("DOMContentLoaded", () => {
 
   function stopSelecting(options = {}) {
     selecting = false;
+    document.documentElement.classList.remove("omega-pilot-selecting");
     document.body.style.cursor = "";
+    if (highlightFrame) {
+      window.cancelAnimationFrame(highlightFrame);
+      highlightFrame = 0;
+      pendingHighlight = null;
+    }
     if (!options.keepHighlight) setHighlight(null);
     fab.querySelector("span").textContent = "☝";
   }
@@ -1441,11 +1581,30 @@ window.addEventListener("DOMContentLoaded", () => {
       window.location.reload();
       return { ok: true, action: "browser-reload" };
     }
-    const result = await ipcRenderer.invoke("omega-preview:reload", {
+    const payload = {
       reason,
       runId: runRecord?.id || "",
       changedFiles: runRecord?.changedFiles || [],
-    });
+    };
+    const fallbackMs = Number(pilotConfig.previewReloadFallbackMs || 3500);
+    const result = await Promise.race([
+      ipcRenderer.invoke("omega-preview:reload", payload),
+      new Promise((resolve) => {
+        window.setTimeout(() => {
+          resolve({
+            ok: true,
+            action: "browser-reload",
+            browserReload: true,
+            status: "renderer-fallback",
+            message: "Preview reload IPC did not finish quickly; reloading from the pilot page.",
+          });
+        }, fallbackMs);
+      }),
+    ]);
+    if (result?.status === "renderer-fallback") {
+      window.location.reload();
+      return result;
+    }
     if (!result?.ok) {
       throw new Error(result?.error || "Preview Runtime refresh failed.");
     }
@@ -1557,6 +1716,22 @@ window.addEventListener("DOMContentLoaded", () => {
     if (annotations.length === 0) return;
     tray = createElement("div", "omega-pilot-tray");
     const chipRow = renderAnnotationHistory(annotations, renderTray, { editable: true });
+    const runnerField = createElement("label", "omega-pilot-runner-field");
+    const runnerLabel = createElement("span", "", "Agent");
+    const runnerSelect = document.createElement("select");
+    pagePilotRunnerOptions.forEach((option) => {
+      const item = document.createElement("option");
+      item.value = option.value;
+      item.textContent = option.label;
+      runnerSelect.appendChild(item);
+    });
+    runnerSelect.value = selectedRunner;
+    runnerSelect.addEventListener("change", () => {
+      selectedRunner = normalizePagePilotRunner(runnerSelect.value);
+      window.localStorage.setItem(runnerStorageKey, selectedRunner);
+      setStatus(`Page Pilot Agent 已切换为 ${pagePilotRunnerOptions.find((option) => option.value === selectedRunner)?.label || selectedRunner}。`);
+    });
+    runnerField.append(runnerLabel, runnerSelect);
     const input = document.createElement("textarea");
     input.className = "omega-pilot-global-input";
     input.placeholder = "继续描述整体修改需求，或者继续点击右下角手指选择更多元素...";
@@ -1570,7 +1745,7 @@ window.addEventListener("DOMContentLoaded", () => {
       globalInstruction = input.value;
     });
     actions.append(submit, clear);
-    tray.append(chipRow, input, actions);
+    tray.append(chipRow, runnerField, input, actions);
     root.appendChild(tray);
     input.focus();
 
@@ -1596,7 +1771,7 @@ window.addEventListener("DOMContentLoaded", () => {
       const events = [
         processEvent(`Captured ${submittedAnnotations.length} page annotation(s).`),
         processEvent(`Primary target: ${annotationLabel(primary)} (${primary.selection.sourceMapping.source || "DOM-only"}).`),
-        processEvent("Submitting selection context to the single Page Pilot Agent."),
+        processEvent(`Submitting selection context to ${pagePilotRunnerOptions.find((option) => option.value === selectedRunner)?.label || selectedRunner}.`),
       ];
       resetAnnotations();
       historyExpanded = false;
@@ -1607,7 +1782,7 @@ window.addEventListener("DOMContentLoaded", () => {
           runId: run?.status === "applied" ? run.id : undefined,
           projectId,
           repositoryTargetId,
-          runner: "profile",
+          runner: selectedRunner,
           instruction,
           selection: primary.selection,
           conversationBatch: batch,
@@ -1760,6 +1935,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   fab.addEventListener("click", () => {
     selecting = !selecting;
+    document.documentElement.classList.toggle("omega-pilot-selecting", selecting);
     fab.querySelector("span").textContent = selecting ? "×" : "☝";
     document.body.style.cursor = selecting ? "crosshair" : "";
     if (selecting) setHighlight(null);
@@ -1769,9 +1945,15 @@ window.addEventListener("DOMContentLoaded", () => {
 
   document.addEventListener("pointermove", (event) => {
     if (!selecting) return;
-    const candidate = candidateForEvent(event, root);
-    if (candidate && !root.contains(candidate)) setHighlight(candidate);
-  }, true);
+    scheduleHighlightFromPointer(event);
+  }, { capture: true, passive: true });
+
+  document.addEventListener("scroll", () => {
+    if (!selecting) return;
+    hoverPausedUntil = performance.now() + 140;
+    lastPointerRawTarget = null;
+    setHighlight(null);
+  }, { capture: true, passive: true });
 
   document.addEventListener("click", (event) => {
     if (!selecting) return;
@@ -1779,7 +1961,8 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!candidate || root.contains(candidate)) return;
     event.preventDefault();
     event.stopPropagation();
-    selected = selectionFor(candidate);
+    selected = captureSelectionFor(candidate);
+    setHighlight(candidate);
     stopSelecting({ keepHighlight: true });
     showChoice(candidate, selected);
   }, true);

@@ -24,14 +24,16 @@ describe("App operator view", () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    expect(await screen.findByText("Welcome back to Omega")).toBeInTheDocument();
-    expect(screen.getByText("AI DevFlow Workbench")).toBeInTheDocument();
+    expect(await screen.findByText("Omega AI DevFlow")).toBeInTheDocument();
+    expect(screen.getByText("Local-first DevFlow loop")).toBeInTheDocument();
+    expect(screen.getAllByText("Feature 2").length).toBeGreaterThan(0);
     expect(screen.getAllByRole("button", { name: "Open Workboard" }).length).toBeGreaterThan(0);
 
     fireEvent.change(screen.getByLabelText("Switch language"), { target: { value: "zh-CN" } });
-    expect(await screen.findByText("张涌，欢迎回到 Omega")).toBeInTheDocument();
-    expect(screen.getByText("AI DevFlow 工作台")).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "打开 Workboard" }).length).toBeGreaterThan(0);
+    expect(await screen.findByText("比赛演示入口")).toBeInTheDocument();
+    expect(screen.getByText("Local-first DevFlow 闭环")).toBeInTheDocument();
+    expect(screen.getAllByText("功能二").length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "进入 Workboard" }).length).toBeGreaterThan(0);
   });
 
   it("creates manual work items with a local repository target path", async () => {
@@ -716,7 +718,7 @@ describe("App operator view", () => {
       if (url.endsWith("/local-workspace-root")) {
         return Promise.resolve(jsonResponse({ workspaceRoot: "" }));
       }
-      if (url.endsWith("/page-pilot/runs")) {
+      if (url.endsWith("/page-pilot/runs") || url.includes("/page-pilot/runs?")) {
         return Promise.resolve(jsonResponse([]));
       }
       if (url.endsWith("/llm-providers") || url.endsWith("/pipeline-templates") || url.endsWith("/agent-definitions") || url.endsWith("/pipelines") || url.endsWith("/checkpoints") || url.endsWith("/local-capabilities") || url.endsWith("/requirements") || url.endsWith("/attempts") || url.endsWith("/proof-records") || url.endsWith("/run-workpads") || url.endsWith("/operations") || url.includes("/runtime-logs") || url.endsWith("/runner-credentials") || url.endsWith("/execution-locks") || url.endsWith("/orchestrator/watchers")) {
@@ -1460,7 +1462,7 @@ describe("App operator view", () => {
         expect(item).toMatchObject({
           title: "Create an empty docs file",
           source: "manual",
-          target: "https://github.com/acme/demo",
+          target: "acme/demo",
           repositoryTargetId: "repo_acme_demo"
         });
         workspaceSnapshot = {
@@ -1492,7 +1494,7 @@ describe("App operator view", () => {
         const { item } = JSON.parse(String(init?.body));
         expect(item).toMatchObject({
           source: "manual",
-          target: "https://github.com/acme/demo",
+          target: "acme/demo",
           repositoryTargetId: "repo_acme_demo"
         });
         return Promise.resolve(jsonResponse({
@@ -1820,7 +1822,7 @@ describe("App operator view", () => {
     );
   });
 
-  it("can run a DevFlow PR cycle from the operator pipeline list", async () => {
+  it("can run a workflow-backed SaaS Launch cycle from the operator pipeline list", async () => {
     vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
 
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -1845,10 +1847,10 @@ describe("App operator view", () => {
         return Promise.resolve(jsonResponse({ providerId: "openai", model: "gpt-5.4-mini", reasoningEffort: "medium" }));
       }
       if (url.endsWith("/pipeline-templates")) {
-        return Promise.resolve(jsonResponse([{ id: "devflow-pr", name: "DevFlow PR cycle", description: "", stages: [{ id: "todo" }, { id: "done" }] }]));
+        return Promise.resolve(jsonResponse([{ id: "saas-launch", name: "SaaS Launch Flow", description: "", stages: [{ id: "todo" }, { id: "done" }] }]));
       }
       if (url.endsWith("/pipelines")) {
-        return Promise.resolve(jsonResponse([{ id: "pipeline_item_1", workItemId: "item_1", status: "running", templateId: "devflow-pr", run: { stages: [] } }]));
+        return Promise.resolve(jsonResponse([{ id: "pipeline_item_1", workItemId: "item_1", status: "running", templateId: "saas-launch", run: { stages: [] } }]));
       }
       if (url.endsWith("/pipelines/pipeline_item_1/run-devflow-cycle")) {
         expect(init).toMatchObject({ method: "POST" });
@@ -1858,7 +1860,7 @@ describe("App operator view", () => {
           branchName: "omega/OMG-1-devflow-cycle",
           pullRequestUrl: "https://github.com/acme/demo/pull/123",
           proofFiles: ["/tmp/proof.md"],
-          pipeline: { id: "pipeline_item_1", workItemId: "item_1", status: "done", templateId: "devflow-pr", run: { stages: [] } }
+          pipeline: { id: "pipeline_item_1", workItemId: "item_1", status: "done", templateId: "saas-launch", run: { stages: [] } }
         }));
       }
       if (url.endsWith("/github/oauth/config")) {
@@ -2433,7 +2435,7 @@ describe("App operator view", () => {
           ]
         }]));
       }
-      if (url.endsWith("/attempts/pipeline_item_review%3Aattempt%3A1/timeline")) {
+      if (url.includes("/attempts/pipeline_item_review%3Aattempt%3A1/timeline")) {
         return Promise.resolve(jsonResponse({
           attempt: { id: "pipeline_item_review:attempt:1", itemId: "item_review", pipelineId: "pipeline_item_review", status: "waiting-human" },
           pipeline: { id: "pipeline_item_review", workItemId: "item_review", status: "waiting-human" },

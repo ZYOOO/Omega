@@ -133,7 +133,7 @@ func (server *Server) prepareDevFlowAttemptRetry(ctx context.Context, database W
 	}
 	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
 	if !isDevFlowPRTemplate(text(pipeline, "templateId")) {
-		return database, nil, nil, attemptRetryError{status: http.StatusConflict, message: "pipeline is not using the devflow-pr template"}
+		return database, nil, nil, attemptRetryError{status: http.StatusConflict, message: "pipeline is not using a runnable DevFlow template"}
 	}
 	if active := activeAttemptForPipeline(database, text(pipeline, "id"), attemptID); active != "" {
 		return database, nil, nil, attemptRetryError{status: http.StatusConflict, message: "pipeline already has an active attempt: " + active}
@@ -211,7 +211,7 @@ func (server *Server) prepareDevFlowHumanRequestedRework(ctx context.Context, da
 	}
 	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
 	if !isDevFlowPRTemplate(text(pipeline, "templateId")) {
-		return database, nil, nil, attemptRetryError{status: http.StatusConflict, message: "pipeline is not using the devflow-pr template"}
+		return database, nil, nil, attemptRetryError{status: http.StatusConflict, message: "pipeline is not using a runnable DevFlow template"}
 	}
 	previousAttemptIndex := attemptIndexForCheckpoint(database, checkpoint)
 	if previousAttemptIndex < 0 {

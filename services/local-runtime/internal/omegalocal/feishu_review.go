@@ -994,6 +994,12 @@ func buildFeishuReviewCardWithOptions(packet map[string]any, options feishuRevie
 	if summary := text(reviewPacket, "summary"); summary != "" {
 		elements = append(elements, map[string]any{"tag": "markdown", "content": "**" + feishuLabel(lang, "Review packet", "审核包") + "**\n" + truncateForProof(summary, 900)})
 	}
+	if riskBasis := renderFeishuRiskBasisMarkdown(reviewPacket, lang, 4); riskBasis != "" {
+		elements = append(elements, map[string]any{"tag": "markdown", "content": riskBasis})
+	}
+	if todoMarkdown := renderFeishuTodoCompletionMarkdown(reviewPacket, lang, 6); todoMarkdown != "" {
+		elements = append(elements, map[string]any{"tag": "markdown", "content": todoMarkdown})
+	}
 	actions := []any{}
 	if reviewURL != "" {
 		actions = append(actions, map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": feishuLabel(lang, "Open review", "打开审核")}, "type": "default", "url": reviewURL})
@@ -1056,6 +1062,12 @@ func buildFeishuReviewDocMarkdown(packet map[string]any, language ...string) str
 		for _, reason := range stringSlice(risk["reasons"]) {
 			lines = append(lines, "- "+reason)
 		}
+		if basis := renderFeishuRiskBasisMarkdown(reviewPacket, lang, 12); basis != "" {
+			lines = append(lines, "", basis)
+		}
+	}
+	if todoMarkdown := renderFeishuTodoCompletionMarkdown(reviewPacket, lang, 24); todoMarkdown != "" {
+		lines = append(lines, "", todoMarkdown)
 	}
 	if diff := mapValue(reviewPacket["diffPreview"]); len(diff) > 0 {
 		lines = append(lines, "", "## "+feishuLabel(lang, "Diff preview", "Diff 预览"), "", "```diff", truncateForProof(text(diff, "patchExcerpt"), 5000), "```")
@@ -1088,6 +1100,9 @@ func renderFeishuReviewText(packet map[string]any, language ...string) string {
 	if risk != "" {
 		lines = append(lines, feishuLabel(lang, "Risk", "风险")+": "+risk)
 	}
+	if riskLines := renderFeishuRiskBasisPlain(reviewPacket, lang, 4); len(riskLines) > 0 {
+		lines = append(lines, riskLines...)
+	}
 	if prURL := text(attempt, "pullRequestUrl"); prURL != "" {
 		lines = append(lines, "PR: "+prURL)
 	}
@@ -1100,8 +1115,117 @@ func renderFeishuReviewText(packet map[string]any, language ...string) string {
 	if summary := text(reviewPacket, "summary"); summary != "" {
 		lines = append(lines, "", feishuLabel(lang, "🧾 Review packet", "🧾 Review packet"), truncateForProof(summary, 700))
 	}
+	if todoLines := renderFeishuTodoCompletionPlain(reviewPacket, lang, 6); len(todoLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, todoLines...)
+	}
 	lines = append(lines, "", feishuLabel(lang, "🛠️ Review actions", "🛠️ 审核动作"), feishuLabel(lang, "Approve or Request changes in Omega. In Feishu task mode, completing the task approves delivery; comments with requested changes route to rework.", "在 Omega 中 Approve 或 Request changes；如果是飞书任务模式，完成任务表示审核通过；评论修改意见会进入 rework。"))
 	return strings.Join(lines, "\n")
+}
+
+func renderFeishuRiskBasisMarkdown(reviewPacket map[string]any, lang string, limit int) string {
+	risk := mapValue(reviewPacket["risk"])
+	basis := arrayMaps(risk["basis"])
+	if len(basis) == 0 {
+		return ""
+	}
+	lines := []string{"**" + feishuLabel(lang, "Risk basis", "风险依据") + "**"}
+	for index, entry := range basis {
+		if index >= limit {
+			lines = append(lines, fmt.Sprintf("- ... %d more", len(basis)-index))
+			break
+		}
+		lines = append(lines, fmt.Sprintf("- `%s` %s: %s", stringOr(text(entry, "level"), "unknown"), stringOr(text(entry, "source"), "source"), truncateForProof(oneLine(stringOr(text(entry, "evidence"), text(entry, "reason"))), 180)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderFeishuRiskBasisPlain(reviewPacket map[string]any, lang string, limit int) []string {
+	risk := mapValue(reviewPacket["risk"])
+	basis := arrayMaps(risk["basis"])
+	if len(basis) == 0 {
+		return nil
+	}
+	lines := []string{feishuLabel(lang, "Risk basis:", "风险依据:")}
+	for index, entry := range basis {
+		if index >= limit {
+			lines = append(lines, fmt.Sprintf("... %d more", len(basis)-index))
+			break
+		}
+		lines = append(lines, fmt.Sprintf("- %s/%s: %s", stringOr(text(entry, "level"), "unknown"), stringOr(text(entry, "source"), "source"), truncateForProof(oneLine(stringOr(text(entry, "evidence"), text(entry, "reason"))), 180)))
+	}
+	return lines
+}
+
+func renderFeishuTodoCompletionMarkdown(reviewPacket map[string]any, lang string, limit int) string {
+	completion := mapValue(reviewPacket["todoCompletion"])
+	if len(completion) == 0 || text(completion, "status") == "not_captured" {
+		return ""
+	}
+	lines := []string{"**" + feishuLabel(lang, "Plan / TODO verification", "Plan / TODO 复核") + "**"}
+	if summary := text(completion, "summary"); summary != "" {
+		lines = append(lines, truncateForProof(summary, 500))
+	}
+	lines = append(lines, renderFeishuTodoCompletionMarkdownGroup(feishuLabel(lang, "Functional TODO", "功能 TODO"), arrayMaps(completion["functional"]), limit)...)
+	remaining := limit - (len(lines) - 2)
+	if remaining < 0 {
+		remaining = 0
+	}
+	lines = append(lines, renderFeishuTodoCompletionMarkdownGroup(feishuLabel(lang, "Project TODO", "项目 TODO"), arrayMaps(completion["project"]), remaining)...)
+	return strings.Join(lines, "\n")
+}
+
+func renderFeishuTodoCompletionMarkdownGroup(title string, items []map[string]any, limit int) []string {
+	if len(items) == 0 || limit <= 0 {
+		return []string{}
+	}
+	lines := []string{"", title}
+	for index, item := range items {
+		if index >= limit {
+			lines = append(lines, fmt.Sprintf("- ... %d more", len(items)-index))
+			break
+		}
+		lines = append(lines, fmt.Sprintf("- %s %s", feishuTodoStatusIcon(text(item, "status")), truncateForProof(text(item, "text"), 180)))
+	}
+	return lines
+}
+
+func renderFeishuTodoCompletionPlain(reviewPacket map[string]any, lang string, limit int) []string {
+	completion := mapValue(reviewPacket["todoCompletion"])
+	if len(completion) == 0 || text(completion, "status") == "not_captured" {
+		return nil
+	}
+	lines := []string{feishuLabel(lang, "✅ Plan / TODO verification", "✅ Plan / TODO 复核")}
+	if summary := text(completion, "summary"); summary != "" {
+		lines = append(lines, truncateForProof(oneLine(summary), 500))
+	}
+	appendPlainGroup := func(title string, items []map[string]any) {
+		if len(items) == 0 || len(lines) >= limit+2 {
+			return
+		}
+		lines = append(lines, title)
+		for index, item := range items {
+			if len(lines) >= limit+2 {
+				lines = append(lines, fmt.Sprintf("... %d more", len(items)-index))
+				return
+			}
+			lines = append(lines, fmt.Sprintf("%s %s", feishuTodoStatusIcon(text(item, "status")), truncateForProof(oneLine(text(item, "text")), 180)))
+		}
+	}
+	appendPlainGroup(feishuLabel(lang, "Functional TODO", "功能 TODO"), arrayMaps(completion["functional"]))
+	appendPlainGroup(feishuLabel(lang, "Project TODO", "项目 TODO"), arrayMaps(completion["project"]))
+	return lines
+}
+
+func feishuTodoStatusIcon(status string) string {
+	switch status {
+	case "verified":
+		return "✅"
+	case "attention":
+		return "⚠️"
+	default:
+		return "○"
+	}
 }
 
 func sendFeishuWebhookInteractiveCard(ctx context.Context, webhook string, card map[string]any) (map[string]any, error) {

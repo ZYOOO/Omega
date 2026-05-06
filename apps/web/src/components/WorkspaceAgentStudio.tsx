@@ -249,6 +249,12 @@ function inheritedModelLabel(runner: string, runnerCredentials: RunnerCredential
   return "Global runner default";
 }
 
+function effectiveAgentModelLabel(profile: AgentProfileDraft, runnerCredentials: RunnerCredentialInfo[], preflight?: AgentRunnerPreflightResult) {
+  const override = modelOverrideValue(profile.model);
+  if (override) return override;
+  return preflight?.effectiveModel || inheritedModelLabel(profile.runner, runnerCredentials);
+}
+
 function lines(value: string) {
   return value.split("\n").map((line) => line.trim()).filter(Boolean);
 }
@@ -670,7 +676,7 @@ export function WorkspaceAgentStudio({
                       onClick={() => onSelectAgentProfile(profile.id)}
                     >
                       <strong>{profile.label}</strong>
-                      <small>{profile.runner} · {profile.model}</small>
+                      <small>{profile.runner} · {effectiveAgentModelLabel(profile, runnerCredentials, agentPreflightResults[profile.id])}</small>
                     </button>
                   ))}
                 </div>
@@ -781,7 +787,7 @@ export function WorkspaceAgentStudio({
                         onClick={() => onSelectAgentProfile(profile.id)}
                       >
                         <strong>{profile.label}</strong>
-                        <span>{profile.runner} · {profile.model}</span>
+                        <span>{profile.runner} · {effectiveAgentModelLabel(profile, runnerCredentials, preflight)}</span>
                         <small className={`agent-preflight-chip ${preflightClass}`}>
                           {preflight?.status === "ready" ? "tested" : preflight?.status === "failed" ? "failed" : runnerReady ? "test needed" : "missing"}
                         </small>

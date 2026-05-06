@@ -75,7 +75,16 @@ func (server *Server) pagePilotApply(response http.ResponseWriter, request *http
 }
 
 func (server *Server) listPagePilotRuns(response http.ResponseWriter, request *http.Request) {
-	runs, err := server.Repo.ListPagePilotRuns(request.Context())
+	query := request.URL.Query()
+	options := PagePilotRunListOptions{
+		ID:                 strings.TrimSpace(query.Get("id")),
+		ProjectID:          strings.TrimSpace(query.Get("projectId")),
+		RepositoryTargetID: strings.TrimSpace(query.Get("repositoryTargetId")),
+		Status:             strings.TrimSpace(query.Get("status")),
+		Limit:              intValueFromString(query.Get("limit")),
+		Compact:            strings.EqualFold(query.Get("compact"), "true") || query.Get("compact") == "1",
+	}
+	runs, err := server.Repo.ListPagePilotRuns(request.Context(), options)
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, err)
 		return
@@ -85,7 +94,34 @@ func (server *Server) listPagePilotRuns(response http.ResponseWriter, request *h
 			runs = legacyRuns
 		}
 	}
+	runs = filterPagePilotRuns(runs, options)
 	writeJSON(response, http.StatusOK, runs)
+}
+
+func filterPagePilotRuns(runs []map[string]any, options PagePilotRunListOptions) []map[string]any {
+	if len(runs) == 0 {
+		return runs
+	}
+	filtered := make([]map[string]any, 0, len(runs))
+	for _, run := range runs {
+		if options.ID != "" && text(run, "id") != options.ID {
+			continue
+		}
+		if options.ProjectID != "" && text(run, "projectId") != options.ProjectID {
+			continue
+		}
+		if options.RepositoryTargetID != "" && text(run, "repositoryTargetId") != options.RepositoryTargetID {
+			continue
+		}
+		if options.Status != "" && text(run, "status") != options.Status {
+			continue
+		}
+		filtered = append(filtered, run)
+		if options.Limit > 0 && len(filtered) >= options.Limit {
+			break
+		}
+	}
+	return filtered
 }
 
 func (server *Server) discardPagePilotRun(response http.ResponseWriter, request *http.Request) {
@@ -164,6 +200,7 @@ func (server *Server) executePagePilotApply(ctx context.Context, payload pagePil
 		server.logError(ctx, "page_pilot.apply.preflight_failed", err.Error(), map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "runner": runnerID})
 		return nil, err
 	}
+	payload.Runner = effectiveRunner
 	server.logDebug(ctx, "page_pilot.apply.runner_selected", "Page Pilot runner selected.", map[string]any{"projectId": payload.ProjectID, "repositoryTargetId": payload.RepositoryTargetID, "runner": effectiveRunner, "repositoryPath": repoPath})
 	annotations := pagePilotSubmittedAnnotations(payload.ConversationBatch, payload.SubmittedAnnotations, payload.Selection)
 	sourceMappingReport := pagePilotSourceMappingReport(annotations, payload.Selection)
@@ -365,7 +402,7 @@ func (server *Server) executePagePilotDeliver(ctx context.Context, payload pageP
 		return nil, fmt.Errorf("commit page pilot changes: %w", err)
 	}
 	commitSha, _ := runCommand(repoPath, "git", "rev-parse", "HEAD")
-	commitDiff, _ := runCommand(repoPath, "git", "diff", "HEAD~1..HEAD")
+	commitDiff, _, _ := gitHeadDiff(repoPath)
 	prURL := ""
 	if text(target, "kind") == "github" {
 		_, _ = runCommand(repoPath, "gh", "auth", "setup-git")
@@ -485,7 +522,7 @@ func (server *Server) executePagePilotDiscard(ctx context.Context, runID string)
 	if err := server.Repo.SetPagePilotRun(ctx, record); err != nil {
 		return nil, err
 	}
-	_ = server.updatePagePilotWorkItemStatus(ctx, text(record, "workItemId"), "Blocked", text(record, "pipelineId"), "discarded")
+	_ = server.updatePagePilotWorkItemStatus(ctx, text(record, "workItemId"), "Canceled", text(record, "pipelineId"), "discarded")
 	_ = server.syncPagePilotRunRecords(ctx, record, "delivery")
 	_ = releasePagePilotRunExecutionLock(ctx, server, record, "released-after-discard")
 	server.logInfo(ctx, "page_pilot.discard.discarded", "Page Pilot local source changes discarded.", map[string]any{"entityType": "page-pilot-run", "entityId": runID, "projectId": text(record, "projectId"), "repositoryTargetId": text(record, "repositoryTargetId"), "workItemId": text(record, "workItemId"), "pipelineId": text(record, "pipelineId")})
@@ -752,6 +789,7 @@ func (server *Server) ensurePagePilotWorkItem(ctx context.Context, payload pageP
 			"selectionContext": selectionRecord(payload.Selection),
 			"agentMode":        "single-page-pilot-agent",
 			"executionMode":    "live-preview",
+			"runner":           stringOr(payload.Runner, "profile"),
 		},
 	}
 	database = appendWorkItem(database, item)
@@ -822,6 +860,7 @@ func makePagePilotPipeline(item map[string]any, payload pagePilotApplyRequest) m
 				"id":             "page-pilot",
 				"name":           "Page Pilot Agent",
 				"role":           "Preview runtime, page editing, and delivery",
+				"runner":         stringOr(payload.Runner, "profile"),
 				"inputContract":  []any{"selection-context", "preview-runtime-profile", "user-instruction"},
 				"outputContract": []any{"source-patch", "diff-summary", "delivery-proof"},
 			}},
@@ -831,6 +870,7 @@ func makePagePilotPipeline(item map[string]any, payload pagePilotApplyRequest) m
 				"templateId":         "page-pilot",
 				"repositoryTargetId": text(item, "repositoryTargetId"),
 				"executionMode":      "live-preview",
+				"runner":             stringOr(payload.Runner, "profile"),
 			},
 			"workflow": map[string]any{
 				"id":   "page-pilot",
@@ -840,10 +880,11 @@ func makePagePilotPipeline(item map[string]any, payload pagePilotApplyRequest) m
 				{"from": "preview_runtime", "to": "page_editing", "artifact": "preview-runtime-profile"},
 				{"from": "page_editing", "to": "delivery", "artifact": "source-patch"},
 			},
-			"selectedCapabilities": map[string]any{"agentMode": "single-page-pilot-agent", "executionMode": "live-preview"},
+			"selectedCapabilities": map[string]any{"agentMode": "single-page-pilot-agent", "executionMode": "live-preview", "runner": stringOr(payload.Runner, "profile")},
 			"artifacts": map[string]any{
 				"selectionContext": selectionRecord(payload.Selection),
 				"instruction":      payload.Instruction,
+				"runner":           stringOr(payload.Runner, "profile"),
 			},
 			"events": []map[string]any{
 				{"id": fmt.Sprintf("event_%s_1", runID), "type": "run.created", "message": "Page Pilot session captured as a Requirement-backed run.", "timestamp": createdAt, "stageId": "preview_runtime", "agentId": "page-pilot"},
@@ -927,6 +968,7 @@ func (server *Server) syncPagePilotRunRecords(ctx context.Context, run map[strin
 			"prPreview":             run["prPreview"],
 			"visualProof":           run["visualProof"],
 			"roundNumber":           run["roundNumber"],
+			"runner":                run["runner"],
 		},
 		"createdAt": stringOr(text(run, "createdAt"), timestamp),
 		"updatedAt": timestamp,
@@ -936,6 +978,7 @@ func (server *Server) syncPagePilotRunRecords(ctx context.Context, run map[strin
 		"missionId":     missionID,
 		"stageId":       activeStageID,
 		"agentId":       "page-pilot",
+		"runner":        run["runner"],
 		"status":        operationStatus,
 		"prompt":        stringOr(text(run, "instruction"), "Page Pilot live-preview edit."),
 		"requiredProof": []any{"selection-context", "source-patch", "diff-summary", "delivery-proof"},
@@ -988,6 +1031,7 @@ func (server *Server) syncPagePilotRunRecords(ctx context.Context, run map[strin
 		artifacts["prPreview"] = run["prPreview"]
 		artifacts["visualProof"] = run["visualProof"]
 		artifacts["roundNumber"] = run["roundNumber"]
+		artifacts["runner"] = run["runner"]
 		runRecord["artifacts"] = artifacts
 		stages := arrayMaps(runRecord["stages"])
 		for stageIndex, stage := range stages {
@@ -998,6 +1042,7 @@ func (server *Server) syncPagePilotRunRecords(ctx context.Context, run map[strin
 			stage["completedAt"] = timestamp
 			stage["notes"] = pagePilotOperationSummary(run)
 			stage["evidence"] = pagePilotEvidence(run)
+			stage["runner"] = run["runner"]
 			stages[stageIndex] = stage
 		}
 		runRecord["stages"] = stages

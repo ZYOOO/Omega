@@ -22,22 +22,25 @@ import (
 )
 
 type Server struct {
-	Repo           *SQLiteRepository
-	WorkspaceRoot  string
-	OpenAPIPath    string
-	GitHubOAuth    GitHubOAuthConfig
-	HTTPClient     *http.Client
-	CommandStarter func(name string, args ...string) error
-	watcherMu      sync.Mutex
-	watcherStarted bool
-	watcherCancel  context.CancelFunc
-	jobMu          sync.Mutex
-	attemptCancels map[string]context.CancelFunc
-	checkpointMu   sync.Mutex
-	deliveryMu     sync.Mutex
-	deliveryJobs   map[string]bool
-	previewMu      sync.Mutex
-	previewRuntime map[string]*previewRuntimeSession
+	Repo            *SQLiteRepository
+	WorkspaceRoot   string
+	OpenAPIPath     string
+	GitHubOAuth     GitHubOAuthConfig
+	HTTPClient      *http.Client
+	CommandStarter  func(name string, args ...string) error
+	watcherMu       sync.Mutex
+	watcherStarted  bool
+	watcherCancel   context.CancelFunc
+	jobMu           sync.Mutex
+	attemptCancels  map[string]context.CancelFunc
+	checkpointMu    sync.Mutex
+	deliveryMu      sync.Mutex
+	deliveryJobs    map[string]bool
+	previewMu       sync.Mutex
+	previewRuntime  map[string]*previewRuntimeSession
+	capabilityMu    sync.Mutex
+	capabilityCache []LocalCapability
+	capabilityAt    time.Time
 }
 
 type GitHubOAuthConfig struct {
@@ -81,6 +84,20 @@ func ensureCommonLocalToolPaths() {
 		filepath.Join(home, ".local", "bin"),
 		filepath.Join(home, ".npm-global", "bin"),
 		filepath.Join(home, ".bun", "bin"),
+		filepath.Join(home, "go", "bin"),
+		"/opt/homebrew/bin",
+		"/opt/homebrew/sbin",
+		"/usr/local/bin",
+		"/usr/local/go/bin",
+		"/Applications/Codex.app/Contents/Resources",
+	}
+	nvmVersions := filepath.Join(home, ".nvm", "versions", "node")
+	if entries, readErr := os.ReadDir(nvmVersions); readErr == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				candidates = append(candidates, filepath.Join(nvmVersions, entry.Name(), "bin"))
+			}
+		}
 	}
 	prefix := []string{}
 	for _, candidate := range candidates {
@@ -195,7 +212,27 @@ func (server *Server) createProject(response http.ResponseWriter, request *http.
 }
 
 func (server *Server) localCapabilities(response http.ResponseWriter, request *http.Request) {
-	writeJSON(response, http.StatusOK, detectLocalCapabilities(request.Context()))
+	refresh := strings.EqualFold(request.URL.Query().Get("refresh"), "true") || request.URL.Query().Get("refresh") == "1"
+	writeJSON(response, http.StatusOK, server.cachedLocalCapabilities(request.Context(), refresh))
+}
+
+func (server *Server) cachedLocalCapabilities(ctx context.Context, refresh bool) []LocalCapability {
+	server.capabilityMu.Lock()
+	if !refresh && len(server.capabilityCache) > 0 && time.Since(server.capabilityAt) < 5*time.Minute {
+		cached := cloneLocalCapabilities(server.capabilityCache)
+		server.capabilityMu.Unlock()
+		return cached
+	}
+	server.capabilityMu.Unlock()
+
+	next := detectLocalCapabilities(ctx)
+
+	server.capabilityMu.Lock()
+	server.capabilityCache = cloneLocalCapabilities(next)
+	server.capabilityAt = time.Now()
+	cached := cloneLocalCapabilities(server.capabilityCache)
+	server.capabilityMu.Unlock()
+	return cached
 }
 
 func (server *Server) getProviderSelection(response http.ResponseWriter, request *http.Request) {
@@ -654,7 +691,7 @@ func (server *Server) runDevFlowCycle(response http.ResponseWriter, request *htt
 	}
 	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
 	if !isDevFlowPRTemplate(text(pipeline, "templateId")) {
-		writeJSON(response, http.StatusConflict, map[string]any{"error": "pipeline is not using the devflow-pr template"})
+		writeJSON(response, http.StatusConflict, map[string]any{"error": "pipeline is not using a runnable DevFlow template"})
 		return
 	}
 	item := findWorkItem(database, text(pipeline, "workItemId"))
@@ -1368,11 +1405,11 @@ func (server *Server) runDemoCodeChange(mission map[string]any, operation map[st
 	if err != nil {
 		return demoCodeRunResult{branchName: branchName}, fmt.Errorf("read commit sha: %w", err)
 	}
-	diff, err := runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
+	diff, _, err := gitHeadDiff(repoWorkspace)
 	if err != nil {
 		return demoCodeRunResult{branchName: branchName}, fmt.Errorf("create diff proof: %w", err)
 	}
-	stat, err := runCommand(repoWorkspace, "git", "diff", "--stat", "HEAD~1..HEAD")
+	stat, err := gitHeadDiffStat(repoWorkspace)
 	if err != nil {
 		return demoCodeRunResult{branchName: branchName}, fmt.Errorf("create diff stat: %w", err)
 	}
@@ -1396,7 +1433,7 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 	targetRepo := strings.TrimSpace(text(mission, "target"))
 	if targetRepo == "" || targetRepo == "No target" {
 		prompt := text(operation, "prompt") + "\n\n" + agentPolicyBlock(profile, agentID)
-		model, env := server.runnerCredentialModelAndEnv(context.Background(), resolvedRunnerID, stringOr(agent.Model, "gpt-5.4-mini"))
+		model, env := server.runnerCredentialModelAndEnv(context.Background(), resolvedRunnerID, agent.Model)
 		turn := agentRunner.RunTurn(context.Background(), AgentTurnRequest{
 			Role:       agentID,
 			StageID:    text(operation, "stageId"),
@@ -1426,7 +1463,7 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 	_, _ = runCommand(repoWorkspace, "git", "config", "user.name", "Omega Codex Runner")
 
 	prompt := fmt.Sprintf("%s\n\nRepository target: %s\nCreate the requested code change in this repository. Leave generated proof in %s.\n\n%s", text(operation, "prompt"), targetRepo, proofDir, agentPolicyBlock(profile, agentID))
-	model, env := server.runnerCredentialModelAndEnv(context.Background(), resolvedRunnerID, stringOr(agent.Model, "gpt-5.4-mini"))
+	model, env := server.runnerCredentialModelAndEnv(context.Background(), resolvedRunnerID, agent.Model)
 	turn := agentRunner.RunTurn(context.Background(), AgentTurnRequest{
 		Role:       agentID,
 		StageID:    text(operation, "stageId"),
@@ -1466,17 +1503,13 @@ func (server *Server) runAgentRepositoryChange(mission map[string]any, operation
 	if err != nil {
 		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, fmt.Errorf("read commit sha: %w", err)
 	}
-	diff, err := runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
+	diff, changedNames, err := gitHeadDiff(repoWorkspace)
 	if err != nil {
 		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, fmt.Errorf("create diff proof: %w", err)
 	}
-	stat, err := runCommand(repoWorkspace, "git", "diff", "--stat", "HEAD~1..HEAD")
+	stat, err := gitHeadDiffStat(repoWorkspace)
 	if err != nil {
 		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, fmt.Errorf("create diff stat: %w", err)
-	}
-	changedNames, err := runCommand(repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
-	if err != nil {
-		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, fmt.Errorf("list changed files: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(proofDir, "git-diff.patch"), []byte(diff), 0o644); err != nil {
 		return demoCodeRunResult{stdout: stdout, stderr: stderr, branchName: branchName, runnerProcess: process}, err
@@ -1500,6 +1533,39 @@ func compactLines(raw string) []string {
 		}
 	}
 	return items
+}
+
+const gitEmptyTreeObject = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+func gitHeadDiffRange(repoWorkspace string) (string, error) {
+	if _, err := runCommand(repoWorkspace, "git", "rev-parse", "--verify", "HEAD^"); err == nil {
+		return "HEAD^..HEAD", nil
+	}
+	if _, err := runCommand(repoWorkspace, "git", "rev-parse", "--verify", "HEAD"); err != nil {
+		return "", err
+	}
+	return gitEmptyTreeObject + "..HEAD", nil
+}
+
+func gitHeadDiff(repoWorkspace string) (string, string, error) {
+	diffRange, err := gitHeadDiffRange(repoWorkspace)
+	if err != nil {
+		return "", "", err
+	}
+	diffText, diffErr := runCommand(repoWorkspace, "git", "diff", diffRange)
+	changedNames, changedErr := runCommand(repoWorkspace, "git", "diff", "--name-only", diffRange)
+	if changedErr != nil {
+		return diffText, changedNames, changedErr
+	}
+	return diffText, changedNames, diffErr
+}
+
+func gitHeadDiffStat(repoWorkspace string) (string, error) {
+	diffRange, err := gitHeadDiffRange(repoWorkspace)
+	if err != nil {
+		return "", err
+	}
+	return runCommand(repoWorkspace, "git", "diff", "--stat", diffRange)
 }
 
 func uniqueStrings(values []string) []string {
@@ -1530,8 +1596,12 @@ func markdownFileList(files []string) string {
 
 func runRepositoryValidation(repoWorkspace string) (string, error) {
 	outputs := []string{}
-	diffOutput, diffErr := runCommand(repoWorkspace, "git", "diff", "--check", "HEAD~1", "HEAD")
-	outputs = append(outputs, "$ git diff --check HEAD~1 HEAD\n"+stringOr(strings.TrimSpace(diffOutput), "No whitespace errors found."))
+	diffRange, rangeErr := gitHeadDiffRange(repoWorkspace)
+	if rangeErr != nil {
+		return "", rangeErr
+	}
+	diffOutput, diffErr := runCommand(repoWorkspace, "git", "diff", "--check", diffRange)
+	outputs = append(outputs, "$ git diff --check "+diffRange+"\n"+stringOr(strings.TrimSpace(diffOutput), "No whitespace errors found."))
 	if diffErr != nil {
 		return strings.Join(outputs, "\n\n"), diffErr
 	}
@@ -1652,7 +1722,12 @@ If the verdict is APPROVED, explain why the diff satisfies the requirement and l
 }
 
 func runDevFlowReviewAgent(repoWorkspace string, prompt string, outputPath string, model string) (map[string]any, error) {
-	process, err := runSupervisedCommand(repoWorkspace, prompt, "codex", "--ask-for-approval", "never", "exec", "--model", stringOr(model, "gpt-5.4-mini"), "-c", "model_reasoning_effort=\"medium\"", "--skip-git-repo-check", "--sandbox", "read-only", "--output-last-message", outputPath, "-")
+	args := []string{"--ask-for-approval", "never", "exec"}
+	if trimmedModel := strings.TrimSpace(model); trimmedModel != "" {
+		args = append(args, "--model", trimmedModel)
+	}
+	args = append(args, "-c", "model_reasoning_effort=\"medium\"", "--skip-git-repo-check", "--sandbox", "read-only", "--output-last-message", outputPath, "-")
+	process, err := runSupervisedCommand(repoWorkspace, prompt, "codex", args...)
 	ensureAgentOutputFile(outputPath, process)
 	return process, err
 }

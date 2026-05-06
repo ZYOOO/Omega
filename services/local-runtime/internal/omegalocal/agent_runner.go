@@ -145,7 +145,7 @@ func executableAvailable(name string) error {
 type CodexExecAgentRunner struct{}
 
 func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequest) AgentTurnResult {
-	model := stringOr(request.Model, "gpt-5.4-mini")
+	model := strings.TrimSpace(request.Model)
 	effort := stringOr(request.Effort, "medium")
 	sandbox := stringOr(request.Sandbox, "workspace-write")
 	if err := executableAvailable("codex"); err != nil {
@@ -154,20 +154,24 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 		process["effort"] = effort
 		return AgentTurnResult{Status: "failed", Process: process, Error: err}
 	}
+	args := []string{"--ask-for-approval", "never", "exec"}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	args = append(args,
+		"-c", "model_reasoning_effort=\""+effort+"\"",
+		"--skip-git-repo-check",
+		"--sandbox", sandbox,
+		"--output-last-message", request.OutputPath,
+		"-",
+	)
 	process, err := runSupervisedCommandContextWithOptions(
 		ctx,
 		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: request.Env},
 		request.Workspace,
 		request.Prompt,
 		"codex",
-		"--ask-for-approval", "never",
-		"exec",
-		"--model", model,
-		"-c", "model_reasoning_effort=\""+effort+"\"",
-		"--skip-git-repo-check",
-		"--sandbox", sandbox,
-		"--output-last-message", request.OutputPath,
-		"-",
+		args...,
 	)
 	if request.OutputPath != "" {
 		ensureAgentOutputFile(request.OutputPath, process)
@@ -185,7 +189,7 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 type OpenCodeAgentRunner struct{}
 
 func (runner OpenCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequest) AgentTurnResult {
-	model := stringOr(request.Model, "gpt-5.4-mini")
+	model := strings.TrimSpace(request.Model)
 	if err := executableAvailable("opencode"); err != nil {
 		process := runnerProcessNotAvailable("opencode", "opencode", request.Workspace, err)
 		process["model"] = model
@@ -201,7 +205,11 @@ func (runner OpenCodeAgentRunner) RunTurn(ctx context.Context, request AgentTurn
 		process["provider"] = provider
 		return AgentTurnResult{Status: "failed", Process: process, Error: configErr}
 	}
-	args := []string{"run", "--model", model, "--dangerously-skip-permissions", request.Prompt}
+	args := []string{"run"}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	args = append(args, "--dangerously-skip-permissions", request.Prompt)
 	process, err := runSupervisedCommandContextWithOptions(ctx, SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: env}, request.Workspace, "", "opencode", args...)
 	if request.OutputPath != "" {
 		ensureAgentOutputFile(request.OutputPath, process)
@@ -287,6 +295,7 @@ func (runner TraeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequ
 	cliProvider := traeCLIProvider(provider)
 	env := mergeEnvMaps(traeProviderEnv(provider), request.Env)
 	env = addTraeProviderCompatibilityEnv(provider, cliProvider, env)
+	modelBaseURL := traeModelBaseURL(provider, cliProvider, env)
 	configPath, configErr := writeTraeRunnerConfig(request.Workspace, cliProvider, model)
 	if configErr != nil {
 		process := runnerProcessNotAvailable("trae-agent", "trae-cli", request.Workspace, configErr)
@@ -302,6 +311,9 @@ func (runner TraeAgentRunner) RunTurn(ctx context.Context, request AgentTurnRequ
 			args = append(args, "--provider", cliProvider)
 		}
 		args = append(args, "--model", model)
+	}
+	if modelBaseURL != "" {
+		args = append(args, "--model-base-url", modelBaseURL)
 	}
 	process, err := runSupervisedCommandContextWithOptions(
 		ctx,
@@ -407,6 +419,21 @@ func addTraeProviderCompatibilityEnv(provider string, cliProvider string, env ma
 		next[cliPrefix+"_BASE_URL"] = next[providerPrefix+"_BASE_URL"]
 	}
 	return next
+}
+
+func traeModelBaseURL(provider string, cliProvider string, env map[string]string) string {
+	for _, candidate := range []string{provider, cliProvider} {
+		prefix := credentialEnvPrefix(candidate)
+		if prefix != "" && strings.TrimSpace(env[prefix+"_BASE_URL"]) != "" {
+			return strings.TrimSpace(env[prefix+"_BASE_URL"])
+		}
+	}
+	for _, candidate := range []string{provider, cliProvider} {
+		if baseURL := defaultRunnerProviderBaseURL(candidate); baseURL != "" {
+			return baseURL
+		}
+	}
+	return ""
 }
 
 func traeProviderAndModel(rawModel string) (string, string) {
@@ -542,4 +569,12 @@ func ensureAgentOutputFile(outputPath string, process map[string]any) {
 	if fallback != "" {
 		_ = os.WriteFile(outputPath, []byte(fallback), 0o644)
 	}
+}
+
+func agentArtifactCaptureInstruction(outputPath string) string {
+	outputPath = strings.TrimSpace(outputPath)
+	if outputPath == "" {
+		return "\n\nArtifact capture: return the complete artifact content in your final answer only."
+	}
+	return fmt.Sprintf("\n\nArtifact capture: return the complete artifact content in your final answer only. Do not attempt to write, patch, or edit `%s`; Omega will persist your final answer to that path after the runner exits.", outputPath)
 }

@@ -4,6 +4,7 @@ import {
   startPagePilotPreviewRuntime,
   type PagePilotApplyResult,
   type PagePilotDeliverResult,
+  type PagePilotRunFilters,
   type PagePilotRunInfo,
   type PagePilotSelectionContext,
 } from "../omegaControlApiClient";
@@ -20,17 +21,26 @@ type PagePilotPreviewProps = {
   apiUrl?: string;
   onReloadApp?: () => void;
   onSelectRepositoryTarget: (repositoryTargetId: string) => void;
-  onApply: (instruction: string, selection: PagePilotSelectionContext) => Promise<PagePilotApplyResult>;
+  onApply: (instruction: string, selection: PagePilotSelectionContext, runner: PagePilotRunnerId) => Promise<PagePilotApplyResult>;
   onDeliver: (instruction: string, selection: PagePilotSelectionContext, runId?: string) => Promise<PagePilotDeliverResult>;
   onDiscard: (runId: string) => Promise<{ status: string; lineDiffSummary?: string }>;
-  onFetchRuns: () => Promise<PagePilotRunInfo[]>;
+  onFetchRuns: (filters?: PagePilotRunFilters) => Promise<PagePilotRunInfo[]>;
   onExit?: () => void;
 };
 
 const previewUrlStorageKey = "omega-page-pilot-preview-url";
 const previewModeStorageKey = "omega-page-pilot-preview-mode";
+const pagePilotRunnerStorageKey = "omega-page-pilot-agent-runner";
 
 type PreviewMode = "repo-source" | "dev-server" | "html-file";
+type PagePilotRunnerId = "codex" | "claude-code" | "opencode" | "trae-agent";
+
+const pagePilotRunnerOptions: Array<{ value: PagePilotRunnerId; label: string }> = [
+  { value: "codex", label: "Codex" },
+  { value: "claude-code", label: "Claude Code" },
+  { value: "opencode", label: "opencode" },
+  { value: "trae-agent", label: "Trae Agent" },
+];
 
 type PreviewRuntimeProfile = {
   agentId?: string;
@@ -86,6 +96,7 @@ type OmegaDesktopBridge = {
     projectId?: string;
     repositoryTargetId?: string;
     repositoryLabel?: string;
+    runner?: PagePilotRunnerId;
     returnUrl?: string;
     previewRuntimeProfile?: PreviewRuntimeProfile;
   }) => Promise<{ ok: boolean; error?: string; url?: string }>;
@@ -100,6 +111,15 @@ function initialPreviewMode(): PreviewMode {
   if (typeof window === "undefined") return "repo-source";
   const saved = window.localStorage.getItem(previewModeStorageKey);
   return saved === "dev-server" || saved === "html-file" ? saved : "repo-source";
+}
+
+function initialPagePilotRunner(): PagePilotRunnerId {
+  if (typeof window === "undefined") return "codex";
+  return normalizePagePilotRunner(window.localStorage.getItem(pagePilotRunnerStorageKey));
+}
+
+function normalizePagePilotRunner(value: string | null | undefined): PagePilotRunnerId {
+  return pagePilotRunnerOptions.some((option) => option.value === value) ? value as PagePilotRunnerId : "codex";
 }
 
 function omegaDesktopBridge(): OmegaDesktopBridge | undefined {
@@ -221,6 +241,7 @@ export function PagePilotPreview({
   const { t } = useI18n();
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const [previewMode, setPreviewMode] = useState<PreviewMode>(initialPreviewMode);
+  const [pagePilotRunner, setPagePilotRunner] = useState<PagePilotRunnerId>(initialPagePilotRunner);
   const [draftUrl, setDraftUrl] = useState(initialPreviewUrl);
   const [browserPreviewUrl, setBrowserPreviewUrl] = useState("");
   const [targetDocument, setTargetDocument] = useState<Document | null>(null);
@@ -257,6 +278,10 @@ export function PagePilotPreview({
   }, [previewMode]);
 
   useEffect(() => {
+    window.localStorage.setItem(pagePilotRunnerStorageKey, pagePilotRunner);
+  }, [pagePilotRunner]);
+
+  useEffect(() => {
     if (draftUrl.trim()) window.localStorage.setItem(previewUrlStorageKey, draftUrl);
   }, [draftUrl]);
 
@@ -275,7 +300,7 @@ export function PagePilotPreview({
     }
     setRunsLoading(true);
     setRunsError("");
-    onFetchRuns()
+    onFetchRuns({ repositoryTargetId: effectiveRepositoryTargetId, limit: 8, compact: true })
       .then((nextRuns) => {
         if (!canceled) setRuns(filterRunsForRepository(nextRuns, effectiveRepositoryTargetId).slice(0, 8));
       })
@@ -366,6 +391,19 @@ export function PagePilotPreview({
     setActivePreviewRuntimeProfile(null);
     setLaunchStatus(`${t("Repository ready")}: ${result.repoPath ?? ""}. ${t("Enter a preview URL or HTML file.")}`, "error");
     return { url: "" };
+  }
+
+  async function openRunDetails(run: PagePilotRunInfo) {
+    setSelectedRun(run);
+    if (!run.id || run.prPreview || run.visualProof || run.diffSummary || run.conversationBatch) return;
+    try {
+      const [fullRun] = await onFetchRuns({ id: run.id, limit: 1, compact: false });
+      if (fullRun) {
+        setSelectedRun((current) => current?.id === run.id ? fullRun : current);
+      }
+    } catch {
+      setSelectedRun((current) => current?.id === run.id ? run : current);
+    }
   }
 
   async function startDevServerPreview() {
@@ -519,6 +557,7 @@ export function PagePilotPreview({
           projectId,
           repositoryTargetId: effectiveRepositoryTargetId,
           repositoryLabel: selectedRepositoryLabel,
+          runner: pagePilotRunner,
           returnUrl: "#page-pilot",
           previewRuntimeProfile: launchTarget.profile ?? undefined,
         }), "Opening Page Pilot", previewOpenTimeoutMs);
@@ -594,6 +633,22 @@ export function PagePilotPreview({
             ))}
           </select>
         </label>
+        <label>
+          <span>{t("Editing Agent")}</span>
+          <select
+            value={pagePilotRunner}
+            onChange={(event) => {
+              setPagePilotRunner(normalizePagePilotRunner(event.currentTarget.value));
+              clearLaunchStatus();
+            }}
+          >
+            {pagePilotRunnerOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
       </section>
 
       <section className="page-pilot-launch-panel">
@@ -656,7 +711,7 @@ export function PagePilotPreview({
             onClick={() => {
               setRunsLoading(true);
               setRunsError("");
-              onFetchRuns()
+              onFetchRuns({ repositoryTargetId: effectiveRepositoryTargetId, limit: 8, compact: true })
                 .then((nextRuns) => setRuns(filterRunsForRepository(nextRuns, effectiveRepositoryTargetId).slice(0, 8)))
                 .catch((error) => setRunsError(error instanceof Error ? error.message : String(error)))
                 .finally(() => setRunsLoading(false));
@@ -680,7 +735,7 @@ export function PagePilotPreview({
                   <small>{pagePilotRunSubtitle(run)}</small>
                 </div>
                 <div className="page-pilot-run-actions">
-                  <button type="button" onClick={() => setSelectedRun(run)}>{t("Details")}</button>
+                  <button type="button" onClick={() => void openRunDetails(run)}>{t("Details")}</button>
                   {run.pullRequestUrl ? <a href={run.pullRequestUrl} target="_blank" rel="noreferrer">PR</a> : null}
                   {run.workItemId ? <a href={workItemDetailHash(run.workItemId)}>Work Item</a> : null}
                   {run.pipelineId ? <span>{run.pipelineId}</span> : null}
@@ -721,7 +776,10 @@ export function PagePilotPreview({
           targetFrameElement={iframeRef.current}
           targetUnavailableMessage={!targetDocument ? targetMessage || "Preview is not inspectable yet. Use the local Page Pilot target proxy or Electron preview bridge." : ""}
           apiAvailable={apiAvailable}
-          onApply={onApply}
+          onApply={(instruction, selection, runner) => onApply(instruction, selection, normalizePagePilotRunner(runner))}
+          runner={pagePilotRunner}
+          runnerOptions={pagePilotRunnerOptions}
+          onRunnerChange={(runner) => setPagePilotRunner(normalizePagePilotRunner(runner))}
           onDeliver={onDeliver}
           onDiscard={onDiscard}
           onFetchRuns={onFetchRuns}

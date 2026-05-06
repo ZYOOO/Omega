@@ -22,7 +22,7 @@ func beginDevFlowAttemptFromStage(database WorkspaceDatabase, pipelineIndex int,
 	pipeline["updatedAt"] = nowISO()
 	database.Tables.Pipelines[pipelineIndex] = pipeline
 	database = updateWorkItem(database, text(item, "id"), map[string]any{"status": "In Review"})
-	attempt := makeAttemptRecord(item, pipeline, trigger, "devflow-pr", entryStageID)
+	attempt := makeAttemptRecord(item, pipeline, trigger, stringOr(text(pipeline, "templateId"), "devflow-pr"), entryStageID)
 	runtime := workflowRuntimeFromPipeline(pipeline)
 	attempt["continuation"] = map[string]any{
 		"maxTurns":    intOrDefault(runtime["maxContinuationTurns"], 1),
@@ -247,7 +247,7 @@ func (server *Server) failDevFlowCycleJobWithResult(ctx context.Context, pipelin
 	if findByID(database.Tables.Attempts, attemptID) < 0 {
 		if item := findWorkItem(*database, text(pipeline, "workItemId")); item != nil {
 			server.logError(ctx, "devflow.attempt.missing_backfilled", "Missing attempt was backfilled during failure handling.", map[string]any{"pipelineId": pipelineID, "attemptId": attemptID, "workItemId": text(item, "id")})
-			attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", firstRunnableStageID(pipeline))
+			attempt := makeAttemptRecord(item, pipeline, "manual", stringOr(text(pipeline, "templateId"), "devflow-pr"), firstRunnableStageID(pipeline))
 			attempt["id"] = attemptID
 			database.Tables.Attempts = appendOrReplace(database.Tables.Attempts, attempt)
 		}
@@ -279,7 +279,7 @@ func (server *Server) completeDevFlowCycleJob(ctx context.Context, pipelineID st
 	}
 	if findByID(database.Tables.Attempts, attemptID) < 0 {
 		server.logError(ctx, "devflow.attempt.missing_backfilled", "Missing attempt was backfilled before applying job result.", map[string]any{"pipelineId": pipelineID, "attemptId": attemptID, "workItemId": text(item, "id"), "status": text(result, "status")})
-		attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", firstRunnableStageID(pipeline))
+		attempt := makeAttemptRecord(item, pipeline, "manual", stringOr(text(pipeline, "templateId"), "devflow-pr"), firstRunnableStageID(pipeline))
 		attempt["id"] = attemptID
 		attempt["workspacePath"] = stringOr(result["workspacePath"], text(attempt, "workspacePath"))
 		attempt["branchName"] = stringOr(result["branchName"], text(attempt, "branchName"))
@@ -552,7 +552,7 @@ func (server *Server) persistDevFlowAgentInvocation(ctx context.Context, pipelin
 		database.Tables.Attempts[attemptIndex] = attempt
 	} else if item := findWorkItem(*database, itemID); item != nil {
 		server.logError(ctx, "devflow.attempt.missing_backfilled", "Missing attempt was backfilled during agent invocation persistence.", map[string]any{"pipelineId": pipelineID, "attemptId": attemptID, "workItemId": itemID, "stageId": text(invocation, "stageId"), "agentId": text(invocation, "agentId")})
-		attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", text(invocation, "stageId"))
+		attempt := makeAttemptRecord(item, pipeline, "manual", stringOr(text(pipeline, "templateId"), "devflow-pr"), text(invocation, "stageId"))
 		attempt["id"] = attemptID
 		attempt["status"] = "running"
 		attempt["currentStageId"] = text(invocation, "stageId")
@@ -1119,14 +1119,21 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		pipeline = applyWorkflowTemplateToPipeline(pipeline, repoTemplate)
 		server.logInfo(ctx, "workflow_contract.repository.loaded", "Repository-owned workflow contract loaded.", map[string]any{"pipelineId": text(pipeline, "id"), "workItemId": text(item, "id"), "source": repoTemplate.Source})
 	}
-	if err := writeRunnerPolicyFiles(repoWorkspace, profile, "coding"); err != nil {
-		return nil, err
-	}
 	runnerRegistry := NewAgentRunnerRegistry()
+	requirementProfile := agentProfileForRole(profile, "requirement")
+	requirementRunner, requirementRunnerID := runnerRegistry.Resolve(requirementProfile.Runner)
+	masterProfile := agentProfileForRole(profile, "master")
+	masterRunner, masterRunnerID := runnerRegistry.Resolve(masterProfile.Runner)
+	architectProfile := agentProfileForRole(profile, "architect")
+	architectRunner, architectRunnerID := runnerRegistry.Resolve(architectProfile.Runner)
 	codingProfile := agentProfileForRole(profile, "coding")
 	codingRunner, codingRunnerID := runnerRegistry.Resolve(codingProfile.Runner)
+	testingProfile := agentProfileForRole(profile, "testing")
+	testingRunner, testingRunnerID := runnerRegistry.Resolve(testingProfile.Runner)
 	reviewProfile := agentProfileForRole(profile, "review")
 	reviewRunner, reviewRunnerID := runnerRegistry.Resolve(reviewProfile.Runner)
+	deliveryProfile := agentProfileForRole(profile, "delivery")
+	deliveryRunner, deliveryRunnerID := runnerRegistry.Resolve(deliveryProfile.Runner)
 
 	proofDir := filepath.Join(workspace, ".omega", "proof")
 	if err := os.MkdirAll(proofDir, 0o755); err != nil {
@@ -1199,6 +1206,28 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 			stageArtifacts = append(stageArtifacts, map[string]any{"stageId": stageID, "agentId": agentID, "artifact": artifact})
 		}
 		_ = server.persistDevFlowAgentInvocation(context.Background(), text(pipeline, "id"), text(item, "id"), attemptID, invocation)
+	}
+	runProfileAgent := func(agentID string, runner AgentRunner, runnerID string, agent AgentProfileConfig, role string, stageID string, workspacePath string, prompt string, outputPath string, sandbox string, effort string) AgentTurnResult {
+		if err := writeRunnerPolicyFiles(workspacePath, profile, agentID); err != nil {
+			process := runnerProcessNotAvailable(runnerID, runnerID, workspacePath, err)
+			process["agentId"] = agentID
+			return AgentTurnResult{Status: "failed", Process: process, Error: err}
+		}
+		model, credentialEnv := server.runnerCredentialModelAndEnv(ctx, runnerID, agent.Model)
+		return runner.RunTurn(ctx, AgentTurnRequest{
+			Role:              role,
+			StageID:           stageID,
+			Runner:            runnerID,
+			Workspace:         workspacePath,
+			Prompt:            prompt,
+			OutputPath:        outputPath,
+			Sandbox:           sandbox,
+			Model:             model,
+			Effort:            effort,
+			Env:               mergeEnvMaps(agentCapabilityEnv(profile, agentID), credentialEnv),
+			HeartbeatInterval: runnerHeartbeatInterval,
+			OnProcessEvent:    server.runnerHeartbeatRecorder(text(pipeline, "id"), text(item, "id"), attemptID, stageID, agentID, runnerID),
+		})
 	}
 	recordGitHubOutboundSync := func(event string, status string, stageID string, summary string, prURL string, checksOutput string, changedFiles []string, failureReason string, failureDetail string, reviewPacket map[string]any) {
 		report := server.syncGitHubIssueOutbound(ctx, githubOutboundSyncInput{
@@ -1294,7 +1323,42 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 		if err := os.WriteFile(assessmentPath, []byte(reworkAssessmentMarkdown(reworkAssessment)), 0o644); err != nil {
 			return nil, err
 		}
-		recordAgent("rework", "master", "passed", "Assess whether human-requested changes need fast rework or replanning.", "rework-assessment.md", text(reworkAssessment, "rationale"), []string{assessmentPath}, map[string]any{"runner": "local-orchestrator", "status": "passed", "strategy": text(reworkAssessment, "strategy")})
+		assessmentPrompt := fmt.Sprintf(`You are the Master Orchestrator Agent for Omega.
+
+Assess the human-requested changes and confirm whether this run should use fast rework or return to planning.
+
+Repository: %s
+Repository path: %s
+Work item: %s
+Title: %s
+Pull request: %s
+
+Requirement:
+%s
+
+Human feedback:
+%s
+
+Omega precomputed strategy: %s
+Omega rationale: %s
+
+Prepare the final rework assessment with:
+- strategy
+- rationale
+- stage routing
+- risks or blocked assumptions
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, reworkFeedbackInput, text(reworkAssessment, "strategy"), text(reworkAssessment, "rationale")) + agentArtifactCaptureInstruction(assessmentPath) + "\n\n" + agentPolicyBlock(profile, "master")
+		assessmentTurn := runProfileAgent("master", masterRunner, masterRunnerID, masterProfile, "master", "rework", workspace, assessmentPrompt, assessmentPath, "read-only", "medium")
+		assessmentProcess := assessmentTurn.Process
+		if assessmentProcess == nil {
+			assessmentProcess = map[string]any{"runner": masterRunnerID, "status": "passed"}
+		}
+		assessmentProcess["strategy"] = text(reworkAssessment, "strategy")
+		if assessmentTurn.Error != nil {
+			recordAgent("rework", "master", "failed", assessmentPrompt, "rework-assessment.md", "Master agent failed while assessing human-requested rework.", []string{assessmentPath}, assessmentProcess)
+			return failureResult("rework", "master", "Master agent failed while assessing human-requested rework.", assessmentTurn.Error.Error(), humanChangeRequest), assessmentTurn.Error
+		}
+		recordAgent("rework", "master", "passed", assessmentPrompt, "rework-assessment.md", text(reworkAssessment, "rationale"), []string{assessmentPath}, assessmentProcess)
 
 		previousHead, _ := runCommand(repoWorkspace, "git", "rev-parse", "HEAD")
 		notePath := filepath.Join(proofDir, "human-rework-agent-note.md")
@@ -1334,6 +1398,9 @@ Rules:
 		if err := os.WriteFile(promptPath, []byte(reworkPrompt), 0o644); err != nil {
 			return nil, err
 		}
+		if err := writeRunnerPolicyFiles(repoWorkspace, profile, "coding"); err != nil {
+			return nil, err
+		}
 		recordAgent("rework", "coding", "running", reworkPrompt, "", "Fast rework agent is applying human feedback on the existing PR branch.", []string{promptPath}, map[string]any{"runner": codingRunnerID, "status": "running", "strategy": text(reworkAssessment, "strategy")})
 		reworkModel, reworkEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
 		reworkTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
@@ -1354,7 +1421,7 @@ Rules:
 			recordAgent("rework", "coding", "failed", reworkPrompt, filepath.Base(notePath), reason, []string{promptPath, notePath}, reworkTurn.Process)
 			return failureResult("rework", "coding", reason, reworkTurn.Error.Error(), humanChangeRequest), reworkTurn.Error
 		}
-		statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short")
+		statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short", "--", ".", ":(exclude).omega", ":(exclude).codex", ":(exclude).claude", ":(exclude).opencode", ":(exclude).trae")
 		if err != nil {
 			return nil, fmt.Errorf("read fast rework changes: %w", err)
 		}
@@ -1363,7 +1430,7 @@ Rules:
 			recordAgent("rework", "coding", "failed", reworkPrompt, filepath.Base(notePath), reason, []string{promptPath, notePath}, reworkTurn.Process)
 			return failureResult("rework", "coding", reason, "git status --short returned no changed files after fast rework.", humanChangeRequest), errors.New("fast rework produced no repository changes")
 		}
-		if _, err := runCommand(repoWorkspace, "git", "add", "-A"); err != nil {
+		if _, err := runCommand(repoWorkspace, "git", "add", "-A", "--", ".", ":(exclude).omega", ":(exclude).codex", ":(exclude).claude", ":(exclude).opencode", ":(exclude).trae"); err != nil {
 			return nil, fmt.Errorf("stage fast rework changes: %w", err)
 		}
 		if _, err := runCommand(repoWorkspace, "git", "commit", "-m", "Omega human rework for "+text(item, "key")); err != nil {
@@ -1375,8 +1442,7 @@ Rules:
 		diffText, _ := runCommand(repoWorkspace, "git", "diff", diffRange)
 		changedNames, err := runCommand(repoWorkspace, "git", "diff", "--name-only", diffRange)
 		if err != nil || strings.TrimSpace(changedNames) == "" {
-			diffText, _ = runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
-			changedNames, err = runCommand(repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
+			diffText, changedNames, err = gitHeadDiff(repoWorkspace)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("list fast rework changed files: %w", err)
@@ -1402,12 +1468,34 @@ Rules:
 		testVariables := cloneStringMap(promptVariables)
 		testVariables["changedFiles"] = strings.Join(changedFiles, ", ")
 		testVariables["testOutput"] = testOutput
-		testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, fmt.Sprintf("Validate %s after human-requested fast rework. Changed files: %s", text(item, "key"), strings.Join(changedFiles, ", ")))
-		testReport := fmt.Sprintf("# Human Rework Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after human-requested fast rework.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None"))
-		if err := os.WriteFile(testReportPath, []byte(testReport), 0o644); err != nil {
-			return nil, err
+		testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, fmt.Sprintf("Validate %s after human-requested fast rework. Changed files: %s", text(item, "key"), strings.Join(changedFiles, ", "))) + "\n\n" + agentPolicyBlock(profile, "testing") + fmt.Sprintf(`
+
+Local repository validation has already run for human-requested fast rework. Use the output below as evidence and prepare the final validation report.
+
+Validation status: %s
+
+Validation output:
+~~~text
+%s
+~~~
+
+Validation failure summary:
+%s
+`, testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None")) + agentArtifactCaptureInstruction(testReportPath)
+		testingTurn := runProfileAgent("testing", testingRunner, testingRunnerID, testingProfile, "testing", "rework", repoWorkspace, testPrompt, testReportPath, "read-only", "medium")
+		if testingTurn.Error != nil {
+			recordAgent("rework", "testing", "failed", testPrompt, filepath.Base(testReportPath), "Testing agent failed while verifying human-requested fast rework.", []string{testReportPath}, testingTurn.Process)
+			return failureResult("rework", "testing", "Testing agent failed after human-requested fast rework.", testingTurn.Error.Error(), humanChangeRequest), testingTurn.Error
 		}
-		recordAgent("rework", "testing", testStatus, testPrompt, filepath.Base(testReportPath), "Repository validation completed after human-requested fast rework.", []string{testReportPath}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput})
+		if reportRaw, _ := os.ReadFile(testReportPath); strings.TrimSpace(string(reportRaw)) == "" {
+			testReport := fmt.Sprintf("# Human Rework Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after human-requested fast rework.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None"))
+			if err := os.WriteFile(testReportPath, []byte(testReport), 0o644); err != nil {
+				return nil, err
+			}
+		}
+		testingProcess := cloneMap(testingTurn.Process)
+		testingProcess["localValidation"] = map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput}
+		recordAgent("rework", "testing", testStatus, testPrompt, filepath.Base(testReportPath), "Testing agent verified human-requested fast rework validation output.", []string{testReportPath}, testingProcess)
 		if testErr != nil {
 			reason := "Repository validation failed after human-requested fast rework."
 			return failureResult("rework", "testing", reason, stringOr(testOutput, testErr.Error()), humanChangeRequest), fmt.Errorf("repository validation failed after fast rework: %w", testErr)
@@ -1524,6 +1612,7 @@ Rules:
 			PullRequestURL:      prURL,
 			ChangedFiles:        changedFiles,
 			DiffText:            stringOr(prDiff, diffText),
+			PlanOutput:          "Fast rework reused the previous solution plan; review the current diff against the latest requirement and rework checklist.",
 			TestOutput:          testOutput,
 			ChecksOutput:        checksOutput,
 			PullRequestFeedback: pullRequestFeedback,
@@ -1536,6 +1625,10 @@ Rules:
 			return nil, err
 		}
 		stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reviewPacketPath)})
+		humanReviewRequest = appendDevFlowTodoCompletionSection(humanReviewRequest, reviewPacket)
+		if err := os.WriteFile(humanReviewRequestPath, []byte(humanReviewRequest), 0o644); err != nil {
+			return nil, err
+		}
 		reportInput.ReviewPacket = reviewPacket
 		if reportPath, err := writeDevFlowRunReport(proofDir, reportInput); err != nil {
 			return nil, err
@@ -1575,7 +1668,29 @@ Rules:
 		}); err != nil {
 			return nil, err
 		}
-		recordAgent("done", "delivery", "waiting-human", deliveryPrompt, "handoff-bundle.json", "Delivery is blocked by the human review checkpoint after fast rework.", []string{filepath.Join(proofDir, "handoff-bundle.json")}, map[string]any{"runner": "local-orchestrator", "status": "waiting-human"})
+		deliveryHandoffPath := filepath.Join(proofDir, "delivery-handoff-fast-rework.md")
+		deliveryAgentPrompt := deliveryPrompt + fmt.Sprintf(`
+
+You are the Delivery Agent for Omega.
+
+Omega has assembled the machine-readable handoff bundle at:
+%s
+
+Prepare the human review handoff.
+
+Include:
+- delivery readiness
+- PR and changed file summary
+- validation and review evidence
+- remaining human gate decision
+- risks or blocked assumptions
+`, filepath.Join(proofDir, "handoff-bundle.json")) + agentArtifactCaptureInstruction(deliveryHandoffPath) + "\n\n" + agentPolicyBlock(profile, "delivery")
+		deliveryTurn := runProfileAgent("delivery", deliveryRunner, deliveryRunnerID, deliveryProfile, "delivery", "done", workspace, deliveryAgentPrompt, deliveryHandoffPath, "read-only", "medium")
+		if deliveryTurn.Error != nil {
+			recordAgent("done", "delivery", "failed", deliveryAgentPrompt, filepath.Base(deliveryHandoffPath), "Delivery agent failed while preparing the human handoff after fast rework.", []string{filepath.Join(proofDir, "handoff-bundle.json"), deliveryHandoffPath}, deliveryTurn.Process)
+			return failureResult("done", "delivery", "Delivery agent failed while preparing the human handoff after fast rework.", deliveryTurn.Error.Error(), humanChangeRequest), deliveryTurn.Error
+		}
+		recordAgent("done", "delivery", "waiting-human", deliveryAgentPrompt, filepath.Base(deliveryHandoffPath), "Delivery agent prepared the handoff and is waiting for the human review checkpoint after fast rework.", []string{filepath.Join(proofDir, "handoff-bundle.json"), deliveryHandoffPath}, deliveryTurn.Process)
 		recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review after fast rework.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 		proofFiles, _ := collectFiles(proofDir)
 		return map[string]any{
@@ -1636,8 +1751,29 @@ Rules:
 			return err
 		}
 		requirementFallback := fmt.Sprintf("Structure requirement %s for repository %s.\n\nTitle: %s\n\nDescription:\n%s", text(item, "key"), repoSlug, text(item, "title"), effectiveDescription)
-		requirementPrompt := renderWorkflowPromptSection(template, "requirement", promptVariables, requirementFallback)
-		recordAgent("todo", "requirement", "passed", requirementPrompt, "requirement-artifact.json", "Requirement artifact captured with repository boundary and acceptance criteria.", []string{filepath.Join(proofDir, "requirement-artifact.json")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		requirementHandoffPath := filepath.Join(proofDir, "requirement-handoff.md")
+		requirementPrompt := renderWorkflowPromptSection(template, "requirement", promptVariables, requirementFallback) + fmt.Sprintf(`
+
+You are the Requirement Agent for Omega.
+
+Omega has written the machine-readable requirement artifact to:
+%s
+
+Prepare a concise human-readable requirement handoff.
+
+Include:
+- requirement summary
+- repository boundary
+- acceptance criteria
+- assumptions and open questions
+- signals the downstream Master and Architect agents should preserve
+`, filepath.Join(proofDir, "requirement-artifact.json")) + agentArtifactCaptureInstruction(requirementHandoffPath) + "\n\n" + agentPolicyBlock(profile, "requirement")
+		requirementTurn := runProfileAgent("requirement", requirementRunner, requirementRunnerID, requirementProfile, "requirement", "todo", workspace, requirementPrompt, requirementHandoffPath, "read-only", "medium")
+		if requirementTurn.Error != nil {
+			recordAgent("todo", "requirement", "failed", requirementPrompt, "requirement-handoff.md", "Requirement agent failed before producing the requirement handoff.", []string{filepath.Join(proofDir, "requirement-artifact.json"), requirementHandoffPath}, requirementTurn.Process)
+			return fmt.Errorf("requirement agent failed: %w", requirementTurn.Error)
+		}
+		recordAgent("todo", "requirement", "passed", requirementPrompt, "requirement-handoff.md", "Requirement agent captured repository boundary and acceptance criteria.", []string{filepath.Join(proofDir, "requirement-artifact.json"), requirementHandoffPath}, requirementTurn.Process)
 		return nil
 	}
 	classifyTask := func() error {
@@ -1654,7 +1790,32 @@ Rules:
 		if err := writeJSONFile(filepath.Join(proofDir, "task-classification.json"), classification); err != nil {
 			return err
 		}
-		recordAgent("in_progress", "master", "passed", "Classify task from workflow contract and repository target.", "task-classification.json", "Task classification captured from the active workflow contract.", []string{filepath.Join(proofDir, "task-classification.json")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		masterOutputPath := filepath.Join(proofDir, "master-dispatch.md")
+		masterPrompt := fmt.Sprintf(`You are the Master Orchestrator Agent for Omega.
+
+Classify the Work Item and dispatch the stage agents without editing repository source.
+
+Repository: %s
+Repository path: %s
+Work item: %s
+Title: %s
+Workflow template: %s
+
+Requirement:
+%s
+
+Prepare a concise dispatch note with:
+- task class and workflow route
+- repository boundary
+- stage agent assignments
+- key risks or blocked assumptions
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), text(pipeline, "templateId"), effectiveDescription) + agentArtifactCaptureInstruction(masterOutputPath) + "\n\n" + agentPolicyBlock(profile, "master")
+		masterTurn := runProfileAgent("master", masterRunner, masterRunnerID, masterProfile, "master", "in_progress", workspace, masterPrompt, masterOutputPath, "read-only", "medium")
+		if masterTurn.Error != nil {
+			recordAgent("in_progress", "master", "failed", masterPrompt, "master-dispatch.md", "Master agent failed before dispatching stage work.", []string{filepath.Join(proofDir, "task-classification.json"), masterOutputPath}, masterTurn.Process)
+			return fmt.Errorf("master agent failed: %w", masterTurn.Error)
+		}
+		recordAgent("in_progress", "master", "passed", masterPrompt, "master-dispatch.md", "Master agent classified the task and dispatched stage work from the active workflow contract.", []string{filepath.Join(proofDir, "task-classification.json"), masterOutputPath}, masterTurn.Process)
 		return nil
 	}
 	runArchitecture := func() error {
@@ -1683,13 +1844,27 @@ Rules:
 			"- [ ] Create or update the pull request and collect GitHub Actions CI evidence.\n"+
 			"- [ ] Review the diff against this plan and todo list before Human Review.\n",
 			text(item, "key"), repoSlug, baseBranch, branchName, text(item, "key"), branchName)
-		architecturePlan = solutionPlan
-		if err := os.WriteFile(filepath.Join(proofDir, "solution-plan.md"), []byte(solutionPlan), 0o644); err != nil {
-			return err
-		}
+		solutionPlanPath := filepath.Join(proofDir, "solution-plan.md")
 		solutionFallback := fmt.Sprintf("Design implementation for %s in %s.\n\nRequirement:\n%s", text(item, "key"), repoSlug, effectiveDescription)
-		solutionPrompt := renderWorkflowPromptSection(template, "architect", promptVariables, solutionFallback)
-		recordAgent("in_progress", "architect", "passed", solutionPrompt, "solution-plan.md", "Solution plan created and handed to the coding agent.", []string{filepath.Join(proofDir, "solution-plan.md")}, map[string]any{"runner": "local-orchestrator", "status": "passed"})
+		solutionPrompt := renderWorkflowPromptSection(template, "architect", promptVariables, solutionFallback) + "\n\nReturn the final plan, functional TODO list, and project TODO list." + agentArtifactCaptureInstruction(solutionPlanPath) + "\n\n" + agentPolicyBlock(profile, "architect")
+		architectTurn := runProfileAgent("architect", architectRunner, architectRunnerID, architectProfile, "architect", "in_progress", repoWorkspace, solutionPrompt, solutionPlanPath, "read-only", "medium")
+		if architectTurn.Error != nil {
+			recordAgent("in_progress", "architect", "failed", solutionPrompt, "solution-plan.md", "Architect agent failed before producing a solution plan.", []string{solutionPlanPath}, architectTurn.Process)
+			return fmt.Errorf("architect agent failed: %w", architectTurn.Error)
+		}
+		planRaw, _ := os.ReadFile(solutionPlanPath)
+		architecturePlan = strings.TrimSpace(string(planRaw))
+		if architecturePlan == "" {
+			architecturePlan = solutionPlan
+		}
+		planLower := strings.ToLower(architecturePlan)
+		if !strings.Contains(planLower, "functional todo") || !strings.Contains(planLower, "project todo") || !strings.Contains(architecturePlan, repoSlug) || !strings.Contains(planLower, "requested product change") {
+			architecturePlan = strings.TrimSpace(architecturePlan) + "\n\n---\n\n" + solutionPlan
+			if err := os.WriteFile(solutionPlanPath, []byte(architecturePlan), 0o644); err != nil {
+				return err
+			}
+		}
+		recordAgent("in_progress", "architect", "passed", solutionPrompt, "solution-plan.md", "Architect agent produced the solution plan and TODO handoff.", []string{solutionPlanPath}, architectTurn.Process)
 		return nil
 	}
 	runCoding := func() error {
@@ -1719,6 +1894,9 @@ Rules:
 		if err := os.WriteFile(filepath.Join(proofDir, "coding-prompt.md"), []byte(codingPrompt), 0o644); err != nil {
 			return err
 		}
+		if err := writeRunnerPolicyFiles(repoWorkspace, profile, "coding"); err != nil {
+			return err
+		}
 		recordAgent("in_progress", "coding", "running", codingPrompt, "", "Coding agent is editing the repository workspace.", []string{filepath.Join(proofDir, "coding-prompt.md")}, map[string]any{"runner": codingRunnerID, "status": "running"})
 		codingModel, codingEnv := server.runnerCredentialModelAndEnv(ctx, codingRunnerID, codingProfile.Model)
 		codingTurn := codingRunner.RunTurn(ctx, AgentTurnRequest{
@@ -1740,7 +1918,7 @@ Rules:
 			recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
 			return fmt.Errorf("coding agent failed: %w", codingErr)
 		}
-		statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short")
+		statusOutput, err := runCommand(repoWorkspace, "git", "status", "--short", "--", ".", ":(exclude).omega", ":(exclude).codex", ":(exclude).claude", ":(exclude).opencode", ":(exclude).trae")
 		if err != nil {
 			return fmt.Errorf("read coding agent changes: %w", err)
 		}
@@ -1749,7 +1927,7 @@ Rules:
 			recordAgent("in_progress", "coding", "failed", codingPrompt, "coding-agent-note.md", reason, []string{filepath.Join(proofDir, "coding-prompt.md"), filepath.Join(proofDir, "coding-agent-note.md")}, codingProcess)
 			return errors.New("coding agent produced no repository changes")
 		}
-		if _, err := runCommand(repoWorkspace, "git", "add", "-A"); err != nil {
+		if _, err := runCommand(repoWorkspace, "git", "add", "-A", "--", ".", ":(exclude).omega", ":(exclude).codex", ":(exclude).claude", ":(exclude).opencode", ":(exclude).trae"); err != nil {
 			return fmt.Errorf("stage coding agent changes: %w", err)
 		}
 		if _, err := runCommand(repoWorkspace, "git", "commit", "-m", "Omega implementation for "+text(item, "key")); err != nil {
@@ -1757,8 +1935,7 @@ Rules:
 		}
 		commitSha, _ = runCommand(repoWorkspace, "git", "rev-parse", "HEAD")
 		commitSummary, _ = runCommand(repoWorkspace, "git", "show", "--stat", "--oneline", "--no-renames", "HEAD")
-		diffText, _ = runCommand(repoWorkspace, "git", "diff", "HEAD~1..HEAD")
-		changedNames, err = runCommand(repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
+		diffText, changedNames, err = gitHeadDiff(repoWorkspace)
 		if err != nil {
 			return fmt.Errorf("list changed files: %w", err)
 		}
@@ -1783,12 +1960,35 @@ Rules:
 		testVariables["changedFiles"] = strings.Join(changedFiles, ", ")
 		testVariables["testOutput"] = testOutput
 		testFallback := fmt.Sprintf("Validate %s after coding changes. Changed files: %s", text(item, "key"), strings.Join(changedFiles, ", "))
-		testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, testFallback)
-		testReport := fmt.Sprintf("# Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after coding changes.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None"))
-		if err := os.WriteFile(filepath.Join(proofDir, "test-report.md"), []byte(testReport), 0o644); err != nil {
-			return err
+		testReportPath := filepath.Join(proofDir, "test-report.md")
+		testPrompt := renderWorkflowPromptSection(template, "testing", testVariables, testFallback) + "\n\n" + agentPolicyBlock(profile, "testing") + fmt.Sprintf(`
+
+Local repository validation has already run. Use the output below as evidence, inspect the diff if needed, and prepare the final validation report.
+
+Validation status: %s
+
+Validation output:
+~~~text
+%s
+~~~
+
+Validation failure summary:
+%s
+`, testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None")) + agentArtifactCaptureInstruction(testReportPath)
+		testingTurn := runProfileAgent("testing", testingRunner, testingRunnerID, testingProfile, "testing", "in_progress", repoWorkspace, testPrompt, testReportPath, "read-only", "medium")
+		if testingTurn.Error != nil {
+			recordAgent("in_progress", "testing", "failed", testPrompt, "test-report.md", "Testing agent failed while verifying local validation output.", []string{testReportPath}, testingTurn.Process)
+			return fmt.Errorf("testing agent failed: %w", testingTurn.Error)
 		}
-		recordAgent("in_progress", "testing", testStatus, testPrompt, "test-report.md", "Repository validation completed.", []string{filepath.Join(proofDir, "test-report.md")}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput})
+		if reportRaw, _ := os.ReadFile(testReportPath); strings.TrimSpace(string(reportRaw)) == "" {
+			testReport := fmt.Sprintf("# Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after coding changes.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(testOutput), "No validation output."), stringOr(testFailureSummary(testErr, testOutput), "None"))
+			if err := os.WriteFile(testReportPath, []byte(testReport), 0o644); err != nil {
+				return err
+			}
+		}
+		testingProcess := cloneMap(testingTurn.Process)
+		testingProcess["localValidation"] = map[string]any{"runner": "local-validation", "status": testStatus, "stdout": testOutput}
+		recordAgent("in_progress", "testing", testStatus, testPrompt, "test-report.md", "Testing agent verified repository validation output.", []string{testReportPath}, testingProcess)
 		if testErr != nil {
 			return fmt.Errorf("repository validation failed: %w", testErr)
 		}
@@ -1868,9 +2068,15 @@ Rules:
 			ctx:                     ctx,
 			template:                template,
 			profile:                 profile,
+			masterProfile:           masterProfile,
+			masterRunner:            masterRunner,
+			masterRunnerID:          masterRunnerID,
 			codingProfile:           codingProfile,
 			codingRunner:            codingRunner,
 			codingRunnerID:          codingRunnerID,
+			testingProfile:          testingProfile,
+			testingRunner:           testingRunner,
+			testingRunnerID:         testingRunnerID,
 			runnerHeartbeatInterval: runnerHeartbeatInterval,
 			pipeline:                pipeline,
 			item:                    item,
@@ -1958,6 +2164,9 @@ Rules:
 			reviewVariables["reviewFeedback"] = combinedFeedback(stringOr(reviewFeedback, humanChangeRequest))
 			reviewFallback := buildDevFlowReviewPrompt(item, repoSlug, prURL, changedFiles, reviewDiff, testOutput, reviewChecks, reviewRound.Focus, combinedFeedback(stringOr(reviewFeedback, humanChangeRequest)), architecturePlan)
 			reviewPrompt := renderWorkflowPromptSection(template, "review", reviewVariables, reviewFallback) + "\n\n" + agentPolicyBlock(profile, "review")
+			if err := writeRunnerPolicyFiles(repoWorkspace, profile, "review"); err != nil {
+				return failureResult(stageID, "review", "Review agent policy materialization failed.", err.Error(), ""), err
+			}
 			reviewModel, reviewEnv := server.runnerCredentialModelAndEnv(ctx, reviewRunnerID, reviewProfile.Model)
 			reviewTurn := reviewRunner.RunTurn(ctx, AgentTurnRequest{
 				Role:              "review",
@@ -2041,6 +2250,7 @@ Rules:
 		PullRequestURL:      prURL,
 		ChangedFiles:        changedFiles,
 		DiffText:            stringOr(prDiff, diffText),
+		PlanOutput:          architecturePlan,
 		TestOutput:          testOutput,
 		ChecksOutput:        checksOutput,
 		PullRequestFeedback: pullRequestFeedback,
@@ -2053,6 +2263,10 @@ Rules:
 		return nil, err
 	}
 	stageArtifacts = append(stageArtifacts, map[string]any{"stageId": "human_review", "agentId": "delivery", "artifact": filepath.Base(reviewPacketPath)})
+	humanReviewRequest = appendDevFlowTodoCompletionSection(humanReviewRequest, reviewPacket)
+	if err := os.WriteFile(humanReviewRequestPath, []byte(humanReviewRequest), 0o644); err != nil {
+		return nil, err
+	}
 	reportInput.ReviewPacket = reviewPacket
 	if reportPath, err := writeDevFlowRunReport(proofDir, reportInput); err != nil {
 		return nil, err
@@ -2089,7 +2303,29 @@ Rules:
 	}); err != nil {
 		return nil, err
 	}
-	recordAgent("done", "delivery", "waiting-human", deliveryPrompt, "handoff-bundle.json", "Delivery is blocked by the human review checkpoint.", []string{filepath.Join(proofDir, "handoff-bundle.json")}, map[string]any{"runner": "local-orchestrator", "status": "waiting-human"})
+	deliveryHandoffPath := filepath.Join(proofDir, "delivery-handoff.md")
+	deliveryAgentPrompt := deliveryPrompt + fmt.Sprintf(`
+
+You are the Delivery Agent for Omega.
+
+Omega has assembled the machine-readable handoff bundle at:
+%s
+
+Prepare the human review handoff.
+
+Include:
+- delivery readiness
+- PR and changed file summary
+- validation and review evidence
+- remaining human gate decision
+- risks or blocked assumptions
+`, filepath.Join(proofDir, "handoff-bundle.json")) + agentArtifactCaptureInstruction(deliveryHandoffPath) + "\n\n" + agentPolicyBlock(profile, "delivery")
+	deliveryTurn := runProfileAgent("delivery", deliveryRunner, deliveryRunnerID, deliveryProfile, "delivery", "done", workspace, deliveryAgentPrompt, deliveryHandoffPath, "read-only", "medium")
+	if deliveryTurn.Error != nil {
+		recordAgent("done", "delivery", "failed", deliveryAgentPrompt, "delivery-handoff.md", "Delivery agent failed while preparing the human handoff.", []string{filepath.Join(proofDir, "handoff-bundle.json"), deliveryHandoffPath}, deliveryTurn.Process)
+		return failureResult("done", "delivery", "Delivery agent failed while preparing the human handoff.", deliveryTurn.Error.Error(), humanChangeRequest), deliveryTurn.Error
+	}
+	recordAgent("done", "delivery", "waiting-human", deliveryAgentPrompt, "delivery-handoff.md", "Delivery agent prepared the handoff and is waiting for the human review checkpoint.", []string{filepath.Join(proofDir, "handoff-bundle.json"), deliveryHandoffPath}, deliveryTurn.Process)
 	recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 	proofFiles, _ := collectFiles(proofDir)
 	return map[string]any{

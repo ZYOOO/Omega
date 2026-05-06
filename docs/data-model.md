@@ -27,6 +27,8 @@ Omega runtime data must be owned by SQLite first-class tables. The historical fu
 
 - Session restore must use `GET /workspace?scope=session`.
 - Detail pages should fetch dedicated read models: `/run-workpads`, `/pipelines`, `/attempts`, `/checkpoints`, `/proof-records`, `/runtime-logs`.
+- Ordinary control-plane refresh should use compact execution lists (`/attempts?compact=true`, `/run-workpads?compact=true`, `/operations?compact=true`). Full prompt/stdout/stderr, attempt events, and Workpad patch history belong to scoped detail reads, not global refresh.
+- Page Pilot recent run lists should use `/page-pilot/runs?repositoryTargetId=...&limit=8&compact=true`; full `run_json` payloads with conversation, visual proof, PR preview, diff, and source mapping should be loaded by run id only when a detail view is opened.
 - JobSupervisor should update and recover by first-class identifiers: `pipeline_id`, `attempt_id`, `stage_id`, checkpoint status, and Feishu task/message columns.
 - JobSupervisor maintenance ticks and DevFlow execution-state maintenance must load `LoadSupervisorExecutionState`, not the full snapshot. This read model contains projects/repository targets, requirements, work items, pipelines, attempts, checkpoints, run workpads, recent missions/operations, and recent proof records.
 - JobSupervisor maintenance ticks and DevFlow execution-state maintenance must save with `SaveSupervisorExecutionState`, which upserts execution tables instead of rewriting the full workspace snapshot.

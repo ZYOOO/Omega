@@ -36,6 +36,39 @@ type StageAgentRunSummary = {
   launchedCount: number;
   agents: string[];
   details: string[];
+  operationDetails: StageAgentRunDetail[];
+  eventCount: number;
+  totalDurationMs: number;
+  durationSampleCount: number;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  statusCounts: Record<string, number>;
+};
+
+type StageAgentRunDetail = {
+  id: string;
+  stageId: string;
+  agentId?: string;
+  agentLabel: string;
+  roleLabel: string;
+  status: string;
+  runner?: string;
+  provider?: string;
+  model?: string;
+  processStatus?: string;
+  durationMs?: number;
+  tokenUsage?: AgentTokenUsage;
+  summary: string;
+  startedAt?: string;
+  finishedAt?: string;
+  source: "operation" | "event";
+};
+
+type AgentTokenUsage = {
+  input?: number;
+  output?: number;
+  total: number;
 };
 
 type WorkpadSection = {
@@ -342,6 +375,7 @@ export function WorkItemDetailPage({
           <DeliveryFlowGrid
             actionPlan={attemptActionPlan}
             agentShortLabel={agentShortLabel}
+            operationStatusLabel={operationStatusLabel}
             pipeline={pipeline}
             pipelineStageClassName={pipelineStageClassName}
             pipelineStageLabel={pipelineStageLabel}
@@ -702,16 +736,23 @@ function linesFromDraft(value: string): string[] {
 function DeliveryFlowGrid({
   actionPlan,
   agentShortLabel,
+  operationStatusLabel,
   pipeline,
   pipelineStageClassName,
   pipelineStageLabel,
   stageAgentRuns
-}: Pick<DetailHelpers, "agentShortLabel" | "pipelineStageClassName" | "pipelineStageLabel"> & {
+}: Pick<DetailHelpers, "agentShortLabel" | "operationStatusLabel" | "pipelineStageClassName" | "pipelineStageLabel"> & {
   actionPlan?: AttemptActionPlanInfo | null;
   pipeline?: PipelineRecordInfo;
   stageAgentRuns: Map<string, StageAgentRunSummary>;
 }) {
   const { t } = useI18n();
+  const [activeStage, setActiveStage] = useState<{
+    agentIds: string[];
+    status: string;
+    stageId: string;
+    title: string;
+  } | null>(null);
   const pipelineStages = pipeline?.run?.stages ?? [];
   const planStates = actionPlan?.states?.length ? actionPlan.states : [];
   const stages = pipelineStages.length ? pipelineStages : planStates;
@@ -734,20 +775,165 @@ function DeliveryFlowGrid({
             ? "running"
             : rawStatus;
         const participantLabel = stageParticipantLabel(stageRecord, agentIds, agentShortLabel);
-        const runtimeLabel = stageAgentRuntimeLabel(stageAgentRuns.get(stageId), agentIds, agentShortLabel, t);
+        const summary = stageAgentRuns.get(stageId);
+        const runtimeLabel = stageAgentRuntimeLabel(summary, agentIds, agentShortLabel, t);
+        const stageTitle = recordString(stageRecord, "title") || recordString(stageRecord, "id") || stageId;
         return (
-          <article key={stageId} className={pipelineStageClassName(status)}>
-            <span>{index + 1}</span>
-            <div>
-              <strong>{recordString(stageRecord, "title") || recordString(stageRecord, "id")}</strong>
+          <article key={stageId} className={`detail-stage-card ${pipelineStageClassName(status)}`}>
+            <span className="stage-card-index">{index + 1}</span>
+            <div className="stage-card-content">
+              <strong>{stageTitle}</strong>
               {participantLabel ? <small>{participantLabel}</small> : null}
               {runtimeLabel ? <small className="stage-agent-runtime">{runtimeLabel}</small> : null}
+              <StageAgentMetrics summary={summary} plannedAgentIds={agentIds} />
             </div>
-            <em>{pipelineStageLabel(status)}</em>
+            <div className="stage-card-actions">
+              <span className="stage-card-status">{pipelineStageLabel(status)}</span>
+              <button
+                type="button"
+                className="stage-agent-detail-button"
+                aria-label={`${t("View agents")}: ${stageTitle}`}
+                onClick={() => setActiveStage({ agentIds, stageId, status, title: stageTitle })}
+              >
+                {t("View agents")}
+              </button>
+            </div>
           </article>
         );
       })}
+      {activeStage ? (
+        <StageAgentDetailDialog
+          agentShortLabel={agentShortLabel}
+          onClose={() => setActiveStage(null)}
+          operationStatusLabel={operationStatusLabel}
+          plannedAgentIds={activeStage.agentIds}
+          pipelineStageLabel={pipelineStageLabel}
+          stageId={activeStage.stageId}
+          status={activeStage.status}
+          summary={stageAgentRuns.get(activeStage.stageId)}
+          title={activeStage.title}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function StageAgentMetrics({ plannedAgentIds, summary }: { plannedAgentIds: string[]; summary?: StageAgentRunSummary }) {
+  const { t } = useI18n();
+  if (!summary?.launchedCount) {
+    if (plannedAgentIds.length <= 1) return null;
+    return (
+      <div className="stage-agent-metrics" aria-label="Planned stage agents">
+        <span>{t("{count} planned", { count: plannedAgentIds.length })}</span>
+      </div>
+    );
+  }
+  const duration = stageDurationLabel(summary);
+  const tokens = summary.totalTokens > 0 ? formatTokenCount(summary.totalTokens) : "";
+  const failedCount = summary.statusCounts.failed ?? 0;
+  const runningCount = summary.statusCounts.running ?? 0;
+  return (
+    <div className="stage-agent-metrics" aria-label="Stage agent statistics">
+      <span>{t("{count} runs", { count: summary.launchedCount })}</span>
+      {duration ? <span>{duration}</span> : null}
+      {tokens ? <span>{tokens}</span> : null}
+      {failedCount ? <span className="stage-agent-metric-warning">{t("{count} failed", { count: failedCount })}</span> : null}
+      {runningCount ? <span>{t("{count} running", { count: runningCount })}</span> : null}
+    </div>
+  );
+}
+
+function StageAgentDetailDialog({
+  agentShortLabel,
+  onClose,
+  operationStatusLabel,
+  pipelineStageLabel,
+  plannedAgentIds,
+  stageId,
+  status,
+  summary,
+  title
+}: {
+  agentShortLabel: (agentId: string) => string;
+  onClose: () => void;
+  operationStatusLabel: (status: string) => string;
+  pipelineStageLabel: (status: string) => string;
+  plannedAgentIds: string[];
+  stageId: string;
+  status: string;
+  summary?: StageAgentRunSummary;
+  title: string;
+}) {
+  const { t } = useI18n();
+  const details = summary?.operationDetails ?? [];
+  const duration = summary ? stageDurationLabel(summary) : "";
+  const runnerMix = compactAgentRunDetails(summary?.details ?? []);
+  const planned = plannedAgentIds.map(agentShortLabel);
+  return (
+    <section className="detail-popover-backdrop" role="presentation" onClick={onClose}>
+      <article
+        className="detail-popover stage-agent-popover"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${title} agent statistics`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span>{stageId}</span>
+            <strong>{title}</strong>
+          </div>
+          <button type="button" onClick={onClose}>{t("Close")}</button>
+        </header>
+        <div className="detail-popover-body stage-agent-popover-body">
+          <div className="stage-agent-stat-grid" aria-label={t("Stage statistics")}>
+            <span>
+              <strong>{t("Status")}</strong>
+              <small>{pipelineStageLabel(status)}</small>
+            </span>
+            <span>
+              <strong>{t("Agent runs")}</strong>
+              <small>{summary?.launchedCount ?? 0}</small>
+            </span>
+            <span>
+              <strong>{t("Duration")}</strong>
+              <small>{duration || t("Not captured")}</small>
+            </span>
+            <span>
+              <strong>{t("Tokens")}</strong>
+              <small>{summary?.totalTokens ? formatTokenUsage(summary) : t("Not captured")}</small>
+            </span>
+            <span>
+              <strong>{t("Runtime")}</strong>
+              <small>{runnerMix || planned.join(" + ") || t("Not captured")}</small>
+            </span>
+          </div>
+          {details.length ? (
+            <div className="stage-agent-detail-list">
+              {details.map((detail) => (
+                <article key={detail.id} className={`stage-agent-detail-row ${detail.source === "event" ? "is-event" : ""}`}>
+                  <div className="stage-agent-detail-main">
+                    <span>{t(detail.roleLabel)}</span>
+                    <strong>{detail.agentLabel}</strong>
+                    <small>{agentRuntimeMeta(detail) || t("Runtime not captured")}</small>
+                    <p>{shortText(detail.summary, 220)}</p>
+                  </div>
+                  <div className="stage-agent-detail-facts">
+                    <span>{operationStatusLabel(detail.status)}</span>
+                    {typeof detail.durationMs === "number" && detail.durationMs > 0 ? <span>{formatDurationLabel(detail.durationMs)}</span> : null}
+                    {detail.tokenUsage?.total ? <span>{formatTokenUsage(detail.tokenUsage)}</span> : null}
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="muted-copy">
+              {planned.length ? `${t("Planned agents")}: ${planned.join(" + ")}` : t("Agent trace will appear as soon as the local orchestrator starts assigning stage work.")}
+            </p>
+          )}
+        </div>
+      </article>
+    </section>
   );
 }
 
@@ -786,6 +972,49 @@ function compactAgentRunDetails(details: string[]): string {
   const unique = Array.from(new Set(details.map((detail) => detail.trim()).filter(Boolean)));
   if (unique.length <= 2) return unique.join(" + ");
   return `${unique.slice(0, 2).join(" + ")} +${unique.length - 2}`;
+}
+
+function stageDurationLabel(summary: StageAgentRunSummary): string {
+  if (summary.totalDurationMs <= 0 || summary.durationSampleCount <= 0) return "";
+  const total = formatDurationLabel(summary.totalDurationMs);
+  if (summary.durationSampleCount <= 1) return total;
+  return `${total} total · ${formatDurationLabel(summary.totalDurationMs / summary.durationSampleCount)} avg`;
+}
+
+function formatDurationLabel(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0ms";
+  if (value < 1000) return `${Math.round(value)}ms`;
+  const seconds = value / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = Math.round(seconds % 60);
+  return remaining ? `${minutes}m ${remaining}s` : `${minutes}m`;
+}
+
+function formatTokenCount(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "";
+  if (value < 1000) return `${Math.round(value)} tokens`;
+  if (value < 1000000) return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)}k tokens`;
+  return `${(value / 1000000).toFixed(1)}m tokens`;
+}
+
+function formatTokenUsage(value: AgentTokenUsage | StageAgentRunSummary): string {
+  const input = "inputTokens" in value ? value.inputTokens : value.input;
+  const output = "outputTokens" in value ? value.outputTokens : value.output;
+  const total = "totalTokens" in value ? value.totalTokens : value.total;
+  const pieces = [formatTokenCount(total)].filter(Boolean);
+  if (input || output) {
+    pieces.push(`in ${formatTokenCount(input ?? 0) || "0 tokens"}`);
+    pieces.push(`out ${formatTokenCount(output ?? 0) || "0 tokens"}`);
+  }
+  return pieces.join(" · ");
+}
+
+function agentRuntimeMeta(detail: StageAgentRunDetail): string {
+  return [detail.runner, detail.provider, detail.model, detail.processStatus ? `process ${detail.processStatus}` : ""]
+    .map((value) => value?.trim())
+    .filter(Boolean)
+    .join(" · ");
 }
 
 function ReworkReturnSignal({
@@ -1222,47 +1451,63 @@ function ArtifactList({ artifacts }: { artifacts: DetailProofCard[] }) {
 }
 
 function ReviewPacketPreview({ packet }: { packet: Record<string, unknown> }) {
+  const { t } = useI18n();
   const diff = recordValue(packet.diffPreview);
   const test = recordValue(packet.testPreview);
   const checks = recordValue(packet.checkPreview);
   const risk = recordValue(packet.risk);
+  const todoCompletion = recordValue(packet.todoCompletion);
+  const riskBasis = arrayRecords(risk?.basis);
   const actions = arrayRecords(packet.recommendedActions);
   const changedFiles = asStringArray(diff?.changedFiles);
   return (
-    <div className="review-packet-preview" aria-label="Review packet preview">
-      <p>{recordString(packet, "summary") || "Review packet is ready for human review."}</p>
+    <div className="review-packet-preview" aria-label={t("Review packet preview")}>
+      <p>{recordString(packet, "summary") || t("Review packet is ready for human review.")}</p>
       <div className="review-packet-grid">
         <article>
-          <span>Diff</span>
-          <strong>{recordString(diff, "summary") || `${changedFiles.length} changed file${changedFiles.length === 1 ? "" : "s"}`}</strong>
+          <span>{t("Diff")}</span>
+          <strong>{recordString(diff, "summary") || t("{count} changed files", { count: changedFiles.length })}</strong>
           {changedFiles.length ? (
             <ul>{changedFiles.slice(0, 6).map((file) => <li key={file}>{file}</li>)}</ul>
           ) : (
-            <small>No changed files captured.</small>
+            <small>{t("No changed files captured.")}</small>
           )}
         </article>
         <article>
-          <span>Tests</span>
-          <strong>{recordString(test, "status") || "unknown"}</strong>
-          <small>{recordString(test, "summary") || "No validation preview captured."}</small>
+          <span>{t("Tests")}</span>
+          <strong>{recordString(test, "status") || t("unknown")}</strong>
+          <small>{recordString(test, "summary") || t("No validation preview captured.")}</small>
         </article>
         <article>
-          <span>Checks</span>
-          <strong>{recordString(checks, "status") || "unknown"}</strong>
-          <small>{recordString(checks, "summary") || "No check preview captured."}</small>
+          <span>{t("Checks")}</span>
+          <strong>{recordString(checks, "status") || t("unknown")}</strong>
+          <small>{recordString(checks, "summary") || t("No check preview captured.")}</small>
         </article>
         <article className={`review-packet-risk review-packet-risk-${recordString(risk, "level") || "low"}`}>
-          <span>Risk</span>
-          <strong>{recordString(risk, "level") || "low"}</strong>
+          <span>{t("Risk")}</span>
+          <strong>{recordString(risk, "level") || t("low")}</strong>
           <ul>{asStringArray(risk?.reasons).slice(0, 4).map((reason) => <li key={reason}>{reason}</li>)}</ul>
+          {riskBasis.length ? (
+            <div className="review-packet-risk-basis" aria-label={t("Risk basis")}>
+              <span>{t("Risk basis")}</span>
+              {riskBasis.slice(0, 4).map((entry, index) => (
+                <small key={`${recordString(entry, "source")}-${index}`}>
+                  <b>{recordString(entry, "level") || t("unknown")}</b>
+                  {recordString(entry, "source") ? ` · ${recordString(entry, "source")}` : ""}
+                  {recordString(entry, "evidence") ? `: ${recordString(entry, "evidence")}` : ""}
+                </small>
+              ))}
+            </div>
+          ) : null}
         </article>
       </div>
+      {todoCompletion ? <TodoCompletionPreview completion={todoCompletion} /> : null}
       {actions.length ? (
         <div className="review-packet-actions">
-          <span>Next actions</span>
+          <span>{t("Next actions")}</span>
           <ul>
             {actions.slice(0, 5).map((action, index) => {
-              const label = recordString(action, "label") || recordString(action, "type") || `Action ${index + 1}`;
+              const label = recordString(action, "label") || recordString(action, "type") || t("Action {count}", { count: index + 1 });
               const url = recordString(action, "url");
               return <li key={`${label}-${index}`}>{url ? <a href={url} target="_blank" rel="noreferrer">{label}</a> : label}</li>;
             })}
@@ -1274,6 +1519,76 @@ function ReviewPacketPreview({ packet }: { packet: Record<string, unknown> }) {
       ) : null}
     </div>
   );
+}
+
+function TodoCompletionPreview({ completion }: { completion: Record<string, unknown> }) {
+  const { t } = useI18n();
+  const counts = recordValue(completion.counts);
+  const functional = arrayRecords(completion.functional);
+  const project = arrayRecords(completion.project);
+  const status = recordString(completion, "status") || "pending";
+  const verified = numberValue(counts?.verified) ?? 0;
+  const total = numberValue(counts?.total) ?? functional.length + project.length;
+  const pending = numberValue(counts?.pending) ?? 0;
+  const attention = numberValue(counts?.attention) ?? 0;
+  return (
+    <section className={`todo-completion-preview todo-completion-${status}`} aria-label={t("Plan TODO verification")}>
+      <header>
+        <span>{t("Plan TODO verification")}</span>
+        <strong>{recordString(completion, "summary") || t("{verified}/{total} TODOs verified", { verified, total })}</strong>
+      </header>
+      <div className="todo-completion-counts" aria-label={t("TODO verification counts")}>
+        <span>{t("Verified")}: {verified}</span>
+        <span>{t("Pending")}: {pending}</span>
+        <span>{t("Attention")}: {attention}</span>
+      </div>
+      <TodoCompletionGroup title={t("Functional TODO")} items={functional} empty={t("No functional TODO captured.")} />
+      <TodoCompletionGroup title={t("Project TODO")} items={project} empty={t("No project TODO captured.")} />
+    </section>
+  );
+}
+
+function TodoCompletionGroup({ empty, items, title }: { empty: string; items: Record<string, unknown>[]; title: string }) {
+  const { t } = useI18n();
+  if (!items.length) {
+    return (
+      <div className="todo-completion-group">
+        <span>{title}</span>
+        <small>{empty}</small>
+      </div>
+    );
+  }
+  return (
+    <div className="todo-completion-group">
+      <span>{title}</span>
+      <ul>
+        {items.map((item, index) => {
+          const status = recordString(item, "status") || "pending";
+          return (
+            <li key={`${recordString(item, "text")}-${index}`} className={`todo-completion-item todo-completion-item-${status}`}>
+              <strong aria-label={t(todoStatusLabel(status))}>{todoStatusMark(status)}</strong>
+              <div>
+                <b>{recordString(item, "text") || t("Untitled TODO")}</b>
+                <small>{recordString(item, "evidence") || t("No evidence captured.")}</small>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function todoStatusMark(status: string): string {
+  if (status === "verified") return "✓";
+  if (status === "attention") return "!";
+  return "·";
+}
+
+function todoStatusLabel(status: string): string {
+  if (status === "verified") return "Verified";
+  if (status === "attention") return "Attention";
+  return "Pending";
 }
 
 function reviewPacketTitle(packet: Record<string, unknown>): string {
@@ -1552,12 +1867,25 @@ function summarizeStageAgentRuns({
 }): Map<string, StageAgentRunSummary> {
   const summaries = new Map<string, StageAgentRunSummary>();
   const operationStageAgents = new Set<string>();
+  const operationStages = new Set<string>();
   const seenRuns = new Set<string>();
 
   const ensure = (stageId: string) => {
     const existing = summaries.get(stageId);
     if (existing) return existing;
-    const created: StageAgentRunSummary = { launchedCount: 0, agents: [], details: [] };
+    const created: StageAgentRunSummary = {
+      launchedCount: 0,
+      agents: [],
+      details: [],
+      operationDetails: [],
+      eventCount: 0,
+      totalDurationMs: 0,
+      durationSampleCount: 0,
+      totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      statusCounts: {}
+    };
     summaries.set(stageId, created);
     return created;
   };
@@ -1569,6 +1897,13 @@ function summarizeStageAgentRuns({
     runner?: string;
     model?: string;
     provider?: string;
+    processStatus?: string;
+    durationMs?: number;
+    tokenUsage?: AgentTokenUsage;
+    status?: string;
+    summary?: string;
+    startedAt?: string;
+    finishedAt?: string;
     fromOperation?: boolean;
   }) => {
     const stageId = input.stageId.trim();
@@ -1580,7 +1915,52 @@ function summarizeStageAgentRuns({
     if (!summary.agents.includes(agentLabel)) summary.agents.push(agentLabel);
     const runtime = stageAgentRuntimeDetail(agentLabel, input.runner, input.model, input.provider);
     if (runtime && !summary.details.includes(runtime)) summary.details.push(runtime);
+    const status = input.status || input.processStatus || "recorded";
+    summary.statusCounts[status] = (summary.statusCounts[status] ?? 0) + 1;
+    if (typeof input.durationMs === "number" && input.durationMs > 0) {
+      summary.totalDurationMs += input.durationMs;
+      summary.durationSampleCount += 1;
+    }
+    if (input.tokenUsage?.total) {
+      summary.totalTokens += input.tokenUsage.total;
+      summary.inputTokens += input.tokenUsage.input ?? 0;
+      summary.outputTokens += input.tokenUsage.output ?? 0;
+    }
+    if (input.fromOperation) {
+      summary.operationDetails.push({
+        id: input.id,
+        stageId,
+        agentId: input.agentId,
+        agentLabel,
+        roleLabel: agentRoleLabel(input.agentId, stageId),
+        status,
+        runner: input.runner,
+        provider: input.provider,
+        model: input.model,
+        processStatus: input.processStatus,
+        durationMs: input.durationMs,
+        tokenUsage: input.tokenUsage,
+        summary: input.summary || "Trace details captured for this stage.",
+        startedAt: input.startedAt,
+        finishedAt: input.finishedAt,
+        source: "operation"
+      });
+    } else {
+      summary.eventCount += 1;
+      summary.operationDetails.push({
+        id: input.id,
+        stageId,
+        agentId: input.agentId,
+        agentLabel,
+        roleLabel: agentRoleLabel(input.agentId, stageId),
+        status,
+        summary: input.summary || "Agent event captured before operation detail was persisted.",
+        startedAt: input.startedAt,
+        source: "event"
+      });
+    }
     if (input.fromOperation && input.agentId) operationStageAgents.add(`${stageId}:${input.agentId}`);
+    if (input.fromOperation) operationStages.add(stageId);
   };
 
   for (const operation of operations) {
@@ -1591,6 +1971,7 @@ function summarizeStageAgentRuns({
     const runner = operation.runnerProcess?.runner;
     const model = operation.runnerProcess?.model;
     const provider = operation.runnerProcess?.provider;
+    const runnerProcess = recordValue(operation.runnerProcess);
     addRun({
       id: `operation:${operation.id}`,
       stageId,
@@ -1598,6 +1979,13 @@ function summarizeStageAgentRuns({
       runner,
       model,
       provider,
+      processStatus: operation.runnerProcess?.status,
+      durationMs: operation.runnerProcess?.durationMs,
+      tokenUsage: tokenUsageFromRecord(runnerProcess),
+      status: operation.status,
+      summary: operation.summary || agentOperationSummary(operation),
+      startedAt: operation.runnerProcess?.startedAt || operation.createdAt,
+      finishedAt: operation.runnerProcess?.finishedAt || operation.updatedAt,
       fromOperation: true
     });
   }
@@ -1613,15 +2001,78 @@ function summarizeStageAgentRuns({
     const stageId = recordString(eventRecord, "stageId");
     const agentId = recordString(eventRecord, "agentId");
     if (!stageId) continue;
+    if (!agentId && operationStages.has(stageId)) continue;
     if (agentId && operationStageAgents.has(`${stageId}:${agentId}`)) continue;
     addRun({
       id: `event:${stageId}:${agentId || "agent"}:${type}:${recordString(eventRecord, "createdAt")}`,
       stageId,
-      agentId
+      agentId,
+      status: agentEventStatus(type),
+      summary: recordString(eventRecord, "message") || type,
+      startedAt: recordString(eventRecord, "createdAt")
     });
   }
 
   return summaries;
+}
+
+function agentOperationSummary(operation: OperationRecordInfo): string {
+  return shortText(
+    operation.summary ||
+    operation.runnerProcess?.stderr ||
+    operation.runnerProcess?.stdout ||
+    operation.prompt ||
+    "",
+    260
+  );
+}
+
+function agentEventStatus(type: string): string {
+  if (/failed|error/i.test(type)) return "failed";
+  if (/completed|passed|done/i.test(type)) return "passed";
+  if (/started|running|heartbeat/i.test(type)) return "running";
+  return "recorded";
+}
+
+function agentRoleLabel(agentId?: string, stageId?: string): string {
+  const raw = `${agentId ?? ""} ${stageId ?? ""}`.toLowerCase();
+  if (/requirement|intake|todo/.test(raw)) return "Requirement";
+  if (/master|dispatch|orchestrat/.test(raw)) return "Orchestration";
+  if (/architect|plan|solution/.test(raw)) return "Plan";
+  if (/coding|code|implement|rework/.test(raw)) return "Code";
+  if (/testing|test|validation|check/.test(raw)) return "Test";
+  if (/review|human/.test(raw)) return "Review";
+  if (/delivery|merge|done|handoff/.test(raw)) return "Delivery";
+  return "Agent";
+}
+
+function tokenUsageFromRecord(record?: Record<string, unknown>): AgentTokenUsage | undefined {
+  if (!record) return undefined;
+  const usage = recordValue(record.usage) || recordValue(record.tokenUsage) || recordValue(record.tokens);
+  const input =
+    firstNumber(record, ["inputTokens", "promptTokens", "input_tokens", "prompt_tokens"]) ||
+    firstNumber(usage, ["inputTokens", "promptTokens", "input_tokens", "prompt_tokens"]);
+  const output =
+    firstNumber(record, ["outputTokens", "completionTokens", "output_tokens", "completion_tokens"]) ||
+    firstNumber(usage, ["outputTokens", "completionTokens", "output_tokens", "completion_tokens"]);
+  const total =
+    firstNumber(record, ["totalTokens", "total_tokens", "tokensTotal"]) ||
+    firstNumber(usage, ["totalTokens", "total_tokens", "tokensTotal"]) ||
+    ((input || output) ? (input ?? 0) + (output ?? 0) : 0);
+  return total > 0 ? { input, output, total } : undefined;
+}
+
+function firstNumber(record: Record<string, unknown> | undefined, keys: string[]): number | undefined {
+  if (!record) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+    if (typeof value === "string") {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+  return undefined;
 }
 
 function parseAgentOperationId(id: string): { stageId?: string; agentId?: string } {

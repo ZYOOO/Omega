@@ -16,7 +16,10 @@ func (server *Server) attemptTimeline(response http.ResponseWriter, request *htt
 	if limit <= 0 {
 		limit = 120
 	}
-	database, attempt, pipeline, err := server.loadAttemptTimelineContext(request.Context(), attemptID)
+	if limit > 240 {
+		limit = 240
+	}
+	database, attempt, pipeline, err := server.loadAttemptTimelineContext(request.Context(), attemptID, limit)
 	if err != nil {
 		writeJSON(response, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -26,7 +29,7 @@ func (server *Server) attemptTimeline(response http.ResponseWriter, request *htt
 		return
 	}
 
-	items, err := server.buildAttemptTimelineItems(request.Context(), database, attempt, pipeline)
+	items, err := server.buildAttemptTimelineItems(request.Context(), database, attempt, pipeline, limit)
 	if err != nil {
 		writeJSON(response, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -35,14 +38,14 @@ func (server *Server) attemptTimeline(response http.ResponseWriter, request *htt
 		items = items[len(items)-limit:]
 	}
 	writeJSON(response, http.StatusOK, AttemptTimelineResponse{
-		Attempt:     attempt,
-		Pipeline:    pipeline,
+		Attempt:     compactAttemptTimelineRecord(attempt),
+		Pipeline:    compactPipelineTimelineRecord(pipeline),
 		Items:       items,
 		GeneratedAt: nowISO(),
 	})
 }
 
-func (server *Server) loadAttemptTimelineContext(ctx context.Context, attemptID string) (WorkspaceDatabase, map[string]any, map[string]any, error) {
+func (server *Server) loadAttemptTimelineContext(ctx context.Context, attemptID string, limit int) (WorkspaceDatabase, map[string]any, map[string]any, error) {
 	attempts, err := server.Repo.ListAttempts(ctx, map[string]string{"id": attemptID, "limit": "1"})
 	if err != nil {
 		return WorkspaceDatabase{}, nil, nil, err
@@ -69,8 +72,9 @@ func (server *Server) loadAttemptTimelineContext(ctx context.Context, attemptID 
 	}
 
 	if pipelineID != "" || workItemID != "" {
-		operationFilters := map[string]string{"limit": "320"}
-		proofFilters := map[string]string{"limit": "320"}
+		readLimit := timelineRecordReadLimit(limit)
+		operationFilters := map[string]string{"limit": readLimit}
+		proofFilters := map[string]string{"limit": readLimit}
 		if pipelineID != "" {
 			operationFilters["pipelineId"] = pipelineID
 			proofFilters["pipelineId"] = pipelineID
@@ -91,15 +95,16 @@ func (server *Server) loadAttemptTimelineContext(ctx context.Context, attemptID 
 	}
 
 	checkpoints := []map[string]any{}
+	checkpointLimit := timelineCheckpointReadLimit(limit)
 	if pipelineID != "" {
-		rows, err := server.Repo.ListCheckpoints(ctx, map[string]string{"pipelineId": pipelineID, "limit": "160"})
+		rows, err := server.Repo.ListCheckpoints(ctx, map[string]string{"pipelineId": pipelineID, "limit": checkpointLimit})
 		if err != nil {
 			return WorkspaceDatabase{}, nil, nil, err
 		}
 		checkpoints = appendUniqueTimelineMaps(checkpoints, rows)
 	}
 	if attemptID != "" {
-		rows, err := server.Repo.ListCheckpoints(ctx, map[string]string{"attemptId": attemptID, "limit": "160"})
+		rows, err := server.Repo.ListCheckpoints(ctx, map[string]string{"attemptId": attemptID, "limit": checkpointLimit})
 		if err != nil {
 			return WorkspaceDatabase{}, nil, nil, err
 		}
@@ -107,6 +112,28 @@ func (server *Server) loadAttemptTimelineContext(ctx context.Context, attemptID 
 	}
 	database.Tables.Checkpoints = checkpoints
 	return database, attempt, pipeline, nil
+}
+
+func timelineRecordReadLimit(limit int) string {
+	readLimit := limit * 2
+	if readLimit < 80 {
+		readLimit = 80
+	}
+	if readLimit > 160 {
+		readLimit = 160
+	}
+	return strconv.Itoa(readLimit)
+}
+
+func timelineCheckpointReadLimit(limit int) string {
+	readLimit := limit
+	if readLimit < 40 {
+		readLimit = 40
+	}
+	if readLimit > 120 {
+		readLimit = 120
+	}
+	return strconv.Itoa(readLimit)
 }
 
 func appendUniqueTimelineMaps(current []map[string]any, next []map[string]any) []map[string]any {
@@ -129,6 +156,45 @@ func appendUniqueTimelineMaps(current []map[string]any, next []map[string]any) [
 	return current
 }
 
+func compactAttemptTimelineRecord(attempt map[string]any) map[string]any {
+	return compactDetails(attempt,
+		"id",
+		"pipelineId",
+		"itemId",
+		"repositoryTargetId",
+		"status",
+		"currentStageId",
+		"runner",
+		"trigger",
+		"branchName",
+		"pullRequestUrl",
+		"workspacePath",
+		"retryOfAttemptId",
+		"retryRootAttemptId",
+		"retryIndex",
+		"durationMs",
+		"createdAt",
+		"startedAt",
+		"finishedAt",
+		"updatedAt",
+	)
+}
+
+func compactPipelineTimelineRecord(pipeline map[string]any) map[string]any {
+	if pipeline == nil {
+		return nil
+	}
+	return compactDetails(pipeline,
+		"id",
+		"workItemId",
+		"templateId",
+		"runId",
+		"status",
+		"createdAt",
+		"updatedAt",
+	)
+}
+
 func intValueFromString(value string) int {
 	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil {
@@ -137,7 +203,7 @@ func intValueFromString(value string) int {
 	return parsed
 }
 
-func (server *Server) buildAttemptTimelineItems(ctx context.Context, database WorkspaceDatabase, attempt map[string]any, pipeline map[string]any) ([]AttemptTimelineItem, error) {
+func (server *Server) buildAttemptTimelineItems(ctx context.Context, database WorkspaceDatabase, attempt map[string]any, pipeline map[string]any, limit int) ([]AttemptTimelineItem, error) {
 	attemptID := text(attempt, "id")
 	pipelineID := text(attempt, "pipelineId")
 	fallbackTime := firstNonEmpty(text(attempt, "startedAt"), text(attempt, "createdAt"), text(attempt, "updatedAt"), nowISO())
@@ -261,7 +327,7 @@ func (server *Server) buildAttemptTimelineItems(ctx context.Context, database Wo
 		})
 	}
 
-	logs, err := timelineRuntimeLogs(ctx, server, attemptID, pipelineID)
+	logs, err := timelineRuntimeLogs(ctx, server, attemptID, pipelineID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -320,9 +386,19 @@ func operationBelongsToAttempt(operation map[string]any, attempt map[string]any,
 		(workItemID != "" && strings.Contains(missionID, workItemID))
 }
 
-func timelineRuntimeLogs(ctx context.Context, server *Server, attemptID string, pipelineID string) ([]RuntimeLogRecord, error) {
+func timelineRuntimeLogs(ctx context.Context, server *Server, attemptID string, pipelineID string, limit int) ([]RuntimeLogRecord, error) {
 	records := []RuntimeLogRecord{}
 	seen := map[string]bool{}
+	readLimit := limit
+	if readLimit <= 0 {
+		readLimit = 120
+	}
+	if readLimit < 80 {
+		readLimit = 80
+	}
+	if readLimit > 160 {
+		readLimit = 160
+	}
 	for _, filters := range []map[string]string{{"attemptId": attemptID}, {"pipelineId": pipelineID}} {
 		for key, value := range filters {
 			if strings.TrimSpace(value) == "" {
@@ -332,7 +408,7 @@ func timelineRuntimeLogs(ctx context.Context, server *Server, attemptID string, 
 		if len(filters) == 0 {
 			continue
 		}
-		logs, err := server.Repo.ListRuntimeLogs(ctx, filters, 200)
+		logs, err := server.Repo.ListRuntimeLogs(ctx, filters, readLimit)
 		if err != nil {
 			return nil, err
 		}

@@ -15,9 +15,94 @@ function repoRootFromDesktopSource() {
   return path.resolve(__dirname, "../../..");
 }
 
+function desktopResourceRoot(app) {
+  return app?.isPackaged ? process.resourcesPath : repoRootFromDesktopSource();
+}
+
+function releaseBinaryName(name) {
+  return process.platform === "win32" ? `${name}.exe` : name;
+}
+
 function envFlag(value, defaultValue = true) {
   if (value === undefined || value === "") return defaultValue;
   return !["0", "false", "no", "off"].includes(String(value).toLowerCase());
+}
+
+let cachedLoginShellPath;
+
+function desktopProcessEnv(env = process.env) {
+  return {
+    ...env,
+    PATH: augmentedToolPath(env),
+  };
+}
+
+function augmentedToolPath(env = process.env) {
+  const entries = [];
+  const addPathList = (value) => {
+    for (const entry of String(value || "").split(path.delimiter)) {
+      if (entry) entries.push(entry);
+    }
+  };
+  addPathList(env.PATH);
+  addPathList(loginShellPath(env));
+  for (const entry of commonToolPathEntries()) {
+    entries.push(entry);
+  }
+  const seen = new Set();
+  const result = [];
+  for (const entry of entries) {
+    const resolved = path.resolve(entry);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    result.push(entry);
+  }
+  return result.join(path.delimiter);
+}
+
+function loginShellPath(env = process.env) {
+  if (cachedLoginShellPath !== undefined) return cachedLoginShellPath;
+  const shell = env.SHELL || "/bin/zsh";
+  try {
+    cachedLoginShellPath = execFileSync(shell, ["-lc", "printf %s \"$PATH\""], {
+      encoding: "utf8",
+      timeout: 2500,
+      env,
+    }).trim();
+  } catch (_error) {
+    cachedLoginShellPath = "";
+  }
+  return cachedLoginShellPath;
+}
+
+function commonToolPathEntries() {
+  const home = os.homedir();
+  const entries = [
+    path.join(home, ".local", "bin"),
+    path.join(home, ".npm-global", "bin"),
+    path.join(home, ".bun", "bin"),
+    path.join(home, "go", "bin"),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/go/bin",
+    "/Applications/Codex.app/Contents/Resources",
+  ];
+  const nvmVersions = path.join(home, ".nvm", "versions", "node");
+  try {
+    for (const version of fs.readdirSync(nvmVersions)) {
+      entries.push(path.join(nvmVersions, version, "bin"));
+    }
+  } catch (_error) {
+    // nvm is optional.
+  }
+  return entries.filter((entry) => {
+    try {
+      return fs.statSync(entry).isDirectory();
+    } catch (_error) {
+      return false;
+    }
+  });
 }
 
 function logService(service, message, details = "") {
@@ -82,7 +167,7 @@ async function waitForHttp(url, options = {}) {
 function spawnManagedProcess(service, command, args, options = {}) {
   const child = spawn(command, args, {
     cwd: options.cwd,
-    env: { ...process.env, ...(options.env || {}) },
+    env: { ...desktopProcessEnv(process.env), ...(options.env || {}) },
     shell: Boolean(options.shell),
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
@@ -649,11 +734,12 @@ async function refreshPreviewRuntime(session, options = {}) {
 
 function buildWebLaunchPlan(app, env = process.env) {
   const repoRoot = repoRootFromDesktopSource();
+  const resourceRoot = desktopResourceRoot(app);
   const webUrl = env.OMEGA_WEB_URL || DEFAULT_WEB_URL;
   const webPort = new URL(webUrl).port || "5173";
   const mode = env.OMEGA_DESKTOP_WEB_MODE || (app?.isPackaged ? "static" : "dev");
   if (mode === "static") {
-    const filePath = env.OMEGA_WEB_DIST_INDEX || path.join(repoRoot, "dist", "apps", "web", "index.html");
+    const filePath = env.OMEGA_WEB_DIST_INDEX || path.join(resourceRoot, app?.isPackaged ? "web" : path.join("dist", "apps", "web"), "index.html");
     return { mode: "static", filePath, url: webUrl, repoRoot };
   }
   return {
@@ -666,16 +752,41 @@ function buildWebLaunchPlan(app, env = process.env) {
   };
 }
 
-function buildRuntimeLaunchPlan(env = process.env) {
+function buildRuntimeLaunchPlan(app, env = process.env) {
   const repoRoot = repoRootFromDesktopSource();
+  const resourceRoot = desktopResourceRoot(app);
   const runtimeUrl = env.OMEGA_RUNTIME_URL || DEFAULT_RUNTIME_URL;
+  const packagedRuntimeCommand = path.join(resourceRoot, "bin", releaseBinaryName("omega-local-runtime"));
+  const userDataRoot = app?.getPath ? app.getPath("userData") : repoRoot;
+  const defaultDatabase = app?.isPackaged ? path.join(userDataRoot, ".omega", "omega.db") : path.join(repoRoot, ".omega", "omega.db");
+  const defaultWorkspaceRoot = app?.isPackaged ? path.join(userDataRoot, "workspaces") : path.join(os.homedir(), "Omega", "workspaces");
+  const packagedArgs = [
+    "--host", "127.0.0.1",
+    "--port", "3888",
+    "--database", env.OMEGA_RUNTIME_DATABASE || defaultDatabase,
+    "--workspace-root", env.OMEGA_WORKSPACE_ROOT || defaultWorkspaceRoot,
+    "--openapi", env.OMEGA_OPENAPI_PATH || path.join(resourceRoot, "docs", "openapi.yaml")
+  ];
+  const devArgs = [
+    "run", "./services/local-runtime/cmd/omega-local-runtime",
+    "--host", "127.0.0.1",
+    "--port", "3888",
+    "--database", env.OMEGA_RUNTIME_DATABASE || defaultDatabase,
+    "--workspace-root", env.OMEGA_WORKSPACE_ROOT || defaultWorkspaceRoot,
+  ];
   return {
     url: runtimeUrl,
-    repoRoot,
-    command: env.OMEGA_RUNTIME_COMMAND || "go",
+    repoRoot: app?.isPackaged ? resourceRoot : repoRoot,
+    source: app?.isPackaged ? "packaged" : "dev",
+    databasePath: env.OMEGA_RUNTIME_DATABASE || defaultDatabase,
+    workspaceRoot: env.OMEGA_WORKSPACE_ROOT || defaultWorkspaceRoot,
+    managePortConflicts: !env.OMEGA_RUNTIME_URL && !env.OMEGA_RUNTIME_COMMAND,
+    command: env.OMEGA_RUNTIME_COMMAND || (app?.isPackaged ? packagedRuntimeCommand : "go"),
     args: env.OMEGA_RUNTIME_COMMAND
       ? []
-      : ["run", "./services/local-runtime/cmd/omega-local-runtime", "--host", "127.0.0.1", "--port", "3888"],
+      : app?.isPackaged
+        ? packagedArgs
+        : devArgs,
     shell: Boolean(env.OMEGA_RUNTIME_COMMAND),
   };
 }
@@ -684,6 +795,9 @@ async function ensureService(service, plan, options = {}) {
   if (options.disabled) return { service, status: "disabled", plan };
   const url = options.url || plan.url || plan.previewUrl;
   if (url) {
+    if (service === "runtime" && plan.managePortConflicts) {
+      stopStaleRuntimeListeners(plan, url);
+    }
     const probe = await httpGetStatus(url, options.requestTimeoutMs ?? 1000);
     if (probe.ok) {
       logService(service, "already running", url);
@@ -742,6 +856,62 @@ function stopStalePreviewRuntimeListeners(plan, rawUrl) {
   }
 }
 
+function stopStaleRuntimeListeners(plan, rawUrl) {
+  const endpoint = rawUrl || plan.url;
+  let port = "";
+  let hostname = "";
+  try {
+    const parsed = new URL(endpoint);
+    port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    hostname = parsed.hostname;
+  } catch (_error) {
+    return;
+  }
+  if (!port || !["127.0.0.1", "localhost", "::1"].includes(hostname)) return;
+  let output = "";
+  try {
+    output = execFileSync("lsof", ["-nP", `-tiTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+  } catch (_error) {
+    return;
+  }
+  const expectedDatabase = normalizeComparablePath(plan.databasePath || "");
+  const expectedRepoRoot = normalizeComparablePath(plan.repoRoot || "");
+  for (const rawPid of output.split(/\s+/).filter(Boolean)) {
+    const pid = Number(rawPid);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const command = processCommandLine(pid);
+    if (!command.includes("omega-local-runtime") && !command.includes("cmd/omega-local-runtime")) continue;
+    const cwd = processCwd(pid);
+    const commandMatchesDatabase = expectedDatabase && command.includes(plan.databasePath);
+    const devRuntimeMatchesRepo = plan.source === "dev" && expectedRepoRoot && normalizeComparablePath(cwd) === expectedRepoRoot;
+    if (commandMatchesDatabase || devRuntimeMatchesRepo) continue;
+    try {
+      process.kill(pid, "SIGTERM");
+      logService("runtime", "stopped stale listener", `pid=${pid} port=${port}`);
+    } catch (_error) {
+      // Best-effort cleanup. The following spawn attempt will surface any remaining port conflict.
+    }
+  }
+}
+
+function processCommandLine(pid) {
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }).trim();
+  } catch (_error) {
+    return "";
+  }
+}
+
+function processCwd(pid) {
+  try {
+    const output = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { encoding: "utf8" });
+    const line = output.split(/\r?\n/).find((entry) => entry.startsWith("n"));
+    return line ? line.slice(1).trim() : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
 function previewRuntimeProcessOwnsWorkspace(pid, repoPath) {
   let output = "";
   try {
@@ -757,6 +927,7 @@ function previewRuntimeProcessOwnsWorkspace(pid, repoPath) {
 }
 
 function normalizeComparablePath(value) {
+  if (!value) return "";
   try {
     return fs.realpathSync(value);
   } catch (_error) {
@@ -774,7 +945,7 @@ async function startDesktopServices(app, env = process.env) {
     };
   }
 
-  const runtimePlan = buildRuntimeLaunchPlan(env);
+  const runtimePlan = buildRuntimeLaunchPlan(app, env);
   const webPlan = buildWebLaunchPlan(app, env);
   const previewPlan = buildPreviewRuntimePlan({ env });
   const children = [];

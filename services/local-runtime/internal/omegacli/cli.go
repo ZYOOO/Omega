@@ -41,6 +41,10 @@ func (cli *CLI) Run(ctx context.Context, args []string) error {
 	apiURL := global.String("api-url", envOr("OMEGA_API_URL", defaultAPIURL), "Omega Local Runtime API URL")
 	jsonOutput := global.Bool("json", false, "print raw JSON for supported commands")
 	if err := global.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			cli.printUsage()
+			return nil
+		}
 		return err
 	}
 	cli.APIURL = strings.TrimRight(*apiURL, "/")
@@ -66,8 +70,16 @@ func (cli *CLI) Run(ctx context.Context, args []string) error {
 		return cli.workItems(ctx, rest[1:], *jsonOutput)
 	case "attempts":
 		return cli.attempts(ctx, rest[1:], *jsonOutput)
+	case "operations":
+		return cli.operations(ctx, rest[1:], *jsonOutput)
 	case "checkpoints":
 		return cli.checkpoints(ctx, rest[1:], *jsonOutput)
+	case "workpads", "run-workpads":
+		return cli.workpads(ctx, rest[1:], *jsonOutput)
+	case "proof":
+		return cli.proof(ctx, rest[1:], *jsonOutput)
+	case "pr":
+		return cli.pullRequests(ctx, rest[1:], *jsonOutput)
 	case "supervisor":
 		return cli.supervisor(ctx, rest[1:], *jsonOutput)
 	default:
@@ -91,9 +103,15 @@ Commands:
   attempts timeline <id>         Show an attempt timeline
   attempts retry <id>            Retry a failed/stalled/canceled attempt
   attempts cancel <id>           Cancel a running attempt
+  operations list                List Agent/operation records
   checkpoints list               List checkpoints
   checkpoints approve <id>       Approve a checkpoint
   checkpoints changes <id>       Request checkpoint changes
+  workpads list                  List Run Workpads
+  workpads show <id>             Show one Run Workpad
+  proof list                     List proof records
+  proof preview <id-or-path>     Preview a proof artifact
+  pr status <attempt-id-or-url>  Refresh GitHub PR status through runtime
   supervisor tick                Run one JobSupervisor tick
 
 Supervisor safety:
@@ -282,7 +300,11 @@ func (cli *CLI) workItemsRun(ctx context.Context, args []string, jsonOutput bool
 	if !ok {
 		return fmt.Errorf("work item %q not found", positionals[0])
 	}
-	pipeline, ok := findDevFlowPipeline(workspace, text(item, "id"))
+	pipelines, err := cli.pipelinesForWorkItem(ctx, text(item, "id"))
+	if err != nil {
+		return err
+	}
+	pipeline, ok := findDevFlowPipelineInList(pipelines, text(item, "id"))
 	if !ok {
 		var created map[string]any
 		if err := cli.post(ctx, "/pipelines/from-template", map[string]any{"item": item, "templateId": "devflow-pr"}, &created); err != nil {
@@ -329,22 +351,29 @@ func (cli *CLI) attempts(ctx context.Context, args []string, jsonOutput bool) er
 func (cli *CLI) attemptsList(ctx context.Context, args []string, jsonOutput bool) error {
 	flags := flag.NewFlagSet("attempts list", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	id := flags.String("id", "", "filter by attempt id")
 	status := flags.String("status", "", "filter by status")
+	workItemID := flags.String("work-item", "", "filter by Work Item id")
+	pipelineID := flags.String("pipeline", "", "filter by Pipeline id")
+	repositoryTargetID := flags.String("repository", "", "filter by Repository Workspace id")
+	limit := flags.Int("limit", 50, "maximum records")
+	full := flags.Bool("full", false, "include full attempt stages/events")
 	if _, err := parseCommandFlags(flags, args); err != nil {
 		return err
 	}
-	var attempts []map[string]any
-	if err := cli.get(ctx, "/attempts", &attempts); err != nil {
-		return err
+	query := url.Values{}
+	setQuery(query, "id", *id)
+	setQuery(query, "status", *status)
+	setQuery(query, "workItemId", *workItemID)
+	setQuery(query, "pipelineId", *pipelineID)
+	setQuery(query, "repositoryTargetId", *repositoryTargetID)
+	query.Set("limit", strconv.Itoa(*limit))
+	if !*full {
+		query.Set("compact", "true")
 	}
-	if *status != "" {
-		filtered := []map[string]any{}
-		for _, attempt := range attempts {
-			if strings.EqualFold(text(attempt, "status"), *status) {
-				filtered = append(filtered, attempt)
-			}
-		}
-		attempts = filtered
+	var attempts []map[string]any
+	if err := cli.get(ctx, queryPath("/attempts", query), &attempts); err != nil {
+		return err
 	}
 	if jsonOutput {
 		return printJSON(cli.Stdout, attempts)
@@ -353,6 +382,75 @@ func (cli *CLI) attemptsList(ctx context.Context, args []string, jsonOutput bool
 	fmt.Fprintln(writer, "ID\tSTATUS\tITEM\tSTAGE\tUPDATED")
 	for _, attempt := range attempts {
 		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", text(attempt, "id"), text(attempt, "status"), text(attempt, "itemId"), text(attempt, "currentStageId"), text(attempt, "updatedAt"))
+	}
+	return writer.Flush()
+}
+
+func (cli *CLI) operations(ctx context.Context, args []string, jsonOutput bool) error {
+	if len(args) == 0 {
+		return errors.New("operations requires a subcommand: list")
+	}
+	switch args[0] {
+	case "list":
+		return cli.operationsList(ctx, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown operations subcommand %q", args[0])
+	}
+}
+
+func (cli *CLI) operationsList(ctx context.Context, args []string, jsonOutput bool) error {
+	flags := flag.NewFlagSet("operations list", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	id := flags.String("id", "", "filter by operation id")
+	status := flags.String("status", "", "filter by status")
+	missionID := flags.String("mission", "", "filter by mission id")
+	stageID := flags.String("stage", "", "filter by stage id")
+	agentID := flags.String("agent", "", "filter by agent id")
+	pipelineID := flags.String("pipeline", "", "filter by Pipeline id")
+	workItemID := flags.String("work-item", "", "filter by Work Item id")
+	limit := flags.Int("limit", 50, "maximum records")
+	full := flags.Bool("full", false, "include full prompts and operation records")
+	if _, err := parseCommandFlags(flags, args); err != nil {
+		return err
+	}
+	query := url.Values{}
+	setQuery(query, "id", *id)
+	setQuery(query, "status", *status)
+	setQuery(query, "missionId", *missionID)
+	setQuery(query, "stageId", *stageID)
+	setQuery(query, "agentId", *agentID)
+	setQuery(query, "pipelineId", *pipelineID)
+	setQuery(query, "workItemId", *workItemID)
+	query.Set("limit", strconv.Itoa(*limit))
+	if !*full {
+		query.Set("compact", "true")
+	}
+	var operations []map[string]any
+	if err := cli.get(ctx, queryPath("/operations", query), &operations); err != nil {
+		return err
+	}
+	if jsonOutput {
+		return printJSON(cli.Stdout, operations)
+	}
+	writer := tabwriter.NewWriter(cli.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(writer, "ID\tSTATUS\tSTAGE\tAGENT\tRUNNER\tMODEL\tDURATION\tTOKENS\tSUMMARY")
+	for _, operation := range operations {
+		runner := mapValue(operation["runnerProcess"])
+		model := firstNonEmpty(text(runner, "model"), text(runner, "provider"))
+		tokens := intValue(runner["totalTokens"])
+		if tokens == 0 {
+			tokens = intValue(runner["promptTokens"]) + intValue(runner["completionTokens"])
+		}
+		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+			text(operation, "id"),
+			text(operation, "status"),
+			text(operation, "stageId"),
+			text(operation, "agentId"),
+			text(runner, "runner"),
+			model,
+			formatDurationMs(intValue(runner["durationMs"])),
+			tokens,
+			oneLine(firstNonEmpty(text(operation, "summary"), text(operation, "prompt")), 80))
 	}
 	return writer.Flush()
 }
@@ -441,22 +539,25 @@ func (cli *CLI) checkpoints(ctx context.Context, args []string, jsonOutput bool)
 func (cli *CLI) checkpointsList(ctx context.Context, args []string, jsonOutput bool) error {
 	flags := flag.NewFlagSet("checkpoints list", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	id := flags.String("id", "", "filter by checkpoint id")
 	status := flags.String("status", "", "filter by status")
+	pipelineID := flags.String("pipeline", "", "filter by Pipeline id")
+	attemptID := flags.String("attempt", "", "filter by Attempt id")
+	stageID := flags.String("stage", "", "filter by stage id")
+	limit := flags.Int("limit", 50, "maximum records")
 	if _, err := parseCommandFlags(flags, args); err != nil {
 		return err
 	}
+	query := url.Values{}
+	setQuery(query, "id", *id)
+	setQuery(query, "status", *status)
+	setQuery(query, "pipelineId", *pipelineID)
+	setQuery(query, "attemptId", *attemptID)
+	setQuery(query, "stageId", *stageID)
+	query.Set("limit", strconv.Itoa(*limit))
 	var checkpoints []map[string]any
-	if err := cli.get(ctx, "/checkpoints", &checkpoints); err != nil {
+	if err := cli.get(ctx, queryPath("/checkpoints", query), &checkpoints); err != nil {
 		return err
-	}
-	if *status != "" {
-		filtered := []map[string]any{}
-		for _, checkpoint := range checkpoints {
-			if strings.EqualFold(text(checkpoint, "status"), *status) {
-				filtered = append(filtered, checkpoint)
-			}
-		}
-		checkpoints = filtered
 	}
 	if jsonOutput {
 		return printJSON(cli.Stdout, checkpoints)
@@ -516,6 +617,231 @@ func (cli *CLI) checkpointChanges(ctx context.Context, args []string, jsonOutput
 	return nil
 }
 
+func (cli *CLI) workpads(ctx context.Context, args []string, jsonOutput bool) error {
+	if len(args) == 0 {
+		return errors.New("workpads requires a subcommand: list, show")
+	}
+	switch args[0] {
+	case "list":
+		return cli.workpadsList(ctx, args[1:], jsonOutput)
+	case "show":
+		return cli.workpadShow(ctx, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown workpads subcommand %q", args[0])
+	}
+}
+
+func (cli *CLI) workpadsList(ctx context.Context, args []string, jsonOutput bool) error {
+	flags := flag.NewFlagSet("workpads list", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	id := flags.String("id", "", "filter by Run Workpad id")
+	status := flags.String("status", "", "filter by status")
+	workItemID := flags.String("work-item", "", "filter by Work Item id")
+	pipelineID := flags.String("pipeline", "", "filter by Pipeline id")
+	attemptID := flags.String("attempt", "", "filter by Attempt id")
+	repositoryTargetID := flags.String("repository", "", "filter by Repository Workspace id")
+	limit := flags.Int("limit", 50, "maximum records")
+	full := flags.Bool("full", false, "include full workpad payload")
+	if _, err := parseCommandFlags(flags, args); err != nil {
+		return err
+	}
+	query := workpadQuery(*id, *status, *workItemID, *pipelineID, *attemptID, *repositoryTargetID, *limit)
+	if !*full {
+		query.Set("compact", "true")
+	}
+	var workpads []map[string]any
+	if err := cli.get(ctx, queryPath("/run-workpads", query), &workpads); err != nil {
+		return err
+	}
+	if jsonOutput {
+		return printJSON(cli.Stdout, workpads)
+	}
+	writer := tabwriter.NewWriter(cli.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(writer, "ID\tSTATUS\tITEM\tPIPELINE\tATTEMPT\tUPDATED")
+	for _, workpad := range workpads {
+		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", text(workpad, "id"), text(workpad, "status"), text(workpad, "workItemId"), text(workpad, "pipelineId"), text(workpad, "attemptId"), text(workpad, "updatedAt"))
+	}
+	return writer.Flush()
+}
+
+func (cli *CLI) workpadShow(ctx context.Context, args []string, jsonOutput bool) error {
+	if len(args) != 1 {
+		return errors.New("workpads show requires <workpad-id>")
+	}
+	query := workpadQuery(args[0], "", "", "", "", "", 1)
+	var workpads []map[string]any
+	if err := cli.get(ctx, queryPath("/run-workpads", query), &workpads); err != nil {
+		return err
+	}
+	if len(workpads) == 0 {
+		return fmt.Errorf("run workpad %q not found", args[0])
+	}
+	workpad := workpads[0]
+	if jsonOutput {
+		return printJSON(cli.Stdout, workpad)
+	}
+	fmt.Fprintf(cli.Stdout, "id=%s status=%s workItem=%s pipeline=%s attempt=%s updated=%s\n",
+		text(workpad, "id"), text(workpad, "status"), text(workpad, "workItemId"), text(workpad, "pipelineId"), text(workpad, "attemptId"), text(workpad, "updatedAt"))
+	details := mapValue(workpad["workpad"])
+	printWorkpadSection(cli.Stdout, "Plan", details["plan"])
+	printWorkpadSection(cli.Stdout, "Acceptance Criteria", details["acceptanceCriteria"])
+	printWorkpadSection(cli.Stdout, "Validation", details["validation"])
+	printWorkpadSection(cli.Stdout, "Review Packet", details["reviewPacket"])
+	printWorkpadSection(cli.Stdout, "Blockers", details["blockers"])
+	printWorkpadSection(cli.Stdout, "Retry Reason", details["retryReason"])
+	printWorkpadSection(cli.Stdout, "Notes", details["notes"])
+	printWorkpadSection(cli.Stdout, "Pull Request", details["pullRequest"])
+	return nil
+}
+
+func (cli *CLI) proof(ctx context.Context, args []string, jsonOutput bool) error {
+	if len(args) == 0 {
+		return errors.New("proof requires a subcommand: list, preview")
+	}
+	switch args[0] {
+	case "list":
+		return cli.proofList(ctx, args[1:], jsonOutput)
+	case "preview":
+		return cli.proofPreview(ctx, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown proof subcommand %q", args[0])
+	}
+}
+
+func (cli *CLI) proofList(ctx context.Context, args []string, jsonOutput bool) error {
+	flags := flag.NewFlagSet("proof list", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	id := flags.String("id", "", "filter by proof id")
+	label := flags.String("label", "", "filter by proof label")
+	operationID := flags.String("operation", "", "filter by operation id")
+	pipelineID := flags.String("pipeline", "", "filter by Pipeline id")
+	workItemID := flags.String("work-item", "", "filter by Work Item id")
+	limit := flags.Int("limit", 50, "maximum records")
+	if _, err := parseCommandFlags(flags, args); err != nil {
+		return err
+	}
+	query := url.Values{}
+	setQuery(query, "id", *id)
+	setQuery(query, "label", *label)
+	setQuery(query, "operationId", *operationID)
+	setQuery(query, "pipelineId", *pipelineID)
+	setQuery(query, "workItemId", *workItemID)
+	query.Set("limit", strconv.Itoa(*limit))
+	var proofs []map[string]any
+	if err := cli.get(ctx, queryPath("/proof-records", query), &proofs); err != nil {
+		return err
+	}
+	if jsonOutput {
+		return printJSON(cli.Stdout, proofs)
+	}
+	writer := tabwriter.NewWriter(cli.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(writer, "ID\tLABEL\tOPERATION\tSOURCE\tCREATED")
+	for _, proof := range proofs {
+		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", text(proof, "id"), text(proof, "label"), text(proof, "operationId"), oneLine(text(proof, "sourcePath"), 56), text(proof, "createdAt"))
+	}
+	return writer.Flush()
+}
+
+func (cli *CLI) proofPreview(ctx context.Context, args []string, jsonOutput bool) error {
+	if len(args) != 1 {
+		return errors.New("proof preview requires <proof-id-or-path>")
+	}
+	var preview map[string]any
+	if err := cli.get(ctx, "/proof-records/"+url.PathEscape(args[0])+"/preview", &preview); err != nil {
+		return err
+	}
+	if jsonOutput {
+		return printJSON(cli.Stdout, preview)
+	}
+	fmt.Fprintf(cli.Stdout, "available=%v type=%s truncated=%v source=%s\n",
+		preview["available"], text(preview, "previewType"), preview["truncated"], text(preview, "sourcePath"))
+	if content := text(preview, "content"); strings.TrimSpace(content) != "" {
+		fmt.Fprintln(cli.Stdout)
+		fmt.Fprintln(cli.Stdout, content)
+	}
+	return nil
+}
+
+func (cli *CLI) pullRequests(ctx context.Context, args []string, jsonOutput bool) error {
+	if len(args) == 0 {
+		return errors.New("pr requires a subcommand: status")
+	}
+	switch args[0] {
+	case "status":
+		return cli.pullRequestStatus(ctx, args[1:], jsonOutput)
+	default:
+		return fmt.Errorf("unknown pr subcommand %q", args[0])
+	}
+}
+
+func (cli *CLI) pullRequestStatus(ctx context.Context, args []string, jsonOutput bool) error {
+	flags := flag.NewFlagSet("pr status", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	repo := flags.String("repo", "", "GitHub repository slug owner/name")
+	workspacePath := flags.String("workspace", "", "repository workspace root")
+	repositoryPath := flags.String("repo-path", "", "git repository path")
+	requiredChecks := flags.String("required-checks", "", "comma-separated required check names")
+	positionals, err := parseCommandFlags(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return errors.New("pr status requires <attempt-id-or-url>")
+	}
+	payload := map[string]any{}
+	if *workspacePath != "" {
+		payload["workspacePath"] = *workspacePath
+	}
+	if *repositoryPath != "" {
+		payload["repositoryPath"] = *repositoryPath
+	}
+	if owner, name, ok := strings.Cut(*repo, "/"); ok {
+		payload["repositoryOwner"] = owner
+		payload["repositoryName"] = name
+	}
+	if checks := splitCSV(*requiredChecks); len(checks) > 0 {
+		payload["requiredChecks"] = checks
+	}
+	selector := strings.TrimSpace(positionals[0])
+	switch {
+	case strings.HasPrefix(selector, "http://") || strings.HasPrefix(selector, "https://"):
+		payload["url"] = selector
+	case isInteger(selector):
+		payload["number"], _ = strconv.Atoi(selector)
+	default:
+		attempt, err := cli.findAttempt(ctx, selector)
+		if err != nil {
+			return err
+		}
+		if text(attempt, "pullRequestUrl") == "" {
+			return fmt.Errorf("attempt %q does not have a pull request URL", selector)
+		}
+		payload["url"] = text(attempt, "pullRequestUrl")
+		if payload["workspacePath"] == nil && text(attempt, "workspacePath") != "" {
+			payload["workspacePath"] = text(attempt, "workspacePath")
+		}
+	}
+	var status map[string]any
+	if err := cli.post(ctx, "/github/pr-status", payload, &status); err != nil {
+		return err
+	}
+	if jsonOutput {
+		return printJSON(cli.Stdout, status)
+	}
+	summary := mapValue(status["checkSummary"])
+	fmt.Fprintf(cli.Stdout, "pr=%s state=%s review=%s gate=%s url=%s\n",
+		text(status, "number"), text(status, "state"), text(status, "reviewDecision"), text(status, "deliveryGate"), text(status, "url"))
+	fmt.Fprintf(cli.Stdout, "checks passed=%d failed=%d pending=%d missing=%d\n",
+		intValue(summary["passed"]), intValue(summary["failed"]), intValue(summary["pending"]), intValue(summary["missing"]))
+	if actions := arrayMaps(status["recommendedActions"]); len(actions) > 0 {
+		fmt.Fprintln(cli.Stdout, "\nRecommended actions:")
+		for _, action := range actions {
+			fmt.Fprintf(cli.Stdout, "- %s\n", text(action, "label"))
+		}
+	}
+	return nil
+}
+
 func (cli *CLI) supervisor(ctx context.Context, args []string, jsonOutput bool) error {
 	if len(args) == 0 || args[0] != "tick" {
 		return errors.New("supervisor requires subcommand: tick")
@@ -556,10 +882,39 @@ func (cli *CLI) supervisor(ctx context.Context, args []string, jsonOutput bool) 
 
 func (cli *CLI) workspace(ctx context.Context) (map[string]any, error) {
 	var workspace map[string]any
-	if err := cli.get(ctx, "/workspace", &workspace); err != nil {
+	if err := cli.get(ctx, "/workspace?scope=session", &workspace); err != nil {
+		if strings.Contains(err.Error(), "workspace not found") {
+			return map[string]any{"tables": map[string]any{"workItems": []map[string]any{}}}, nil
+		}
 		return nil, err
 	}
 	return workspace, nil
+}
+
+func (cli *CLI) pipelinesForWorkItem(ctx context.Context, itemID string) ([]map[string]any, error) {
+	query := url.Values{}
+	query.Set("workItemId", itemID)
+	query.Set("limit", "20")
+	var pipelines []map[string]any
+	if err := cli.get(ctx, queryPath("/pipelines", query), &pipelines); err != nil {
+		return nil, err
+	}
+	return pipelines, nil
+}
+
+func (cli *CLI) findAttempt(ctx context.Context, attemptID string) (map[string]any, error) {
+	query := url.Values{}
+	query.Set("id", attemptID)
+	query.Set("limit", "1")
+	query.Set("compact", "true")
+	var attempts []map[string]any
+	if err := cli.get(ctx, queryPath("/attempts", query), &attempts); err != nil {
+		return nil, err
+	}
+	if len(attempts) == 0 {
+		return nil, fmt.Errorf("attempt %q not found", attemptID)
+	}
+	return attempts[0], nil
 }
 
 func (cli *CLI) get(ctx context.Context, path string, out any) error {
@@ -618,12 +973,131 @@ func findWorkItem(workspace map[string]any, idOrKey string) (map[string]any, boo
 }
 
 func findDevFlowPipeline(workspace map[string]any, itemID string) (map[string]any, bool) {
-	for _, pipeline := range arrayMaps(mapValue(workspace["tables"])["pipelines"]) {
+	return findDevFlowPipelineInList(arrayMaps(mapValue(workspace["tables"])["pipelines"]), itemID)
+}
+
+func findDevFlowPipelineInList(pipelines []map[string]any, itemID string) (map[string]any, bool) {
+	for _, pipeline := range pipelines {
 		if text(pipeline, "workItemId") == itemID && text(pipeline, "templateId") == "devflow-pr" {
 			return pipeline, true
 		}
 	}
 	return nil, false
+}
+
+func queryPath(path string, query url.Values) string {
+	if len(query) == 0 {
+		return path
+	}
+	return path + "?" + query.Encode()
+}
+
+func setQuery(query url.Values, key string, value string) {
+	if strings.TrimSpace(value) != "" {
+		query.Set(key, strings.TrimSpace(value))
+	}
+}
+
+func workpadQuery(id string, status string, workItemID string, pipelineID string, attemptID string, repositoryTargetID string, limit int) url.Values {
+	query := url.Values{}
+	setQuery(query, "id", id)
+	setQuery(query, "status", status)
+	setQuery(query, "workItemId", workItemID)
+	setQuery(query, "pipelineId", pipelineID)
+	setQuery(query, "attemptId", attemptID)
+	setQuery(query, "repositoryTargetId", repositoryTargetID)
+	query.Set("limit", strconv.Itoa(limit))
+	return query
+}
+
+func printWorkpadSection(writer io.Writer, title string, value any) {
+	rendered := renderCLIValue(value)
+	if strings.TrimSpace(rendered) == "" || rendered == "{}" || rendered == "[]" {
+		return
+	}
+	fmt.Fprintf(writer, "\n%s:\n%s\n", title, rendered)
+}
+
+func renderCLIValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	case []string:
+		return "- " + strings.Join(typed, "\n- ")
+	case []any:
+		lines := []string{}
+		for _, item := range typed {
+			rendered := renderCLIValue(item)
+			if rendered != "" {
+				lines = append(lines, "- "+strings.ReplaceAll(rendered, "\n", "\n  "))
+			}
+		}
+		return strings.Join(lines, "\n")
+	case map[string]any:
+		if len(typed) == 0 {
+			return ""
+		}
+		if summary := firstNonEmpty(text(typed, "summary"), text(typed, "title"), text(typed, "url"), text(typed, "reason")); summary != "" && len(typed) <= 3 {
+			return summary
+		}
+		encoded, err := json.MarshalIndent(typed, "", "  ")
+		if err != nil {
+			return fmt.Sprint(typed)
+		}
+		return string(encoded)
+	default:
+		return fmt.Sprint(value)
+	}
+}
+
+func formatDurationMs(milliseconds int) string {
+	if milliseconds <= 0 {
+		return ""
+	}
+	if milliseconds < 1000 {
+		return strconv.Itoa(milliseconds) + "ms"
+	}
+	seconds := milliseconds / 1000
+	if seconds < 60 {
+		return strconv.Itoa(seconds) + "s"
+	}
+	minutes := seconds / 60
+	seconds = seconds % 60
+	return fmt.Sprintf("%dm%02ds", minutes, seconds)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func splitCSV(value string) []string {
+	output := []string{}
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			output = append(output, part)
+		}
+	}
+	return output
+}
+
+func isInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func printJSON(writer io.Writer, value any) error {

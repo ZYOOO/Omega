@@ -106,6 +106,7 @@ import {
   type LlmProviderSelection,
   type ObservabilitySummary,
   type OperationRecordInfo,
+  type PagePilotRunFilters,
   type PagePilotSelectionContext,
   type PatchRunWorkpadInput,
   type OrchestratorWatcherInfo,
@@ -181,9 +182,9 @@ const workItemFlowLaneDefinitions: WorkItemFlowLaneDefinition[] = [
   {
     id: "done",
     label: "Done",
-    statuses: ["Done"],
+    statuses: ["Done", "Canceled"],
     visualStatus: "Done",
-    emptyCopy: "Completed and proof-backed work closes here."
+    emptyCopy: "Completed, canceled, and proof-backed work closes here."
   }
 ];
 
@@ -243,10 +244,13 @@ function InfoIcon() {
   );
 }
 
-const RECENT_OPERATION_LIMIT = 40;
+const RECENT_OPERATION_LIMIT = 12;
+const RECENT_ATTEMPT_LIMIT = 80;
+const RECENT_RUN_WORKPAD_LIMIT = 60;
 const RECENT_PROOF_RECORD_LIMIT = 80;
 const DETAIL_OPERATION_LIMIT = 240;
 const DETAIL_PROOF_RECORD_LIMIT = 320;
+const SCOPED_EXECUTION_RECORD_LIMIT = 120;
 
 type ExecutionRefreshScope = {
   workItemId?: string;
@@ -298,6 +302,7 @@ async function fetchPipelinesForExecutionScope(
   }
   if (scope.repositoryTargetId) {
     const workItemIDs = new Set<string>();
+    const pipelineIDs = new Set<string>();
     for (const item of workItems) {
       if (item.repositoryTargetId === scope.repositoryTargetId) {
         workItemIDs.add(item.id);
@@ -307,16 +312,20 @@ async function fetchPipelinesForExecutionScope(
       if (attempt.repositoryTargetId === scope.repositoryTargetId && attempt.itemId) {
         workItemIDs.add(attempt.itemId);
       }
+      if (attempt.repositoryTargetId === scope.repositoryTargetId && attempt.pipelineId) {
+        pipelineIDs.add(attempt.pipelineId);
+      }
     }
     for (const workpad of runWorkpads) {
       if (workpad.repositoryTargetId === scope.repositoryTargetId && workpad.workItemId) {
         workItemIDs.add(workpad.workItemId);
       }
+      if (workpad.repositoryTargetId === scope.repositoryTargetId && workpad.pipelineId) {
+        pipelineIDs.add(workpad.pipelineId);
+      }
     }
-    const pipelineBatches = await Promise.all(
-      [...workItemIDs].slice(0, 80).map((workItemId) => fetchPipelines(apiUrl, { workItemId }).catch(() => []))
-    );
-    return uniqueExecutionRecords(pipelineBatches.flat());
+    const pipelines = await fetchPipelines(apiUrl, { limit: 500 }).catch(() => []);
+    return pipelines.filter((pipeline) => workItemIDs.has(pipeline.workItemId) || pipelineIDs.has(pipeline.id));
   }
   return fetchPipelines(apiUrl, { limit: 500 }).catch(() => []);
 }
@@ -433,10 +442,21 @@ const defaultStagePolicy = [
 
 const defaultAgentProfiles: AgentProfileDraft[] = [
   {
+    id: "master",
+    label: "Master",
+    runner: "codex",
+    model: "",
+    skills: "bb-browser\nopenai-docs",
+    mcp: "omega-filesystem\nomega-memory\nomega-sequential-thinking",
+    stageNotes: "Classify requirements, choose workflow route, and dispatch stage agents with repository boundaries.",
+    codexPolicy: "orchestrate only, do not edit repository source, write dispatch and handoff proof",
+    claudePolicy: "focus on workflow choice, ownership, and stage handoff clarity"
+  },
+  {
     id: "requirement",
     label: "Requirement",
     runner: "codex",
-    model: "gpt-5.4-mini",
+    model: "",
     skills: "bb-browser\nopenai-docs",
     mcp: "omega-filesystem\nomega-memory\nomega-sequential-thinking",
     stageNotes: "Clarify acceptance criteria, repository target, risks, and suggested work items before planning.",
@@ -447,7 +467,7 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     id: "architect",
     label: "Architect",
     runner: "codex",
-    model: "gpt-5.4-mini",
+    model: "",
     skills: "security-threat-model\nopenai-docs",
     mcp: "omega-filesystem\nomega-sequential-thinking",
     stageNotes: "Map affected files, data flow, integration risks, and verification plan.",
@@ -458,7 +478,7 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     id: "coding",
     label: "Coding",
     runner: "codex",
-    model: "gpt-5.4-mini",
+    model: "",
     skills: "playwright\nsecurity-best-practices",
     mcp: "omega-filesystem\nomega-git\nomega-puppeteer",
     stageNotes: "Implement inside the locked repository workspace and keep changes scoped to the Work Item.",
@@ -469,7 +489,7 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     id: "testing",
     label: "Testing",
     runner: "codex",
-    model: "gpt-5.4-mini",
+    model: "",
     skills: "playwright\ngh-fix-ci",
     mcp: "omega-filesystem\nomega-puppeteer\nomega-git",
     stageNotes: "Run focused tests first, then broader checks when shared contracts changed.",
@@ -480,7 +500,7 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     id: "review",
     label: "Review",
     runner: "codex",
-    model: "gpt-5.4-mini",
+    model: "",
     skills: "gh-address-comments\ngh-fix-ci\nsecurity-best-practices",
     mcp: "omega-git\nomega-filesystem",
     stageNotes: "Review correctness, safety, tests, and contract drift. Changes requested routes to Rework.",
@@ -491,7 +511,7 @@ const defaultAgentProfiles: AgentProfileDraft[] = [
     id: "delivery",
     label: "Delivery",
     runner: "codex",
-    model: "gpt-5.4-mini",
+    model: "",
     skills: "yeet\ngh-address-comments",
     mcp: "omega-git\nomega-filesystem",
     stageNotes: "After human approval, prepare PR or delivery proof and final handoff bundle.",
@@ -530,6 +550,17 @@ function initialAgentConfigurationDraft(): AgentConfigurationDraft {
 function normalizeAgentConfigurationDraft(profile: Partial<ProjectAgentProfileInfo> | Partial<AgentConfigurationDraft>): AgentConfigurationDraft {
   const rawProfile = profile as Partial<ProjectAgentProfileInfo> & Partial<AgentConfigurationDraft>;
   const rawStagePolicy = typeof rawProfile.stagePolicy === "string" ? rawProfile.stagePolicy.trim() : "";
+  const normalizedAgents = rawProfile.agentProfiles?.length
+    ? rawProfile.agentProfiles.map((agent) => ({
+        ...agent,
+        runner: normalizeWorkspaceAgentRunner(agent.runner)
+      }))
+    : defaultAgentProfiles;
+  const seenAgents = new Set(normalizedAgents.map((agent) => agent.id));
+  const agentProfiles = [
+    ...normalizedAgents,
+    ...defaultAgentProfiles.filter((agent) => !seenAgents.has(agent.id))
+  ];
   return {
     ...defaultAgentConfigurationDraft,
     ...rawProfile,
@@ -538,12 +569,7 @@ function normalizeAgentConfigurationDraft(profile: Partial<ProjectAgentProfileIn
       !rawStagePolicy || rawStagePolicy === legacyCompactStagePolicy
         ? defaultStagePolicy
         : rawProfile.stagePolicy ?? defaultStagePolicy,
-    agentProfiles: rawProfile.agentProfiles?.length
-      ? rawProfile.agentProfiles.map((agent) => ({
-          ...agent,
-          runner: normalizeWorkspaceAgentRunner(agent.runner)
-        }))
-      : defaultAgentProfiles
+    agentProfiles
   };
 }
 
@@ -737,11 +763,12 @@ function displayText(value: string): string {
 }
 
 function isCompletedWork(item: WorkItem, pipeline?: PipelineRecordInfo): boolean {
-  return runtimeStatusForWorkItem(item, pipeline) === "Done" || pipeline?.status === "done" || pipeline?.status === "delivered";
+  const status = runtimeStatusForWorkItem(item, pipeline);
+  return status === "Done" || status === "Canceled" || pipeline?.status === "done" || pipeline?.status === "delivered" || pipeline?.status === "discarded";
 }
 
 function isFailedWork(item: WorkItem, pipeline?: PipelineRecordInfo): boolean {
-  return runtimeStatusForWorkItem(item, pipeline) === "Blocked" || pipeline?.status === "failed" || pipeline?.status === "discarded";
+  return runtimeStatusForWorkItem(item, pipeline) === "Blocked" || pipeline?.status === "failed";
 }
 
 function isPagePilotWorkItem(item: WorkItem): boolean {
@@ -750,7 +777,8 @@ function isPagePilotWorkItem(item: WorkItem): boolean {
 
 function runtimeStatusForWorkItem(item: WorkItem, pipeline?: PipelineRecordInfo): WorkItemStatus {
   if (pipeline?.status === "waiting-human") return "Human Review";
-  if (pipeline?.status === "discarded" || pipeline?.status === "failed" || pipeline?.status === "stalled") return "Blocked";
+  if (pipeline?.status === "discarded") return "Canceled";
+  if (pipeline?.status === "failed" || pipeline?.status === "stalled") return "Blocked";
   if (pipeline?.status === "delivered" || pipeline?.status === "done") return "Done";
   if (pipeline?.status === "running") return item.status === "Human Review" ? "Human Review" : "In Review";
   return item.status;
@@ -1069,7 +1097,7 @@ function App() {
   const [llmProviders, setLlmProviders] = useState<LlmProviderInfo[]>([]);
   const [llmSelection, setLlmSelection] = useState<LlmProviderSelection>({
     providerId: "openai",
-    model: "gpt-5.4-mini",
+    model: "",
     reasoningEffort: "medium"
   });
   const [pipelines, setPipelines] = useState<PipelineRecordInfo[]>([]);
@@ -1345,7 +1373,38 @@ function App() {
     ? isCompletedWork(activeWorkItemDetail, activeDetailPipeline)
     : false;
   useEffect(() => {
-    if (!missionControlApiUrl || !activeWorkItemDetail || !activeDetailPipeline) return;
+    if (!missionControlApiUrl || activeNav === "Page Pilot" || !activeWorkItemDetail) return;
+    let cancelled = false;
+    const scope = {
+      workItemId: activeWorkItemDetail.id,
+      repositoryTargetId: activeWorkItemDetail.repositoryTargetId
+    };
+    const loadScopedDetailExecutionState = async () => {
+      const [scopedAttempts, scopedRunWorkpads] = await Promise.all([
+        fetchAttempts(missionControlApiUrl, { ...scope, limit: SCOPED_EXECUTION_RECORD_LIMIT }).catch(() => []),
+        fetchRunWorkpads(missionControlApiUrl, { ...scope, limit: SCOPED_EXECUTION_RECORD_LIMIT }).catch(() => [])
+      ]);
+      const scopedPipelines = await fetchPipelinesForExecutionScope(
+        missionControlApiUrl,
+        scope,
+        [activeWorkItemDetail],
+        scopedAttempts,
+        scopedRunWorkpads
+      );
+      const scopedCheckpoints = await fetchCheckpointsForExecutionScope(missionControlApiUrl, scope, scopedPipelines, scopedAttempts);
+      if (cancelled) return;
+      setPipelines((current) => mergeExecutionRecords(current, scopedPipelines, 500));
+      setAttempts((current) => mergeExecutionRecords(current, scopedAttempts, 500));
+      setRunWorkpads((current) => mergeExecutionRecords(current, scopedRunWorkpads, 500));
+      setCheckpoints((current) => mergeExecutionRecords(current, scopedCheckpoints, 300));
+    };
+    void loadScopedDetailExecutionState();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeNav, activeWorkItemDetail?.id, activeWorkItemDetail?.repositoryTargetId, missionControlApiUrl]);
+  useEffect(() => {
+    if (!missionControlApiUrl || activeNav === "Page Pilot" || !activeWorkItemDetail || !activeDetailPipeline) return;
     let cancelled = false;
     const filters = {
       pipelineId: activeDetailPipeline.id,
@@ -1366,9 +1425,9 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeDetailPipeline?.id, activeWorkItemDetail?.id, missionControlApiUrl]);
+  }, [activeDetailPipeline?.id, activeNav, activeWorkItemDetail?.id, missionControlApiUrl]);
   useEffect(() => {
-    if (!missionControlApiUrl || !activeDetailAttempt?.id) {
+    if (!missionControlApiUrl || activeNav === "Page Pilot" || !activeDetailAttempt?.id) {
       setActiveAttemptActionPlan(null);
       setActiveAttemptTimeline(null);
       return;
@@ -1378,7 +1437,7 @@ function App() {
       const attemptId = activeDetailAttempt.id;
       const [actionPlanResult, timelineResult] = await Promise.allSettled([
         fetchAttemptActionPlan(missionControlApiUrl, attemptId),
-        fetchAttemptTimeline(missionControlApiUrl, attemptId)
+        fetchAttemptTimeline(missionControlApiUrl, attemptId, { limit: 80 })
       ]);
       if (!cancelled) {
         setActiveAttemptActionPlan(actionPlanResult.status === "fulfilled" ? actionPlanResult.value : null);
@@ -1386,11 +1445,11 @@ function App() {
       }
     };
     void loadAttemptDetail();
-    const shouldPollAttemptDetail = ["running", "waiting-human", "stalled", "failed"].includes(activeDetailAttempt.status);
+    const shouldPollAttemptDetail = ["running", "waiting-human"].includes(activeDetailAttempt.status);
     const timer = shouldPollAttemptDetail
       ? window.setInterval(() => {
           void loadAttemptDetail();
-        }, 2500)
+        }, 10000)
       : null;
     return () => {
       cancelled = true;
@@ -1398,7 +1457,7 @@ function App() {
         window.clearInterval(timer);
       }
     };
-  }, [activeDetailAttempt?.id, activeDetailAttempt?.status, missionControlApiUrl]);
+  }, [activeDetailAttempt?.id, activeDetailAttempt?.status, activeNav, missionControlApiUrl]);
   useEffect(() => {
     if (!missionControlApiUrl || !activeDetailAttempt?.pullRequestUrl) {
       setActivePullRequestStatus(null);
@@ -1499,7 +1558,6 @@ function App() {
   async function refreshControlPlane() {
     if (!missionControlApiUrl) return;
     const [
-      nextObservability,
       nextProviders,
       nextSelection,
       nextTemplates,
@@ -1515,35 +1573,29 @@ function App() {
       nextRunnerCredentials,
       nextExecutionLocks,
       nextOrchestratorWatchers,
-      nextCapabilities,
       nextWorkspaceRoot,
       nextGitHubOAuthConfig,
-      nextGitHubStatus,
       nextFeishuConfig
     ] = await Promise.all([
-      fetchObservability(missionControlApiUrl, { windowDays: observabilityWindowDays, groupBy: observabilityGroupBy, limit: 10 }),
       fetchLlmProviders(missionControlApiUrl),
       fetchLlmProviderSelection(missionControlApiUrl),
       fetchPipelineTemplates(missionControlApiUrl),
       fetchAgentDefinitions(missionControlApiUrl),
       fetchRequirements(missionControlApiUrl).catch(() => []),
       fetchPipelines(missionControlApiUrl, { limit: 500 }),
-      fetchAttempts(missionControlApiUrl, { limit: 200 }).catch(() => []),
+      fetchAttempts(missionControlApiUrl, { limit: RECENT_ATTEMPT_LIMIT, compact: true }).catch(() => []),
       fetchProofRecords(missionControlApiUrl, { limit: RECENT_PROOF_RECORD_LIMIT }).catch(() => []),
-      fetchRunWorkpads(missionControlApiUrl, { limit: 200 }).catch(() => []),
+      fetchRunWorkpads(missionControlApiUrl, { limit: RECENT_RUN_WORKPAD_LIMIT, compact: true }).catch(() => []),
       fetchCheckpoints(missionControlApiUrl, { limit: 300 }),
-      fetchOperations(missionControlApiUrl, { limit: RECENT_OPERATION_LIMIT }).catch(() => []),
+      fetchOperations(missionControlApiUrl, { limit: RECENT_OPERATION_LIMIT, compact: true }).catch(() => []),
       fetchRuntimeLogs(missionControlApiUrl, { limit: 80 }).catch(() => []),
       fetchRunnerCredentials(missionControlApiUrl).catch(() => []),
       fetchExecutionLocks(missionControlApiUrl).catch(() => []),
       fetchOrchestratorWatchers(missionControlApiUrl).catch(() => []),
-      fetchLocalCapabilities(missionControlApiUrl),
       fetchLocalWorkspaceRoot(missionControlApiUrl).catch(() => ({ workspaceRoot: "" })),
       fetchGitHubOAuthConfig(missionControlApiUrl).catch(() => defaultGitHubOAuthConfig),
-      fetchGitHubStatus(missionControlApiUrl).catch(() => null),
       fetchFeishuConfig(missionControlApiUrl).catch(() => defaultFeishuConfig)
     ]);
-    setObservability(normalizeObservability(nextObservability));
     setLlmProviders(nextProviders);
     setLlmSelection(nextSelection);
     setPipelineTemplates(nextTemplates);
@@ -1559,11 +1611,9 @@ function App() {
     setRunnerCredentials(nextRunnerCredentials);
     setExecutionLocks(nextExecutionLocks);
     setOrchestratorWatchers(nextOrchestratorWatchers);
-    setLocalCapabilities(nextCapabilities);
     setLocalWorkspaceRoot(nextWorkspaceRoot.workspaceRoot);
     setLocalWorkspaceRootDraft((currentDraft) => currentDraft || nextWorkspaceRoot.workspaceRoot);
     setGitHubOAuthConfig(nextGitHubOAuthConfig);
-    setGitHubStatus(nextGitHubStatus);
     setFeishuConfig(nextFeishuConfig);
     setFeishuConfigDraft((currentDraft) => ({
       ...nextFeishuConfig,
@@ -1580,9 +1630,6 @@ function App() {
       webhookUrl: currentDraft.webhookUrl || nextFeishuConfig.webhookUrl,
       docFolderToken: currentDraft.docFolderToken || nextFeishuConfig.docFolderToken
     }));
-    if (nextGitHubStatus?.authenticated) {
-      setConnections((current) => grantProviderConnection(current, "github", nextGitHubStatus.account ?? "gh-cli"));
-    }
     if (feishuReviewRouteReady(nextFeishuConfig)) {
       setConnections((current) =>
         grantProviderConnection(current, "feishu", feishuConnectionIdentity(nextFeishuConfig))
@@ -1593,6 +1640,24 @@ function App() {
       clientSecret: "",
       redirectUri: nextGitHubOAuthConfig.redirectUri || currentDraft.redirectUri
     }));
+    void refreshDeferredControlPlane().catch((error) => {
+      console.warn("Deferred control plane refresh failed", error);
+    });
+  }
+
+  async function refreshDeferredControlPlane() {
+    if (!missionControlApiUrl) return;
+    const [nextObservability, nextCapabilities, nextGitHubStatus] = await Promise.all([
+      fetchObservability(missionControlApiUrl, { windowDays: observabilityWindowDays, groupBy: observabilityGroupBy, limit: 10 }).catch(() => emptyObservability()),
+      fetchLocalCapabilities(missionControlApiUrl).catch(() => []),
+      fetchGitHubStatus(missionControlApiUrl).catch(() => null)
+    ]);
+    setObservability(normalizeObservability(nextObservability));
+    setLocalCapabilities(nextCapabilities);
+    setGitHubStatus(nextGitHubStatus);
+    if (nextGitHubStatus?.authenticated) {
+      setConnections((current) => grantProviderConnection(current, "github", nextGitHubStatus.account ?? "gh-cli"));
+    }
     setLocalRunner((currentRunner) =>
       currentRunner === "local-proof" && nextCapabilities.some((capability) => capability.id === "codex" && capability.available)
         ? "codex"
@@ -1654,10 +1719,22 @@ function App() {
     if (!missionControlApiUrl) return;
     const scope = options.scope ?? {};
     const scoped = hasExecutionRefreshScope(scope);
+    const repositoryScoped = Boolean(scoped && scope.repositoryTargetId && !scope.workItemId && !scope.pipelineId);
+    const shouldRefreshSession = !scoped || (!scope.workItemId && !scope.pipelineId);
     const [session, nextAttempts, nextRunWorkpads] = await Promise.all([
-      fetchWorkspaceSession(missionControlApiUrl, run).catch(() => null),
-      fetchAttempts(missionControlApiUrl, scoped ? { ...scope, limit: 120 } : { limit: 200 }).catch(() => []),
-      fetchRunWorkpads(missionControlApiUrl, scoped ? { ...scope, limit: 120 } : { limit: 200 }).catch(() => [])
+      shouldRefreshSession ? fetchWorkspaceSession(missionControlApiUrl, run).catch(() => null) : Promise.resolve(null),
+      fetchAttempts(
+        missionControlApiUrl,
+        scoped
+          ? { ...scope, limit: SCOPED_EXECUTION_RECORD_LIMIT, compact: repositoryScoped }
+          : { limit: RECENT_ATTEMPT_LIMIT, compact: true }
+      ).catch(() => []),
+      fetchRunWorkpads(
+        missionControlApiUrl,
+        scoped
+          ? { ...scope, limit: SCOPED_EXECUTION_RECORD_LIMIT, compact: repositoryScoped }
+          : { limit: RECENT_RUN_WORKPAD_LIMIT, compact: true }
+      ).catch(() => [])
     ]);
     const sessionWorkItems = session?.workItems ?? workItems;
     const nextPipelines = await fetchPipelinesForExecutionScope(missionControlApiUrl, scope, sessionWorkItems, nextAttempts, nextRunWorkpads);
@@ -1684,7 +1761,7 @@ function App() {
         ? { pipelineId: activeDetailPipeline.id, workItemId: activeWorkItemDetail.id }
         : {};
       const [nextOperations, nextProofRecords] = await Promise.all([
-        fetchOperations(missionControlApiUrl, { ...artifactFilters, limit: activeDetailPipeline ? DETAIL_OPERATION_LIMIT : RECENT_OPERATION_LIMIT }).catch(() => []),
+        fetchOperations(missionControlApiUrl, { ...artifactFilters, limit: activeDetailPipeline ? DETAIL_OPERATION_LIMIT : RECENT_OPERATION_LIMIT, compact: !activeDetailPipeline }).catch(() => []),
         fetchProofRecords(missionControlApiUrl, { ...artifactFilters, limit: activeDetailPipeline ? DETAIL_PROOF_RECORD_LIMIT : RECENT_PROOF_RECORD_LIMIT }).catch(() => [])
       ]);
       setOperations((current) => mergeExecutionRecords(current, nextOperations, RECENT_OPERATION_LIMIT + DETAIL_OPERATION_LIMIT));
@@ -1708,7 +1785,7 @@ function App() {
     attempts.some((attempt) => attempt.status === "running" || attempt.status === "waiting-human");
 
   const liveExecutionScope = useMemo<ExecutionRefreshScope>(() => {
-    if (activeWorkItemDetail) {
+    if (activeNav !== "Page Pilot" && activeWorkItemDetail) {
       return {
         workItemId: activeWorkItemDetail.id,
         pipelineId: activeDetailPipeline?.id,
@@ -1719,15 +1796,16 @@ function App() {
       return { repositoryTargetId: activeRepositoryWorkspace.id };
     }
     return {};
-  }, [activeDetailPipeline?.id, activeRepositoryWorkspace?.id, activeWorkItemDetail?.id, activeWorkItemDetail?.repositoryTargetId]);
+  }, [activeDetailPipeline?.id, activeNav, activeRepositoryWorkspace?.id, activeWorkItemDetail?.id, activeWorkItemDetail?.repositoryTargetId]);
   const liveExecutionScopeToken = executionRefreshScopeKey(liveExecutionScope);
   const activeDetailHasLiveExecution =
-    Boolean(activeDetailPipeline && (activeDetailPipeline.status === "running" || activeDetailPipeline.status === "waiting-human")) ||
-    activeDetailAttempts.some((attempt) => attempt.status === "running" || attempt.status === "waiting-human");
+    activeNav !== "Page Pilot" &&
+    (Boolean(activeDetailPipeline && (activeDetailPipeline.status === "running" || activeDetailPipeline.status === "waiting-human")) ||
+      activeDetailAttempts.some((attempt) => attempt.status === "running" || attempt.status === "waiting-human"));
   const liveExecutionPollIntervalMs = activeDetailHasLiveExecution ? 2500 : 5000;
 
   useEffect(() => {
-    if (!missionControlApiUrl || !hasLiveExecution) return;
+    if (!missionControlApiUrl || activeNav === "Page Pilot" || !hasLiveExecution) return;
     let cancelled = false;
     let inFlight = false;
     const pollExecutionState = async () => {
@@ -1750,7 +1828,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [missionControlApiUrl, hasLiveExecution, run.id, liveExecutionPollIntervalMs, liveExecutionScopeToken]);
+  }, [activeNav, missionControlApiUrl, hasLiveExecution, run.id, liveExecutionPollIntervalMs, liveExecutionScopeToken]);
 
   useEffect(() => {
     if (!missionControlApiUrl) return;
@@ -1860,7 +1938,7 @@ function App() {
     }
 
     const target = activeRepositoryWorkspace
-      ? activeRepositoryWorkspaceTarget ?? "No target"
+      ? activeRepositoryWorkspaceLabel || activeRepositoryWorkspaceTarget || "No target"
       : newItemTarget.trim() || activeRepositoryWorkspaceTarget || "No target";
     const item = createManualWorkItem(
       workItems.length + 1,
@@ -2780,7 +2858,7 @@ function App() {
     }
   }
 
-  const inspectorAvailable = true;
+  const inspectorAvailable = activeNav !== "Page Pilot";
   const shellClassName = [
     "product-shell",
     `theme-${uiTheme}`,
@@ -2892,7 +2970,7 @@ function App() {
     }
   }
 
-  async function applyPagePilotChange(instruction: string, selection: PagePilotSelectionContext) {
+  async function applyPagePilotChange(instruction: string, selection: PagePilotSelectionContext, runner = "codex") {
     if (!missionControlApiUrl || !pagePilotRepositoryTarget?.id) {
       throw new Error("Page Pilot needs the local runtime and a repository workspace.");
     }
@@ -2901,7 +2979,7 @@ function App() {
       repositoryTargetId: pagePilotRepositoryTarget.id,
       instruction,
       selection,
-      runner: "profile"
+      runner
     });
   }
 
@@ -2930,11 +3008,17 @@ function App() {
     return result;
   }
 
-  async function loadPagePilotRuns() {
+  async function loadPagePilotRuns(filters: PagePilotRunFilters = {}) {
     if (!missionControlApiUrl) return [];
-    const runs = await fetchPagePilotRuns(missionControlApiUrl);
-    return pagePilotRepositoryTarget?.id
-      ? runs.filter((run) => run.repositoryTargetId === pagePilotRepositoryTarget.id)
+    const effectiveFilters = { ...filters };
+    if (!effectiveFilters.id && !effectiveFilters.repositoryTargetId && pagePilotRepositoryTarget?.id) {
+      effectiveFilters.repositoryTargetId = pagePilotRepositoryTarget.id;
+    }
+    if (!effectiveFilters.id && effectiveFilters.limit === undefined) effectiveFilters.limit = 8;
+    if (!effectiveFilters.id && effectiveFilters.compact === undefined) effectiveFilters.compact = true;
+    const runs = await fetchPagePilotRuns(missionControlApiUrl, effectiveFilters);
+    return effectiveFilters.repositoryTargetId
+      ? runs.filter((run) => run.repositoryTargetId === effectiveFilters.repositoryTargetId)
       : runs;
   }
 
@@ -3303,7 +3387,7 @@ function App() {
                 {runnerMessage}
               </p>
             ) : null}
-            <section className="operator-section">
+            <section className="operator-section views-overview-section">
               <div className="operator-section-heading">
                 <div>
                   <span className="section-label">Status</span>
@@ -3498,7 +3582,7 @@ function App() {
                           {pipeline.status === "ready" || pipeline.status === "draft" || pipeline.status === "running" ? (
                             <button onClick={() => runOperatorPipelineStage(pipeline.id)}>Run stage</button>
                           ) : null}
-                          {pipeline.templateId === "devflow-pr" && pipeline.status !== "done" ? (
+                          {(pipeline.templateId === "devflow-pr" || pipeline.templateId === "saas-launch") && pipeline.status !== "done" ? (
                             <button onClick={() => runOperatorDevFlowCycle(pipeline.id)}>Run DevFlow cycle</button>
                           ) : null}
                         </span>
@@ -4044,7 +4128,7 @@ function App() {
               <label>
                 <span>{t("Status")}</span>
                 <select value={statusFilter} onChange={(event) => setStatusFilter(event.currentTarget.value as "All" | WorkItemStatus)}>
-                  {["All", "Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Done"].map((status) => (
+                  {["All", "Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Canceled", "Done"].map((status) => (
                     <option key={status} value={status}>
                       {status === "All" ? t("All") : localizedWorkItemStatusLabel(status as WorkItemStatus)}
                     </option>
@@ -4315,7 +4399,7 @@ function App() {
                     }
                   }}
                 >
-                  {["Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Done"].map((status) => (
+                  {["Planning", "Ready", "In Review", "Human Review", "Backlog", "Blocked", "Canceled", "Done"].map((status) => (
                     <option key={status} value={status}>
                       {localizedWorkItemStatusLabel(status as WorkItemStatus)}
                     </option>
@@ -4354,7 +4438,7 @@ function App() {
               </label>
               <label>
                 <span>{t("Target")}</span>
-                <input value={selectedWorkItem.target} readOnly />
+                <input value={repositoryLabelForItem(selectedWorkItem) || selectedWorkItem.target} readOnly />
               </label>
             </div>
             <div className="property-copy">

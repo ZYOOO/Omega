@@ -17,9 +17,15 @@ type devFlowReworkActionHandler struct {
 	ctx                     context.Context
 	template                *PipelineTemplate
 	profile                 ProjectAgentProfile
+	masterProfile           AgentProfileConfig
+	masterRunner            AgentRunner
+	masterRunnerID          string
 	codingProfile           AgentProfileConfig
 	codingRunner            AgentRunner
 	codingRunnerID          string
+	testingProfile          AgentProfileConfig
+	testingRunner           AgentRunner
+	testingRunnerID         string
 	runnerHeartbeatInterval time.Duration
 	pipeline                map[string]any
 	item                    map[string]any
@@ -87,7 +93,64 @@ func (handler *devFlowReworkActionHandler) buildChecklist() error {
 	if err := os.WriteFile(checklistPath, []byte(checklist), 0o644); err != nil {
 		return err
 	}
-	handler.recordAgent(handler.stageID, "master", "passed", "Build rework checklist from review, PR, check, and human feedback.", filepath.Base(checklistPath), "Rework checklist captured for the next coding pass.", []string{checklistPath}, map[string]any{"runner": "local-orchestrator", "status": "passed", "reviewCycle": handler.cycle})
+	masterPrompt := fmt.Sprintf(`You are the Master Orchestrator Agent for Omega.
+
+Build the rework checklist for the next coding pass.
+
+Repository: %s
+Repository path: %s
+Work item: %s
+Title: %s
+Pull request: %s
+Review cycle: %d
+Source stage: %s
+Target stage: %s
+
+Requirement:
+%s
+
+Feedback:
+%s
+
+Omega has written the machine-readable checklist draft to:
+%s
+
+Prepare the final checklist with:
+- exact feedback items to address
+- expected files or areas to inspect
+- validation required before review
+- risks or blocked assumptions
+`, handler.repoSlug, handler.repoWorkspace, text(handler.item, "key"), text(handler.item, "title"), handler.prURL, handler.cycle, handler.fromStageID, handler.stageID, handler.effectiveDescription, handler.roundFeedback, checklistPath) + agentArtifactCaptureInstruction(checklistPath) + "\n\n" + agentPolicyBlock(handler.profile, "master")
+	if err := writeRunnerPolicyFiles(handler.repoWorkspace, handler.profile, "master"); err != nil {
+		process := runnerProcessNotAvailable(handler.masterRunnerID, handler.masterRunnerID, handler.repoWorkspace, err)
+		handler.recordAgent(handler.stageID, "master", "failed", masterPrompt, filepath.Base(checklistPath), "Master agent policy files could not be materialized for rework checklist.", []string{checklistPath}, process)
+		return err
+	}
+	masterModel, masterEnv := handler.server.runnerCredentialModelAndEnv(handler.ctx, handler.masterRunnerID, handler.masterProfile.Model)
+	turn := handler.masterRunner.RunTurn(handler.ctx, AgentTurnRequest{
+		Role:              "master",
+		StageID:           handler.stageID,
+		Runner:            handler.masterRunnerID,
+		Workspace:         handler.repoWorkspace,
+		Prompt:            masterPrompt,
+		OutputPath:        checklistPath,
+		Sandbox:           "read-only",
+		Model:             masterModel,
+		Effort:            "medium",
+		Env:               mergeEnvMaps(agentCapabilityEnv(handler.profile, "master"), masterEnv),
+		HeartbeatInterval: handler.runnerHeartbeatInterval,
+		OnProcessEvent:    handler.server.runnerHeartbeatRecorder(text(handler.pipeline, "id"), text(handler.item, "id"), handler.attemptID, handler.stageID, "master", handler.masterRunnerID),
+	})
+	process := turn.Process
+	if process == nil {
+		process = map[string]any{"runner": handler.masterRunnerID, "status": "passed"}
+	}
+	process["reviewCycle"] = handler.cycle
+	if turn.Error != nil {
+		handler.recordAgent(handler.stageID, "master", "failed", masterPrompt, filepath.Base(checklistPath), "Master agent failed while building the rework checklist.", []string{checklistPath}, process)
+		return turn.Error
+	}
+	handler.recordAgent(handler.stageID, "master", "passed", masterPrompt, filepath.Base(checklistPath), "Master agent captured the rework checklist for the next coding pass.", []string{checklistPath}, process)
 	return nil
 }
 
@@ -129,6 +192,9 @@ Rules:
 	if err := os.WriteFile(handler.promptPath, []byte(handler.reworkPrompt), 0o644); err != nil {
 		return err
 	}
+	if err := writeRunnerPolicyFiles(handler.repoWorkspace, handler.profile, "coding"); err != nil {
+		return err
+	}
 	handler.recordAgent(handler.stageID, "coding", "running", handler.reworkPrompt, "", "Rework agent is applying review feedback in the same workspace.", []string{handler.promptPath}, map[string]any{"runner": handler.codingRunnerID, "status": "running", "reviewCycle": handler.cycle})
 	reworkModel, reworkEnv := handler.server.runnerCredentialModelAndEnv(handler.ctx, handler.codingRunnerID, handler.codingProfile.Model)
 	turn := handler.codingRunner.RunTurn(handler.ctx, AgentTurnRequest{
@@ -148,7 +214,7 @@ Rules:
 		handler.recordAgent(handler.stageID, "coding", "failed", handler.reworkPrompt, filepath.Base(handler.notePath), "Rework agent failed before producing an acceptable repository diff.", []string{handler.promptPath, handler.notePath}, turn.Process)
 		return fmt.Errorf("rework agent failed: %w", turn.Error)
 	}
-	statusOutput, err := runCommand(handler.repoWorkspace, "git", "status", "--short")
+	statusOutput, err := runCommand(handler.repoWorkspace, "git", "status", "--short", "--", ".", ":(exclude).omega", ":(exclude).codex", ":(exclude).claude", ":(exclude).opencode", ":(exclude).trae")
 	if err != nil {
 		return fmt.Errorf("read rework changes: %w", err)
 	}
@@ -156,7 +222,7 @@ Rules:
 		handler.recordAgent(handler.stageID, "coding", "failed", handler.reworkPrompt, filepath.Base(handler.notePath), "Rework agent produced no repository changes.", []string{handler.promptPath, handler.notePath}, turn.Process)
 		return errors.New("rework agent produced no repository changes")
 	}
-	if _, err := runCommand(handler.repoWorkspace, "git", "add", "-A"); err != nil {
+	if _, err := runCommand(handler.repoWorkspace, "git", "add", "-A", "--", ".", ":(exclude).omega", ":(exclude).codex", ":(exclude).claude", ":(exclude).opencode", ":(exclude).trae"); err != nil {
 		return fmt.Errorf("stage rework changes: %w", err)
 	}
 	if _, err := runCommand(handler.repoWorkspace, "git", "commit", "-m", fmt.Sprintf("Omega rework for %s round %d", text(handler.item, "key"), handler.cycle)); err != nil {
@@ -164,9 +230,8 @@ Rules:
 	}
 	*handler.commitSha, _ = runCommand(handler.repoWorkspace, "git", "rev-parse", "HEAD")
 	*handler.commitSummary, _ = runCommand(handler.repoWorkspace, "git", "show", "--stat", "--oneline", "--no-renames", "HEAD")
-	*handler.diffText, _ = runCommand(handler.repoWorkspace, "git", "diff", "HEAD~1..HEAD")
 	var changedNames string
-	changedNames, err = runCommand(handler.repoWorkspace, "git", "diff", "--name-only", "HEAD~1..HEAD")
+	*handler.diffText, changedNames, err = gitHeadDiff(handler.repoWorkspace)
 	if err != nil {
 		return fmt.Errorf("list rework changed files: %w", err)
 	}
@@ -196,12 +261,51 @@ func (handler *devFlowReworkActionHandler) validate() error {
 	testVariables["changedFiles"] = strings.Join(*handler.changedFiles, ", ")
 	testVariables["testOutput"] = *handler.testOutput
 	testFallback := fmt.Sprintf("Validate %s after rework round %d. Changed files: %s", text(handler.item, "key"), handler.cycle, strings.Join(*handler.changedFiles, ", "))
-	testPrompt := renderWorkflowPromptSection(handler.template, "testing", testVariables, testFallback)
-	testReport := fmt.Sprintf("# Rework Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after rework round %d.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(*handler.testOutput), "No validation output."), handler.cycle, stringOr(testFailureSummary(*handler.testErr, *handler.testOutput), "None"))
-	if err := os.WriteFile(testReportPath, []byte(testReport), 0o644); err != nil {
+	testPrompt := renderWorkflowPromptSection(handler.template, "testing", testVariables, testFallback) + "\n\n" + agentPolicyBlock(handler.profile, "testing") + fmt.Sprintf(`
+
+Local repository validation has already run for rework round %d. Use the output below as evidence and prepare the final validation report.
+
+Validation status: %s
+
+Validation output:
+~~~text
+%s
+~~~
+
+Validation failure summary:
+%s
+`, handler.cycle, testStatus, stringOr(strings.TrimSpace(*handler.testOutput), "No validation output."), stringOr(testFailureSummary(*handler.testErr, *handler.testOutput), "None")) + agentArtifactCaptureInstruction(testReportPath)
+	if err := writeRunnerPolicyFiles(handler.repoWorkspace, handler.profile, "testing"); err != nil {
 		return err
 	}
-	handler.recordAgent(handler.stageID, "testing", testStatus, testPrompt, filepath.Base(testReportPath), "Repository validation completed after rework.", []string{testReportPath}, map[string]any{"runner": "local-validation", "status": testStatus, "stdout": *handler.testOutput})
+	testModel, testEnv := handler.server.runnerCredentialModelAndEnv(handler.ctx, handler.testingRunnerID, handler.testingProfile.Model)
+	turn := handler.testingRunner.RunTurn(handler.ctx, AgentTurnRequest{
+		Role:              "testing",
+		StageID:           handler.stageID,
+		Runner:            handler.testingRunnerID,
+		Workspace:         handler.repoWorkspace,
+		Prompt:            testPrompt,
+		OutputPath:        testReportPath,
+		Sandbox:           "read-only",
+		Model:             testModel,
+		Effort:            "medium",
+		Env:               mergeEnvMaps(agentCapabilityEnv(handler.profile, "testing"), testEnv),
+		HeartbeatInterval: handler.runnerHeartbeatInterval,
+		OnProcessEvent:    handler.server.runnerHeartbeatRecorder(text(handler.pipeline, "id"), text(handler.item, "id"), handler.attemptID, handler.stageID, "testing", handler.testingRunnerID),
+	})
+	if turn.Error != nil {
+		handler.recordAgent(handler.stageID, "testing", "failed", testPrompt, filepath.Base(testReportPath), "Testing agent failed while verifying rework validation output.", []string{testReportPath}, turn.Process)
+		return fmt.Errorf("testing agent failed after rework: %w", turn.Error)
+	}
+	if reportRaw, _ := os.ReadFile(testReportPath); strings.TrimSpace(string(reportRaw)) == "" {
+		testReport := fmt.Sprintf("# Rework Test Report\n\nStatus: %s\n\n## Commands\n\n```text\n%s\n```\n\n## Acceptance coverage\n\n- Validation was run against the repository after rework round %d.\n\n## Failures\n\n%s\n\n## Residual risk\n\n- Project-specific coverage depends on available repository test commands.\n", testStatus, stringOr(strings.TrimSpace(*handler.testOutput), "No validation output."), handler.cycle, stringOr(testFailureSummary(*handler.testErr, *handler.testOutput), "None"))
+		if err := os.WriteFile(testReportPath, []byte(testReport), 0o644); err != nil {
+			return err
+		}
+	}
+	testProcess := cloneMap(turn.Process)
+	testProcess["localValidation"] = map[string]any{"runner": "local-validation", "status": testStatus, "stdout": *handler.testOutput}
+	handler.recordAgent(handler.stageID, "testing", testStatus, testPrompt, filepath.Base(testReportPath), "Testing agent verified repository validation output after rework.", []string{testReportPath}, testProcess)
 	if *handler.testErr != nil {
 		return fmt.Errorf("repository validation failed after rework: %w", *handler.testErr)
 	}

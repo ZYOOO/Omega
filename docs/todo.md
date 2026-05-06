@@ -16,6 +16,14 @@ Requirement 需求源
 
 近期完成：
 
+- [x] 演示前 release refresh：README 改为开源项目结构，最新版 CLI / runtime binary 和 `Omega-0.1.0-arm64.dmg` 已重新构建，CLI `--help` smoke test 已修复。
+- [x] DevFlow 角色型阶段真实使用 AI Agent：Requirement / Master / Architect / Coding / Testing / Review / Delivery 均调用对应 Agent Profile，runtime 只保留确定性控制动作，并新增职责边界文档。
+- [x] Desktop release packaging dry-run：新增 Electron builder 配置、release binaries 构建脚本、macOS dmg/zip 打包命令和 release packaging 文档；本机已生成 ad-hoc signed macOS arm64 产物。
+- [x] Work Item 详情页性能复测与 compact 执行列表：普通刷新改用 compact attempts / run-workpads / operations，详情页按 Work Item 收缩补全完整记录，Review packet 和 Agent statistics 点击响应实测约 50-100ms。
+- [x] 默认测试集收敛：`npm run test` 聚焦当前产品主链路，旧前端 Mission Control 原型测试移到 `npm run test:legacy`，P0 脚本改用定向 Go runtime 回归。
+- [x] Review packet 风险分级证据化：缺验证 / 缺远端 checks 不再直接 high，只有明确阻塞信号才 high，并在详情页、proof、飞书里展示 risk basis。
+- [x] Human Review 显式展示 Plan/TODO 复核结果：review packet、run report、human-review-request、Work Item 详情页和飞书审核内容都展示 Functional / Project TODO 的 verified / pending / attention 状态。
+- [x] Work Item 详情页按阶段新增 Agent 统计与明细：阶段卡片展示 run 数、耗时、可用 token 和状态计数，`View agents` 弹窗展示每个 Agent 的角色、runner/model、耗时、token 和产出摘要。
 - [x] Work Item 详情页执行态热路径收缩：live polling 按当前 Work Item / Pipeline / Repository Workspace 读取，Attempt Timeline 不再读取 full supervisor snapshot。
 - [x] Work Item 详情页 light / dark 视觉收口：产物预览、Agent 操作弹窗、Review packet 和 Agent trace 卡片统一主题颜色，避免浅色页面混入深色弹窗壳。
 - [x] 四类 Agent runner 启动链路拆成 runner-specific adapter：Codex 走 `codex exec`，Claude Code 继承本机 CLI 配置，opencode 生成临时 `OPENCODE_CONFIG`，Trae Agent 生成临时 `trae_config.yaml`。
@@ -523,6 +531,8 @@ Item
 - [x] Feishu Human Review approve 路由收敛：未配置 Card Request URL 时不再发送会报 `200340` 的卡片按钮，当前用户 fallback 改走可同步的 Task 审核。
 - [x] Sidebar Agent Access：左侧 sidebar 展示本机级 runner / model / profile / account 绑定状态，点击进入 Agent Studio；workspace 级 stage 分配继续保留在 Agent Studio 内。
 - [x] Stage 级 Skills / MCP 真实物化：Agent Profile 保存后，runner 启动前写入 `.omega/agent-capabilities.*`、`.codex/OMEGA.md`、`.claude/CLAUDE.md`，注入 `OMEGA_AGENT_*` 环境变量，并用 fake runner 测试证明 Agent 进程可读取。
+- [x] 项目内置 Skills fallback：runner workspace 会生成 `.omega/skills/<skill>/SKILL.md` 和 `.omega/agent-skill-manifest.json`；本机已安装时复制宿主 `SKILL.md`，未安装时写入 Omega fallback，避免用户没装 skill 就只剩 UI 标签。
+- [x] Master / Architect / Testing 执行链路对齐 Agent Profile：Master 写 dispatch，Architect 写 plan/todo，Testing 在本地验证后由 Testing Agent 复核 test report；详情页不再把这些阶段误呈现为纯 local action。
 - [x] 本机 Skills / MCP 安装与映射文档：安装 stage 适用 Skills / MCP server，并在 `docs/agent-skills-and-mcp.md` 记录安装位置、默认 stage 映射和验证方式。
 - [x] GitHub Actions CI 进入默认 DevFlow：PR publish/update 后执行 `run_ci_checks`，采集 checks 和 failed run logs，写入 CI proof，并将 failed/missing required checks 输入 Rework / Review / Workpad。
 - [x] DevFlow Plan/TODO 显式化：Architect action 作为 Plan 等价阶段，输出 technical plan、functional todo list、project todo list，Review prompt 按清单核对 diff / validation / CI。
@@ -541,6 +551,7 @@ Item
 - [x] Work Item 详情页动作收口：顶部主按钮只负责启动未开始项；完成后的重新运行和失败/阻塞恢复不再混在顶部，attempt 级失败恢复保留在 attempt 卡片。
 - [x] Work Item 产物区 UI 收口：Artifact 卡片和预览弹窗改为证据/文档式排版，Markdown 产物按标题、列表、checkbox、代码块格式化展示。
 - [x] Agent operations 弹窗 UI 收口：状态/runner/model/exit/duration 进入 metadata，Summary/Prompt/Stdout/Stderr 分块展示，Prompt 常见结构格式化为可读文档。
+- [x] Omega CLI operator surface 对齐：Work Item / Attempt / Checkpoint 命令改走 session / compact / filtered read model，并新增 operations、Run Workpads、proof preview、PR status 命令。
 - [ ] 收尾剩余 full snapshot 兼容层：`GET/PUT /workspace`、少量 connection 状态镜像和旧 missionEvents fallback 仍保留为兼容/导出/恢复用途，后续要继续收窄或标记为 legacy-only。
 
 ## Page Pilot 产品化
@@ -548,6 +559,7 @@ Item
 - [x] Page Pilot 入口接入 Workboard / Work Item，并支持选择明确 Repository Workspace。
 - [x] Electron Open preview 增加真实 IPC 结果反馈和失败日志，避免端口未启动时表现为无响应。
 - [x] Page Pilot Web fallback 恢复：无 Electron bridge 时通过 Go Preview Runtime API 启动所选 workspace，并用 `/page-pilot-target` 同源 iframe 打开 3009 预览。
+- [x] Page Pilot 编辑 Agent 可选择当前四类 AI Agent：Codex、Claude Code、opencode、Trae Agent，并将实际 runner 写入 run / pipeline / operation 记录。
 - [x] Page Pilot Preview Runtime 会清理同 workspace 的陈旧 3009 监听进程，避免旧 `ERR_EMPTY_RESPONSE` server 阻塞新预览。
 - [x] Page Pilot GitHub target 使用 Omega 管理的隔离 preview workspace；不再扫描用户本机默认目录猜测 worktree。
 - [x] Electron 基础版 Preview Runtime Agent/Profile：Dev server 模式会读取所选 repo、生成 profile、启动 dev server、health check 通过后打开 direct pilot。

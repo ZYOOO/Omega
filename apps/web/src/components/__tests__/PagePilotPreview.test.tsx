@@ -57,6 +57,10 @@ describe("PagePilotPreview", () => {
 
     expect(screen.getAllByText("ZYOOO/TestRepo").length).toBeGreaterThan(0);
     expect(screen.getByLabelText("Target repo")).toHaveValue("repo_test");
+    expect(screen.getByLabelText("Editing Agent")).toHaveValue("codex");
+    expect(screen.getByRole("option", { name: "Claude Code" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "opencode" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Trae Agent" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "AI" })).not.toBeInTheDocument();
   });
 
@@ -93,6 +97,7 @@ describe("PagePilotPreview", () => {
     );
 
     expect(await screen.findByText("Waiting for confirmation")).toBeInTheDocument();
+    expect(onFetchRuns).toHaveBeenCalledWith({ repositoryTargetId: "repo_test", limit: 8, compact: true });
     expect(screen.getByText("pipeline_item_page_pilot_1")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Work Item" })).toHaveAttribute("href", "#/work-items/item_page_pilot_1");
     fireEvent.click(screen.getByRole("button", { name: "Details" }));
@@ -147,6 +152,7 @@ describe("PagePilotPreview", () => {
       projectId: "project_omega",
       repositoryTargetId: "repo_test",
       repositoryLabel: "ZYOOO/TestRepo",
+      runner: "codex",
       returnUrl: "#page-pilot",
       previewRuntimeProfile: { source: "npm:dev", devCommand: "npm run dev -- --host 127.0.0.1 --port 3009" },
     }));

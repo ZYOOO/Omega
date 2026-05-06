@@ -2,6 +2,407 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-06: macOS 安装包启动后白屏
+
+### 现象
+
+从 DMG 安装 Omega 后，Electron 窗口打开但页面白屏。
+
+### 原因
+
+打包后的 `Resources/web/index.html` 使用了 Vite 默认的绝对资源路径：
+
+```html
+<script src="/assets/index-*.js">
+<link href="/assets/index-*.css">
+```
+
+开发环境通过 Vite dev server 访问时 `/assets/...` 是正确的；但 packaged Electron 使用 `mainWindow.loadFile(...)` 加载 `file://.../Resources/web/index.html`。在 `file://` 协议下，`/assets/...` 会解析到磁盘根目录 `/assets/...`，导致 JS/CSS 加载失败，React 没有启动，表现为白屏。
+
+### 修复
+
+- `apps/web/vite.config.ts` 设置 `base: "./"`，生产构建改为相对资源路径 `./assets/...`。
+- `apps/web/index.html` 标题改为 `Omega`，避免打包应用标题仍显示旧名称。
+- 重新生成 `dist/desktop/Omega-0.1.0-arm64.dmg` 和 `dist/desktop/Omega-0.1.0-mac-arm64.zip`。
+
+### 验证
+
+```bash
+npm run build
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=30000
+CSC_IDENTITY_AUTO_DISCOVERY=false npm run desktop:dist
+sed -n '1,40p' dist/desktop/mac-arm64/Omega.app/Contents/Resources/web/index.html
+APP="dist/desktop/mac-arm64/Omega.app"; test -f "$APP/Contents/Resources/web/assets/index-DjUU0zFN.js"
+ELECTRON_ENABLE_LOGGING=1 "dist/desktop/mac-arm64/Omega.app/Contents/MacOS/Omega"
+```
+
+## 2026-05-06: 安装版 runtime 残留导致 dev 桌面看到空数据
+
+### 现象
+
+关闭安装版 Omega 后，`127.0.0.1:3888` 仍被 `/Applications/Omega.app/Contents/Resources/bin/omega-local-runtime` 占用。随后运行 `npm run desktop` 时，开发版桌面直接复用这个已存在的 3888 runtime，看到的是安装版 userData 下的空数据库，而不是项目目录 `.omega/omega.db` 中已有的开发数据。
+
+本机确认：
+
+```text
+~/Library/Application Support/omega-ai-delivery-engine/.omega/omega.db  work_items=0
+/Users/zyong/Projects/Omega/.omega/omega.db                             work_items=7
+```
+
+### 原因
+
+- macOS 上 `window-all-closed` 之前遵循默认 Mac 行为，只关闭窗口但不退出 app，因此 runtime 可能继续运行。
+- 如果 app 进程后来退出但 detached runtime 没有被 stop，runtime 会变成 PPID 1 的残留进程。
+- desktop supervisor 启动时只探测 `3888 /health` 是否可用；只要已有 runtime 健康，就将其标记为 `external` 并复用，没有检查该 runtime 是否使用当前 dev/project 数据库。
+
+### 修复
+
+- macOS 关闭最后一个窗口时也执行 `app.quit()`，让 Omega 桌面应用关闭语义与本地 runtime 生命周期一致。
+- dev desktop runtime 显式传入 `--database /Users/zyong/Projects/Omega/.omega/omega.db` 和 `--workspace-root ~/Omega/workspaces`，不再依赖 `go run` 的 cwd 默认值。
+- desktop supervisor 在 autostart runtime 前检查 3888 上的 `omega-local-runtime` listener；如果它使用的数据库 / cwd 与当前启动计划不匹配，会先停止 stale listener，再启动当前上下文的 runtime。
+
+### 验证
+
+```bash
+kill <stale-runtime-pid>
+lsof -nP -iTCP:3888 -sTCP:LISTEN
+node --check apps/desktop/src/process-supervisor.cjs
+node --check apps/desktop/src/main.cjs
+node -e 'const { buildRuntimeLaunchPlan } = require("./apps/desktop/src/process-supervisor.cjs"); console.log(buildRuntimeLaunchPlan({ isPackaged:false, getPath:()=>"/tmp/unused" }, {}).args)'
+```
+
+## 2026-05-06: Finder 启动桌面应用时 AI runner 显示缺失
+
+### 现象
+
+Global Agent Access 中 Codex、Claude Code、opencode 显示“缺失”，但同一台机器的 shell 中可以 `command -v codex/claude/opencode`。Trae Agent 因为安装在 `~/.local/bin`，之前仍能显示就绪。
+
+### 原因
+
+从 Finder 启动的 macOS app 不会继承登录 shell 的完整 PATH。Codex / Claude / opencode 安装在 nvm 的 Node bin 目录：
+
+```text
+~/.nvm/versions/node/v20.19.4/bin
+```
+
+安装版 Electron 启动 bundled Go runtime 时继承的是精简 PATH，因此 Go runtime 的 `exec.LookPath` 找不到这些 runner。前面安装版 runtime 残留占住 3888 时，开发版 `npm run desktop` 也可能误连到这个精简 PATH 的 runtime，于是 npm / DMG 两边都显示缺失。
+
+### 修复
+
+- Electron supervisor 启动 runtime / web / preview 子进程时，PATH 会合并：
+  - 当前进程 PATH；
+  - 登录 shell 的 PATH；
+  - 常见 CLI 目录：`~/.nvm/versions/node/*/bin`、`~/.local/bin`、Homebrew、Go bin、Codex.app resources 等。
+- Go runtime 启动时也会补充同一类常见本机工具路径，避免直接启动 runtime 时缺失。
+
+### 验证
+
+```bash
+node --check apps/desktop/src/process-supervisor.cjs
+go test ./services/local-runtime/internal/omegalocal -run 'TestLocalCapabilitiesReportsInstalledCliTools|TestLocalCapabilitiesTimesOutSlowVersionCommands' -count=1 -timeout=60s
+npm run local-runtime:dev
+curl -s 'http://127.0.0.1:3888/local-capabilities?refresh=true'
+```
+
+本机验证结果：
+
+```text
+codex       true /Users/zyong/.nvm/versions/node/v20.19.4/bin/codex
+claude-code true /Users/zyong/.nvm/versions/node/v20.19.4/bin/claude
+opencode    true /Users/zyong/.nvm/versions/node/v20.19.4/bin/opencode
+trae-agent  true /Users/zyong/.local/bin/trae-cli
+```
+
+## 2026-05-06: CLI `--help` 返回非 0
+
+### 现象
+
+演示前 smoke test 运行 `dist/release/bin/omega --help` 时，CLI 输出 `omega: flag: help requested` 并返回退出码 1；`omega help` 可以正常显示帮助。
+
+### 原因
+
+Go `flag.FlagSet.Parse` 在处理 `--help` 时返回 `flag.ErrHelp`。CLI 入口原先把所有 parse error 都当作真实错误返回，导致标准 help flag 也被视为失败。
+
+### 修复
+
+- `CLI.Run` 识别 `flag.ErrHelp`，打印 usage 并返回 nil。
+- 增加 `TestGlobalHelpPrintsUsageWithoutError` 覆盖全局 `--help`。
+- 重新构建 release binary 和 DMG，确认打包内 `Resources/bin/omega --help` 同样正常。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegacli -count=1 -timeout=60s
+dist/release/bin/omega --help
+APP="dist/desktop/mac-arm64/Omega.app"; "$APP/Contents/Resources/bin/omega" --help
+```
+
+## 2026-05-06: DevFlow Arch/Test 显示为 local runner 而不是配置 Agent
+
+### 现象
+
+Work Item 详情页中 Master / Arch / Test 的执行详情显示 `local-orchestrator` 或 `local-validation`，但 Workspace Agent Studio 又允许配置 Architect / Testing runner，容易让用户误以为这些设置没有生效，也削弱“由 Agent 设计方案、验证测试”的产品表达。
+
+后续复核发现 Requirement、rework assessment/checklist 和 Delivery handoff 也存在类似问题：runtime 已经写出结构化 artifact，但详情页仍把这些角色结果显示为本地 orchestration。
+
+### 原因
+
+- workflow contract 已把 `architecture_handoff` 标成 `run_agent`、`validate_repository` 标成 testing action，但 Go executor 里 Architect plan 和 Testing report 仍由本地确定性代码直接生成。
+- Master 分类同样只记录本地 control-plane 结果，默认 Agent Profile 里没有 `master` 角色，缺失时还会 fallback 到 coding profile。
+- runner policy 文件写进 repository workspace 后，旧 `git add -A` 会把 `.omega` / `.codex` / `.claude` runtime 文件一并纳入提交，导致测试阶段 `git diff --check` 会检查到这些运行时文件。
+
+### 修复
+
+- 默认 Agent Profile 和前端默认配置新增 `master` Agent；旧 profile 归一化时会补齐缺失的默认角色。
+- DevFlow 中 `classify_task` 现在会调用 Master Agent 产出 `master-dispatch.md`，同时保留机器可读 `task-classification.json`。
+- `architecture_handoff` 改为调用配置的 Architect Agent 产出 `solution-plan.md`；若 Agent plan 缺少 TODO / 仓库上下文，Omega 会追加 deterministic guardrail，确保 Review / Human Review 仍有可核对清单。
+- `validate_repository` 和 rework validation 先运行真实本地验证命令，再调用 Testing Agent 读取输出并产出最终 `test-report.md` / `test-report-rework-*.md`。
+- Requirement intake 调用 Requirement Agent 产出 `requirement-handoff.md`；`requirement-artifact.json` 保留为机器可读 proof。
+- Human-requested fast rework 与自动 rework checklist 调用 Master Agent 产出 `rework-assessment.md` / `rework-checklist-*.md`。
+- Delivery handoff 调用 Delivery Agent 产出 `delivery-handoff.md` / `delivery-handoff-fast-rework.md`；`handoff-bundle.json` 保留为 checkpoint / read model 输入。
+- Coding / Rework commit 阶段排除 `.omega`、`.codex`、`.claude`、`.opencode`、`.trae` runtime 目录，避免把 Agent policy/runtime 文件提交到用户仓库。
+- 空模型不再在 policy / capability Markdown 里输出 `Model: ` 尾随空格。
+- 新增 `docs/devflow-agent-execution-policy.md`，明确 AI Agent 与本地确定性执行器的职责边界。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestDefaultAgentProfileLeavesModelUnset|TestProjectAgentProfilePersistsAndFeedsRuntimeBundle|TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof|TestProfileSkillsAndMCPAreMaterializedForRunnerProcess' -count=1 -timeout=120s
+```
+
+## 2026-05-06: Agent Studio 左侧错误展示旧默认模型
+
+## 2026-05-06: View Runtime health 间距过紧且 Trend 含义不清
+
+### 现象
+
+Workspace Agent Studio 右侧 Model 输入已经显示“继承真实 runner 模型”，但左侧 Agent roster 仍然显示 `gpt-5.4-mini`，容易让用户误以为所有阶段都固定使用这个模型。
+
+### 原因
+
+- 历史默认 Agent Profile 把 `gpt-5.4-mini` 写进了每个 stage 的 `model` 字段。
+- 右侧编辑器已经把该值当作 legacy inherited sentinel 处理，但左侧摘要仍直接渲染原始 `profile.model`。
+- 后端默认 profile / normalization 也还会为空模型补写旧默认值，运行侧部分 Codex/opencode 路径会把空模型再次补成旧默认。
+
+### 修复
+
+- 前端默认 Agent Profile 的 `model` 改为空字符串。
+- 后端默认 Agent Profile 和 normalization 不再生成模型默认值。
+- 左侧 Agent roster 改为显示有效模型：显式 override 优先，其次 preflight / runner credential 解析出的模型，最后才显示 runner 默认说明。
+- Codex/opencode runner 在模型为空时不再自动传入 `gpt-5.4-mini`，而是让 CLI 使用自身配置或 credential 解析结果。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkspaceAgentStudio.test.tsx --testTimeout=30000
+go test ./services/local-runtime/internal/omegalocal -run 'TestDefaultAgentProfileLeavesModelUnset|TestProjectAgentProfilePersistsAndFeedsRuntimeBundle' -count=1 -timeout=60s
+npm run lint
+git diff --check
+```
+
+### 现象
+
+View 页面 Runtime health 区域上下左右间距过紧，下方卡片挤在一起；`Trend` 只显示两根柱状条，没有说明统计口径，用户无法判断它对交付状态有什么意义。真实数据中多个 `Unknown` stage 还会触发 React duplicate key warning。
+
+### 原因
+
+- Observability 面板沿用了早期密集布局，适合调试但不适合作为产品视图展示。
+- Trend 直接透出后端趋势数组长度和日柱图，没有把 started / completed / failed / PR merged 聚合成可读指标。
+- Grouped by stage 使用 stage label/key 作为 React key，后端返回多个 Unknown 分组时 key 会重复。
+
+### 修复
+
+- View 的 Delivery overview 和 Runtime health 增加更稳定的 padding、gap、卡片圆角和控件点击区域。
+- 将 `Trend` 改为 `Delivery movement`，展示窗口内 started / completed / failed / PR merged 汇总，并给日柱图补充图例和 hover title。
+- 统一拉开 View 内 `operator-section`、`control-card` 和列表项的内边距，避免 Runtime / Pipeline 区块标题和卡片内容贴边。
+- 分组和趋势列表 key 增加索引兜底，避免重复 stage label 导致 React 警告。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/ObservabilityDashboard.test.tsx --testTimeout=30000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "renders Go control-plane observability" --testTimeout=60000
+```
+
+## 2026-05-06: compact/detail 改动后 TypeScript 校验缺口
+
+### 现象
+
+补跑 `npm run lint` 时发现前面详情页、Agent Studio 和 compact API 类型改动仍有类型缺口：`fetchCheckpoints` filter 缺 `attemptId`，`run-workpads` filter 缺 `compact`，pipeline stage 类型缺 `startedAt` / `completedAt`，Work Item `stageId` 仍按旧 legacy stage union 限制，Markdown heading 渲染使用 `JSX.IntrinsicElements` 在当前 TS 配置下报错。
+
+### 修复
+
+- 补齐 API client filter 和 stage timestamp 类型。
+- Workboard `WorkItem.stageId` 改为字符串，适配 workflow contract 的真实阶段 id。
+- `LocalCapabilityInfo.description` 改为可选，兼容测试和旧 runtime payload。
+- 修正 Global Agent Access 的窄化分支和 Markdown heading 的 React element type。
+
+### 验证
+
+```bash
+npm run lint
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx apps/web/src/components/__tests__/WorkspaceAgentStudio.test.tsx --testTimeout=60000
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=60000
+npm run test:legacy -- apps/web/src/core/__tests__/masterAgent.test.ts apps/web/src/core/__tests__/pipeline.test.ts --testTimeout=30000
+```
+
+## 2026-05-06: 进入 Page Pilot 后滚动和右下角交互卡顿
+
+### 现象
+
+进入 Page Pilot 后，目标页面滚动和右下角 Page Pilot 浮动入口动画会一起变慢；问题不随视觉样式变化明显改善。
+
+### 根因
+
+Page Pilot 面板加载 Recent runs 时调用 `/page-pilot/runs`，后端会读取所有 `page_pilot_runs.run_json` 并逐条 JSON 反序列化；前端拿到所有完整 run 后再按 Repository Workspace 过滤。历史 run 中包含 `conversationBatch`、`visualProof`、PR preview、diff/source mapping 等重 payload，进入页面时会造成不必要的后端 JSON decode、网络传输、浏览器 JSON parse 和 React state 更新。
+
+### 修复
+
+- `/page-pilot/runs` 新增过滤和 `compact=true` 摘要模式，列表读取只返回当前 Repository Workspace 最近记录的轻量字段。
+- Page Pilot 面板 Recent runs 默认请求 `repositoryTargetId + limit=8 + compact=true`；详情弹窗按 run id 懒加载单条完整记录。
+- DOM 圈选 hover/highlight 更新按 animation frame 合并，避免 pointermove 高频触发 UI 状态更新。
+- 保留原 Page Pilot 视觉样式，本轮没有通过降低阴影、blur 或动效来掩盖数据路径问题。
+- 二次收敛圈选热路径：direct pilot hover 不再兜底调用 `elementsFromPoint`，只用当前 `event.target.closest(...)` 快速定位；tooltip 复用已有 DOM 节点，不再每次 hover 重建；hover 高亮改为给目标 DOM 临时添加 outline class，不再移动 overlay 框或读取 rect；滚动期间暂停 hover 更新并主动清掉旧高亮，减少 layout/paint 牵连。完整 rect/style/source 捕获只在点击确认元素时执行。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=30000
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=30000
+go test ./services/local-runtime/internal/omegalocal -run TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget -count=1 -timeout=60s
+node --check apps/desktop/src/pilot-preload.cjs
+git diff --check
+```
+
+## 2026-05-06: Page Pilot apply 后预览不刷新缺少兜底
+
+### 现象
+
+Page Pilot 修改完成后，状态显示已经 apply，但预览页面没有及时热更新/刷新，用户需要手动重新打开或刷新才能看到结果。
+
+### 原因
+
+Direct pilot 的 apply 链路依赖 Electron main process 的 `omega-preview:reload` IPC 去调用 Preview Runtime Supervisor 并 reload BrowserView。如果 Electron desktop 进程被重启/关闭，或者 reload IPC 卡在 runtime health check / dev server 恢复等待里，pilot 页面自身没有快速兜底刷新路径，表现为“做完了但页面不动”。
+
+### 修复
+
+- `refreshLivePreview` 增加 renderer-side timeout fallback：`omega-preview:reload` 未在短时间内返回时，direct pilot 直接 `window.location.reload()`。
+- Desktop main process 为 preview reload 增加请求/完成日志，便于下次定位是 IPC 没到、runtime supervisor 卡住，还是 BrowserView reload 后目标页面本身未更新。
+
+### 验证
+
+```bash
+node --check apps/desktop/src/pilot-preload.cjs
+node --check apps/desktop/src/main.cjs
+git diff --check
+```
+
+## 2026-05-06: Page Pilot Trae runner 没有产生源码 diff
+
+### 现象
+
+Page Pilot 提交批注后显示 `page pilot runner produced no repository changes`，状态面板里只看到 captured / submitting / no changes，没有进入 apply 成功和预览刷新。
+
+### 原因
+
+- 本次批注全是 DOM-only，没有 `data-omega-source` 强源码映射；source locator 虽然为前两条文本批注找到了 `index.html`，但主目标是只有单字 `O` 的 brand mark，候选证据弱。
+- 更关键的是 Trae Agent 动态生成的 `.omega/trae-runner-config.yaml` 把 `base_url: ""` 写死。Trae CLI 的配置解析优先级会把这个空字符串当成 config value，覆盖环境变量/默认 provider URL，最终在 note 里报 `Request URL is missing an 'http://' or 'https://' protocol`。Agent 没真实改文件，后端检查 `git status --short` 后自然得到 no changes。
+- direct pilot hover 高亮 class 被带进 selection selector / className，prompt 出现 `omega-pilot-page-highlighted`，降低 DOM-only 定位质量。
+
+### 修复
+
+- Trae Agent runner 调用 CLI 时显式传入 `--model-base-url`：优先使用保存的 provider base URL / 环境变量，缺省时使用 provider 默认地址；不把 API key 放进命令行参数。
+- Selection 捕获前移除 Page Pilot 自己的临时高亮 class，`selectorFor` 也过滤 `omega-pilot-*` class，避免污染 prompt。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestTraeAgentRunnerUsesTraeCLI|TestRunnerCredentialEncryptsAndInjectsTraeEnv|TestRunnerCredentialMapsKimiForTraeThroughOpenAICompatibleConfig' -count=1 -timeout=60s
+node --check apps/desktop/src/pilot-preload.cjs
+git diff --check
+```
+
+## 2026-05-06: Direct Page Pilot 相比早期 preview 明显不丝滑
+
+### 现象
+
+Direct Page Pilot 打开后滚动、右下角入口动效和圈选反馈明显不如早期 direct preview 丝滑。
+
+### 原因
+
+- 早期 Electron direct preview 使用的是极轻的 `preview-preload.cjs`：只负责工具条、点击选取和原生 CSS hover；当前 direct pilot 使用完整 `pilot-preload.cjs`，把对话、状态栏、Confirm/Discard、runner apply、历史记录等完整面板注入目标页面，脚本和 DOM 复杂度大幅增加。
+- 早期 BrowserView 只占窗口右侧预览区域；当前 BrowserView 覆盖整个窗口，滚动和浮层需要合成的像素面积更大。
+- Desktop main 曾默认禁用 GPU acceleration / GPU compositing。当前 direct pilot 有 conic animation、阴影、固定浮层和滚动，CPU 合成会明显拉低帧率。
+- hover 圈选曾在鼠标经过时用 JS 改目标 DOM class、更新 tooltip；即使比 `pointermove + elementsFromPoint` 轻，也仍会在滚动/hover 中触发样式重算。
+
+### 修复
+
+- Electron 默认保留 GPU acceleration；只有显式设置 `OMEGA_DISABLE_GPU_ACCELERATION=1` 时才禁用。
+- 选择模式不再使用广撒网 CSS `:hover`，因为它会同时命中祖先 section/card，导致圈选不准确；改为 hybrid 路径：pointer move 节流后复用后续版本的 `elementsFromPoint` 候选排序，只移动一个轻量 overlay 高亮框，不改目标 DOM class，不显示 hover tooltip；点击确认元素时才执行完整 selection capture 和确认 UI。
+
+### 验证
+
+```bash
+node --check apps/desktop/src/main.cjs
+node --check apps/desktop/src/pilot-preload.cjs
+git diff --check
+```
+
+## 2026-05-06: Page Pilot discard 后 Work Item 被归到受阻
+
+### 现象
+
+Page Pilot 中用户点击 Discard 放弃本地页面修改后，对应 Work Item 在 Workboard 中显示为 `Blocked / 受阻`，看起来像仍有失败或等待处理的问题。
+
+### 原因
+
+早期实现把 discard 当成异常终止处理：`executePagePilotDiscard` 会把 Work Item 状态写成 `Blocked`，前端也把 `pipeline.status === "discarded"` 映射到 `Blocked`。这不符合产品语义；Discard 是用户主动取消本次 Page Pilot run，不是需要修复的阻塞态。
+
+### 修复
+
+- Discard 后 Work Item 写为 `Canceled`，pipeline 仍保留 `discarded` 作为审计状态。
+- 前端把 `discarded` pipeline 投影为 `Canceled`，不再计入 failed/blocked。
+- Workboard 的 Done 终态列包含 `Canceled`，并给 Canceled 增加中性状态样式。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run TestPagePilotApplyAndDeliverUsesLocalRepositoryTarget -count=1 -timeout=60s
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=60000
+npm run lint
+git diff --check
+```
+
+## 2026-05-06: Work Item 详情页普通刷新仍传输大 JSON
+
+### 现象
+
+在前一轮 live polling 收缩后，Work Item 详情页按钮响应已经改善，但浏览器 resource timing 仍显示普通 control-plane refresh 会传输大 payload：`/operations?limit=12` 约 682KB，`/attempts?limit=80` 约 668KB，`/run-workpads?limit=60` 约 838KB。单独 `JSON.parse` 不慢，但并发传输和后端序列化会挤占首屏刷新队列。
+
+### 根因
+
+- `operations.record_json` 保存 runner prompt/stdout/stderr 和 runner details，普通 recent 列表也会合并完整 record payload。
+- attempts 列表默认返回 `stages_json`、`events_json` 和 `record_json`；run workpads 列表默认返回完整 `workpad_json`、patch sources/history。
+- `refreshControlPlane()` 同步等待 observability、local capabilities、GitHub status 等慢元数据，Work Item 详情首屏会被非关键状态拖住。
+
+### 修复
+
+- `/operations`、`/attempts`、`/run-workpads` 增加 `compact=true` 摘要模式，普通 refresh 使用 compact；详情页 scoped 读取继续拿完整审计数据。
+- 详情 route 锁定 Work Item 后，按 `workItemId` 补拉完整 attempts / run workpads / pipelines / checkpoints，避免 recent compact 列表影响详情完整性。
+- Work Item / Pipeline scoped live polling 不再重复拉 session read model。
+- observability、local capabilities、GitHub status 改为 deferred control-plane refresh。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestListOperationsSupportsFilteredFastPath|TestJobSupervisorTickUsesNormalizedExecutionStateWhenSnapshotIsCorrupt|TestSQLiteAttemptStoresFeishuFailureFacts' -count=1 -timeout=90s
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=30000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx -t "renders a workpad-first detail page" --testTimeout=60000
+git diff --check
+```
+
+实测：`operations` 682KB -> 14.7KB，`attempts` 668KB -> 28KB，`run-workpads` 838KB -> 2.6KB；Review packet 打开约 96ms，Agent statistics 打开约 49ms。
+
 ## 2026-05-06: Work Item 详情页加载后仍然卡顿
 
 ### 现象
@@ -2140,3 +2541,158 @@ npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx apps/web/src/co
 ```
 
 备注：本轮也跑了 `go test ./services/local-runtime/internal/omegalocal -count=1`，仍有既有 orchestrator/supervisor 异步 settling 用例在本机超时，失败点集中在 job drain / auto-run settle 等长链路等待窗口，需单独收敛测试稳定性。
+
+## 2026-05-06: Omega CLI 列表和 Work Item run 仍依赖 full workspace snapshot
+
+### 现象
+
+`omega work-items list` / `omega work-items run` 仍通过 `GET /workspace` 读取完整 workspace，`attempts list` / `checkpoints list` 也缺少服务端过滤和 compact 参数。随着 operation、attempt、run workpad、proof 数据增多，CLI 会继承 full snapshot JSON 解析和传输开销，也可能在 snapshot 兼容层损坏时无法完成本该可由规范化表支持的操作。
+
+### 原因
+
+CLI 早期只作为 `/workspace` 的薄包装，没有跟随后端 session read model、compact operation/attempt list、Run Workpad 表和 proof preview API 一起演进。
+
+### 修复
+
+- `workspace()` 改为读取 `/workspace?scope=session`。
+- `work-items run` 用 `/pipelines?workItemId=<id>&limit=20` 查找已有 DevFlow pipeline。
+- `attempts list`、`operations list`、`workpads list` 默认使用 `compact=true`。
+- `checkpoints list` 默认带 `limit=50`，走规范化 checkpoint 表。
+- 空数据库 / 尚未初始化 workspace 时，`work-items list` 返回空表头，避免 CLI smoke 或新环境启动后误报失败。
+- 补齐 CLI 测试，断言新命令不会回退 full snapshot 路径。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegacli -count=1
+```
+
+## 2026-05-06: Portal 首页入口拥挤且右侧信息过时
+
+### 现象
+
+Portal 首页左侧导航在窄宽度下出现单字图标和截断文本，顶栏语言 / 夜间模式控件占用空间过多；中间首屏像通用协作应用入口，两个真正要用的 Workboard / Page Pilot 入口不够突出；右侧仍展示“下一阶段”内容，和当前 Page Pilot / DevFlow 状态不匹配。
+
+### 原因
+
+首页早期按应用门户堆叠入口，没有随着比赛演示主线和功能一 / 功能二能力更新同步收敛。
+
+### 修复
+
+- 移除左侧截断导航。
+- 主题切换去文字化，语言控件隐藏冗余 label。
+- 首屏重做为 Omega AI DevFlow 说明 + 功能一 / 功能二双入口卡。
+- 右侧改为功能一 / 功能二能力摘要。
+- 修复夜间模式 logo 可读性。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "renders the portal homepage" --testTimeout=30000
+npm run lint
+git diff --check
+```
+
+## 2026-05-06: Page Pilot direct pilot 滚动和圈选交互卡顿
+
+### 现象
+
+在 Electron direct pilot 中打开 Page Pilot 后，预览页上下滑动、右下角手指按钮动效和选择页面组件时出现明显卡顿；Activity Monitor 中 Electron Helper / GPU 进程 CPU 会被拉高。修复后又发现手指按钮点击后会保留一圈黑色原生 focus outline。
+
+### 原因
+
+- direct pilot 注入层的圈选 hover 逻辑在 `pointermove` 高频路径上执行 `elementsFromPoint()`、多次 `getBoundingClientRect()`，并提前调用 `getComputedStyle()` 生成完整 selection context。
+- 圈选高亮使用 `box-shadow: 0 0 0 9999px` 作为整屏遮罩，滚动或移动高亮时会触发大面积重绘。
+- Page Pilot 的固定浮层、状态条、选择确认条使用多处 `backdrop-filter: blur(...)`，在 Electron BrowserView + 预览页面滚动场景下容易增加 GPU 合成压力。
+- 右下角手指按钮的旋转效果本身保留；问题主要来自圈选和遮罩/毛玻璃组合，而不是入口动效。
+- direct pilot 的手指按钮没有覆盖 Chromium 原生 `button:focus` outline，鼠标点击后会留下黑色圆环。
+
+### 修复
+
+- direct pilot hover 改为轻量预览：只收集 element kind、selector、文本摘要和 source mapping；完整 `styleSnapshot` / `domContext` 只在点击确认时生成。
+- 圈选事件从高频 `pointermove` 改为 `pointerover` 驱动，并增加同 target / 时间节流，避免鼠标滑过页面时连续做 DOM 命中测试。
+- 高亮遮罩移除 9999px 巨型阴影，改为局部 outline + 小范围 shadow，保留可见选区但不再整屏重绘。
+- direct pilot 固定浮层移除 `backdrop-filter`，保留半透明背景和阴影，降低 Electron GPU 合成压力。
+- 保留右下角手指按钮的 conic-gradient 旋转视觉。
+- 手指按钮增加自定义 `:focus-visible` 样式并清理原生黑色 focus outline，鼠标点击后不再残留黑圈，键盘聚焦仍保留轻量品牌色焦点提示。
+- Web fallback 的 Page Pilot overlay 同步做轻量 hover preview 和局部高亮，避免浏览器内嵌预览走同类热路径。
+
+### 验证
+
+```bash
+node --check apps/desktop/src/pilot-preload.cjs
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=60000
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=30000
+```
+
+## 2026-05-06: Work Item 详情页 Agent 阶段统计入口不可用
+
+### 现象
+
+Work Item 详情页新增的阶段 Agent 统计卡片在真实详情页里可用性很差：单个阶段卡片会被撑成大面积空白，阶段标题和说明被挤成极窄竖排；只有已经记录 operation/event 的阶段才显示“查看 Agent”，计划 Agent 阶段无法展开核对。
+
+### 原因
+
+- 阶段卡片依赖裸 `span / div / em` 的隐式 grid 布局，状态文本和操作入口没有稳定的列约束。
+- `View agents` 只在有 operation detail 或 agent event 时出现，导致计划阶段没有可解释入口。
+- 组件测试只验证文本存在，没有按具体阶段点击 Agent 详情，也没有覆盖“只有计划 Agent”时的展开状态。
+
+### 修复
+
+- 阶段卡片改成显式三段式布局：序号、阶段内容、状态 / 查看 Agent 操作区。
+- 每个阶段都展示“查看 Agent”，有真实 operation 时展示实际 Agent 运行、runner/model、耗时、状态和摘要；没有 operation 时展示计划 Agent。
+- 调整 light/dark 样式，避免长 runtime 文本压缩标题列或造成竖排。
+- 测试改为按阶段名点击 Agent 详情，并覆盖计划 Agent 展开。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx -t "renders a workpad-first detail page" --testTimeout=60000
+```
+
+## 2026-05-06: DevFlow proof 写入误报无权限与单提交仓库 diff 失败
+
+### 现象
+
+演示用 DevFlow Work Item 在 Requirement / Master / Architect 阶段的 proof 中出现“read-only filesystem sandbox blocked write”提示；同一个 OMG-8 运行在 Coding 完成后又因为 `git diff --name-only HEAD~1..HEAD` 报错进入 Blocked / stalled。Work Item Inspector 的 Target 还可能显示成 `https://github.com/owner/repoowner/repo`，让人误以为实际仓库目标被拼错。
+
+### 原因
+
+- 非代码 Agent 使用 `read-only` sandbox 是为了防止误改仓库源码，但 prompt 又要求 Agent 直接写 `.omega/proof/*.md`，导致 Codex 在只读沙箱中尝试写 proof 时被拒绝。
+- 新建 demo 仓库只有一个提交时不存在 `HEAD~1`，用固定 `HEAD~1..HEAD` 统计 changed files 会失败。
+- Work Item 创建和 Inspector 展示混用了 clone URL 与 `owner/repo` 标签，显示层容易把完整 URL 与仓库 label 叠在一起；数据库中的 repository target 本身是正确的。
+
+### 修复
+
+- 只读分析类 Agent 改为“最终回答即 artifact 内容”，由 Omega runner 的 output capture 持久化到 `.omega/proof/*.md`；prompt 不再要求 Agent 自己写文件。
+- 新增统一 Git diff helper：有父提交时使用 `HEAD^..HEAD`，单提交仓库时使用 Git empty tree 到 `HEAD`，并覆盖 DevFlow、rework、Page Pilot 和 demo-code diff/stat/validation。
+- 新建 Work Item 在绑定 repository target 时保存 `owner/repo` 可读 label；Inspector 优先展示 repository target label，避免拼接错觉。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestGitHeadDiff|TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof' -count=1 -timeout=120s
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "creates app requirements inside the active repository workspace and runs them against that repo" --testTimeout=60000
+git diff --check
+```
+
+## 2026-05-07: Agent Studio 选择 saas-launch 后仍显示旧 workflow contract
+
+### 现象
+
+在 Settings / Agent Studio 中把 Template 切到 `saas-launch` 后，右上角和下拉框显示为 `saas-launch`，但编辑区仍然展示旧的 `devflow-pr-test` markdown；后续 Work Item 运行也会被旧 contract 的校验错误卡住。只有点击 Import sample template 后，前端内容才会刷新。
+
+### 原因
+
+Agent profile 中的 `workflowTemplate` 和 `workflowMarkdown` 是两份字段。模板下拉只更新了 `workflowTemplate`，没有同步替换已经保存过的 repository-scope `workflowMarkdown`；后端归一化 profile 时也没有检测“当前模板 ID 与 markdown frontmatter ID 不一致”的情况，导致 UI 和执行链路引用了不同 contract。
+
+### 修复
+
+- 后端归一化 Agent profile 时，如果 `workflowTemplate` 指向内置模板，而当前 `workflowMarkdown` 的 ID 缺失或仍属于另一个模板，则自动用选中模板的内置 markdown 替换旧内容。
+- 保存或重新读取 profile 后，Settings 页面会看到与下拉选择一致的 contract；新建或重试的 pipeline 会使用同一个 workflow contract。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestAgentProfileTemplateSelectionReplacesStaleWorkflowMarkdown|TestSaaSLaunchTemplateLoadsWorkflowMarkdownContract|TestDevFlowTemplateLoadsWorkflowMarkdownContract' -count=1 -timeout=90s
+```

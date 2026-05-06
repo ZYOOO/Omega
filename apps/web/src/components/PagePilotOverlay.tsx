@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import type { PagePilotApplyResult, PagePilotDeliverResult, PagePilotRunInfo, PagePilotSelectionContext } from "../omegaControlApiClient";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { PagePilotApplyResult, PagePilotDeliverResult, PagePilotRunFilters, PagePilotRunInfo, PagePilotSelectionContext } from "../omegaControlApiClient";
 
 type PagePilotOverlayProps = {
   projectId?: string;
@@ -10,10 +10,13 @@ type PagePilotOverlayProps = {
   targetFrameElement?: HTMLElement | null;
   targetUnavailableMessage?: string;
   apiAvailable: boolean;
-  onApply: (instruction: string, selection: PagePilotSelectionContext) => Promise<PagePilotApplyResult>;
+  runner?: string;
+  runnerOptions?: Array<{ value: string; label: string }>;
+  onRunnerChange?: (runner: string) => void;
+  onApply: (instruction: string, selection: PagePilotSelectionContext, runner: string) => Promise<PagePilotApplyResult>;
   onDeliver: (instruction: string, selection: PagePilotSelectionContext, runId?: string) => Promise<PagePilotDeliverResult>;
   onDiscard: (runId: string) => Promise<{ status: string; lineDiffSummary?: string }>;
-  onFetchRuns: () => Promise<PagePilotRunInfo[]>;
+  onFetchRuns: (filters?: PagePilotRunFilters) => Promise<PagePilotRunInfo[]>;
 };
 
 function parseOmegaSource(value: string | null): PagePilotSelectionContext["sourceMapping"] {
@@ -95,6 +98,16 @@ function collectSelection(element: Element, ownerDocument: Document = document):
   };
 }
 
+function previewSelection(element: Element): Pick<PagePilotSelectionContext, "elementKind" | "stableSelector" | "textSnapshot" | "sourceMapping"> {
+  const sourceElement = element.closest("[data-omega-source]") ?? element;
+  return {
+    elementKind: elementKind(element),
+    stableSelector: selectorFor(element),
+    textSnapshot: (sourceElement.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 180),
+    sourceMapping: parseOmegaSource(sourceElement.getAttribute("data-omega-source")),
+  };
+}
+
 export function PagePilotOverlay({
   projectId,
   repositoryTargetId,
@@ -104,6 +117,9 @@ export function PagePilotOverlay({
   targetFrameElement,
   targetUnavailableMessage,
   apiAvailable,
+  runner = "codex",
+  runnerOptions = [],
+  onRunnerChange,
   onApply,
   onDeliver,
   onDiscard,
@@ -118,6 +134,8 @@ export function PagePilotOverlay({
   const [applyResult, setApplyResult] = useState<PagePilotApplyResult | null>(null);
   const [deliverResult, setDeliverResult] = useState<PagePilotDeliverResult | null>(null);
   const [runs, setRuns] = useState<PagePilotRunInfo[]>([]);
+  const hoveredRef = useRef<Element | null>(null);
+  const hoverFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!externalSelection) return;
@@ -138,16 +156,20 @@ export function PagePilotOverlay({
       return undefined;
     }
     const activeDocument = targetDocument;
+    const activeWindow = activeDocument.defaultView ?? window;
+    function scheduleHovered(target: Element | null) {
+      if (!target || target === hoveredRef.current) return;
+      hoveredRef.current = target;
+      if (hoverFrameRef.current !== null) return;
+      hoverFrameRef.current = activeWindow.requestAnimationFrame(() => {
+        hoverFrameRef.current = null;
+        setHovered(hoveredRef.current);
+      });
+    }
     function onPointerOver(event: PointerEvent) {
       const target = candidateFor(event.target);
       if (target && !(target as Element).closest(".page-pilot-overlay")) {
-        setHovered(target as Element);
-      }
-    }
-    function onPointerMove(event: PointerEvent) {
-      const target = candidateFor(event.target);
-      if (target && !(target as Element).closest(".page-pilot-overlay")) {
-        setHovered(target as Element);
+        scheduleHovered(target as Element);
       }
     }
     function onClick(event: MouseEvent) {
@@ -161,19 +183,22 @@ export function PagePilotOverlay({
       setStatus("Element captured. Add an instruction and apply it to the mapped source.");
     }
     activeDocument.addEventListener("pointerover", onPointerOver, true);
-    activeDocument.addEventListener("pointermove", onPointerMove, true);
     activeDocument.addEventListener("click", onClick, true);
     return () => {
       activeDocument.removeEventListener("pointerover", onPointerOver, true);
-      activeDocument.removeEventListener("pointermove", onPointerMove, true);
       activeDocument.removeEventListener("click", onClick, true);
+      if (hoverFrameRef.current !== null) {
+        activeWindow.cancelAnimationFrame(hoverFrameRef.current);
+        hoverFrameRef.current = null;
+      }
+      hoveredRef.current = null;
     };
   }, [selecting, targetDocument]);
 
   useEffect(() => {
     if (!open || !apiAvailable) return;
     let cancelled = false;
-    onFetchRuns()
+    onFetchRuns({ repositoryTargetId, limit: 5, compact: true })
       .then((records) => {
         if (!cancelled) setRuns(records.slice(0, 5));
       })
@@ -183,7 +208,7 @@ export function PagePilotOverlay({
     return () => {
       cancelled = true;
     };
-  }, [apiAvailable, open]);
+  }, [apiAvailable, onFetchRuns, open, repositoryTargetId]);
 
   const hoverStyle = useMemo(() => {
     if (!hovered) return undefined;
@@ -196,7 +221,7 @@ export function PagePilotOverlay({
       height: rect.height,
     };
   }, [hovered, targetFrameElement]);
-  const hoveredSelection = useMemo(() => hovered ? collectSelection(hovered, targetDocument ?? document) : null, [hovered, targetDocument]);
+  const hoveredPreview = useMemo(() => hovered ? previewSelection(hovered) : null, [hovered]);
   const canApply = Boolean(selection && instruction.trim());
   const canConfirm = Boolean(applyResult && applyResult.status === "applied");
   const canDiscard = Boolean(applyResult?.id && applyResult.status === "applied");
@@ -213,7 +238,7 @@ export function PagePilotOverlay({
     setStatus("Applying real source change through the local runtime...");
     setDeliverResult(null);
     try {
-      const result = await onApply(instruction, selection);
+      const result = await onApply(instruction, selection, runner);
       setApplyResult(result);
       setRuns((current) => [result, ...current.filter((run) => run.id !== result.id)].slice(0, 5));
       setStatus("Applied. Vite HMR or dev server reload should now reflect the source change.");
@@ -262,6 +287,16 @@ export function PagePilotOverlay({
               <small>{repositoryLabel || "No repository workspace"}</small>
             </div>
             <div className="page-pilot-actions">
+              {runnerOptions.length > 0 ? (
+                <label className="page-pilot-agent-select">
+                  <span>Agent</span>
+                  <select value={runner} onChange={(event) => onRunnerChange?.(event.currentTarget.value)}>
+                    {runnerOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
               <button
                 type="button"
                 disabled={Boolean(targetUnavailableMessage)}
@@ -277,9 +312,9 @@ export function PagePilotOverlay({
             {selecting ? (
               <>
                 <div className="page-pilot-inspector">
-                  <span>{hoveredSelection?.elementKind ?? "Inspecting"}</span>
-                  <strong>{hoveredSelection?.textSnapshot || hoveredSelection?.stableSelector || "Move over a visible element."}</strong>
-                  <small>{hoveredSelection?.sourceMapping.source || "No data-omega-source on current element"}</small>
+                  <span>{hoveredPreview?.elementKind ?? "Inspecting"}</span>
+                  <strong>{hoveredPreview?.textSnapshot || hoveredPreview?.stableSelector || "Move over a visible element."}</strong>
+                  <small>{hoveredPreview?.sourceMapping.source || "No data-omega-source on current element"}</small>
                 </div>
                 <p className="page-pilot-status">Click the highlighted element to capture it. The panel stays compact while selecting.</p>
               </>

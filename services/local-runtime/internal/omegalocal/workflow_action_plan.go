@@ -1,19 +1,45 @@
 package omegalocal
 
 import (
+	"context"
 	"net/http"
 	"strings"
 )
 
 func (server *Server) attemptActionPlan(response http.ResponseWriter, request *http.Request) {
 	attemptID := strings.TrimSuffix(pathID(request.URL.Path), "/action-plan")
-	database, err := server.Repo.LoadSupervisorExecutionState(request.Context())
+	database, err := server.loadAttemptActionPlanDatabase(request.Context(), attemptID)
 	if err != nil {
 		writeJSON(response, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	plan, status := buildAttemptActionPlan(*database, attemptID)
-	writeJSON(response, status, plan)
+	plan, planStatus := buildAttemptActionPlan(*database, attemptID)
+	writeJSON(response, planStatus, plan)
+}
+
+func (server *Server) loadAttemptActionPlanDatabase(ctx context.Context, attemptID string) (*WorkspaceDatabase, error) {
+	attempts, err := server.Repo.ListAttempts(ctx, map[string]string{"id": attemptID, "limit": "1"})
+	if err != nil {
+		return nil, err
+	}
+	if len(attempts) == 0 {
+		return &WorkspaceDatabase{Tables: WorkspaceTables{}}, nil
+	}
+	pipelineID := text(attempts[0], "pipelineId")
+	if pipelineID == "" {
+		return &WorkspaceDatabase{Tables: WorkspaceTables{Attempts: attempts}}, nil
+	}
+	pipelines, err := server.Repo.ListPipelines(ctx, map[string]string{"id": pipelineID, "limit": "1"})
+	if err != nil {
+		return nil, err
+	}
+	if len(pipelines) == 0 {
+		return &WorkspaceDatabase{Tables: WorkspaceTables{Attempts: attempts}}, nil
+	}
+	return &WorkspaceDatabase{Tables: WorkspaceTables{
+		Attempts:  attempts,
+		Pipelines: pipelines,
+	}}, nil
 }
 
 func buildAttemptActionPlan(database WorkspaceDatabase, attemptID string) (map[string]any, int) {

@@ -1,8 +1,11 @@
 {
   "name": "omega-ai-delivery-engine",
   "version": "0.1.0",
+  "description": "Local-first AI DevFlow desktop app for repository-bound delivery workflows.",
+  "author": "Omega",
   "private": true,
   "type": "module",
+  "main": "apps/desktop/src/main.cjs",
   "scripts": {
     "dev": "vite --config apps/web/vite.config.ts",
     "web:dev": "vite --config apps/web/vite.config.ts",
@@ -11,6 +14,11 @@
     "desktop:pilot": "electron apps/desktop/src/pilot-main.cjs",
     "build": "tsc -b && vite build --config apps/web/vite.config.ts",
     "web:build": "vite build --config apps/web/vite.config.ts",
+    "release:binaries": "node scripts/build-release-binaries.mjs",
+    "release:prepare": "npm run build && npm run release:binaries",
+    "desktop:pack": "npm run release:prepare && electron-builder --dir",
+    "desktop:dist": "npm run release:prepare && electron-builder --publish never",
+    "release:github": "npm run release:prepare && electron-builder --publish always",
     "preview": "vite preview --config apps/web/vite.config.ts",
     "local:runner:demo": "node scripts/local-runner-demo.mjs",
     "local-runtime:dev": "go run ./services/local-runtime/cmd/omega-local-runtime",
@@ -18,9 +26,13 @@
     "mission-control:api": "go run ./services/local-runtime/cmd/omega-local-runtime",
     "mission-control:api:node": "node scripts/local-runner-api.mjs",
     "go:test": "go test ./...",
+    "go:test:focused": "go test ./services/local-runtime/internal/omegalocal -run 'TestAttemptTimeline|TestRunWorkpad|TestDevFlowRiskSummaryUsesEvidenceBasedLevels|TestDevFlowReviewPacketIncludesPlanTodoCompletion|TestRenderFeishuReviewTextUsesPlainFeishuText|TestPagePilot|TestRunnerModelDiscovery|TestAgentRunnerPreflight|TestRunDevFlowContractState|TestDefaultDevFlowWorkflowIncludesGitHubActionsCIAction' -count=1 -timeout=60s",
+    "openapi:check": "node scripts/check-openapi-routes.mjs",
     "codex:proof:smoke": "node scripts/codex-proof-smoke.mjs",
     "test": "vitest run --config apps/web/vite.config.ts",
-    "test:feature-p0": "npm run lint && npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000 && node --check apps/desktop/src/process-supervisor.cjs && node --check apps/desktop/src/pilot-preload.cjs && go test ./services/local-runtime/internal/omegalocal",
+    "test:all": "OMEGA_TEST_SUITE=all vitest run --config apps/web/vite.config.ts",
+    "test:legacy": "OMEGA_TEST_SUITE=legacy vitest run --config apps/web/vite.config.ts",
+    "test:feature-p0": "npm run lint && npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000 && node --check apps/desktop/src/process-supervisor.cjs && node --check apps/desktop/src/pilot-preload.cjs && npm run go:test:focused",
     "test:watch": "vitest --config apps/web/vite.config.ts",
     "coverage": "vitest run --coverage --config apps/web/vite.config.ts",
     "lint": "tsc -b --pretty false"
@@ -37,9 +49,66 @@
     "@vitejs/plugin-react": "^5.0.4",
     "@vitest/coverage-v8": "^3.2.4",
     "electron": "^41.3.0",
+    "electron-builder": "^26.8.1",
     "jsdom": "^27.0.0",
     "typescript": "^5.9.3",
     "vite": "^7.1.12",
     "vitest": "^3.2.4"
+  },
+  "build": {
+    "appId": "ai.omega.delivery-engine",
+    "productName": "Omega",
+    "directories": {
+      "output": "dist/desktop"
+    },
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "files": [
+      "apps/desktop/src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/apps/web",
+        "to": "web"
+      },
+      {
+        "from": "dist/release/bin",
+        "to": "bin"
+      },
+      {
+        "from": "docs/openapi.yaml",
+        "to": "docs/openapi.yaml"
+      },
+      {
+        "from": "services/local-runtime/workflows",
+        "to": "workflows"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "category": "Development"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "publish": {
+      "provider": "github"
+    }
   }
 }

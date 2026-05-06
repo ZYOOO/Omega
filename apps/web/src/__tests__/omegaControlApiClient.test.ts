@@ -24,6 +24,7 @@ import {
   fetchOperationQueue,
   fetchRuntimeLogPage,
   fetchPagePilotRuns,
+  fetchAttemptTimeline,
   fetchPipelines,
   fetchPipelineTemplates,
   fetchProofPreview,
@@ -58,6 +59,18 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("omegaControlApiClient", () => {
+  it("requests bounded attempt timelines for live detail refresh", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      expect(String(input)).toBe("http://omega.local/attempts/attempt_1/timeline?limit=80");
+      return Promise.resolve(jsonResponse({ attempt: { id: "attempt_1" }, items: [] }));
+    }) as unknown as typeof fetch;
+
+    await expect(fetchAttemptTimeline("http://omega.local", "attempt_1", { limit: 80 }, fetchImpl)).resolves.toMatchObject({
+      attempt: { id: "attempt_1" },
+      items: []
+    });
+  });
+
   it("reads and patches Run Workpad records through the local control plane", async () => {
     const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       if (!init) {
@@ -269,10 +282,11 @@ describe("omegaControlApiClient", () => {
         expect(init?.method).toBe("POST");
         const body = JSON.parse(String(init?.body));
         expect(body.repositoryTargetId).toBe("repo_ZYOOO_Omega");
+        expect(body.runner).toBe("opencode");
         expect(body.selection.sourceMapping.symbol).toBe("headline");
         return Promise.resolve(jsonResponse({ id: "page_pilot_1", status: "applied", changedFiles: ["apps/web/src/components/PortalHome.tsx"] }));
       }
-      if (String(input).endsWith("/page-pilot/runs")) {
+      if (String(input).endsWith("/page-pilot/runs") || String(input).includes("/page-pilot/runs?")) {
         expect(init).toBeUndefined();
         return Promise.resolve(jsonResponse([{ id: "page_pilot_1", status: "applied", changedFiles: ["apps/web/src/components/PortalHome.tsx"] }]));
       }
@@ -292,6 +306,7 @@ describe("omegaControlApiClient", () => {
         projectId: "project_omega",
         repositoryTargetId: "repo_ZYOOO_Omega",
         instruction: "Make the headline shorter",
+        runner: "opencode",
         selection
       }, fetchImpl)
     ).resolves.toMatchObject({ id: "page_pilot_1", status: "applied" });
@@ -307,6 +322,13 @@ describe("omegaControlApiClient", () => {
     ).resolves.toMatchObject({ status: "delivered" });
 
     await expect(fetchPagePilotRuns("http://omega.local", fetchImpl)).resolves.toMatchObject([
+      { id: "page_pilot_1", status: "applied" }
+    ]);
+    await expect(fetchPagePilotRuns("http://omega.local", {
+      repositoryTargetId: "repo_ZYOOO_Omega",
+      limit: 8,
+      compact: true
+    }, fetchImpl)).resolves.toMatchObject([
       { id: "page_pilot_1", status: "applied" }
     ]);
     await expect(discardPagePilotRun("http://omega.local", "page_pilot_1", fetchImpl)).resolves.toMatchObject({

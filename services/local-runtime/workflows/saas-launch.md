@@ -1,0 +1,605 @@
+---
+id: saas-launch
+name: SaaS Launch Flow
+description: Demo-ready SaaS feature launch workflow: requirement shaping, product architecture, implementation, CI, review, human launch gate, deployment proof.
+stages:
+  - id: todo
+    title: Requirement shaping
+    agentId: requirement
+    agents: [requirement]
+    humanGate: false
+    outputArtifacts: [structured-requirement, acceptance-criteria, dispatch-plan]
+  - id: in_progress
+    title: Product implementation and CI
+    agentId: coding
+    agents: [architect, coding, testing]
+    humanGate: false
+    outputArtifacts: [technical-plan, functional-todo-list, project-todo-list, code-diff, changed-files, implementation-notes, test-report, ci-report]
+  - id: code_review_round_1
+    title: Product Review Round 1
+    agentId: review
+    agents: [review]
+    humanGate: false
+    outputArtifacts: [review-report, blocking-risks, merge-recommendation]
+  - id: code_review_round_2
+    title: Launch Readiness Review
+    agentId: review
+    agents: [review]
+    humanGate: false
+    outputArtifacts: [review-report, blocking-risks, merge-recommendation]
+  - id: rework
+    title: Rework
+    agentId: coding
+    agents: [coding, testing]
+    humanGate: false
+    inputArtifacts: [review-report, blocking-risks, code-diff, changed-files]
+    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report, ci-report]
+  - id: human_review
+    title: Human Launch Review
+    agentId: delivery
+    agents: [human, review, delivery]
+    humanGate: true
+    outputArtifacts: [human-decision, review-notes]
+  - id: merging
+    title: Merge and Deploy
+    agentId: delivery
+    agents: [delivery]
+    humanGate: false
+    outputArtifacts: [pull-request, delivery-summary, rollback-plan]
+  - id: done
+    title: Launch Done
+    agentId: delivery
+    agents: [delivery]
+    humanGate: false
+    outputArtifacts: [handoff-bundle, proof-records]
+states:
+  - id: todo
+    title: Requirement shaping
+    agentId: requirement
+    agents: [requirement]
+    outputArtifacts: [structured-requirement, acceptance-criteria, dispatch-plan]
+    actions:
+      - id: capture_requirement
+        type: write_requirement_artifact
+        agent: requirement
+        prompt: requirement
+        outputArtifacts: [structured-requirement, acceptance-criteria]
+    transitions:
+      passed: in_progress
+  - id: in_progress
+    title: Product implementation and CI
+    agentId: coding
+    agents: [architect, coding, testing]
+    inputArtifacts: [structured-requirement, acceptance-criteria, repository-target]
+    outputArtifacts: [technical-plan, functional-todo-list, project-todo-list, code-diff, changed-files, implementation-notes, test-report, pull-request, ci-report]
+    actions:
+      - id: classify_task
+        type: classify_task
+        agent: master
+        outputArtifacts: [task-classification]
+      - id: architecture_handoff
+        type: run_agent
+        agent: architect
+        prompt: architect
+        outputArtifacts: [technical-plan, functional-todo-list, project-todo-list]
+      - id: implement_change
+        type: run_agent
+        agent: coding
+        prompt: coding
+        requiresDiff: true
+        outputArtifacts: [code-diff, changed-files, implementation-notes]
+      - id: validate_repository
+        type: run_validation
+        agent: testing
+        prompt: testing
+        outputArtifacts: [test-report]
+      - id: publish_pull_request
+        type: ensure_pr
+        agent: delivery
+        outputArtifacts: [pull-request]
+      - id: collect_ci_results
+        type: run_ci_checks
+        agent: testing
+        outputArtifacts: [ci-report, check-status, check-log]
+    transitions:
+      passed: code_review_round_1
+      failed: rework
+  - id: code_review_round_1
+    title: Product Review Round 1
+    agentId: review
+    agents: [review]
+    inputArtifacts: [technical-plan, functional-todo-list, project-todo-list, code-diff, changed-files, test-report, ci-report, check-status, check-log]
+    outputArtifacts: [review-report, blocking-risks, merge-recommendation]
+    actions:
+      - id: review_round_1
+        type: run_review
+        agent: review
+        prompt: review
+        diffSource: local_diff
+        outputArtifacts: [review-report]
+        verdicts:
+          approved: code_review_round_2
+          changes_requested: rework
+          needs_human_info: human_review
+  - id: code_review_round_2
+    title: Launch Readiness Review
+    agentId: review
+    agents: [review]
+    inputArtifacts: [technical-plan, functional-todo-list, project-todo-list, pull-request, test-report, ci-report, check-status, check-log, review-report]
+    outputArtifacts: [review-report, blocking-risks, merge-recommendation]
+    actions:
+      - id: review_round_2
+        type: run_review
+        agent: review
+        prompt: review
+        diffSource: pr_diff
+        outputArtifacts: [review-report]
+        verdicts:
+          approved: human_review
+          changes_requested: rework
+          needs_human_info: human_review
+  - id: rework
+    title: Rework
+    agentId: coding
+    agents: [coding, testing]
+    inputArtifacts: [technical-plan, functional-todo-list, project-todo-list, review-report, human-decision, check-log, code-diff]
+    outputArtifacts: [code-diff, changed-files, implementation-notes, test-report, ci-report]
+    actions:
+      - id: build_rework_checklist
+        type: build_rework_checklist
+        agent: master
+        outputArtifacts: [rework-checklist]
+      - id: apply_rework
+        type: run_agent
+        agent: coding
+        prompt: rework
+        requiresDiff: true
+        outputArtifacts: [code-diff, changed-files, implementation-notes]
+      - id: validate_rework
+        type: run_validation
+        agent: testing
+        prompt: testing
+        outputArtifacts: [test-report]
+      - id: update_pull_request
+        type: ensure_pr
+        agent: delivery
+        outputArtifacts: [pull-request]
+      - id: collect_rework_ci_results
+        type: run_ci_checks
+        agent: testing
+        outputArtifacts: [ci-report, check-status, check-log]
+    transitions:
+      passed: code_review_round_1
+      failed: human_review
+  - id: human_review
+    title: Human Launch Review
+    agentId: delivery
+    agents: [human, review, delivery]
+    humanGate: true
+    inputArtifacts: [technical-plan, functional-todo-list, project-todo-list, pull-request, review-report, test-report, ci-report, run-report]
+    outputArtifacts: [human-decision, review-notes]
+    actions:
+      - id: wait_human_decision
+        type: human_gate
+        agent: human
+        outputArtifacts: [human-decision]
+    transitions:
+      approved: merging
+      changes_requested: rework
+  - id: merging
+    title: Merge and Deploy
+    agentId: delivery
+    agents: [delivery]
+    inputArtifacts: [human-decision, pull-request]
+    outputArtifacts: [pull-request, delivery-summary, rollback-plan]
+    actions:
+      - id: refresh_pr_status
+        type: refresh_pr_status
+        agent: delivery
+        outputArtifacts: [check-status, branch-sync-status]
+      - id: merge_pull_request
+        type: merge_pr
+        agent: delivery
+        outputArtifacts: [merge-proof]
+    transitions:
+      passed: done
+      failed: rework
+  - id: done
+    title: Launch Done
+    agentId: delivery
+    agents: [delivery]
+    inputArtifacts: [merge-proof, run-report, proof-records]
+    outputArtifacts: [handoff-bundle, proof-records]
+    actions:
+      - id: finalize_handoff
+        type: write_handoff
+        agent: delivery
+        outputArtifacts: [handoff-bundle, proof-records]
+taskClasses:
+  - id: simple
+    title: Narrow change
+    workpadMode: compact
+    planningMode: direct
+    validationMode: focused
+    maxChangedFiles: 2
+    signals: [docs-only, copy-only, single-purpose]
+  - id: complex
+    title: Cross-cutting change
+    workpadMode: full
+    planningMode: explicit
+    validationMode: broad
+    signals: [multi-layer, behavior-change, data-model, unclear-scope]
+reviewRounds:
+  - stageId: code_review_round_1
+    artifact: code-review-round-1.md
+    focus: correctness, regressions, and acceptance criteria
+    diffSource: local_diff
+    changesRequestedTo: rework
+    needsHumanInfoTo: human_review
+  - stageId: code_review_round_2
+    artifact: code-review-round-2.md
+    focus: maintainability, tests, edge cases, and delivery readiness
+    diffSource: pr_diff
+    changesRequestedTo: rework
+    needsHumanInfoTo: human_review
+runtime:
+  maxReviewCycles: 3
+  runnerHeartbeatSeconds: 10
+  attemptTimeoutMinutes: 30
+  maxRetryAttempts: 2
+  retryBackoffSeconds: 300
+  cleanupRetentionSeconds: 86400
+  maxContinuationTurns: 2
+  requiredChecks: []
+transitions:
+  - from: todo
+    on: passed
+    to: in_progress
+  - from: in_progress
+    on: passed
+    to: code_review_round_1
+  - from: code_review_round_1
+    on: approved
+    to: code_review_round_2
+  - from: code_review_round_1
+    on: changes_requested
+    to: rework
+  - from: code_review_round_2
+    on: approved
+    to: human_review
+  - from: code_review_round_2
+    on: changes_requested
+    to: rework
+  - from: rework
+    on: passed
+    to: code_review_round_1
+  - from: human_review
+    on: approved
+    to: merging
+  - from: merging
+    on: passed
+    to: done
+---
+
+# Omega SaaS Launch Workflow
+
+This workflow contract is optimized for SaaS demo features that need product planning, frontend implementation, validation, review, human launch approval, and deployment proof.
+
+Runtime policy:
+
+1. Work only inside the isolated repository workspace.
+2. The item must be bound to a repository target before any runner starts.
+3. Implementation must produce a real git diff in the target repository.
+4. Validation and GitHub Actions CI collection must run before review.
+5. Review agents are read-only and must emit one explicit verdict line.
+6. `CHANGES_REQUESTED` is a normal workflow transition into Rework, not an execution failure.
+7. Failed or missing required GitHub Actions checks become rework feedback before Human Review.
+8. Rework runs in the same repository workspace, same branch, and same pull request, with the review and CI report as input.
+9. Human Review is a blocking gate. Delivery and merge must wait for an explicit approval.
+10. Reject sends the work back for rework with the human reason preserved.
+
+Review verdict contract:
+
+```text
+Verdict: APPROVED
+```
+
+or
+
+```text
+Verdict: CHANGES_REQUESTED
+```
+
+or
+
+```text
+Verdict: NEEDS_HUMAN_INFO
+```
+
+## Prompt: requirement
+
+You are the requirement agent for Omega.
+
+Repository: {{repository}}
+Repository path: {{repositoryPath}}
+Work item: {{workItemKey}}
+Title: {{title}}
+
+Raw requirement:
+{{description}}
+
+Output a structured requirement artifact with these sections:
+
+```text
+Problem:
+- What user or product problem must be solved.
+
+Expected behavior:
+- Observable behavior after the change.
+
+Acceptance criteria:
+- Concrete checks that prove the requirement is done.
+
+Repository boundary:
+- The exact repository path and target that may be edited.
+
+Risks and assumptions:
+- Ambiguities, dependencies, or assumptions.
+
+Dispatch notes:
+- Which downstream agents need which context.
+```
+
+Rules:
+- Do not invent repository scope.
+- If acceptance criteria are missing, derive concrete criteria from the requirement and mark assumptions.
+- Preserve any human-provided wording that affects behavior.
+
+## Prompt: architect
+
+You are the architecture agent for Omega.
+
+Repository: {{repository}}
+Repository path: {{repositoryPath}}
+Work item: {{workItemKey}}
+Title: {{title}}
+Branch: {{branchName}}
+
+Structured requirement:
+{{description}}
+
+Output a technical handoff with these sections:
+
+```text
+Approach:
+- Short implementation strategy.
+
+Affected areas:
+- Files, components, APIs, data models, or commands likely to change.
+
+Integration risks:
+- Coupling, migration, concurrency, external service, or UX risks.
+
+Validation plan:
+- Focused checks to run before review.
+
+Functional todo list:
+- User-visible behavior tasks, written as checkable todo items.
+
+Project todo list:
+- Repository/file/test/CI tasks, written as checkable todo items.
+
+Agent handoff:
+- Concrete instructions for coding, testing, review, and delivery.
+```
+
+Rules:
+- Keep the plan tied to the repository boundary.
+- Prefer local project patterns over new abstractions.
+- Call out unknowns instead of hiding them.
+- The todo lists must be concrete enough for Review to verify item-by-item.
+- Use `- [ ]` for open work and `- [x]` only for items already proven by existing code or validation.
+
+## Prompt: coding
+
+You are the coding agent for Omega.
+
+Repository: {{repository}}
+Repository path: {{repositoryPath}}
+Work item: {{workItemKey}}
+Title: {{title}}
+
+Requirement:
+{{description}}
+
+Rules:
+- Work only inside this repository checkout.
+- Implement the requested behavior. Do not create a proof-only placeholder.
+- Add or update tests or runnable examples when the requirement asks for them.
+- Keep the diff minimal and reviewable.
+- Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
+- Write a short completion note to {{codingNotePath}} with these sections:
+  - What changed
+  - Files changed
+  - Validation run
+  - Known follow-up or risk
+
+## Prompt: testing
+
+You are the testing agent for Omega.
+
+Repository: {{repository}}
+Repository path: {{repositoryPath}}
+Work item: {{workItemKey}}
+Title: {{title}}
+Changed files: {{changedFiles}}
+
+Requirement:
+{{description}}
+
+Validation output:
+{{testOutput}}
+
+Output a test report with these sections:
+
+```text
+Status:
+- passed or failed.
+
+Commands:
+- Commands that ran and their result.
+
+Acceptance coverage:
+- Which acceptance criteria were covered.
+
+Failures:
+- Actionable failure details, or "None".
+
+Residual risk:
+- What was not covered.
+```
+
+Rules:
+- A failing command must become an actionable failure, not a vague error.
+- If no project-specific tests ran, explain the remaining risk.
+- GitHub Actions CI is collected after the PR is published and must be included as remote check evidence for review.
+
+## Prompt: rework
+
+You are the rework coding agent for Omega.
+
+Repository: {{repository}}
+Repository path: {{repositoryPath}}
+Work item: {{workItemKey}}
+Title: {{title}}
+Pull request: {{pullRequestUrl}}
+
+Requirement:
+{{description}}
+
+Review feedback to address:
+{{reviewFeedback}}
+
+Rules:
+- Continue in the same repository checkout, same branch, and same pull request.
+- Address the review feedback with a real code change.
+- Keep the diff minimal and reviewable.
+- Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
+- Write a short completion note to {{reworkNotePath}} with these sections:
+  - Review feedback addressed
+  - What changed
+  - Files changed
+  - Validation run
+  - Remaining risk
+
+## Prompt: review
+
+You are the review agent for Omega.
+
+Repository: {{repository}}
+Pull request: {{pullRequestUrl}}
+Focus: {{reviewFocus}}
+Changed files: {{changedFiles}}
+
+Requirement:
+{{description}}
+
+Human / previous review feedback to verify:
+{{reviewFeedback}}
+
+Plan and todo list to verify:
+{{planOutput}}
+
+Diff:
+```diff
+{{diff}}
+```
+
+Validation:
+```text
+{{testOutput}}
+```
+
+Remote checks:
+```text
+{{checksOutput}}
+```
+
+Return exactly one verdict line:
+- `Verdict: APPROVED`
+- `Verdict: CHANGES_REQUESTED`
+- `Verdict: NEEDS_HUMAN_INFO`
+
+Then write a concise review packet with these sections:
+
+```text
+Summary:
+- One or two sentences explaining the decision.
+
+Blocking findings:
+- [severity] file-or-scope - what is wrong - required change.
+
+Validation gaps:
+- Missing or weak validation that must be fixed before delivery.
+
+Rework instructions:
+- Concrete edits the rework agent should make next.
+
+Residual risks:
+- Risks that remain even if approved, or "None known".
+```
+
+Rules:
+- If this is a human-requested rework, treat the diff as the increment since the previous reviewed version and verify it directly addresses the human feedback.
+- Verify the diff against the Functional todo list and Project todo list; call out unchecked or contradicted items in Validation gaps or Blocking findings.
+- Treat failed GitHub Actions checks and failed check logs as blocking validation unless they are clearly unrelated infrastructure flakes.
+- If the verdict is `CHANGES_REQUESTED`, include at least one Blocking finding or Rework instruction.
+- If the verdict is `NEEDS_HUMAN_INFO`, include the exact question a human must answer.
+- If the verdict is `APPROVED`, explain why the diff satisfies the requirement and list residual risk.
+
+## Prompt: delivery
+
+You are the delivery agent for Omega.
+
+Repository: {{repository}}
+Repository path: {{repositoryPath}}
+Work item: {{workItemKey}}
+Title: {{title}}
+Pull request: {{pullRequestUrl}}
+Changed files: {{changedFiles}}
+
+Requirement:
+{{description}}
+
+Validation:
+```text
+{{testOutput}}
+```
+
+Remote checks:
+```text
+{{checksOutput}}
+```
+
+Output a delivery handoff with these sections:
+
+```text
+Delivery state:
+- Waiting for human approval, merged, or blocked.
+
+What changed:
+- User-facing and technical summary.
+
+Proof:
+- PR, commits, changed files, validation, GitHub Actions CI status, review artifacts.
+
+Rollback plan:
+- How to revert safely if needed.
+
+Operator notes:
+- Anything the human approver or maintainer should know.
+```
+
+Rules:
+- Do not merge without an explicit human approval.
+- Preserve PR/check/review facts exactly; do not summarize them as passed unless they actually passed.
