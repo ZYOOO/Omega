@@ -147,6 +147,15 @@ Settings -> Provider access -> Feishu
 
 See [docs/feishu-bot-permissions.md](docs/feishu-bot-permissions.md) for the full permission guide.
 
+## Download
+
+macOS Apple Silicon users can install Omega directly from the GitHub Release `.dmg`:
+
+- [Omega-0.1.0-arm64.dmg](https://github.com/ZYOOO/Omega/releases/download/v0.1.0/Omega-0.1.0-arm64.dmg)
+- [Omega v0.1.0 Release page](https://github.com/ZYOOO/Omega/releases/tag/v0.1.0)
+
+This build is ad-hoc signed and not notarized. If macOS blocks it, right-click Omega and choose `Open`, or allow it from `System Settings -> Privacy & Security`.
+
 ## Install
 
 ```bash

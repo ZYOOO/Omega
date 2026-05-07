@@ -276,6 +276,15 @@ Settings -> Provider access -> Feishu
 
 无公网时建议使用 Task review：Omega 本机 runtime 主动通过 `lark-cli` 创建任务，再通过 Task bridge / sync 查询任务完成状态，不需要飞书云端回调你的本机。
 
+## 直接下载
+
+macOS Apple Silicon 用户可以直接下载 GitHub Release 中的 `.dmg` 安装包：
+
+- [Omega-0.1.0-arm64.dmg](https://github.com/ZYOOO/Omega/releases/download/v0.1.0/Omega-0.1.0-arm64.dmg)
+- [Omega v0.1.0 Release 页面](https://github.com/ZYOOO/Omega/releases/tag/v0.1.0)
+
+当前发布包为 ad-hoc signed，未 notarized。如果 macOS 拦截，右键点击 Omega 选择 `打开`，或到 `系统设置 -> 隐私与安全性` 中允许打开。
+
 ## 安装依赖
 
 克隆仓库：
