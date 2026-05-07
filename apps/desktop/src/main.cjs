@@ -13,6 +13,7 @@ let previewViewAttached = false;
 let desktopServices;
 let previewRuntimeSession;
 let omegaAppURL = "";
+const appIconPath = path.join(__dirname, "assets", "omega-icon.png");
 
 function layoutPreviewView() {
   if (!mainWindow || !previewView) return;
@@ -145,12 +146,16 @@ async function createWindow() {
     minWidth: 1100,
     minHeight: 720,
     title: "Omega",
+    icon: appIconPath,
     webPreferences: {
       preload: path.join(__dirname, "omega-preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
+  if (process.platform === "darwin" && app.dock) {
+    app.dock.setIcon(appIconPath);
+  }
 
   if (desktopServices.web?.status === "static" && desktopServices.web.filePath) {
     mainWindow.loadFile(desktopServices.web.filePath);

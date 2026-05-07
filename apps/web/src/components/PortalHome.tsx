@@ -23,6 +23,7 @@ const storyCards = [
   "Agent 执行 → CI → Review",
   "Human Gate → Merge → Proof"
 ];
+const omegaLogoSrc = `${import.meta.env.BASE_URL}omega-logo.png`;
 
 type PortalHomeProps = {
   onOpenWorkboard: () => void;
@@ -61,7 +62,7 @@ export function PortalHome({ onOpenWorkboard, onOpenPagePilot, onToggleTheme, on
     <main className={`site-shell portal-shell theme-${uiTheme}`}>
       <header className="portal-topbar">
         <button type="button" className="portal-brand" onClick={onOpenWorkboard} aria-label={t("Open Omega Workboard")}>
-          <img src="/omega-logo.png" alt="Omega AI DevFlow Engine" />
+          <img src={omegaLogoSrc} alt="Omega AI DevFlow Engine" />
         </button>
         <nav className="portal-nav" aria-label={t("Omega portal navigation")}>
           <a href="#templates">{isZh ? "案例与方案" : "Templates"}</a>

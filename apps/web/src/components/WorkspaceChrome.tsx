@@ -51,6 +51,7 @@ type WorkspaceChromeProps = {
   onAgentAccessClick: (item: AgentAccessSidebarItem) => void;
   onNewRequirement: () => void;
 };
+const omegaLogoSrc = `${import.meta.env.BASE_URL}omega-logo.png`;
 
 export function primaryNavLabel(nav: PrimaryNav) {
   return nav === "Issues" ? "Work items" : nav;
@@ -106,7 +107,7 @@ export function WorkspaceChrome({
     <>
       <aside className="sidebar" aria-label={t("Workspace navigation")}>
         <div className="brand-lockup">
-          <img className="brand-logo" src="/omega-logo.png" alt="Omega AI DevFlow Engine" />
+          <img className="brand-logo" src={omegaLogoSrc} alt="Omega AI DevFlow Engine" />
           <button type="button" className="sidebar-home-button" onClick={onHome}>
             {t("Home")}
           </button>

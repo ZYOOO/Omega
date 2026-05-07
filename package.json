@@ -85,6 +85,7 @@
       }
     ],
     "mac": {
+      "icon": "apps/desktop/src/assets/omega.icns",
       "category": "public.app-category.developer-tools",
       "target": [
         "dmg",
