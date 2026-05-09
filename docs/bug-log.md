@@ -2,6 +2,31 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-09: Workboard 行内重试按钮没有运行过渡态
+
+### 现象
+
+Workboard 的受阻 Work Item 行内 `Retry` 按钮点击后没有立即进入提交中状态，用户只能等待列表刷新，容易误以为没有响应并重复点击。
+
+### 原因
+
+此前只给详情页的 `Retry attempt` 接入了 `retryingAttemptId`，Workboard 行内按钮仍然直接调用 `runItem(item)`。这既没有复用 attempt retry API，也没有把当前行映射为 in-flight 进度。
+
+### 修复
+
+- 新增可复用的 `retryWorkItemAttemptForItem`，Workboard 能基于最近失败 / stalled / canceled attempt 发起真实 retry。
+- Workboard 行内按钮点击后立即显示 `Retrying...`、禁用并展示 spinner，避免重复触发。
+- 对应行的进度条同步切到 running 动效，失败项重试时不再停留在静态 blocked 视觉状态。
+
+### 验证
+
+```bash
+npm run lint
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "shows in-flight feedback when retrying a blocked workboard item" --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+git diff --check
+```
+
 ## 2026-05-09: Retry attempt 点击后没有过渡态，容易重复触发
 
 ### 现象

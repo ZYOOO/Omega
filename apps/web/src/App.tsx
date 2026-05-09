@@ -2509,17 +2509,21 @@ function App() {
     }
   }
 
-  async function retryWorkItemAttempt(attemptId: string) {
-    if (!missionControlApiUrl || !activeWorkItemDetail) return;
+  async function retryWorkItemAttemptForItem(item: WorkItem, attemptId: string) {
+    if (!missionControlApiUrl) {
+      setRunnerMessage(missionControlUnavailableMessage("Retrying an attempt"));
+      return;
+    }
     if (retryingAttemptIdRef.current) return;
     const previousAttempt = attempts.find((attempt) => attempt.id === attemptId);
     retryingAttemptIdRef.current = attemptId;
     setRetryingAttemptId(attemptId);
-    setRunningWorkItemId(activeWorkItemDetail.id);
-    setRunnerMessage(`Retrying ${activeWorkItemDetail.key} from attempt ${attemptId}...`);
+    setRunningWorkItemId(item.id);
+    setSelectedWorkItemId(item.id);
+    setRunnerMessage(`Retrying ${item.key} from attempt ${attemptId}...`);
     try {
       const result = await retryAttempt(missionControlApiUrl, attemptId, retryReasonForAttempt(previousAttempt));
-      setRunnerMessage(`Retry attempt started for ${activeWorkItemDetail.key}: ${result.attempt.id}.`);
+      setRunnerMessage(`Retry attempt started for ${item.key}: ${result.attempt.id}.`);
       await refreshControlPlane();
       await refreshWorkspaceState().catch((error) => {
         console.warn("Workspace refresh after attempt retry failed", error);
@@ -2531,6 +2535,11 @@ function App() {
       setRetryingAttemptId("");
       setRunningWorkItemId("");
     }
+  }
+
+  async function retryWorkItemAttempt(attemptId: string) {
+    if (!activeWorkItemDetail) return;
+    await retryWorkItemAttemptForItem(activeWorkItemDetail, attemptId);
   }
 
   async function saveLocalWorkspaceRoot() {
@@ -4452,15 +4461,27 @@ function App() {
                         const itemPendingCheckpoint = pendingCheckpointForPipeline(checkpoints, itemPipeline);
                         const completed = isCompletedWork(item, itemPipeline);
                         const failed = isFailedWork(item, itemPipeline);
+                        const retryableAttempt = (attemptsByWorkItemId.get(item.id) ?? []).find((attempt) =>
+                          ["failed", "stalled", "canceled"].includes(attempt.status)
+                        );
+                        const retryingRow = Boolean(
+                          retryableAttempt && retryingAttemptId === retryableAttempt.id
+                        ) || (failed && runningWorkItemId === item.id);
                         const runDisabled =
-                          completed || runningWorkItemId === item.id || item.status === "Planning" || item.status === "In Review" || item.status === "Human Review";
-                        const progress = summarizePipelineProgress(item, pipelineStages, runningWorkItemId === item.id);
-                        const hasProgress = pipelineStages.length > 0 || item.status === "Planning" || runningWorkItemId === item.id;
+                          completed ||
+                          runningWorkItemId === item.id ||
+                          item.status === "Planning" ||
+                          item.status === "In Review" ||
+                          item.status === "Human Review";
+                        const progress = retryingRow
+                          ? { label: "Retrying...", percent: 16, status: "running" }
+                          : summarizePipelineProgress(item, pipelineStages, runningWorkItemId === item.id);
+                        const hasProgress = retryingRow || pipelineStages.length > 0 || item.status === "Planning" || runningWorkItemId === item.id;
                         const deleteAllowed = canDeleteWorkItem(item);
                         return (
                           <article
                             key={item.id}
-                            className={`issue-row ${selectedWorkItem?.id === item.id ? "selected" : ""} ${pipelineStages.length ? "has-pipeline" : ""}`}
+                            className={`issue-row ${selectedWorkItem?.id === item.id ? "selected" : ""} ${pipelineStages.length ? "has-pipeline" : ""} ${retryingRow ? "retrying" : ""}`}
                             onClick={() => selectWorkItem(item)}
                           >
                             <div className="issue-leading">
@@ -4531,13 +4552,19 @@ function App() {
                                 </button>
                               ) : failed ? (
                                 <button
-                                  className="run-inline"
+                                  className={`run-inline ${retryingRow ? "retrying" : ""}`}
+                                  disabled={retryingRow}
+                                  aria-busy={retryingRow ? "true" : undefined}
                                   onClick={(event) => {
                                     event.stopPropagation();
-                                    void runItem(item);
+                                    if (retryableAttempt) {
+                                      void retryWorkItemAttemptForItem(item, retryableAttempt.id);
+                                      return;
+                                    }
+                                    void runItem(item, { force: true });
                                   }}
                                 >
-                                  {t("Retry")}
+                                  {retryingRow ? t("Retrying...") : t("Retry")}
                                 </button>
                               ) : !hasProgress && item.status !== "Planning" && item.status !== "In Review" && item.status !== "Human Review" ? (
                                 <button

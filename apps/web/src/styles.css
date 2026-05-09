@@ -7290,15 +7290,44 @@ kbd {
   min-height: 26px;
   min-width: 58px;
   padding: 3px 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   color: #f0f0f1;
   background: #17171b;
   font-size: 0.82rem;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    color 160ms ease,
+    opacity 160ms ease;
 }
 
 .run-inline:disabled {
   color: #777780;
   cursor: not-allowed;
   background: #111114;
+}
+
+.run-inline.retrying:disabled {
+  border-color: rgba(47, 109, 246, 0.52);
+  color: #d8e5ff;
+  cursor: progress;
+  background: rgba(47, 109, 246, 0.16);
+  opacity: 0.9;
+}
+
+.run-inline.retrying::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  animation: omega-retry-spin 0.75s linear infinite;
 }
 
 .row-actions {
@@ -9876,6 +9905,12 @@ kbd,
   color: #9aa5b8;
 }
 
+.run-inline.retrying:disabled {
+  border-color: rgba(47, 109, 246, 0.42);
+  background: #eef5ff;
+  color: #2563eb;
+}
+
 .inspector-panel,
 .inspector-rail {
   border-left-color: #dfe8f5;
@@ -12048,6 +12083,12 @@ kbd,
   border-color: #263244;
   background: #111827;
   color: #64748b;
+}
+
+.product-shell.theme-dark .run-inline.retrying:disabled {
+  border-color: rgba(96, 165, 250, 0.46);
+  background: rgba(37, 99, 235, 0.16);
+  color: #bfdbfe;
 }
 
 .product-shell details.info-popover,
