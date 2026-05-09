@@ -534,6 +534,81 @@ describe("WorkItemDetailPage", () => {
     expect(container.querySelectorAll(".detail-stage-grid .stage-waiting")).toHaveLength(1);
   });
 
+  it("keeps the implementation stage visibly running while rework runs code and test agents", () => {
+    const workItem: WorkItem = {
+      id: "item_manual_35",
+      key: "OMG-35",
+      title: "返工实施",
+      description: "Rework the implementation after review feedback.",
+      status: "In Review" as const,
+      priority: "High" as const,
+      assignee: "coding",
+      labels: [],
+      team: "Omega",
+      stageId: "rework",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: [],
+      blockedByItemIds: []
+    };
+
+    const { container } = render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[]}
+        pipeline={{
+          id: "pipeline_35",
+          workItemId: "item_manual_35",
+          runId: "run_35",
+          status: "running",
+          run: {
+            stages: [
+              { id: "requirement", title: "Todo intake", status: "passed", agentIds: ["requirement"] },
+              { id: "implementation", title: "Implementation and PR", status: "passed", agentIds: ["architect", "coding", "testing"] },
+              { id: "rework", title: "Rework", status: "running", agentIds: ["coding", "testing"] },
+              { id: "human_review", title: "Human Review", status: "waiting", agentIds: ["human"] }
+            ]
+          }
+        }}
+        attempts={[{
+          id: "attempt_35",
+          itemId: "item_manual_35",
+          pipelineId: "pipeline_35",
+          status: "running",
+          currentStageId: "rework"
+        }]}
+        checkpoints={[]}
+        operations={[]}
+        proofRecords={[]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    const implementationStageCard = screen
+      .getAllByText("Implementation and PR")
+      .map((element) => element.closest(".detail-stage-card"))
+      .find(Boolean);
+    const reworkStageCard = screen
+      .getAllByText("Rework")
+      .map((element) => element.closest(".detail-stage-card"))
+      .find(Boolean);
+
+    expect(implementationStageCard).toHaveClass("stage-running");
+    expect(reworkStageCard).toHaveClass("stage-running");
+    expect(container.querySelectorAll(".detail-stage-grid .stage-running")).toHaveLength(2);
+  });
+
   it("hides human approval actions after the current human review checkpoint is approved", () => {
     const workItem: WorkItem = {
       id: "item_manual_30",

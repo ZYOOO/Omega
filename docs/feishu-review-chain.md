@@ -18,6 +18,7 @@
 - `POST /feishu/review-request`
   - 输入 `checkpointId`，可选 `chatId`，也可用 `mode=task` 进入任务审核模式。
   - 读取 Work Item、Requirement、Attempt、Run Workpad、Review Packet。
+  - Review Packet 会包含 Architect Agent 的 Solution Plan 摘要，以及 Delivery Agent 基于已有证据整理的 Human Review Brief；审核人不需要打开 Omega 页面也能看到“计划怎么做”和“现在应该重点验什么”。
   - Webhook / chatId 模式生成飞书 interactive card。
   - Task 模式通过 `lark-cli task +create` 创建一条绑定 checkpoint 的审核任务。
   - Task 模式可选创建飞书文档，把长需求、PR、Review Packet 和风险信息放入文档正文。
@@ -66,16 +67,20 @@ DevFlow 在进入 `human_review.waiting` 后会自动检查配置：
 - 需求摘要
 - PR 链接
 - Review Packet 摘要
+- Solution Plan 摘要和正文预览
+- Human Review Brief：Delivery Agent 只基于 requirement、solution plan、review packet、PR、测试 / CI 和 changed files 证据整理的审核简报
 - `Open review`
 - `Approve`
 - `Request changes`
 
-长内容不会全部塞进卡片。runtime 会生成一份 Markdown 形式的 review doc preview，后续如果接入飞书文档 API，可以把这份内容直接作为文档正文发布。
+长内容不会全部塞进卡片。runtime 会生成一份 Markdown 形式的 review doc preview；开启飞书文档创建时，文档会包含 Requirement、Solution Plan、Human Review Brief、Review Packet、风险依据、TODO 复核和 Diff 预览。普通飞书文本消息仍只发送纯文本，不使用 Markdown 符号。
+
+Human Review Brief 会从 `delivery-handoff.md` / `delivery-handoff-fast-rework.md` 回填到 review packet。它不能改写风险等级、TODO 状态、审批结论或部署状态，只负责把已有证据整理成审核者可快速阅读的判断依据。
 
 Task 审核模式包含：
 
 - task title：Work Item key、Human Review、Work Item 标题。
-- task description：review token、Work Item、PR、branch、操作规则、需求摘要、文档链接。
+- task description：review token、Work Item、PR、branch、操作规则、需求摘要、Solution Plan 摘要、Human Review Brief、文档链接。
 - task comment：首次创建后补一条说明，告诉审核人“完成任务=通过，评论具体修改=请求变更”。
 - checkpoint `feishuReview`：保存 `format=task-review`、`taskGuid`、`taskUrl`、`nonce`、doc 信息和 raw CLI 输出。
 

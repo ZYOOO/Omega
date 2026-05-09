@@ -756,6 +756,10 @@ function DeliveryFlowGrid({
   const pipelineStages = pipeline?.run?.stages ?? [];
   const planStates = actionPlan?.states?.length ? actionPlan.states : [];
   const stages = pipelineStages.length ? pipelineStages : planStates;
+  const reworkRunning = stages.some((stage) => {
+    const stageRecord = stage as Record<string, unknown>;
+    return recordString(stageRecord, "id") === "rework" && recordString(stageRecord, "status") === "running";
+  });
   if (!stages.length) {
     return <p className="muted-copy">Delivery stages will appear after a pipeline is created.</p>;
   }
@@ -770,8 +774,14 @@ function DeliveryFlowGrid({
         const startedAt = recordString(stageRecord, "startedAt");
         const completedAt = recordString(stageRecord, "completedAt");
         const hasRunningAgent = stageAgentRuns.get(stageId)?.details.some((detail) => /running/i.test(detail)) ?? false;
+        const implementationReworkActive =
+          reworkRunning &&
+          (stageId === "in_progress" || stageId === "implementation") &&
+          (rawStatus === "passed" || rawStatus === "waiting");
         const status =
-          rawStatus === "waiting" && !completedAt && (hasRunningAgent || (pipeline?.status === "running" && startedAt))
+          implementationReworkActive
+            ? "running"
+            : rawStatus === "waiting" && !completedAt && (hasRunningAgent || (pipeline?.status === "running" && startedAt))
             ? "running"
             : rawStatus;
         const participantLabel = stageParticipantLabel(stageRecord, agentIds, agentShortLabel);

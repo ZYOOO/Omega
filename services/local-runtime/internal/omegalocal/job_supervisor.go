@@ -783,7 +783,11 @@ func (server *Server) scanApprovedDevFlowDeliveryContinuations(ctx context.Conte
 			continue
 		}
 		attempt := database.Tables.Attempts[attemptIndex]
-		if text(attempt, "status") == "done" || !attemptHasDeliveryContinuationProof(attempt) {
+		switch text(attempt, "status") {
+		case "done", "failed", "canceled", "stalled":
+			continue
+		}
+		if !attemptHasDeliveryContinuationProof(attempt) {
 			continue
 		}
 		if !approvedDevFlowDeliveryQueued(*database, checkpoint) {

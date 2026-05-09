@@ -1684,6 +1684,12 @@ Include:
 - validation and review evidence
 - remaining human gate decision
 - risks or blocked assumptions
+
+Rules:
+- Use only the requirement, solution plan, review packet, PR, test/check output, and changed-file evidence already captured by Omega.
+- Do not invent passed checks, hidden risks, user approval, deployment status, or product scope.
+- Do not change the risk level or TODO status; explain what the reviewer should verify.
+- Keep it concise and reviewer-facing.
 `, filepath.Join(proofDir, "handoff-bundle.json")) + agentArtifactCaptureInstruction(deliveryHandoffPath) + "\n\n" + agentPolicyBlock(profile, "delivery")
 		deliveryTurn := runProfileAgent("delivery", deliveryRunner, deliveryRunnerID, deliveryProfile, "delivery", "done", workspace, deliveryAgentPrompt, deliveryHandoffPath, "read-only", "medium")
 		if deliveryTurn.Error != nil {
@@ -1691,6 +1697,33 @@ Include:
 			return failureResult("done", "delivery", "Delivery agent failed while preparing the human handoff after fast rework.", deliveryTurn.Error.Error(), humanChangeRequest), deliveryTurn.Error
 		}
 		recordAgent("done", "delivery", "waiting-human", deliveryAgentPrompt, filepath.Base(deliveryHandoffPath), "Delivery agent prepared the handoff and is waiting for the human review checkpoint after fast rework.", []string{filepath.Join(proofDir, "handoff-bundle.json"), deliveryHandoffPath}, deliveryTurn.Process)
+		reviewPacket = attachDevFlowHumanReviewBrief(reviewPacket, deliveryHandoffPath)
+		if err := writeJSONFile(reviewPacketPath, reviewPacket); err != nil {
+			return nil, err
+		}
+		updatedAt := nowISO()
+		if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{
+			"pipelineId":         text(pipeline, "id"),
+			"workItemId":         text(item, "id"),
+			"workItemKey":        text(item, "key"),
+			"repositoryTargetId": text(target, "id"),
+			"repositoryTarget":   repoSlug,
+			"workspacePath":      workspace,
+			"repositoryPath":     repoWorkspace,
+			"branchName":         branchName,
+			"pullRequestUrl":     prURL,
+			"merged":             false,
+			"humanGate":          "pending",
+			"reworkAssessment":   reworkAssessment,
+			"reviewPacket":       reviewPacket,
+			"changedFiles":       changedFiles,
+			"artifacts":          stageArtifacts,
+			"agentInvocations":   agentInvocations,
+			"createdAt":          updatedAt,
+			"updatedAt":          updatedAt,
+		}); err != nil {
+			return nil, err
+		}
 		recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review after fast rework.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 		proofFiles, _ := collectFiles(proofDir)
 		return map[string]any{
@@ -2319,6 +2352,12 @@ Include:
 - validation and review evidence
 - remaining human gate decision
 - risks or blocked assumptions
+
+Rules:
+- Use only the requirement, solution plan, review packet, PR, test/check output, and changed-file evidence already captured by Omega.
+- Do not invent passed checks, hidden risks, user approval, deployment status, or product scope.
+- Do not change the risk level or TODO status; explain what the reviewer should verify.
+- Keep it concise and reviewer-facing.
 `, filepath.Join(proofDir, "handoff-bundle.json")) + agentArtifactCaptureInstruction(deliveryHandoffPath) + "\n\n" + agentPolicyBlock(profile, "delivery")
 	deliveryTurn := runProfileAgent("delivery", deliveryRunner, deliveryRunnerID, deliveryProfile, "delivery", "done", workspace, deliveryAgentPrompt, deliveryHandoffPath, "read-only", "medium")
 	if deliveryTurn.Error != nil {
@@ -2326,6 +2365,32 @@ Include:
 		return failureResult("done", "delivery", "Delivery agent failed while preparing the human handoff.", deliveryTurn.Error.Error(), humanChangeRequest), deliveryTurn.Error
 	}
 	recordAgent("done", "delivery", "waiting-human", deliveryAgentPrompt, "delivery-handoff.md", "Delivery agent prepared the handoff and is waiting for the human review checkpoint.", []string{filepath.Join(proofDir, "handoff-bundle.json"), deliveryHandoffPath}, deliveryTurn.Process)
+	reviewPacket = attachDevFlowHumanReviewBrief(reviewPacket, deliveryHandoffPath)
+	if err := writeJSONFile(reviewPacketPath, reviewPacket); err != nil {
+		return nil, err
+	}
+	updatedAt := nowISO()
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{
+		"pipelineId":         text(pipeline, "id"),
+		"workItemId":         text(item, "id"),
+		"workItemKey":        text(item, "key"),
+		"repositoryTargetId": text(target, "id"),
+		"repositoryTarget":   repoSlug,
+		"workspacePath":      workspace,
+		"repositoryPath":     repoWorkspace,
+		"branchName":         branchName,
+		"pullRequestUrl":     prURL,
+		"merged":             merged,
+		"humanGate":          "pending",
+		"reviewPacket":       reviewPacket,
+		"changedFiles":       changedFiles,
+		"artifacts":          stageArtifacts,
+		"agentInvocations":   agentInvocations,
+		"createdAt":          updatedAt,
+		"updatedAt":          updatedAt,
+	}); err != nil {
+		return nil, err
+	}
 	recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 	proofFiles, _ := collectFiles(proofDir)
 	return map[string]any{

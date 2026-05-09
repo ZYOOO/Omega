@@ -159,6 +159,53 @@ describe("PagePilotPreview", () => {
     expect(await screen.findByText("Target page opened. Select elements, add notes, and apply changes there.")).toBeInTheDocument();
   });
 
+  it("does not reuse a saved preview URL from another repository target", async () => {
+    window.localStorage.setItem("omega-page-pilot-preview-mode", "dev-server");
+    window.localStorage.setItem("omega-page-pilot-preview-url", "http://127.0.0.1:3999/");
+    window.localStorage.setItem("omega-page-pilot-preview-url:repo_other", "http://127.0.0.1:3999/");
+    const startPreviewDevServer = vi.fn().mockResolvedValue({
+      ok: true,
+      previewUrl: "http://127.0.0.1:3009/",
+      profile: { source: "npm:dev", previewUrl: "http://127.0.0.1:3009/" },
+    });
+    const openPreview = vi.fn().mockResolvedValue({ ok: true, url: "http://127.0.0.1:3009/" });
+    (window as Window & { omegaDesktop?: unknown }).omegaDesktop = {
+      startPreviewDevServer,
+      openPreview,
+    };
+
+    render(
+      <PagePilotPreview
+        projectId="project_omega"
+        repositoryTargets={[
+          { id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }
+        ]}
+        repositoryTargetId="repo_test"
+        repositoryLabel="ZYOOO/TestRepo"
+        apiAvailable={true}
+        onSelectRepositoryTarget={vi.fn()}
+        onApply={vi.fn()}
+        onDeliver={vi.fn()}
+        onDiscard={vi.fn()}
+        onFetchRuns={vi.fn().mockResolvedValue([])}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open page editor" }));
+
+    await waitFor(() => expect(startPreviewDevServer).toHaveBeenCalledWith({
+      target: { id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" },
+      projectId: "project_omega",
+      repositoryTargetId: "repo_test",
+      intent: "",
+      previewUrl: undefined,
+    }));
+    await waitFor(() => expect(openPreview).toHaveBeenCalledWith(expect.objectContaining({
+      url: "http://127.0.0.1:3009/",
+      repositoryTargetId: "repo_test",
+    })));
+  });
+
   it("surfaces Preview Runtime Agent failures instead of appearing idle", async () => {
     const startPreviewDevServer = vi.fn().mockResolvedValue({ ok: false, error: "no preview command could be detected" });
     const openPreview = vi.fn().mockResolvedValue({ ok: false, error: "ERR_CONNECTION_REFUSED" });

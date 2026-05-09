@@ -10,9 +10,10 @@ func appendWorkItem(database WorkspaceDatabase, item map[string]any) WorkspaceDa
 	normalized := normalizeWorkItem(item)
 	normalized["id"] = uniqueWorkItemID(database, text(normalized, "id"))
 	normalized["key"] = uniqueWorkItemKey(database, text(normalized, "key"))
+	normalized["projectId"] = workItemProjectID(database, normalized)
 	database, normalized = ensureRequirementForWorkItem(database, normalized, timestamp)
 	record := cloneMap(normalized)
-	record["projectId"] = firstProjectID(database)
+	record["projectId"] = workItemProjectID(database, normalized)
 	record["createdAt"] = timestamp
 	record["updatedAt"] = timestamp
 	database.Tables.WorkItems = append(database.Tables.WorkItems, record)
@@ -24,6 +25,23 @@ func appendWorkItem(database WorkspaceDatabase, item map[string]any) WorkspaceDa
 	}
 	touch(&database)
 	return database
+}
+
+func workItemProjectID(database WorkspaceDatabase, item map[string]any) string {
+	if projectID := text(item, "projectId"); projectID != "" {
+		return projectID
+	}
+	targetID := text(item, "repositoryTargetId")
+	if targetID != "" {
+		for _, project := range database.Tables.Projects {
+			for _, target := range arrayMaps(project["repositoryTargets"]) {
+				if text(target, "id") == targetID {
+					return stringOr(text(project, "id"), firstProjectID(database))
+				}
+			}
+		}
+	}
+	return firstProjectID(database)
 }
 
 func canDeleteWorkItem(database WorkspaceDatabase, item map[string]any) (bool, string) {
@@ -278,7 +296,7 @@ func requirementFromWorkItem(database WorkspaceDatabase, item map[string]any, ti
 	}
 	return map[string]any{
 		"id":                 requirementID,
-		"projectId":          firstProjectID(database),
+		"projectId":          workItemProjectID(database, item),
 		"repositoryTargetId": repositoryTargetID,
 		"source":             source,
 		"sourceExternalRef":  externalRef,

@@ -43,6 +43,7 @@ import {
   startPipeline,
   testAgentRunner,
   testFeishuConfig,
+  tickFeishuReviewTaskBridge,
   updateGitHubOAuthConfig,
   updateFeishuConfig,
   updateLlmProviderSelection,
@@ -617,6 +618,28 @@ describe("omegaControlApiClient", () => {
     await expect(
       requestCheckpointChanges("http://omega.local", "pipeline_item_1:intake", "Needs clearer acceptance criteria", fetchImpl)
     ).resolves.toMatchObject({ status: "rejected" });
+  });
+
+  it("ticks the Feishu review task bridge for a pending checkpoint", async () => {
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://omega.local/feishu/review-task/bridge/tick");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        checkpointId: "pipeline_item_1:human_review",
+        limit: 1
+      });
+      return Promise.resolve(jsonResponse({
+        status: "ok",
+        synced: [{ checkpointId: "pipeline_item_1:human_review", state: "synced", decision: "approved" }]
+      }));
+    }) as unknown as typeof fetch;
+
+    await expect(
+      tickFeishuReviewTaskBridge("http://omega.local", "pipeline_item_1:human_review", fetchImpl)
+    ).resolves.toMatchObject({
+      status: "ok",
+      synced: [{ decision: "approved" }]
+    });
   });
 
   it("binds Feishu config and runs provider preflight", async () => {

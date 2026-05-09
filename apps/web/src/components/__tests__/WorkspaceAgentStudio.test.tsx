@@ -53,6 +53,7 @@ function renderStudio(overrides: Partial<Parameters<typeof WorkspaceAgentStudio>
         { id: "trae-agent", command: "trae-cli", category: "ai-runner", available: true, required: false }
       ]}
       pipelineTemplates={[]}
+      workflowTemplates={[]}
       primaryProjectName="Omega"
       runnerCredentials={[
         {
@@ -103,5 +104,85 @@ describe("WorkspaceAgentStudio", () => {
     fireEvent.change(screen.getByLabelText("Runner"), { target: { value: "codex" } });
 
     expect(onUpdateAgentProfile).toHaveBeenCalledWith("testing", { runner: "codex" });
+  });
+
+  it("uses a themed secondary action for agent preflight testing", () => {
+    renderStudio();
+
+    expect(screen.getByRole("button", { name: "Test connection" })).toHaveClass("agent-test-action");
+  });
+
+  it("updates workflow markdown when the selected built-in template changes", () => {
+    const onUpdateDraft = vi.fn();
+    renderStudio({
+      agentConfigTab: "workflow",
+      pipelineTemplates: [
+        {
+          id: "devflow-pr",
+          name: "DevFlow PR cycle",
+          description: "",
+          workflowMarkdown: "workflow: devflow-pr\nstages:\n  - todo",
+          stages: []
+        },
+        {
+          id: "saas-launch",
+          name: "SaaS Launch Flow",
+          description: "",
+          workflowMarkdown: "---\nid: saas-launch\n---\n\nworkflow: saas-launch",
+          stages: []
+        }
+      ],
+      onUpdateDraft
+    });
+
+    fireEvent.change(screen.getByLabelText("Template"), { target: { value: "saas-launch" } });
+
+    expect(onUpdateDraft).toHaveBeenCalledWith({
+      workflowTemplate: "saas-launch",
+      workflowMarkdown: "---\nid: saas-launch\n---\n\nworkflow: saas-launch"
+    });
+  });
+
+  it("prefers the repository workflow template record when a template is selected", () => {
+    const onUpdateDraft = vi.fn();
+    renderStudio({
+      agentConfigTab: "workflow",
+      pipelineTemplates: [
+        {
+          id: "saas-launch",
+          name: "SaaS Launch Flow",
+          description: "",
+          workflowMarkdown: "---\nid: saas-launch\n---\n\nworkflow: saas-launch",
+          stages: []
+        }
+      ],
+      workflowTemplates: [
+        {
+          id: "workflow_template_project_saas",
+          templateId: "saas-launch",
+          name: "SaaS Launch Flow",
+          scope: "project",
+          projectId: "project_omega",
+          markdown: "workflow: saas-launch\nstages:\n  - project-default"
+        },
+        {
+          id: "workflow_template_repo_saas",
+          templateId: "saas-launch",
+          name: "SaaS Launch Flow",
+          scope: "repository",
+          projectId: "project_omega",
+          repositoryTargetId: "repo_1",
+          workflowMarkdown: "workflow: saas-launch\nstages:\n  - repo-override"
+        }
+      ],
+      onUpdateDraft
+    });
+
+    fireEvent.change(screen.getByLabelText("Template"), { target: { value: "saas-launch" } });
+
+    expect(onUpdateDraft).toHaveBeenCalledWith({
+      workflowTemplate: "saas-launch",
+      workflowMarkdown: "workflow: saas-launch\nstages:\n  - repo-override"
+    });
   });
 });

@@ -549,6 +549,8 @@ func feishuReviewPacketFromRecords(database WorkspaceDatabase, checkpoint map[st
 			break
 		}
 	}
+	solutionPlan := feishuSolutionPlanForAttempt(database, attempt, reviewPacket, runWorkpad)
+	humanReviewBrief := feishuHumanReviewBriefForAttempt(database, attempt, reviewPacket)
 	requirement := map[string]any{}
 	if requirementID := text(item, "requirementId"); requirementID != "" {
 		if index := findByID(database.Tables.Requirements, requirementID); index >= 0 {
@@ -556,14 +558,70 @@ func feishuReviewPacketFromRecords(database WorkspaceDatabase, checkpoint map[st
 		}
 	}
 	return map[string]any{
-		"checkpoint":   checkpoint,
-		"pipeline":     pipeline,
-		"item":         item,
-		"attempt":      attempt,
-		"reviewPacket": reviewPacket,
-		"runWorkpad":   runWorkpad,
-		"requirement":  requirement,
+		"checkpoint":       checkpoint,
+		"pipeline":         pipeline,
+		"item":             item,
+		"attempt":          attempt,
+		"reviewPacket":     reviewPacket,
+		"solutionPlan":     solutionPlan,
+		"humanReviewBrief": humanReviewBrief,
+		"runWorkpad":       runWorkpad,
+		"requirement":      requirement,
 	}
+}
+
+func feishuSolutionPlanForAttempt(database WorkspaceDatabase, attempt map[string]any, reviewPacket map[string]any, runWorkpad map[string]any) map[string]any {
+	if solutionPlan := mapValue(reviewPacket["solutionPlan"]); len(solutionPlan) > 0 {
+		return solutionPlan
+	}
+	if solutionPlan := mapValue(mapValue(runWorkpad["workpad"])["solutionPlan"]); len(solutionPlan) > 0 {
+		return solutionPlan
+	}
+	if workspace := text(attempt, "workspacePath"); workspace != "" {
+		path := filepath.Join(workspace, ".omega", "proof", "solution-plan.md")
+		if raw, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(raw)) != "" {
+			plan := devFlowSolutionPlanPreview(string(raw))
+			plan["sourcePath"] = path
+			return plan
+		}
+	}
+	if proofDir := proofDirForSupervisorRecovery(database, attempt); proofDir != "" {
+		path := filepath.Join(proofDir, "solution-plan.md")
+		if raw, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(raw)) != "" {
+			plan := devFlowSolutionPlanPreview(string(raw))
+			plan["sourcePath"] = path
+			return plan
+		}
+	}
+	return map[string]any{}
+}
+
+func feishuHumanReviewBriefForAttempt(database WorkspaceDatabase, attempt map[string]any, reviewPacket map[string]any) map[string]any {
+	if brief := mapValue(reviewPacket["humanReviewBrief"]); len(brief) > 0 {
+		return brief
+	}
+	candidateNames := []string{"delivery-handoff.md", "delivery-handoff-fast-rework.md"}
+	if workspace := text(attempt, "workspacePath"); workspace != "" {
+		for _, name := range candidateNames {
+			path := filepath.Join(workspace, ".omega", "proof", name)
+			if raw, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(raw)) != "" {
+				brief := devFlowHumanReviewBriefPreview(string(raw))
+				brief["sourcePath"] = path
+				return brief
+			}
+		}
+	}
+	if proofDir := proofDirForSupervisorRecovery(database, attempt); proofDir != "" {
+		for _, name := range candidateNames {
+			path := filepath.Join(proofDir, name)
+			if raw, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(raw)) != "" {
+				brief := devFlowHumanReviewBriefPreview(string(raw))
+				brief["sourcePath"] = path
+				return brief
+			}
+		}
+	}
+	return map[string]any{}
 }
 
 func sendFeishuReviewPacket(ctx context.Context, packet map[string]any, options feishuReviewSendOptions) (map[string]any, error) {
@@ -994,6 +1052,16 @@ func buildFeishuReviewCardWithOptions(packet map[string]any, options feishuRevie
 	if summary := text(reviewPacket, "summary"); summary != "" {
 		elements = append(elements, map[string]any{"tag": "markdown", "content": "**" + feishuLabel(lang, "Review packet", "审核包") + "**\n" + truncateForProof(summary, 900)})
 	}
+	if brief := feishuHumanReviewBriefFromPacket(packet); len(brief) > 0 {
+		if briefMarkdown := renderFeishuHumanReviewBriefMarkdown(brief, lang, 900); briefMarkdown != "" {
+			elements = append(elements, map[string]any{"tag": "markdown", "content": briefMarkdown})
+		}
+	}
+	if solutionPlan := feishuSolutionPlanFromPacket(packet); len(solutionPlan) > 0 {
+		if planMarkdown := renderFeishuSolutionPlanMarkdown(solutionPlan, lang, 900); planMarkdown != "" {
+			elements = append(elements, map[string]any{"tag": "markdown", "content": planMarkdown})
+		}
+	}
 	if riskBasis := renderFeishuRiskBasisMarkdown(reviewPacket, lang, 4); riskBasis != "" {
 		elements = append(elements, map[string]any{"tag": "markdown", "content": riskBasis})
 	}
@@ -1057,6 +1125,16 @@ func buildFeishuReviewDocMarkdown(packet map[string]any, language ...string) str
 	if summary := text(reviewPacket, "summary"); summary != "" {
 		lines = append(lines, "", "## "+feishuLabel(lang, "Review packet", "审核包"), "", summary)
 	}
+	if brief := feishuHumanReviewBriefFromPacket(packet); len(brief) > 0 {
+		if briefMarkdown := renderFeishuHumanReviewBriefMarkdown(brief, lang, 2400); briefMarkdown != "" {
+			lines = append(lines, "", briefMarkdown)
+		}
+	}
+	if solutionPlan := feishuSolutionPlanFromPacket(packet); len(solutionPlan) > 0 {
+		if planMarkdown := renderFeishuSolutionPlanMarkdown(solutionPlan, lang, 2400); planMarkdown != "" {
+			lines = append(lines, "", planMarkdown)
+		}
+	}
 	if risk := mapValue(reviewPacket["risk"]); len(risk) > 0 {
 		lines = append(lines, "", "## "+feishuLabel(lang, "Risk", "风险"), "", "- "+feishuLabel(lang, "Level", "等级")+": `"+text(risk, "level")+"`")
 		for _, reason := range stringSlice(risk["reasons"]) {
@@ -1115,12 +1193,117 @@ func renderFeishuReviewText(packet map[string]any, language ...string) string {
 	if summary := text(reviewPacket, "summary"); summary != "" {
 		lines = append(lines, "", feishuLabel(lang, "🧾 Review packet", "🧾 Review packet"), truncateForProof(summary, 700))
 	}
+	if briefLines := renderFeishuHumanReviewBriefPlain(feishuHumanReviewBriefFromPacket(packet), lang, 900); len(briefLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, briefLines...)
+	}
+	if solutionLines := renderFeishuSolutionPlanPlain(feishuSolutionPlanFromPacket(packet), lang, 900); len(solutionLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, solutionLines...)
+	}
 	if todoLines := renderFeishuTodoCompletionPlain(reviewPacket, lang, 6); len(todoLines) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, todoLines...)
 	}
 	lines = append(lines, "", feishuLabel(lang, "🛠️ Review actions", "🛠️ 审核动作"), feishuLabel(lang, "Approve or Request changes in Omega. In Feishu task mode, completing the task approves delivery; comments with requested changes route to rework.", "在 Omega 中 Approve 或 Request changes；如果是飞书任务模式，完成任务表示审核通过；评论修改意见会进入 rework。"))
 	return strings.Join(lines, "\n")
+}
+
+func feishuSolutionPlanFromPacket(packet map[string]any) map[string]any {
+	if solutionPlan := mapValue(packet["solutionPlan"]); len(solutionPlan) > 0 {
+		return solutionPlan
+	}
+	reviewPacket := mapValue(packet["reviewPacket"])
+	if solutionPlan := mapValue(reviewPacket["solutionPlan"]); len(solutionPlan) > 0 {
+		return solutionPlan
+	}
+	return map[string]any{}
+}
+
+func feishuHumanReviewBriefFromPacket(packet map[string]any) map[string]any {
+	if brief := mapValue(packet["humanReviewBrief"]); len(brief) > 0 {
+		return brief
+	}
+	reviewPacket := mapValue(packet["reviewPacket"])
+	if brief := mapValue(reviewPacket["humanReviewBrief"]); len(brief) > 0 {
+		return brief
+	}
+	return map[string]any{}
+}
+
+func renderFeishuSolutionPlanMarkdown(solutionPlan map[string]any, lang string, limit int) string {
+	if len(solutionPlan) == 0 {
+		return ""
+	}
+	lines := []string{"**" + feishuLabel(lang, "Solution plan", "方案计划") + "**"}
+	if summary := strings.TrimSpace(text(solutionPlan, "summary")); summary != "" {
+		lines = append(lines, truncateForProof(summary, 500))
+	}
+	if excerpt := strings.TrimSpace(text(solutionPlan, "excerpt")); excerpt != "" {
+		lines = append(lines, "", "```text", truncateForProof(excerpt, limit), "```")
+	}
+	if len(lines) == 1 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderFeishuSolutionPlanPlain(solutionPlan map[string]any, lang string, limit int) []string {
+	if len(solutionPlan) == 0 {
+		return nil
+	}
+	lines := []string{feishuLabel(lang, "🧭 Solution plan", "🧭 方案计划")}
+	if summary := feishuPlainText(text(solutionPlan, "summary")); summary != "" {
+		lines = append(lines, truncateForProof(summary, 500))
+	}
+	if excerpt := feishuPlainText(text(solutionPlan, "excerpt")); excerpt != "" {
+		lines = append(lines, truncateForProof(excerpt, limit))
+	}
+	if len(lines) == 1 {
+		return nil
+	}
+	return lines
+}
+
+func renderFeishuHumanReviewBriefMarkdown(brief map[string]any, lang string, limit int) string {
+	if len(brief) == 0 {
+		return ""
+	}
+	lines := []string{"**" + feishuLabel(lang, "Human Review brief", "人工审核简报") + "**"}
+	if summary := strings.TrimSpace(text(brief, "summary")); summary != "" {
+		lines = append(lines, truncateForProof(summary, 500))
+	}
+	if excerpt := strings.TrimSpace(text(brief, "excerpt")); excerpt != "" {
+		lines = append(lines, "", "```text", truncateForProof(excerpt, limit), "```")
+	}
+	if len(lines) == 1 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderFeishuHumanReviewBriefPlain(brief map[string]any, lang string, limit int) []string {
+	if len(brief) == 0 {
+		return nil
+	}
+	lines := []string{feishuLabel(lang, "🧾 Human Review brief", "🧾 人工审核简报")}
+	if summary := feishuPlainText(text(brief, "summary")); summary != "" {
+		lines = append(lines, truncateForProof(summary, 500))
+	}
+	if excerpt := feishuPlainText(text(brief, "excerpt")); excerpt != "" {
+		lines = append(lines, truncateForProof(excerpt, limit))
+	}
+	if len(lines) == 1 {
+		return nil
+	}
+	return lines
+}
+
+func feishuPlainText(value string) string {
+	value = strings.ReplaceAll(value, "`", "")
+	value = strings.ReplaceAll(value, "**", "")
+	value = strings.ReplaceAll(value, "__", "")
+	return strings.TrimSpace(value)
 }
 
 func renderFeishuRiskBasisMarkdown(reviewPacket map[string]any, lang string, limit int) string {

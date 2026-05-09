@@ -9,11 +9,9 @@ import {
   createWorkboardView,
   grantProviderConnection,
   loadWorkspaceSession,
-  revokeProviderConnection,
   titleFromMarkdownDescription
 } from "./core";
-import { runOperationViaMissionControlApi } from "./missionControlApiClient";
-import type { MissionControlRunnerPreset } from "./missionControlApiClient";
+import type { RunnerPreset } from "./runnerTypes";
 import { navigateToExternalUrl } from "./browserNavigation";
 import { openExternalUrlInNewTab } from "./browserNavigation";
 import { retryReasonForAttempt } from "./attemptRetryReason";
@@ -56,6 +54,7 @@ import {
   fetchOrchestratorWatchers,
   fetchPipelines,
   fetchPipelineTemplates,
+  fetchWorkflowTemplates,
   fetchPagePilotRuns,
   fetchProofPreview,
   fetchProofRecords,
@@ -79,6 +78,7 @@ import {
   startGitHubOAuth,
   testAgentRunner,
   testFeishuConfig,
+  tickFeishuReviewTaskBridge,
   updateFeishuConfig,
   updateGitHubOAuthConfig,
   updateUiLanguagePreference,
@@ -106,6 +106,7 @@ import {
   type LlmProviderSelection,
   type ObservabilitySummary,
   type OperationRecordInfo,
+  type OrchestratorTickResult,
   type PagePilotRunFilters,
   type PagePilotSelectionContext,
   type PatchRunWorkpadInput,
@@ -118,7 +119,8 @@ import {
   type RunWorkpadRecordInfo,
   type RuntimeLogRecordInfo,
   type RunnerCredentialInfo,
-  type RunnerModelDiscoveryResult
+  type RunnerModelDiscoveryResult,
+  type WorkflowTemplateRecordInfo
 } from "./omegaControlApiClient";
 import { I18nProvider, initialUiLanguage, translateUi, uiLanguageStorageKey, type UiLanguage } from "./i18n";
 import {
@@ -191,7 +193,7 @@ const workItemFlowLaneDefinitions: WorkItemFlowLaneDefinition[] = [
 type AgentProfileDraft = {
   id: string;
   label: string;
-  runner: MissionControlRunnerPreset;
+  runner: RunnerPreset;
   model: string;
   skills: string;
   mcp: string;
@@ -202,7 +204,7 @@ type AgentProfileDraft = {
 type AgentConfigurationDraft = {
   projectId?: string;
   repositoryTargetId?: string;
-  runner: MissionControlRunnerPreset;
+  runner: RunnerPreset;
   workflowTemplate: string;
   workflowMarkdown: string;
   stagePolicy: string;
@@ -780,7 +782,13 @@ function runtimeStatusForWorkItem(item: WorkItem, pipeline?: PipelineRecordInfo)
   if (pipeline?.status === "discarded") return "Canceled";
   if (pipeline?.status === "failed" || pipeline?.status === "stalled") return "Blocked";
   if (pipeline?.status === "delivered" || pipeline?.status === "done") return "Done";
-  if (pipeline?.status === "running") return item.status === "Human Review" ? "Human Review" : "In Review";
+  if (pipeline?.status === "running") {
+    const stage = currentPipelineStage(pipeline);
+    const stageId = stage?.id ?? "";
+    return stageId === "human_review" && (stage?.status === "needs-human" || stage?.status === "waiting-human")
+      ? "Human Review"
+      : "In Review";
+  }
   return item.status;
 }
 
@@ -792,6 +800,16 @@ function pendingCheckpointForPipeline(checkpoints: CheckpointRecordInfo[], pipel
   const humanReviewComplete = humanReviewStage?.status === "passed" || humanReviewStage?.status === "done";
   const pipelineComplete = pipeline.status === "done" || pipeline.status === "delivered";
   return humanReviewComplete || pipelineComplete ? undefined : pending;
+}
+
+function currentPipelineStage(pipeline?: PipelineRecordInfo) {
+  const stages = pipeline?.run?.stages ?? [];
+  return stages.find((stage) => !["passed", "done", "skipped", "waiting"].includes(stage.status)) ?? undefined;
+}
+
+function checkpointHasFeishuReviewTask(checkpoint: CheckpointRecordInfo): boolean {
+  const review = checkpoint.feishuReview ?? {};
+  return checkpoint.status === "pending" && Boolean(review.taskGuid || review.taskId);
 }
 
 function applyRuntimeWorkItemStatus(item: WorkItem, pipeline?: PipelineRecordInfo): WorkItem {
@@ -812,6 +830,51 @@ function operationStatusLabel(status: string): string {
     blocked: "Blocked"
   };
   return labels[status] ?? status;
+}
+
+function autoRunResultMessage(label: string, result: OrchestratorTickResult): string {
+  const readyWork = result.readyWork ?? {};
+  const acceptedReadyRuns = Number(readyWork.acceptedReadyRuns ?? 0);
+  if (result.status === "accepted-ready-work") {
+    return acceptedReadyRuns > 0
+      ? `Auto run started ${acceptedReadyRuns} Not Started work item${acceptedReadyRuns === 1 ? "" : "s"} for ${label}.`
+      : `Auto run scanned ${label}; no Not Started work items were accepted.`;
+  }
+  if (result.status === "accepted") {
+    return `Auto run started a GitHub ready issue for ${label}.`;
+  }
+  if (result.status === "claimed") {
+    return `Auto run claimed a GitHub ready issue for ${label}; it is ready for manual start.`;
+  }
+  if (result.status === "locked") {
+    return `Auto run found an existing execution lock for ${label}.`;
+  }
+  if (result.status === "idle") {
+    return `Auto run scanned ${label}: ${result.reason || "no runnable work item found"}.`;
+  }
+  return `Auto run scanned ${label}: ${result.status}.`;
+}
+
+function findCreatedWorkItem(previousItems: WorkItem[], nextItems: WorkItem[], draft: WorkItem): WorkItem | undefined {
+  const previousIds = new Set(previousItems.map((item) => item.id));
+  const created = nextItems
+    .filter((item) => !previousIds.has(item.id))
+    .sort((left, right) =>
+      ((right as WorkItem & { createdAt?: string }).createdAt ?? "").localeCompare(
+        (left as WorkItem & { createdAt?: string }).createdAt ?? ""
+      )
+    );
+  return (
+    created.find(
+      (item) =>
+        item.title === draft.title &&
+        item.repositoryTargetId === draft.repositoryTargetId &&
+        item.source === draft.source
+    ) ??
+    created.find((item) => item.title === draft.title && item.repositoryTargetId === draft.repositoryTargetId) ??
+    created[0] ??
+    nextItems.find((item) => item.id === draft.id)
+  );
 }
 
 function summarizePipelineProgress(
@@ -1078,8 +1141,9 @@ function App() {
   const [createDescriptionMode, setCreateDescriptionMode] = useState<"write" | "preview">("write");
   const [isCreatingItem, setIsCreatingItem] = useState(false);
   const creatingItemRef = useRef(false);
+  const lastFeishuTaskBridgeTickRef = useRef<Record<string, number>>({});
   const [runnerMessage, setRunnerMessage] = useState("");
-  const [runnerPreset, setRunnerPreset] = useState<MissionControlRunnerPreset>(persistedSession.runnerPreset);
+  const [runnerPreset, setRunnerPreset] = useState<RunnerPreset>(persistedSession.runnerPreset);
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<"All" | WorkItemStatus>(persistedSession.statusFilter);
   const [assigneeFilter, setAssigneeFilter] = useState(persistedSession.assigneeFilter);
@@ -1122,8 +1186,9 @@ function App() {
   const [localCapabilities, setLocalCapabilities] = useState<LocalCapabilityInfo[]>([]);
   const [localWorkspaceRoot, setLocalWorkspaceRoot] = useState("");
   const [localWorkspaceRootDraft, setLocalWorkspaceRootDraft] = useState("");
-  const [localRunner, setLocalRunner] = useState<MissionControlRunnerPreset>("local-proof");
+  const [localRunner, setLocalRunner] = useState<RunnerPreset>("local-proof");
   const [pipelineTemplates, setPipelineTemplates] = useState<PipelineTemplateInfo[]>([]);
+  const [workflowTemplates, setWorkflowTemplates] = useState<WorkflowTemplateRecordInfo[]>([]);
   const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionInfo[]>([]);
   const [githubOAuthConfig, setGitHubOAuthConfig] = useState<GitHubOAuthConfigInfo>(defaultGitHubOAuthConfig);
   const [githubOAuthDraft, setGitHubOAuthDraft] = useState({
@@ -1157,6 +1222,7 @@ function App() {
   const [localRepositoryPath, setLocalRepositoryPath] = useState("");
   const [localRepositoryMessage, setLocalRepositoryMessage] = useState("");
   const [syncingRepositoryKey, setSyncingRepositoryKey] = useState("");
+  const [autoRunBusyTargetId, setAutoRunBusyTargetId] = useState("");
   const [runningWorkItemId, setRunningWorkItemId] = useState("");
   const [repositorySyncMessage, setRepositorySyncMessage] = useState("");
   const [deleteLocalWorkspacesOnRepositoryDelete, setDeleteLocalWorkspacesOnRepositoryDelete] = useState(false);
@@ -1561,6 +1627,7 @@ function App() {
       nextProviders,
       nextSelection,
       nextTemplates,
+      nextWorkflowTemplates,
       nextAgents,
       nextRequirements,
       nextPipelines,
@@ -1580,6 +1647,7 @@ function App() {
       fetchLlmProviders(missionControlApiUrl),
       fetchLlmProviderSelection(missionControlApiUrl),
       fetchPipelineTemplates(missionControlApiUrl),
+      fetchWorkflowTemplates(missionControlApiUrl).catch(() => []),
       fetchAgentDefinitions(missionControlApiUrl),
       fetchRequirements(missionControlApiUrl).catch(() => []),
       fetchPipelines(missionControlApiUrl, { limit: 500 }),
@@ -1599,6 +1667,7 @@ function App() {
     setLlmProviders(nextProviders);
     setLlmSelection(nextSelection);
     setPipelineTemplates(nextTemplates);
+    setWorkflowTemplates(nextWorkflowTemplates);
     setAgentDefinitions(nextAgents);
     setRequirements(nextRequirements);
     setPipelines(nextPipelines);
@@ -1721,7 +1790,7 @@ function App() {
     const scoped = hasExecutionRefreshScope(scope);
     const repositoryScoped = Boolean(scoped && scope.repositoryTargetId && !scope.workItemId && !scope.pipelineId);
     const shouldRefreshSession = !scoped || (!scope.workItemId && !scope.pipelineId);
-    const [session, nextAttempts, nextRunWorkpads] = await Promise.all([
+    const [session, fetchedAttempts, fetchedRunWorkpads] = await Promise.all([
       shouldRefreshSession ? fetchWorkspaceSession(missionControlApiUrl, run).catch(() => null) : Promise.resolve(null),
       fetchAttempts(
         missionControlApiUrl,
@@ -1736,9 +1805,43 @@ function App() {
           : { limit: RECENT_RUN_WORKPAD_LIMIT, compact: true }
       ).catch(() => [])
     ]);
+    let nextAttempts = fetchedAttempts;
+    let nextRunWorkpads = fetchedRunWorkpads;
     const sessionWorkItems = session?.workItems ?? workItems;
-    const nextPipelines = await fetchPipelinesForExecutionScope(missionControlApiUrl, scope, sessionWorkItems, nextAttempts, nextRunWorkpads);
-    const nextCheckpoints = await fetchCheckpointsForExecutionScope(missionControlApiUrl, scope, nextPipelines, nextAttempts);
+    let nextPipelines = await fetchPipelinesForExecutionScope(missionControlApiUrl, scope, sessionWorkItems, nextAttempts, nextRunWorkpads);
+    let nextCheckpoints = await fetchCheckpointsForExecutionScope(missionControlApiUrl, scope, nextPipelines, nextAttempts);
+    const feishuTaskCheckpoint = feishuConfig.taskBridgeEnabled
+      ? nextCheckpoints.find(checkpointHasFeishuReviewTask)
+      : undefined;
+    if (feishuTaskCheckpoint) {
+      const lastTick = lastFeishuTaskBridgeTickRef.current[feishuTaskCheckpoint.id] ?? 0;
+      const now = Date.now();
+      if (now - lastTick > 6000) {
+        lastFeishuTaskBridgeTickRef.current[feishuTaskCheckpoint.id] = now;
+        const bridgeResult = await tickFeishuReviewTaskBridge(missionControlApiUrl, feishuTaskCheckpoint.id).catch((error) => {
+          console.warn("Feishu review task bridge tick failed", error);
+          return null;
+        });
+        const synced = bridgeResult?.synced?.some((entry) => entry.state === "synced" || entry.decision === "approved");
+        if (synced) {
+          const refreshedAttempts = await fetchAttempts(
+            missionControlApiUrl,
+            scoped
+              ? { ...scope, limit: SCOPED_EXECUTION_RECORD_LIMIT, compact: repositoryScoped }
+              : { limit: RECENT_ATTEMPT_LIMIT, compact: true }
+          ).catch(() => nextAttempts);
+          nextAttempts = refreshedAttempts;
+          nextRunWorkpads = await fetchRunWorkpads(
+            missionControlApiUrl,
+            scoped
+              ? { ...scope, limit: SCOPED_EXECUTION_RECORD_LIMIT, compact: repositoryScoped }
+              : { limit: RECENT_RUN_WORKPAD_LIMIT, compact: true }
+          ).catch(() => nextRunWorkpads);
+          nextPipelines = await fetchPipelinesForExecutionScope(missionControlApiUrl, scope, sessionWorkItems, nextAttempts, nextRunWorkpads);
+          nextCheckpoints = await fetchCheckpointsForExecutionScope(missionControlApiUrl, scope, nextPipelines, nextAttempts);
+        }
+      }
+    }
     if (session) {
       setProjects(session.projects);
       setRequirements(session.requirements);
@@ -1954,12 +2057,13 @@ function App() {
       setRunnerMessage("Creating requirement...");
       const apiUrl = requireMissionControlApi(missionControlApiUrl, "Creating a requirement");
       const session = await createWorkItemViaApi(apiUrl, run, item);
+      const createdItem = findCreatedWorkItem(workItems, session.workItems, item);
       setProjects(session.projects);
       setRequirements(session.requirements);
       setWorkItems(session.workItems);
       setMissionState(session.missionState);
 
-      setSelectedWorkItemId(item.id);
+      setSelectedWorkItemId(createdItem?.id ?? item.id);
       setShowInlineCreate(false);
       setNewItemTitle("");
       setNewItemDescription("");
@@ -2110,7 +2214,7 @@ function App() {
       return;
     }
 
-    const runner: MissionControlRunnerPreset =
+    const runner: RunnerPreset =
       runnerPreset === "local-proof" && hasCodeTarget ? "demo-code" : runnerPreset;
     setRunningWorkItemId(item.id);
     setRunnerMessage(`Preparing ${item.key} for ${runner}...`);
@@ -2230,7 +2334,21 @@ function App() {
       setProviderFeedback("Fill Feishu binding details, then save and test the connection.");
       return;
     }
-    setConnections((current) => grantProviderConnection(current, provider.id));
+    if (provider.id === "ci") {
+      const message = "CI evidence is read from repository checks after GitHub is connected; there is no separate local CI permission to grant.";
+      setProviderFeedback(message);
+      setRunnerMessage(message);
+      return;
+    }
+    if (provider.id === "google") {
+      const message = "Local-first sign-in is not enabled in this build. Configure an OAuth app before opening an identity flow.";
+      setProviderFeedback(message);
+      setRunnerMessage(message);
+      return;
+    }
+    const message = `${provider.name} does not have a local connection command in this build. Configure the backed integration before using it.`;
+    setProviderFeedback(message);
+    setRunnerMessage(message);
   }
 
   async function saveGitHubOAuthConfig() {
@@ -2274,7 +2392,22 @@ function App() {
   }
 
   function disconnectProvider(providerId: ProviderId) {
-    setConnections((current) => revokeProviderConnection(current, providerId));
+    if (providerId === "github" && missionControlApiUrl) {
+      const message = "GitHub access is backed by the local gh CLI. Run gh auth logout outside Omega, then check GitHub status again.";
+      setProviderFeedback(message);
+      setRunnerMessage(message);
+      return;
+    }
+    if (providerId === "ci") {
+      const message = "CI status is derived from GitHub checks and cannot be disconnected separately.";
+      setProviderFeedback(message);
+      setRunnerMessage(message);
+      return;
+    }
+    const provider = connectionProviders.find((candidate) => candidate.id === providerId);
+    const message = `${provider?.name ?? providerId} is controlled by its backed integration; no local-only disconnect was performed.`;
+    setProviderFeedback(message);
+    setRunnerMessage(message);
   }
 
   function openInspectorPanel(panel: InspectorPanel) {
@@ -2603,15 +2736,16 @@ function App() {
     if (!missionControlApiUrl) return;
     const target = repositoryTargets.find((candidate) => candidate.id === targetId);
     if (!target) return;
-    const label = target.kind === "github" ? `${target.owner}/${target.repo}` : target.path;
+    const label = target.kind === "github" ? `${target.owner}/${target.repo}` : target.path || target.id;
     const current = watcherByRepositoryTargetId.get(targetId);
     const nextStatus = current?.status === "active" ? "paused" : "active";
-    setSyncingRepositoryKey(label);
-	    setRepositorySyncMessage(
-	      nextStatus === "active"
-	        ? `Auto processing enabled for ${label}. Omega will start Not Started work items and scan ready GitHub issues when available.`
-	        : `Auto processing paused for ${label}.`
-	    );
+    setAutoRunBusyTargetId(targetId);
+    setRepositorySyncMessage(
+      nextStatus === "active"
+        ? `Enabling Auto run for ${label} and scanning now...`
+        : `Pausing Auto run for ${label}...`
+    );
+    setRunnerMessage(nextStatus === "active" ? `Auto run is scanning ${label}...` : `Pausing Auto run for ${label}...`);
     try {
       const watcher = await updateOrchestratorWatcher(missionControlApiUrl, targetId, {
         status: nextStatus,
@@ -2625,6 +2759,22 @@ function App() {
         const rest = currentWatchers.filter((candidate) => candidate.repositoryTargetId !== targetId);
         return [...rest, watcher];
       });
+      if (nextStatus === "active") {
+        const result = await runOrchestratorTick(missionControlApiUrl, {
+          repositoryTargetId: targetId,
+          autoRun: true,
+          autoApproveHuman: watcher.autoApproveHuman === true,
+          autoMerge: watcher.autoMerge === true,
+          limit: watcher.limit || "20"
+        });
+        const message = autoRunResultMessage(label, result);
+        setRepositorySyncMessage(message);
+        setRunnerMessage(message);
+      } else {
+        const message = `Auto run paused for ${label}.`;
+        setRepositorySyncMessage(message);
+        setRunnerMessage(message);
+      }
       await refreshWorkspaceState().catch((error) => {
         console.warn("Workspace refresh after watcher update failed", error);
       });
@@ -2636,7 +2786,42 @@ function App() {
       setRepositorySyncMessage(message);
       setRunnerMessage(message);
     } finally {
-      setSyncingRepositoryKey("");
+      setAutoRunBusyTargetId("");
+    }
+  }
+
+  async function runRepositoryAutoProcessingNow(targetId: string) {
+    if (!missionControlApiUrl) return;
+    const target = repositoryTargets.find((candidate) => candidate.id === targetId);
+    if (!target) return;
+    const label = target.kind === "github" ? `${target.owner}/${target.repo}` : target.path || target.id;
+    const watcher = watcherByRepositoryTargetId.get(targetId);
+    setAutoRunBusyTargetId(targetId);
+    setRepositorySyncMessage(`Scanning ${label} for Not Started work items and ready GitHub issues...`);
+    setRunnerMessage(`Auto run is scanning ${label}...`);
+    try {
+      const result = await runOrchestratorTick(missionControlApiUrl, {
+        repositoryTargetId: targetId,
+        autoRun: true,
+        autoApproveHuman: watcher?.autoApproveHuman === true,
+        autoMerge: watcher?.autoMerge === true,
+        limit: watcher?.limit || "20"
+      });
+      const message = autoRunResultMessage(label, result);
+      setRepositorySyncMessage(message);
+      setRunnerMessage(message);
+      await refreshWorkspaceState().catch((error) => {
+        console.warn("Workspace refresh after manual auto run failed", error);
+      });
+      await refreshControlPlane().catch((error) => {
+        console.warn("Control plane refresh after manual auto run failed", error);
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Auto run scan failed.";
+      setRepositorySyncMessage(message);
+      setRunnerMessage(message);
+    } finally {
+      setAutoRunBusyTargetId("");
     }
   }
 
@@ -3461,7 +3646,7 @@ function App() {
                     </label>
                     <label>
                       <span>Local runner</span>
-                      <select value={localRunner} onChange={(event) => setLocalRunner(event.currentTarget.value as MissionControlRunnerPreset)}>
+                      <select value={localRunner} onChange={(event) => setLocalRunner(event.currentTarget.value as RunnerPreset)}>
                         <option value="local-proof">local-proof</option>
                         <option value="demo-code" disabled={!localCapabilities.some((capability) => capability.id === "git" && capability.available)}>
                           demo-code
@@ -3910,19 +4095,31 @@ function App() {
 	                            : t("Off · manual run only")}
 	                        </small>
 	                      </span>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={activeRepositoryWatcherActive}
-	                        aria-label="Auto run Not Started work items"
-	                        className={activeRepositoryWatcherActive ? "workspace-switch active" : "workspace-switch"}
-	                        disabled={syncingRepositoryKey === activeRepositoryWorkspaceKey}
-                        onClick={() => {
-                          void toggleRepositoryAutoProcessing(activeRepositoryWorkspace.id);
-                        }}
-                      >
-                        <span />
-                      </button>
+                      <div className="workspace-management-actions">
+                        <button
+                          type="button"
+                          className="workspace-run-now-action"
+                          disabled={autoRunBusyTargetId === activeRepositoryWorkspace.id}
+                          onClick={() => {
+                            void runRepositoryAutoProcessingNow(activeRepositoryWorkspace.id);
+                          }}
+                        >
+                          {autoRunBusyTargetId === activeRepositoryWorkspace.id ? t("Scanning...") : t("Run now")}
+                        </button>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={activeRepositoryWatcherActive}
+                          aria-label="Auto run Not Started work items"
+                          className={activeRepositoryWatcherActive ? "workspace-switch active" : "workspace-switch"}
+                          disabled={autoRunBusyTargetId === activeRepositoryWorkspace.id}
+                          onClick={() => {
+                            void toggleRepositoryAutoProcessing(activeRepositoryWorkspace.id);
+                          }}
+                        >
+                          <span />
+                        </button>
+                      </div>
                     </div>
                     <div className="workspace-management-row danger-zone">
                       <span>
@@ -3963,6 +4160,7 @@ function App() {
               testingAgentProfileId={testingAgentProfileId}
               localCapabilities={localCapabilities}
               pipelineTemplates={pipelineTemplates}
+              workflowTemplates={workflowTemplates}
               primaryProjectName={primaryProject?.name ?? "Omega"}
               runnerCredentials={runnerCredentials}
               runtimeConfigTab={runtimeConfigTab}

@@ -34,7 +34,9 @@
 
 ## 为什么 Delivery 不直接合并
 
-Delivery Agent 负责把 PR、diff、测试、review、TODO 复核和风险整理成可交接内容。真正的 merge、checkpoint approve/request changes、GitHub API 调用仍由 runtime 执行，因为这些动作需要幂等、权限检查和可恢复状态机。
+Delivery Agent 负责把 PR、diff、测试、review、TODO 复核和风险整理成可交接内容。进入 Human Review 前，runtime 会把 `handoff-bundle.json` 交给 Delivery Agent，要求它只基于 Omega 已捕获的 requirement、solution plan、review packet、PR、测试 / CI 和 changed files 证据生成审核简报；简报会回填到 review packet，并同步进入飞书卡片、文档、普通文本和 Task description。
+
+真正的 merge、checkpoint approve/request changes、GitHub API 调用仍由 runtime 执行，因为这些动作需要幂等、权限检查和可恢复状态机。Delivery Agent 不允许改写风险等级、TODO 状态、审批结论或部署状态，只能说明审核人应该重点确认什么。
 
 ## 当前 proof 文件
 
@@ -44,7 +46,7 @@ Delivery Agent 负责把 PR、diff、测试、review、TODO 复核和风险整�
 - Coding: `coding-prompt.md` + `coding-agent-note.md` + `git-diff.patch` + `implementation-summary.md`
 - Testing: `test-report.md` / `test-report-rework-*.md`
 - Review: `review-*.md`
-- Human Review: `human-review-request.md` + `review-packet.md`
+- Human Review: `human-review-request.md` + `review-packet.md` + review packet 中的 `humanReviewBrief`
 - Delivery: `handoff-bundle.json` + `delivery-handoff.md`
 
 ## 验证建议

@@ -3323,6 +3323,21 @@ kbd {
   border-radius: 999px;
 }
 
+.agent-test-action {
+  border-color: #d7e3f2;
+  background: #ffffff;
+  color: #172033;
+  font-weight: 800;
+  box-shadow: 0 8px 18px rgba(44, 78, 134, 0.06);
+}
+
+.agent-test-action:hover:not(:disabled),
+.agent-test-action:focus-visible:not(:disabled) {
+  border-color: #9bbcff;
+  background: #f4f8ff;
+  color: #1d4ed8;
+}
+
 .agent-preflight-result {
   display: grid;
   gap: 3px;
@@ -3885,6 +3900,31 @@ kbd {
 .workspace-management-row small {
   color: #8a8a93;
   line-height: 1.35;
+}
+
+.workspace-management-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.workspace-run-now-action {
+  min-height: 38px;
+  border: 1px solid #2d6bff;
+  border-radius: 999px;
+  padding: 0 16px;
+  background: rgba(45, 107, 255, 0.12);
+  color: #dce8ff;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.workspace-run-now-action:hover:not(:disabled),
+.workspace-run-now-action:focus-visible {
+  border-color: #76a4ff;
+  background: rgba(45, 107, 255, 0.2);
+  color: #ffffff;
 }
 
 .workspace-delete-checkbox {
@@ -8848,6 +8888,19 @@ kbd,
   color: #667085;
 }
 
+.product-shell.theme-light .workspace-run-now-action {
+  border-color: #b7ccff;
+  background: #eef5ff;
+  color: #1d5ee8;
+}
+
+.product-shell.theme-light .workspace-run-now-action:hover:not(:disabled),
+.product-shell.theme-light .workspace-run-now-action:focus-visible {
+  border-color: #6f9fff;
+  background: #e2eeff;
+  color: #1648b8;
+}
+
 .product-shell.theme-light .workspace-delete-checkbox {
   color: #475467;
 }
@@ -9968,10 +10021,26 @@ kbd,
   height: 100%;
   min-width: 10px;
   display: block;
+  position: relative;
   border-radius: inherit;
   background: linear-gradient(90deg, #2f6df6, #4ccf8a);
   box-shadow: 0 0 16px rgba(47, 109, 246, 0.28);
   transition: width 180ms ease;
+  overflow: hidden;
+}
+
+.issue-progress-track.stage-running {
+  border-color: rgba(47, 109, 246, 0.48);
+  animation: omega-running-pulse 1.6s ease-in-out infinite;
+}
+
+.issue-progress-track.stage-running .issue-progress-rail span::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.62), transparent);
+  transform: translateX(-65%);
+  animation: omega-active-sweep 1.2s ease-in-out infinite;
 }
 
 .issue-progress-track.stage-needs-human .issue-progress-rail span {
@@ -10871,6 +10940,20 @@ kbd,
   color: #f8fafc;
   box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.22);
   outline: none;
+}
+
+.product-shell.theme-dark .agent-test-action {
+  border-color: #334155;
+  background: #111827;
+  color: #e6edf3;
+  box-shadow: none;
+}
+
+.product-shell.theme-dark .agent-test-action:hover:not(:disabled),
+.product-shell.theme-dark .agent-test-action:focus-visible:not(:disabled) {
+  border-color: #60a5fa;
+  background: #172033;
+  color: #f8fafc;
 }
 
 .product-shell.theme-dark .sidebar-section summary,

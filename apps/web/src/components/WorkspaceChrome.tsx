@@ -53,11 +53,11 @@ type WorkspaceChromeProps = {
 };
 const omegaLogoSrc = `${import.meta.env.BASE_URL}omega-logo.png`;
 
-export function primaryNavLabel(nav: PrimaryNav) {
+function primaryNavLabel(nav: PrimaryNav) {
   return nav === "Issues" ? "Work items" : nav;
 }
 
-export function topbarSearchPlaceholder(nav: PrimaryNav) {
+function topbarSearchPlaceholder(nav: PrimaryNav) {
   if (nav === "Issues") return "Search work items...";
   if (nav === "Page Pilot") return "Search Page Pilot runs...";
   if (nav === "Settings") return "Search settings...";

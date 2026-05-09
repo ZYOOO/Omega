@@ -405,18 +405,20 @@ function buildPreviewRuntimePlan(input = {}) {
   const repoPath = path.resolve(env.OMEGA_PREVIEW_REPO_PATH || env.OMEGA_PAGE_PILOT_REPO_PATH || "");
   const previewUrl = env.OMEGA_PREVIEW_URL || env.OMEGA_PAGE_PILOT_URL || DEFAULT_PREVIEW_URL;
   const port = Number(env.OMEGA_PREVIEW_PORT || new URL(previewUrl).port || "5173");
+  const previewWorkspaceRoot = env.OMEGA_PAGE_PILOT_WORKSPACE_ROOT || "";
 
   if (!env.OMEGA_PREVIEW_REPO_PATH && !env.OMEGA_PAGE_PILOT_REPO_PATH) {
-    return { enabled: false, reason: "OMEGA_PREVIEW_REPO_PATH is not set", previewUrl };
+    return { enabled: false, reason: "OMEGA_PREVIEW_REPO_PATH is not set", previewUrl, previewWorkspaceRoot };
   }
   if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
-    return { enabled: false, reason: `preview repository path does not exist: ${repoPath}`, previewUrl, repoPath };
+    return { enabled: false, reason: `preview repository path does not exist: ${repoPath}`, previewUrl, repoPath, previewWorkspaceRoot };
   }
   if (env.OMEGA_PREVIEW_COMMAND) {
     return {
       enabled: true,
       repoPath,
       previewUrl,
+      previewWorkspaceRoot,
       command: env.OMEGA_PREVIEW_COMMAND,
       args: [],
       shell: true,
@@ -437,6 +439,7 @@ function buildPreviewRuntimePlan(input = {}) {
       enabled: true,
       repoPath,
       previewUrl,
+      previewWorkspaceRoot,
       ...packageManagerCommand(packageManager, script, scripts[script], port),
       source: `${packageManager}:${script}`,
     };
@@ -447,6 +450,7 @@ function buildPreviewRuntimePlan(input = {}) {
       enabled: true,
       repoPath,
       previewUrl,
+      previewWorkspaceRoot,
       command: "python3",
       args: ["-m", "http.server", String(port), "--bind", "127.0.0.1"],
       shell: false,
@@ -454,7 +458,7 @@ function buildPreviewRuntimePlan(input = {}) {
     };
   }
 
-  return { enabled: false, reason: "no preview command could be detected", previewUrl, repoPath };
+  return { enabled: false, reason: "no preview command could be detected", previewUrl, repoPath, previewWorkspaceRoot };
 }
 
 function previewRuntimeEvidence(repoPath) {
@@ -798,6 +802,13 @@ async function ensureService(service, plan, options = {}) {
     if (service === "runtime" && plan.managePortConflicts) {
       stopStaleRuntimeListeners(plan, url);
     }
+    if (service === "preview-runtime") {
+      const guard = reconcilePreviewRuntimeListeners(plan, url);
+      if (!guard.ok) {
+        logService(service, "port ownership blocked", guard.error || url);
+        return { service, status: "failed", url, plan, error: guard.error };
+      }
+    }
     const probe = await httpGetStatus(url, options.requestTimeoutMs ?? 1000);
     if (probe.ok) {
       logService(service, "already running", url);
@@ -823,6 +834,51 @@ async function ensureService(service, plan, options = {}) {
   child.status = "running";
   logService(service, "ready", url);
   return { service, status: "running", url, child, plan };
+}
+
+function reconcilePreviewRuntimeListeners(plan, rawUrl, env = process.env) {
+  const repoPath = plan.repoRoot || plan.repoPath;
+  if (!repoPath || !rawUrl) return { ok: true };
+  let port = "";
+  let hostname = "";
+  try {
+    const parsed = new URL(rawUrl);
+    port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    hostname = parsed.hostname;
+  } catch (_error) {
+    return { ok: true };
+  }
+  if (!port || !["127.0.0.1", "localhost", "::1"].includes(hostname)) return { ok: true };
+  let output = "";
+  try {
+    output = execFileSync("lsof", ["-nP", `-tiTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+  } catch (_error) {
+    return { ok: true };
+  }
+  const expectedRepoPath = normalizeComparablePath(repoPath);
+  const managedRoot = normalizeComparablePath(plan.previewWorkspaceRoot || env.OMEGA_PAGE_PILOT_WORKSPACE_ROOT || path.join(os.homedir(), "Omega", "workspaces", "page-pilot"));
+  for (const rawPid of output.split(/\s+/).filter(Boolean)) {
+    const pid = Number(rawPid);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const cwd = processCwd(pid);
+    const normalizedCwd = normalizeComparablePath(cwd || "");
+    if (normalizedCwd && normalizedCwd === expectedRepoPath) continue;
+    if (normalizedCwd && managedRoot && isPathWithin(normalizedCwd, managedRoot)) {
+      try {
+        process.kill(pid, "SIGKILL");
+        sleepSync(120);
+        logService("preview-runtime", "stopped mismatched workspace listener", `pid=${pid} port=${port} cwd=${cwd}`);
+      } catch (_error) {
+        return { ok: false, error: `preview port ${port} is used by another Page Pilot workspace and could not be stopped: ${cwd || `pid ${pid}`}` };
+      }
+      continue;
+    }
+    return {
+      ok: false,
+      error: `preview port ${port} is already used by another process${cwd ? ` in ${cwd}` : ""}; stop it or choose another preview URL before opening Page Pilot.`,
+    };
+  }
+  return { ok: true };
 }
 
 function stopStalePreviewRuntimeListeners(plan, rawUrl) {
@@ -933,6 +989,16 @@ function normalizeComparablePath(value) {
   } catch (_error) {
     return path.resolve(value);
   }
+}
+
+function isPathWithin(candidate, root) {
+  if (!candidate || !root) return false;
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 async function startDesktopServices(app, env = process.env) {

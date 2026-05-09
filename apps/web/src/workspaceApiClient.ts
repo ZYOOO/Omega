@@ -1,6 +1,6 @@
 import type { Mission, PipelineRun, WorkItem, WorkspaceDatabase, WorkspaceSession } from "./core";
-import { databaseFromWorkspaceSession, workspaceSessionFromDatabase } from "./core";
-import type { MissionControlRunnerPreset, RunOperationViaMissionControlApiResponse } from "./missionControlApiClient";
+import { workspaceSessionFromDatabase } from "./core";
+import type { RunnerPreset, RunOperationResponse } from "./runnerTypes";
 
 export async function fetchWorkspaceSession(
   apiUrl: string,
@@ -17,23 +17,6 @@ export async function fetchWorkspaceSession(
 
   const database = await response.json() as WorkspaceDatabase;
   return workspaceSessionFromDatabase(run, database);
-}
-
-export async function persistWorkspaceSession(
-  apiUrl: string,
-  run: PipelineRun,
-  session: WorkspaceSession,
-  fetchImpl: typeof fetch = fetch
-): Promise<void> {
-  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/workspace`, {
-    method: "PUT",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(databaseFromWorkspaceSession(run, session))
-  });
-
-  if (!response.ok) {
-    throw new Error(`Workspace API save failed: ${response.status}`);
-  }
 }
 
 export async function createWorkItemViaApi(
@@ -77,15 +60,6 @@ export async function createProjectViaApi(
   }
 
   return workspaceSessionFromDatabase(run, await response.json() as WorkspaceDatabase);
-}
-
-export async function saveWorkspaceSessionViaApi(
-  apiUrl: string,
-  run: PipelineRun,
-  session: WorkspaceSession,
-  fetchImpl: typeof fetch = fetch
-): Promise<void> {
-  await persistWorkspaceSession(apiUrl, run, session, fetchImpl);
 }
 
 export async function patchWorkItemViaApi(
@@ -221,9 +195,9 @@ export async function runOperationViaWorkspaceApi(
   apiUrl: string,
   mission: Mission,
   operationId: string,
-  runner: MissionControlRunnerPreset,
+  runner: RunnerPreset,
   fetchImpl: typeof fetch = fetch
-): Promise<RunOperationViaMissionControlApiResponse> {
+): Promise<RunOperationResponse> {
   const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/operations/run`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -238,7 +212,7 @@ export async function runOperationViaWorkspaceApi(
     throw new Error(`Run operation API failed: ${response.status}`);
   }
 
-  return response.json() as Promise<RunOperationViaMissionControlApiResponse>;
+  return response.json() as Promise<RunOperationResponse>;
 }
 
 export async function fetchMissionFromWorkItem(

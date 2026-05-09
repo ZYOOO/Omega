@@ -57,6 +57,8 @@ const zhCN: Record<string, string> = {
   "Operations": "操作",
   "Auto scan": "自动扫描",
   "Auto run": "自动运行",
+  "Run now": "立即运行",
+  "Scanning...": "扫描中...",
   "On · ready issues can start": "开启 · ready issue 可自动启动",
   "On · Not Started and ready issues can run": "开启 · 未开始工作项和 ready issue 会自动运行",
   "On · Not Started items can run": "开启 · 未开始工作项会自动运行",
@@ -530,7 +532,7 @@ const dictionaries: Record<UiLanguage, Record<string, string>> = {
   "zh-CN": zhCN
 };
 
-export function normalizeUiLanguage(value: string | undefined | null): UiLanguage {
+function normalizeUiLanguage(value: string | undefined | null): UiLanguage {
   return value === "zh-CN" || value === "zh" || value === "zh_CN" ? "zh-CN" : "en";
 }
 

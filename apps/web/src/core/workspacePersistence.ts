@@ -1,12 +1,12 @@
 import type { ConnectionState, ProviderId } from "./connections";
 import { connectionProviders, createInitialConnectionState } from "./connections";
-import { applyMissionControlEvents, createMissionControlState, type MissionControlState } from "./missionControlState";
+import { createMissionControlState, type MissionControlState } from "./missionControlState";
 import type { SyncIntent, MissionEvent } from "./missionEvents";
 import type { Mission } from "./mission";
 import { createWorkboardProject, type WorkItem, type WorkItemStatus, type WorkboardProject } from "./workboard";
 import type { PipelineRun, PipelineStageId } from "./types";
 
-export const workspacePersistenceSchemaVersion = 1;
+const workspacePersistenceSchemaVersion = 1;
 
 export type InspectorPanelPersistence = "properties" | "provider" | "agents";
 export type PrimaryNavPersistence = "Projects" | "Views" | "Issues" | "Page Pilot";
@@ -197,27 +197,11 @@ export interface WorkspaceSession {
   collapsedGroups: WorkItemStatus[];
 }
 
-export const workspaceTableDesign = {
-  projects: "Product or engineering goals that can bind one or more repository targets.",
-  requirements: "User needs or imported external issues that own one or more executable work items.",
-  workItems: "Workboard items under a project; each can start one or more pipeline runs.",
-  missionControlStates: "Current reducer state for each mission control run.",
-  missionEvents: "Append-only operation/checkpoint event log.",
-  syncIntents: "Planned connector sync actions derived from mission events.",
-  connections: "Provider connection state and granted permissions.",
-  uiPreferences: "Durable user workspace preferences.",
-  pipelines: "Pipeline lifecycle records linked to work items.",
-  checkpoints: "Human approval records linked to pipeline stages.",
-  missions: "Mission records linked to pipelines and work items.",
-  operations: "Operation execution records linked to missions.",
-  proofRecords: "Structured proof entries linked to operations."
-} as const;
-
 function storageKey(runId: string): string {
   return `omega.workspace.${runId}.v${workspacePersistenceSchemaVersion}`;
 }
 
-export function nowIso(): string {
+function nowIso(): string {
   return new Date().toISOString();
 }
 
@@ -467,215 +451,4 @@ export function saveWorkspaceSession(
   storage: Storage = window.localStorage
 ): void {
   storage.setItem(storageKey(run.id), JSON.stringify(databaseFromWorkspaceSession(run, session)));
-}
-
-export function appendWorkItemToDatabase(database: WorkspaceDatabase, item: WorkItem): WorkspaceDatabase {
-  const timestamp = nowIso();
-  const projectId = database.tables.projects[0]?.id ?? "project_unknown";
-  const normalized = normalizeWorkItem(item);
-  const record: WorkItemRecord = {
-    ...normalized,
-    projectId,
-    createdAt: timestamp,
-    updatedAt: timestamp
-  };
-
-  const nextMissionState = database.tables.missionControlStates[0]
-    ? {
-        ...database.tables.missionControlStates[0],
-        workItems: [...database.tables.missionControlStates[0].workItems.map(normalizeWorkItem), normalized],
-        updatedAt: timestamp
-      }
-    : undefined;
-
-  return {
-    ...database,
-    savedAt: timestamp,
-    tables: {
-      ...database.tables,
-      requirements: database.tables.requirements ?? [],
-      workItems: [...(database.tables.workItems ?? []), record],
-      missionControlStates: nextMissionState ? [nextMissionState] : database.tables.missionControlStates
-    }
-  };
-}
-
-export function updateWorkItemInDatabase(
-  database: WorkspaceDatabase,
-  itemId: string,
-  patch: Partial<Pick<WorkItem, "status" | "priority">>
-): WorkspaceDatabase {
-  const timestamp = nowIso();
-  const workItems = database.tables.workItems.map((item) =>
-    item.id === itemId ? { ...item, ...patch, updatedAt: timestamp } : item
-  );
-  const missionControlStates = database.tables.missionControlStates.map((state) => ({
-    ...state,
-    workItems: state.workItems.map((item) => (item.id === itemId ? { ...item, ...patch } : item)),
-    updatedAt: timestamp
-  }));
-
-  return {
-    ...database,
-    savedAt: timestamp,
-    tables: {
-      ...database.tables,
-      workItems,
-      missionControlStates
-    }
-  };
-}
-
-export function deleteWorkItemFromDatabase(database: WorkspaceDatabase, itemId: string): WorkspaceDatabase {
-  const timestamp = nowIso();
-  const item = database.tables.workItems.find((candidate) => candidate.id === itemId);
-  const workItems = database.tables.workItems.filter((candidate) => candidate.id !== itemId);
-  const requirementId = item?.requirementId;
-  const requirements =
-    requirementId && !workItems.some((candidate) => candidate.requirementId === requirementId)
-      ? database.tables.requirements.filter((requirement) => requirement.id !== requirementId)
-      : database.tables.requirements;
-  const missionControlStates = database.tables.missionControlStates.map((state) => ({
-    ...state,
-    workItems: state.workItems.filter((candidate) => candidate.id !== itemId),
-    updatedAt: timestamp
-  }));
-
-  return {
-    ...database,
-    savedAt: timestamp,
-    tables: {
-      ...database.tables,
-      requirements,
-      workItems,
-      missionControlStates
-    }
-  };
-}
-
-export function applyMissionEventsToDatabase(
-  database: WorkspaceDatabase,
-  events: MissionEvent[]
-): WorkspaceDatabase {
-  const currentState = database.tables.missionControlStates[0];
-  if (!currentState) {
-    return database;
-  }
-
-  const timestamp = nowIso();
-  const nextState = applyMissionControlEvents(
-    {
-      runId: currentState.runId,
-      workItems: currentState.workItems,
-      events: currentState.events,
-      syncIntents: currentState.syncIntents
-    },
-    events
-  );
-
-  return {
-    ...database,
-    savedAt: timestamp,
-    tables: {
-      ...database.tables,
-      workItems: database.tables.workItems.map((record) => {
-        const next = nextState.workItems.find((item) => item.id === record.id);
-        return next ? { ...record, ...next, updatedAt: timestamp } : record;
-      }),
-      missionControlStates: [
-        {
-          ...currentState,
-          workItems: nextState.workItems,
-          events: nextState.events,
-          syncIntents: nextState.syncIntents,
-          updatedAt: timestamp
-        }
-      ],
-      missionEvents: eventRecordsFromState(nextState.runId, nextState.events),
-      syncIntents: syncIntentRecordsFromState(nextState.runId, nextState.syncIntents)
-    }
-  };
-}
-
-export function appendPipelineToDatabase(database: WorkspaceDatabase, pipeline: PipelineRecord): WorkspaceDatabase {
-  return {
-    ...database,
-    savedAt: nowIso(),
-    tables: {
-      ...database.tables,
-      pipelines: [...(database.tables.pipelines ?? []), pipeline]
-    }
-  };
-}
-
-export function updatePipelineInDatabase(
-  database: WorkspaceDatabase,
-  pipelineId: string,
-  updater: (pipeline: PipelineRecord) => PipelineRecord
-): WorkspaceDatabase {
-  return {
-    ...database,
-    savedAt: nowIso(),
-    tables: {
-      ...database.tables,
-      pipelines: (database.tables.pipelines ?? []).map((pipeline) =>
-        pipeline.id === pipelineId ? updater(pipeline) : pipeline
-      )
-    }
-  };
-}
-
-export function upsertCheckpointInDatabase(
-  database: WorkspaceDatabase,
-  checkpoint: CheckpointRecord
-): WorkspaceDatabase {
-  const checkpoints = database.tables.checkpoints ?? [];
-  const exists = checkpoints.some((candidate) => candidate.id === checkpoint.id);
-  return {
-    ...database,
-    savedAt: nowIso(),
-    tables: {
-      ...database.tables,
-      checkpoints: exists
-        ? checkpoints.map((candidate) => (candidate.id === checkpoint.id ? checkpoint : candidate))
-        : [...checkpoints, checkpoint]
-    }
-  };
-}
-
-export function appendMissionToDatabase(database: WorkspaceDatabase, mission: MissionRecord): WorkspaceDatabase {
-  return {
-    ...database,
-    savedAt: nowIso(),
-    tables: {
-      ...database.tables,
-      missions: [...(database.tables.missions ?? []), mission]
-    }
-  };
-}
-
-export function upsertOperationInDatabase(database: WorkspaceDatabase, operation: OperationRecord): WorkspaceDatabase {
-  const operations = database.tables.operations ?? [];
-  const exists = operations.some((candidate) => candidate.id === operation.id);
-  return {
-    ...database,
-    savedAt: nowIso(),
-    tables: {
-      ...database.tables,
-      operations: exists
-        ? operations.map((candidate) => (candidate.id === operation.id ? operation : candidate))
-        : [...operations, operation]
-    }
-  };
-}
-
-export function appendProofRecordToDatabase(database: WorkspaceDatabase, proofRecord: ProofRecord): WorkspaceDatabase {
-  return {
-    ...database,
-    savedAt: nowIso(),
-    tables: {
-      ...database.tables,
-      proofRecords: [...(database.tables.proofRecords ?? []), proofRecord]
-    }
-  };
 }

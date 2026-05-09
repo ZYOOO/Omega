@@ -254,6 +254,75 @@ func TestCreateWorkItemStoresMasterRequirementDispatch(t *testing.T) {
 	}
 }
 
+func TestCreateWorkItemRejectsUnknownRepositoryTarget(t *testing.T) {
+	api, repo := newTestAPI(t)
+	seedWorkspace(t, repo)
+
+	item := map[string]any{
+		"id": "item_bad_target", "key": "OMG-101", "title": "Bad target", "description": "Must not bind to a missing repository.",
+		"status": "Ready", "assignee": "requirement", "repositoryTargetId": "repo_missing", "target": "No target",
+	}
+	response := postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create item status = %d", response.StatusCode)
+	}
+
+	loaded, err := repo.LoadWorkspaceSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findByID(loaded.Tables.WorkItems, "item_bad_target") >= 0 {
+		t.Fatalf("unknown repository target item should not persist: %+v", loaded.Tables.WorkItems)
+	}
+}
+
+func TestCreateWorkItemUsesRepositoryTargetProject(t *testing.T) {
+	api, repo := newTestAPI(t)
+	database := defaultWorkspaceDatabase()
+	timestamp := nowISO()
+	database.Tables.Projects = []map[string]any{
+		{"id": "project_first", "name": "First", "status": "Active", "labels": []any{}, "createdAt": timestamp, "updatedAt": timestamp},
+		{"id": "project_repo", "name": "Repo Project", "status": "Active", "labels": []any{}, "repositoryTargets": []any{
+			map[string]any{"id": "repo_demo", "kind": "github", "owner": "ZYOOO", "repo": "DemoRepo", "url": "https://github.com/ZYOOO/DemoRepo", "defaultBranch": "main"},
+		}, "createdAt": timestamp, "updatedAt": timestamp},
+	}
+	database.Tables.WorkItems = nil
+	database.Tables.Requirements = nil
+	database.Tables.MissionControlStates = []map[string]any{{"runId": "run_demo", "projectId": "project_repo", "workItems": []any{}, "events": []any{}, "syncIntents": []any{}, "updatedAt": timestamp}}
+	if err := repo.Save(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+
+	item := map[string]any{
+		"id": "item_repo_project", "key": "OMG-102", "title": "Repo scoped item", "description": "Should inherit the repository target project.",
+		"status": "Ready", "assignee": "requirement", "repositoryTargetId": "repo_demo", "target": "No target",
+	}
+	response := postJSON(t, api.URL+"/work-items", map[string]any{"item": item})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("create item status = %d", response.StatusCode)
+	}
+
+	var next WorkspaceDatabase
+	decode(t, response, &next)
+	stored := findWorkItem(next, "item_repo_project")
+	if stored == nil {
+		t.Fatalf("created item missing: %+v", next.Tables.WorkItems)
+	}
+	if text(stored, "projectId") != "project_repo" || text(stored, "target") != "ZYOOO/DemoRepo" {
+		t.Fatalf("created item was not repository scoped: %+v", stored)
+	}
+	var requirement map[string]any
+	for _, candidate := range next.Tables.Requirements {
+		if text(candidate, "id") == text(stored, "requirementId") {
+			requirement = candidate
+			break
+		}
+	}
+	if requirement == nil || text(requirement, "projectId") != "project_repo" || text(requirement, "repositoryTargetId") != "repo_demo" {
+		t.Fatalf("requirement scope mismatch: %+v", requirement)
+	}
+}
+
 func TestPipelineTemplateIncludesAgentContractsDependenciesAndDataFlow(t *testing.T) {
 	template := findPipelineTemplate("feature")
 	if template == nil {
@@ -1204,6 +1273,14 @@ func TestRenderFeishuReviewTextUsesPlainFeishuText(t *testing.T) {
 		},
 		"reviewPacket": map[string]any{
 			"summary": "Validation passed.",
+			"solutionPlan": map[string]any{
+				"summary": "Update reviewer context before approval.",
+				"excerpt": "## Solution Plan\n\nUse `src/App.tsx` and **review-card** data to show the plan before approval.",
+			},
+			"humanReviewBrief": map[string]any{
+				"summary": "Delivery Agent brief says review the validated PR evidence.",
+				"excerpt": "Delivery readiness: local validation passed; reviewer should confirm pending remote checks.",
+			},
 			"risk": map[string]any{
 				"level": "low",
 				"basis": []any{
@@ -1231,6 +1308,10 @@ func TestRenderFeishuReviewTextUsesPlainFeishuText(t *testing.T) {
 		"风险依据:",
 		"📋 需求摘要",
 		"🧾 Review packet",
+		"🧾 人工审核简报",
+		"Delivery readiness: local validation passed; reviewer should confirm pending remote checks.",
+		"🧭 方案计划",
+		"Use src/App.tsx and review-card data to show the plan before approval.",
 		"✅ Plan / TODO 复核",
 		"2/2 plan TODO(s) verified for Human Review.",
 		"🛠️ 审核动作",
@@ -1241,6 +1322,82 @@ func TestRenderFeishuReviewTextUsesPlainFeishuText(t *testing.T) {
 	}
 	if strings.Contains(message, "**") || strings.Contains(message, "`") {
 		t.Fatalf("plain Feishu review message should not expose markdown:\n%s", message)
+	}
+}
+
+func TestFeishuReviewPacketReadsSolutionPlanArtifact(t *testing.T) {
+	workspace := t.TempDir()
+	proofDir := filepath.Join(workspace, ".omega", "proof")
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(proofDir, "solution-plan.md")
+	if err := os.WriteFile(planPath, []byte("# Solution Plan\n\nImplement the reviewer-facing summary.\n\n## Functional TODO List\n\n- [x] Show solution plan in Feishu\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	attempt := map[string]any{"id": "attempt_plan", "workspacePath": workspace}
+	packet := feishuReviewPacketFromRecords(WorkspaceDatabase{}, map[string]any{}, map[string]any{}, map[string]any{}, attempt)
+	plan := mapValue(packet["solutionPlan"])
+	if text(plan, "sourcePath") != planPath {
+		t.Fatalf("solution plan source path = %+v", plan)
+	}
+	if !strings.Contains(text(plan, "excerpt"), "Show solution plan in Feishu") {
+		t.Fatalf("solution plan excerpt missing artifact content: %+v", plan)
+	}
+}
+
+func TestFeishuReviewPacketReadsHumanReviewBriefArtifact(t *testing.T) {
+	workspace := t.TempDir()
+	proofDir := filepath.Join(workspace, ".omega", "proof")
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	briefPath := filepath.Join(proofDir, "delivery-handoff.md")
+	if err := os.WriteFile(briefPath, []byte("# Human Review Handoff\n\nDelivery Agent says the PR is ready for reviewer verification.\n\n## Reviewer checks\n\n- Confirm pending remote checks.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	attempt := map[string]any{"id": "attempt_brief", "workspacePath": workspace}
+	packet := feishuReviewPacketFromRecords(WorkspaceDatabase{}, map[string]any{}, map[string]any{}, map[string]any{}, attempt)
+	brief := mapValue(packet["humanReviewBrief"])
+	if text(brief, "sourcePath") != briefPath {
+		t.Fatalf("human review brief source path = %+v", brief)
+	}
+	if !strings.Contains(text(brief, "excerpt"), "ready for reviewer verification") {
+		t.Fatalf("human review brief excerpt missing artifact content: %+v", brief)
+	}
+}
+
+func TestFeishuReviewSurfacesBriefAndSolutionPlanAcrossReviewFormats(t *testing.T) {
+	packet := map[string]any{
+		"item": map[string]any{"id": "item_plan", "key": "OMG-plan", "title": "Plan visibility", "description": "Review the solution plan."},
+		"attempt": map[string]any{
+			"pullRequestUrl": "https://github.com/ZYOOO/TestRepo/pull/88",
+			"branchName":     "omega/OMG-plan-devflow",
+		},
+		"reviewPacket": map[string]any{"summary": "Ready for review.", "risk": map[string]any{"level": "low"}},
+		"solutionPlan": map[string]any{
+			"summary": "Implement a reviewer-facing plan section.",
+			"excerpt": "Update Feishu card, task, and review doc with the solution plan.",
+		},
+		"humanReviewBrief": map[string]any{
+			"summary": "Delivery Agent prepared a concise reviewer brief.",
+			"excerpt": "Reviewer should verify CI, changed files, and risk basis before approving.",
+		},
+	}
+	cardRaw, _ := json.Marshal(buildFeishuReviewCardWithOptions(packet, feishuReviewSendOptions{Language: "zh-CN"}))
+	doc := buildFeishuReviewDocMarkdown(packet, "zh-CN")
+	taskDescription := renderFeishuReviewTaskDescriptionForLanguage(packet, "nonce_plan", map[string]any{}, "zh-CN")
+	for label, content := range map[string]string{
+		"card": string(cardRaw),
+		"doc":  doc,
+		"task": taskDescription,
+	} {
+		if !strings.Contains(content, "方案计划") || !strings.Contains(content, "Implement a reviewer-facing plan section.") {
+			t.Fatalf("%s missing solution plan:\n%s", label, content)
+		}
+		if !strings.Contains(content, "人工审核简报") || !strings.Contains(content, "Delivery Agent prepared a concise reviewer brief.") {
+			t.Fatalf("%s missing human review brief:\n%s", label, content)
+		}
 	}
 }
 
@@ -3524,6 +3681,77 @@ func TestApproveDevFlowCheckpointUsesLatestDeliverableAttempt(t *testing.T) {
 	}
 	if text(database.Tables.Checkpoints[0], "attemptId") != "attempt_latest_ready" {
 		t.Fatalf("checkpoint should be relinked to deliverable attempt: %+v", database.Tables.Checkpoints[0])
+	}
+}
+
+func TestApprovedDevFlowDeliveryMergeFailurePersistsBlockedState(t *testing.T) {
+	root := t.TempDir()
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	workspace := filepath.Join(root, "workspace", "OMG-merge-fail")
+	repoWorkspace := filepath.Join(workspace, "repo")
+	proofDir := filepath.Join(workspace, ".omega", "proof")
+	if err := os.MkdirAll(repoWorkspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(proofDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoWorkspace, "init")
+	runGit(t, repoWorkspace, "checkout", "-b", "main")
+	runGit(t, repoWorkspace, "config", "user.email", "omega-test@example.local")
+	runGit(t, repoWorkspace, "config", "user.name", "Omega Test")
+	if err := os.WriteFile(filepath.Join(repoWorkspace, "README.md"), []byte("demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoWorkspace, "add", ".")
+	runGit(t, repoWorkspace, "commit", "-m", "initial")
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{"merged": false}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	gh := filepath.Join(bin, "gh")
+	script := "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then\n  printf 'checks ok\\n'\n  exit 0\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then\n  printf 'X Pull request is not mergeable\\n'\n  exit 1\nfi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n  printf 'OPEN\\n'\n  exit 0\nfi\nexit 0\n"
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	item := map[string]any{"id": "item_merge_fail", "key": "OMG-merge-fail", "repositoryTargetId": "repo_merge_fail", "status": "In Review", "stageId": "human_review"}
+	pipeline := makePipelineWithTemplate(item, findPipelineTemplate("devflow-pr"))
+	pipeline["id"] = "pipeline_merge_fail"
+	pipeline["status"] = "running"
+	attempt := makeAttemptRecord(item, pipeline, "manual", "devflow-pr", "human_review")
+	attempt["id"] = "attempt_merge_fail"
+	attempt["status"] = "running"
+	attempt["currentStageId"] = "merging"
+	attempt["workspacePath"] = workspace
+	attempt["pullRequestUrl"] = "https://github.com/acme/demo/pull/5"
+	attempt["branchName"] = "omega/missing-merge-fail"
+	checkpoint := map[string]any{"id": "checkpoint_merge_fail", "pipelineId": text(pipeline, "id"), "attemptId": text(attempt, "id"), "stageId": "human_review", "status": "approved"}
+	database := WorkspaceDatabase{Tables: WorkspaceTables{
+		WorkItems:   []map[string]any{item},
+		Pipelines:   []map[string]any{pipeline},
+		Attempts:    []map[string]any{attempt},
+		Checkpoints: []map[string]any{checkpoint},
+	}}
+
+	err := server.completeApprovedDevFlowCheckpoint(&database, checkpoint, "alice")
+	if err == nil {
+		t.Fatal("expected merge failure")
+	}
+	server.markApprovedDevFlowDeliveryFailed(&database, checkpoint, err)
+	if text(database.Tables.Pipelines[0], "status") != "failed" || text(database.Tables.WorkItems[0], "status") != "Blocked" {
+		t.Fatalf("merge failure should block delivery: pipeline=%+v item=%+v", database.Tables.Pipelines[0], database.Tables.WorkItems[0])
+	}
+	if text(database.Tables.Attempts[0], "status") != "failed" || text(database.Tables.Attempts[0], "failureStageId") != "merging" {
+		t.Fatalf("attempt failure not persisted: %+v", database.Tables.Attempts[0])
+	}
+	if text(database.Tables.Checkpoints[0], "deliveryStatus") != "failed" {
+		t.Fatalf("checkpoint delivery failure missing: %+v", database.Tables.Checkpoints[0])
+	}
+	summary := server.scanApprovedDevFlowDeliveryContinuations(context.Background(), &database)
+	if intValue(summary["approvedDeliveryContinuations"]) != 0 {
+		t.Fatalf("failed merge should not be requeued: %+v", summary)
 	}
 }
 
@@ -9061,7 +9289,9 @@ func seedWorkspace(t *testing.T, repo *SQLiteRepository) {
 		SchemaVersion: 1,
 		SavedAt:       nowISO(),
 		Tables: WorkspaceTables{
-			Projects:             []map[string]any{{"id": "project_omega", "name": "Omega", "description": "Omega", "team": "Omega", "status": "Active", "labels": []any{}, "createdAt": nowISO(), "updatedAt": nowISO()}},
+			Projects: []map[string]any{{"id": "project_omega", "name": "Omega", "description": "Omega", "team": "Omega", "status": "Active", "labels": []any{}, "repositoryTargets": []any{
+				map[string]any{"id": "repo_ZYOOO_TestRepo", "kind": "github", "label": "ZYOOO/TestRepo", "owner": "ZYOOO", "repo": "TestRepo", "url": "https://github.com/ZYOOO/TestRepo", "defaultBranch": "main"},
+			}, "createdAt": nowISO(), "updatedAt": nowISO()}},
 			MissionControlStates: []map[string]any{{"runId": "run_req_omega_001", "projectId": "project_omega", "workItems": []any{}, "events": []any{}, "syncIntents": []any{}, "updatedAt": nowISO()}},
 			Connections:          []map[string]any{},
 			UIPreferences:        []map[string]any{},

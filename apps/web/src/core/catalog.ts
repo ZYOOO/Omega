@@ -1,4 +1,4 @@
-import type { Capability, PipelineStageId } from "./types";
+import type { Capability } from "./types";
 
 export const capabilityCatalog: Capability[] = [
   {
@@ -125,10 +125,4 @@ export const capabilityCatalog: Capability[] = [
 
 export function findCapability(id: string): Capability | undefined {
   return capabilityCatalog.find((capability) => capability.id === id);
-}
-
-export function recommendedCapabilitiesForStage(stageId: PipelineStageId): Capability[] {
-  return capabilityCatalog.filter((capability) =>
-    capability.recommendedStages.includes(stageId)
-  );
 }

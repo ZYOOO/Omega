@@ -72,11 +72,11 @@ func (server *Server) importAgentProfileTemplate(response http.ResponseWriter, r
 func (server *Server) agentProfileImportBasePath(ctx context.Context, source string, projectID string, repositoryTargetID string, basePath string) (string, error) {
 	switch source {
 	case "fixtures", "default":
-		root := omegaProjectRoot()
-		if root == "" {
+		fixturesPath, ok := omegaWorkflowFixturePath()
+		if !ok {
 			return "", fmt.Errorf("Omega project root not found; cannot load built-in workflow fixtures")
 		}
-		return filepath.Join(root, "docs", "test-workflow-fixtures"), nil
+		return fixturesPath, nil
 	case "repository":
 		database, err := server.Repo.LoadWorkspaceSession(ctx)
 		if err != nil {
@@ -105,7 +105,21 @@ func omegaProjectRoot() string {
 	if cwd, err := os.Getwd(); err == nil {
 		current := cwd
 		for {
-			if pathExists(filepath.Join(current, "package.json")) && pathExists(filepath.Join(current, "docs", "test-workflow-fixtures", "workflow.md")) {
+			if pathExists(filepath.Join(current, "package.json")) {
+				for _, relative := range omegaWorkflowFixtureRelativePaths() {
+					if pathExists(filepath.Join(current, relative, "workflow.md")) {
+						return current
+					}
+				}
+			}
+			if pathExists(filepath.Join(current, "go.mod")) {
+				for _, relative := range omegaWorkflowFixtureRelativePaths() {
+					if pathExists(filepath.Join(current, relative, "workflow.md")) {
+						return current
+					}
+				}
+			}
+			if pathExists(filepath.Join(current, ".git")) {
 				return current
 			}
 			parent := filepath.Dir(current)
@@ -116,6 +130,27 @@ func omegaProjectRoot() string {
 		}
 	}
 	return ""
+}
+
+func omegaWorkflowFixtureRelativePaths() []string {
+	return []string{
+		filepath.Join("docs", "internal-dev-notes", "test-workflow-fixtures"),
+		filepath.Join("docs", "test-workflow-fixtures"),
+	}
+}
+
+func omegaWorkflowFixturePath() (string, bool) {
+	root := omegaProjectRoot()
+	if root == "" {
+		return "", false
+	}
+	for _, relative := range omegaWorkflowFixtureRelativePaths() {
+		path := filepath.Join(root, relative)
+		if pathExists(filepath.Join(path, "workflow.md")) {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 func importAgentProfileFromDirectory(current ProjectAgentProfile, basePath string, source string) (ProjectAgentProfile, map[string]any, error) {

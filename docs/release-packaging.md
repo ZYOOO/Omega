@@ -80,7 +80,6 @@ Run validation:
 ```bash
 npm run lint
 npm run test -- --reporter=dot
-npm run test:legacy -- --reporter=dot
 npm run go:test:focused
 ```
 

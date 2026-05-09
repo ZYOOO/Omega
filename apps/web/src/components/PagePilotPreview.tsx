@@ -103,8 +103,7 @@ type OmegaDesktopBridge = {
 };
 
 function initialPreviewUrl() {
-  if (typeof window === "undefined") return "";
-  return window.localStorage.getItem(previewUrlStorageKey) ?? "";
+  return "";
 }
 
 function initialPreviewMode(): PreviewMode {
@@ -120,6 +119,10 @@ function initialPagePilotRunner(): PagePilotRunnerId {
 
 function normalizePagePilotRunner(value: string | null | undefined): PagePilotRunnerId {
   return pagePilotRunnerOptions.some((option) => option.value === value) ? value as PagePilotRunnerId : "codex";
+}
+
+function scopedPreviewUrlStorageKey(repositoryTargetId: string) {
+  return repositoryTargetId ? `${previewUrlStorageKey}:${repositoryTargetId}` : previewUrlStorageKey;
 }
 
 function omegaDesktopBridge(): OmegaDesktopBridge | undefined {
@@ -254,6 +257,7 @@ export function PagePilotPreview({
   const [selectedRun, setSelectedRun] = useState<PagePilotRunInfo | null>(null);
   const [activePreviewRuntimeProfile, setActivePreviewRuntimeProfile] = useState<PreviewRuntimeProfile | null>(null);
   const [launching, setLaunching] = useState(false);
+  const previousRepositoryTargetId = useRef("");
   const desktopBridge = omegaDesktopBridge();
   const selectedRepositoryTarget = repositoryTargetId
     ? repositoryTargets.find((target) => repositoryTargetStableId(target) === repositoryTargetId)
@@ -282,8 +286,24 @@ export function PagePilotPreview({
   }, [pagePilotRunner]);
 
   useEffect(() => {
-    if (draftUrl.trim()) window.localStorage.setItem(previewUrlStorageKey, draftUrl);
-  }, [draftUrl]);
+    if (draftUrl.trim() && effectiveRepositoryTargetId) {
+      window.localStorage.setItem(scopedPreviewUrlStorageKey(effectiveRepositoryTargetId), draftUrl);
+    }
+  }, [draftUrl, effectiveRepositoryTargetId]);
+
+  useEffect(() => {
+    if (!effectiveRepositoryTargetId) return;
+    const savedUrl = window.localStorage.getItem(scopedPreviewUrlStorageKey(effectiveRepositoryTargetId)) ?? "";
+    const changedRepository = previousRepositoryTargetId.current && previousRepositoryTargetId.current !== effectiveRepositoryTargetId;
+    previousRepositoryTargetId.current = effectiveRepositoryTargetId;
+    setDraftUrl(savedUrl);
+    if (changedRepository) {
+      setBrowserPreviewUrl("");
+      setActivePreviewRuntimeProfile(null);
+      setSelectedRun(null);
+      clearLaunchStatus();
+    }
+  }, [effectiveRepositoryTargetId]);
 
   useEffect(() => {
     setTargetDocument(null);
