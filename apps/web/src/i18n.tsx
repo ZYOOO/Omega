@@ -173,6 +173,7 @@ const zhCN: Record<string, string> = {
   "Run": "运行",
   "Rerun": "重新运行",
   "Retry": "重试",
+  "Retrying...": "重试中...",
   "Running...": "运行中...",
   "Planning...": "规划中...",
   "Creating...": "创建中...",

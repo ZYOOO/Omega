@@ -937,4 +937,58 @@ describe("WorkItemDetailPage", () => {
       }
     });
   });
+
+  it("shows retry progress and disables the retry button while a retry is starting", () => {
+    const workItem: WorkItem = {
+      id: "item_retry_ui",
+      key: "OMG-retry-ui",
+      title: "Retry UI feedback",
+      description: "Need visible retry feedback.",
+      status: "Blocked" as const,
+      priority: "Medium" as const,
+      assignee: "coding",
+      labels: [],
+      team: "Omega",
+      stageId: "todo",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: [],
+      blockedByItemIds: []
+    };
+
+    render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[]}
+        pipeline={undefined}
+        attempts={[{
+          id: "attempt_retry_ui",
+          itemId: "item_retry_ui",
+          pipelineId: "pipeline_retry_ui",
+          status: "failed",
+          currentStageId: "todo"
+        }]}
+        retryingAttemptId="attempt_retry_ui"
+        checkpoints={[]}
+        operations={[]}
+        proofRecords={[]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    const retryButton = screen.getByRole("button", { name: "Retrying..." });
+    expect(retryButton).toBeDisabled();
+    expect(retryButton).toHaveAttribute("aria-busy", "true");
+  });
 });

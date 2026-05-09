@@ -1224,6 +1224,8 @@ function App() {
   const [syncingRepositoryKey, setSyncingRepositoryKey] = useState("");
   const [autoRunBusyTargetId, setAutoRunBusyTargetId] = useState("");
   const [runningWorkItemId, setRunningWorkItemId] = useState("");
+  const [retryingAttemptId, setRetryingAttemptId] = useState("");
+  const retryingAttemptIdRef = useRef("");
   const [repositorySyncMessage, setRepositorySyncMessage] = useState("");
   const [deleteLocalWorkspacesOnRepositoryDelete, setDeleteLocalWorkspacesOnRepositoryDelete] = useState(false);
   const [feishuChatId, setFeishuChatId] = useState("");
@@ -2509,7 +2511,10 @@ function App() {
 
   async function retryWorkItemAttempt(attemptId: string) {
     if (!missionControlApiUrl || !activeWorkItemDetail) return;
+    if (retryingAttemptIdRef.current) return;
     const previousAttempt = attempts.find((attempt) => attempt.id === attemptId);
+    retryingAttemptIdRef.current = attemptId;
+    setRetryingAttemptId(attemptId);
     setRunningWorkItemId(activeWorkItemDetail.id);
     setRunnerMessage(`Retrying ${activeWorkItemDetail.key} from attempt ${attemptId}...`);
     try {
@@ -2522,6 +2527,8 @@ function App() {
     } catch (error) {
       setRunnerMessage(error instanceof Error ? error.message : "Attempt retry failed.");
     } finally {
+      retryingAttemptIdRef.current = "";
+      setRetryingAttemptId("");
       setRunningWorkItemId("");
     }
   }
@@ -4240,6 +4247,7 @@ function App() {
                 repositoryLabel={activeDetailRepositoryLabel}
                 repositoryTargets={repositoryTargets}
                 requirements={requirements}
+                retryingAttemptId={retryingAttemptId}
                 runWorkpads={runWorkpads}
                 sourceLabel={sourceLabel}
                 statusClassName={statusClassName}

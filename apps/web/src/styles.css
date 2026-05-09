@@ -6083,6 +6083,30 @@ kbd {
   font-weight: 850;
 }
 
+.attempt-retry-action.retrying,
+.attempt-retry-action:disabled {
+  cursor: wait;
+  opacity: 0.78;
+}
+
+.attempt-retry-action.retrying::before {
+  content: "";
+  display: inline-block;
+  width: 0.82em;
+  height: 0.82em;
+  margin-right: 7px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  vertical-align: -0.1em;
+  animation: omega-retry-spin 0.8s linear infinite;
+}
+
+.attempt-card-retrying {
+  border-color: rgba(37, 99, 235, 0.38);
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.1), 0 12px 30px rgba(37, 99, 235, 0.08);
+}
+
 .attempt-stage-flow {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(136px, 1fr));
@@ -7127,6 +7151,12 @@ kbd {
   }
   100% {
     transform: translateX(60%);
+  }
+}
+
+@keyframes omega-retry-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 

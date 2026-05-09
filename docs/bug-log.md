@@ -2,6 +2,30 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-09: Retry attempt 点击后没有过渡态，容易重复触发
+
+### 现象
+
+Work Item 详情页里失败 attempt 的 `Retry attempt` 按钮点击后没有立即切到 loading / disabled 状态。后端创建 retry attempt 需要一点时间，用户会看到按钮仍可点击，容易连续触发。
+
+### 原因
+
+前端只复用了 `runningWorkItemId` 作为宽泛运行态，没有记录“当前正在提交 retry 的 attempt id”。Work Item 详情页组件也没有接收 retry in-flight 状态，因此按钮无法展示提交中反馈。
+
+### 修复
+
+- App 增加 `retryingAttemptId` 和 ref guard，提交 retry 请求期间直接阻止重复点击。
+- Work Item 详情页把 retry in-flight 状态传到 attempt panel，按钮显示 `Retrying...`、`aria-busy=true` 并禁用。
+- 按钮增加轻量 spinner 和 attempt card 聚焦状态，保留 light / dark 可读性。
+
+### 验证
+
+```bash
+npm run lint
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+git diff --check
+```
+
 ## 2026-05-09: Codex read-only 阶段仍把 final answer capture 指向 proof 路径
 
 ### 现象

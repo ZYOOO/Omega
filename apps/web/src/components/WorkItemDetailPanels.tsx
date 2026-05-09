@@ -62,6 +62,7 @@ interface WorkItemAttemptPanelProps extends LabelHelpers {
   onRequestCheckpointChanges: (checkpointId: string, note?: string) => void;
   onRetryAttempt?: (attemptId: string) => void;
   pullRequestStatus?: GitHubPullRequestStatusResult | null;
+  retryingAttemptId?: string;
   timelineItems?: AttemptTimelineItemInfo[];
 }
 
@@ -87,6 +88,7 @@ export function WorkItemAttemptPanel({
   pipelineStageClassName,
   pipelineStageLabel,
   pullRequestStatus,
+  retryingAttemptId = "",
   timelineItems = []
 }: WorkItemAttemptPanelProps) {
   const { t } = useI18n();
@@ -119,9 +121,10 @@ export function WorkItemAttemptPanel({
   const planStates = actionPlan?.states?.length ? actionPlan.states : [];
   const stages = planStates.length ? planStates : attempt.stages?.length ? attempt.stages : pipeline?.run?.stages ?? [];
   const retryable = ["failed", "stalled", "canceled"].includes(attempt.status);
+  const retrying = retryingAttemptId === attempt.id;
 
   return (
-    <article className="attempt-card">
+    <article className={retrying ? "attempt-card attempt-card-retrying" : "attempt-card"}>
       <header>
         <div>
           <strong>{attemptStatusLabel(attempt.status)}</strong>
@@ -136,8 +139,14 @@ export function WorkItemAttemptPanel({
           <span>{attempt.branchName}</span>
         ) : null}
         {retryable && onRetryAttempt ? (
-          <button type="button" className="attempt-retry-action" onClick={() => onRetryAttempt(attempt.id)}>
-            {t("Retry attempt")}
+          <button
+            type="button"
+            className={retrying ? "attempt-retry-action retrying" : "attempt-retry-action"}
+            disabled={retrying}
+            aria-busy={retrying}
+            onClick={() => onRetryAttempt(attempt.id)}
+          >
+            {retrying ? t("Retrying...") : t("Retry attempt")}
           </button>
         ) : null}
       </header>

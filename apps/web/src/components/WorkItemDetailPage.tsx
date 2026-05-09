@@ -176,6 +176,7 @@ export interface WorkItemDetailPageProps extends DetailHelpers {
   repositoryLabel: string;
   repositoryTargets: RepositoryTarget[];
   requirements: RequirementRecordInfo[];
+  retryingAttemptId?: string;
   runWorkpads: RunWorkpadRecordInfo[];
   workItem: WorkItem;
   workItems: WorkItem[];
@@ -217,6 +218,7 @@ export function WorkItemDetailPage({
   repositoryLabel,
   repositoryTargets,
   requirements,
+  retryingAttemptId = "",
   runWorkpads,
   sourceLabel,
   statusClassName,
@@ -432,6 +434,7 @@ export function WorkItemDetailPage({
             pipelineStageClassName={pipelineStageClassName}
             pipelineStageLabel={pipelineStageLabel}
             pullRequestStatus={pullRequestStatus?.url === attempt?.pullRequestUrl ? pullRequestStatus : null}
+            retryingAttemptId={retryingAttemptId}
             timelineItems={timelineItems}
           />
         </section>
