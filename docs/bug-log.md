@@ -2,6 +2,30 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-09: Codex read-only 阶段仍把 final answer capture 指向 proof 路径
+
+### 现象
+
+Requirement / Master / Architect 等只读 Agent 阶段失败时，UI 展示 `--sandbox read-only --output-last-message .../.omega/proof/*.md`，并进入 `Why retry is needed`。这类阶段本应允许读取仓库并产出 proof，不应因为 proof 写入路径和只读沙箱冲突而失败。
+
+### 原因
+
+前一次修复已经把 prompt 改成“Agent 只返回最终内容，由 Omega 持久化 artifact”，但 Codex runner 命令仍把 `--output-last-message` 直接指向 attempt workspace 的 `.omega/proof` 路径。这个路径显示上也容易让人误以为 Agent 仍在只读沙箱内直接写 proof。
+
+### 修复
+
+- Codex read-only 阶段的 final answer 先写入 Omega runtime 管理的临时 capture 文件。
+- runner 退出后由 Omega runtime 复制到 `.omega/proof/*.md`；如果 capture 为空，再回退到 stdout/stderr。
+- workspace-write 阶段继续使用原有输出路径，避免影响 Coding / Page Pilot 等可写场景。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run TestCodexReadOnlySandboxCapturesOutputOutsideWorkspace -count=1 -timeout=30s
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof|TestRunDevFlowContractState' -count=1 -timeout=120s
+git diff --check
+```
+
 ## 2026-05-09: 旧 TypeScript/Node 架构残留拖慢维护与测试
 
 ### 现象

@@ -158,13 +158,27 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 	if model != "" {
 		args = append(args, "--model", model)
 	}
+	outputPath := strings.TrimSpace(request.OutputPath)
+	capturePath := outputPath
+	captureDir := ""
+	if outputPath != "" && strings.EqualFold(strings.TrimSpace(sandbox), "read-only") {
+		if dir, err := os.MkdirTemp("", "omega-codex-last-message-*"); err == nil {
+			captureDir = dir
+			capturePath = filepath.Join(dir, filepath.Base(outputPath))
+		}
+	}
+	if captureDir != "" {
+		defer os.RemoveAll(captureDir)
+	}
 	args = append(args,
 		"-c", "model_reasoning_effort=\""+effort+"\"",
 		"--skip-git-repo-check",
 		"--sandbox", sandbox,
-		"--output-last-message", request.OutputPath,
-		"-",
 	)
+	if capturePath != "" {
+		args = append(args, "--output-last-message", capturePath)
+	}
+	args = append(args, "-")
 	process, err := runSupervisedCommandContextWithOptions(
 		ctx,
 		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: request.Env},
@@ -173,8 +187,11 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 		"codex",
 		args...,
 	)
-	if request.OutputPath != "" {
-		ensureAgentOutputFile(request.OutputPath, process)
+	if outputPath != "" {
+		if capturePath != outputPath {
+			copyAgentOutputFile(capturePath, outputPath, process)
+		}
+		ensureAgentOutputFile(outputPath, process)
 	}
 	status := "passed"
 	if err != nil {
@@ -567,7 +584,22 @@ func ensureAgentOutputFile(outputPath string, process map[string]any) {
 		fallback = strings.TrimSpace(stringOr(process["stderr"], ""))
 	}
 	if fallback != "" {
+		_ = os.MkdirAll(filepath.Dir(outputPath), 0o755)
 		_ = os.WriteFile(outputPath, []byte(fallback), 0o644)
+	}
+}
+
+func copyAgentOutputFile(sourcePath string, outputPath string, process map[string]any) {
+	raw, err := os.ReadFile(sourcePath)
+	if err != nil || strings.TrimSpace(string(raw)) == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		process["outputCaptureError"] = err.Error()
+		return
+	}
+	if err := os.WriteFile(outputPath, raw, 0o644); err != nil {
+		process["outputCaptureError"] = err.Error()
 	}
 }
 
