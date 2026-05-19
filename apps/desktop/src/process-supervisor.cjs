@@ -257,6 +257,48 @@ function packageManagerCommand(packageManager, script, scriptCommand, port) {
   return { command, args, shell: false };
 }
 
+function scriptPreviewPort(scriptCommand) {
+  const fields = String(scriptCommand || "").trim().split(/\s+/).filter(Boolean);
+  for (let index = 0; index < fields.length; index += 1) {
+    const token = fields[index].replace(/^['"]|['"]$/g, "");
+    const lower = token.toLowerCase();
+    if (["--port", "-p", "--listen", "-l"].includes(lower)) {
+      const port = normalizePort(fields[index + 1]);
+      if (port) return port;
+    } else if (/^(--port|--listen|-p|-l)=/.test(lower)) {
+      const port = normalizePort(token.split("=").slice(1).join("="));
+      if (port) return port;
+    } else if (lower === "http.server") {
+      const port = normalizePort(fields[index + 1]);
+      if (port) return port;
+    } else if (lower.includes(":")) {
+      const port = normalizePort(lower.slice(lower.lastIndexOf(":") + 1));
+      if (port) return port;
+    }
+  }
+  return "";
+}
+
+function normalizePort(value) {
+  const trimmed = String(value || "").trim().replace(/^['"]|['"]$/g, "").replace(/[,/]+$/g, "");
+  const candidate = trimmed.includes(":") ? trimmed.slice(trimmed.lastIndexOf(":") + 1) : trimmed;
+  const port = Number(candidate);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? String(port) : "";
+}
+
+function previewURLWithPort(rawUrl, port) {
+  if (!port) return rawUrl;
+  try {
+    const url = new URL(rawUrl || DEFAULT_PREVIEW_URL);
+    const host = url.hostname || "127.0.0.1";
+    url.host = host.includes(":") && !host.startsWith("[") ? `[${host}]:${port}` : `${host}:${port}`;
+    if (!url.pathname) url.pathname = "/";
+    return url.toString();
+  } catch (_error) {
+    return rawUrl;
+  }
+}
+
 function commandLine(command, args = []) {
   return [command, ...args].filter(Boolean).join(" ");
 }
@@ -404,6 +446,7 @@ function buildPreviewRuntimePlan(input = {}) {
   const env = input.env || process.env;
   const repoPath = path.resolve(env.OMEGA_PREVIEW_REPO_PATH || env.OMEGA_PAGE_PILOT_REPO_PATH || "");
   const previewUrl = env.OMEGA_PREVIEW_URL || env.OMEGA_PAGE_PILOT_URL || DEFAULT_PREVIEW_URL;
+  const hasExplicitPreviewUrl = Boolean(env.OMEGA_PREVIEW_URL || env.OMEGA_PAGE_PILOT_URL);
   const port = Number(env.OMEGA_PREVIEW_PORT || new URL(previewUrl).port || "5173");
   const previewWorkspaceRoot = env.OMEGA_PAGE_PILOT_WORKSPACE_ROOT || "";
 
@@ -435,12 +478,15 @@ function buildPreviewRuntimePlan(input = {}) {
     : ["dev", "start", "preview"].find((candidate) => scripts[candidate]);
   if (script) {
     const packageManager = env.OMEGA_PREVIEW_PACKAGE_MANAGER || detectPackageManager(repoPath);
+    const fixedScriptPort = scriptPreviewPort(scripts[script]);
+    const effectivePreviewUrl = fixedScriptPort && !hasExplicitPreviewUrl ? previewURLWithPort(previewUrl, fixedScriptPort) : previewUrl;
+    const effectivePort = Number(env.OMEGA_PREVIEW_PORT || new URL(effectivePreviewUrl).port || port);
     return {
       enabled: true,
       repoPath,
-      previewUrl,
+      previewUrl: effectivePreviewUrl,
       previewWorkspaceRoot,
-      ...packageManagerCommand(packageManager, script, scripts[script], port),
+      ...packageManagerCommand(packageManager, script, scripts[script], effectivePort),
       source: `${packageManager}:${script}`,
     };
   }
@@ -482,13 +528,20 @@ function previewRuntimeEvidence(repoPath) {
 function buildPreviewRuntimeProfile(input = {}) {
   const env = input.env || process.env;
   const repoPath = path.resolve(input.repoPath || env.OMEGA_PREVIEW_REPO_PATH || env.OMEGA_PAGE_PILOT_REPO_PATH || "");
-  const previewUrl = input.previewUrl || env.OMEGA_PREVIEW_URL || env.OMEGA_PAGE_PILOT_URL || DEFAULT_PREVIEW_URL;
+  const explicitPreviewUrl = input.previewUrl || env.OMEGA_PREVIEW_URL || env.OMEGA_PAGE_PILOT_URL || "";
+  const previewUrl = explicitPreviewUrl || DEFAULT_PREVIEW_URL;
+  const planEnv = {
+    ...env,
+    OMEGA_PREVIEW_REPO_PATH: repoPath,
+  };
+  if (explicitPreviewUrl) {
+    planEnv.OMEGA_PREVIEW_URL = explicitPreviewUrl;
+  } else {
+    delete planEnv.OMEGA_PREVIEW_URL;
+    delete planEnv.OMEGA_PAGE_PILOT_URL;
+  }
   const plan = buildPreviewRuntimePlan({
-    env: {
-      ...env,
-      OMEGA_PREVIEW_REPO_PATH: repoPath,
-      OMEGA_PREVIEW_URL: previewUrl,
-    },
+    env: planEnv,
   });
   const evidence = fs.existsSync(repoPath) ? previewRuntimeEvidence(repoPath) : [];
   const devCommand = plan.command ? commandLine(plan.command, plan.args || []) : "";

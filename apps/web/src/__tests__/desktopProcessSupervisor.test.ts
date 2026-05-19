@@ -28,7 +28,7 @@ const {
     source?: string;
     previewUrl: string;
   };
-  buildPreviewRuntimeProfile: (input: { env: Record<string, string | undefined>; repoPath?: string; repositoryTargetId?: string; intent?: string }) => {
+  buildPreviewRuntimeProfile: (input: { env: Record<string, string | undefined>; repoPath?: string; repositoryTargetId?: string; intent?: string; previewUrl?: string }) => {
     plan: { enabled: boolean; command?: string; args?: string[]; source?: string; previewUrl: string };
     profile: {
       agentId: string;
@@ -96,6 +96,34 @@ describe("desktop process supervisor", () => {
       expect(plan.command).toBe("pnpm");
       expect(plan.args).toEqual(["run", "dev", "--", "--host", "127.0.0.1", "--port", "6199"]);
       expect(plan.source).toBe("pnpm:dev");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("uses package script ports for preview runtime when no URL is explicit", () => {
+    const repo = mkdtempSync(path.join(tmpdir(), "omega-preview-agent-"));
+    try {
+      writeFileSync(path.join(repo, "package.json"), JSON.stringify({ scripts: { dev: "python3 -m http.server 4173 -d ." } }));
+
+      const result = buildPreviewRuntimeProfile({
+        repoPath: repo,
+        repositoryTargetId: "repo_local",
+        env: {},
+      });
+
+      expect(result.plan.previewUrl).toBe("http://127.0.0.1:4173/");
+      expect(result.profile.previewUrl).toBe("http://127.0.0.1:4173/");
+      expect(result.profile.devCommand).toBe("npm run dev");
+
+      const explicit = buildPreviewRuntimeProfile({
+        repoPath: repo,
+        repositoryTargetId: "repo_local",
+        previewUrl: "http://127.0.0.1:3009/",
+        env: {},
+      });
+      expect(explicit.plan.previewUrl).toBe("http://127.0.0.1:3009/");
+      expect(explicit.profile.previewUrl).toBe("http://127.0.0.1:3009/");
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

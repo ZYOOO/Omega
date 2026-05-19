@@ -52,6 +52,7 @@ interface WorkItemAttemptPanelProps extends LabelHelpers {
   pipeline?: PipelineRecordInfo;
   checkpoint?: CheckpointRecordInfo;
   checkpointActionable?: boolean;
+  currentFailureReason?: string;
   failedStages: FailedStageSummary[];
   failureOperations: OperationRecordInfo[];
   failureProofCards: DetailProofCard[];
@@ -73,6 +74,7 @@ export function WorkItemAttemptPanel({
   attemptStatusLabel,
   checkpoint,
   checkpointActionable = false,
+  currentFailureReason = "",
   displayText,
   failedStages,
   failureOperations,
@@ -153,7 +155,7 @@ export function WorkItemAttemptPanel({
 
       <details className="attempt-stage-details">
         <summary>{t("Stage details")}</summary>
-        <ActionPlanSummary actionPlan={actionPlan} />
+        <ActionPlanSummary actionPlan={actionPlan} currentFailureReason={currentFailureReason} />
         <div className="attempt-stage-flow" aria-label={`Attempt ${attempt.id} stages`}>
           {stages.map((stage) => (
             <AttemptStageCard
@@ -202,14 +204,20 @@ export function WorkItemAttemptPanel({
   );
 }
 
-function ActionPlanSummary({ actionPlan }: { actionPlan?: AttemptActionPlanInfo | null }) {
-  if (!actionPlan?.currentAction && !actionPlan?.retry && !actionPlan?.transitions?.length) {
+function ActionPlanSummary({
+  actionPlan,
+  currentFailureReason = ""
+}: {
+  actionPlan?: AttemptActionPlanInfo | null;
+  currentFailureReason?: string;
+}) {
+  if (!actionPlan?.currentAction && !actionPlan?.retry && !actionPlan?.transitions?.length && !currentFailureReason) {
     return null;
   }
-  const action = actionPlan.currentAction ?? {};
-  const retry = actionPlan.retry ?? {};
-  const state = actionPlan.currentState ?? {};
-  const transitionLabels = (actionPlan.transitions ?? [])
+  const action = actionPlan?.currentAction ?? {};
+  const retry = actionPlan?.retry ?? {};
+  const state = actionPlan?.currentState ?? {};
+  const transitionLabels = (actionPlan?.transitions ?? [])
     .map((transition) => `${recordText(transition, "on")} -> ${recordText(transition, "to")}`.trim())
     .filter((value) => value !== "->")
     .slice(0, 3);
@@ -218,9 +226,13 @@ function ActionPlanSummary({ actionPlan }: { actionPlan?: AttemptActionPlanInfo 
       <div>
         <span>Action plan</span>
         <strong>{recordText(action, "title") || recordText(action, "id") || recordText(state, "title") || "Runtime contract"}</strong>
-        <small>{recordText(action, "status") || recordText(state, "status") || actionPlan.attemptStatus || "ready"}</small>
+        <small>{recordText(action, "status") || recordText(state, "status") || actionPlan?.attemptStatus || "ready"}</small>
       </div>
-      {recordBool(retry, "available") ? (
+      {currentFailureReason ? (
+        <p>
+          Current blocker: {currentFailureReason}
+        </p>
+      ) : recordBool(retry, "available") ? (
         <p>
           Retry: {recordText(retry, "recommendedAction") || "retry_attempt"} · {recordText(retry, "reason")}
         </p>

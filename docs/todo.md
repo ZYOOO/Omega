@@ -543,6 +543,7 @@ Item
 - [x] Stage 级 Skills / MCP 真实物化：Agent Profile 保存后，runner 启动前写入 `.omega/agent-capabilities.*`、`.codex/OMEGA.md`、`.claude/CLAUDE.md`，注入 `OMEGA_AGENT_*` 环境变量，并用 fake runner 测试证明 Agent 进程可读取。
 - [x] 项目内置 Skills fallback：runner workspace 会生成 `.omega/skills/<skill>/SKILL.md` 和 `.omega/agent-skill-manifest.json`；本机已安装时复制宿主 `SKILL.md`，未安装时写入 Omega fallback，避免用户没装 skill 就只剩 UI 标签。
 - [x] Master / Architect / Testing 执行链路对齐 Agent Profile：Master 写 dispatch，Architect 写 plan/todo，Testing 在本地验证后由 Testing Agent 复核 test report；详情页不再把这些阶段误呈现为纯 local action。
+- [x] GitHub PR delivery failure 对齐 Agent 化恢复：`git_recovery` 只在 PR publish/update action 失败时启动，负责受限 git/gh 修复；runtime 负责仓库边界、触发范围和 PR URL 最终校验。
 - [x] 本机 Skills / MCP 安装与映射文档：安装 stage 适用 Skills / MCP server，并在 `docs/agent-skills-and-mcp.md` 记录安装位置、默认 stage 映射和验证方式。
 - [x] GitHub Actions CI 进入默认 DevFlow：PR publish/update 后执行 `run_ci_checks`，采集 checks 和 failed run logs，写入 CI proof，并将 failed/missing required checks 输入 Rework / Review / Workpad。
 - [x] DevFlow Plan/TODO 显式化：Architect action 作为 Plan 等价阶段，输出 technical plan、functional todo list、project todo list，Review prompt 按清单核对 diff / validation / CI。

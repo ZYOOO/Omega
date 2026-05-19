@@ -695,7 +695,8 @@ function pipelineStageLabel(status: string): string {
     passed: "Done",
     "changes-requested": "Changes requested",
     failed: "Failed",
-    blocked: "Blocked"
+    blocked: "Blocked",
+    paused: "Paused"
   };
   return labels[status] ?? status;
 }

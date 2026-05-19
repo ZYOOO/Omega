@@ -1,6 +1,10 @@
 package omegalocal
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -33,6 +37,153 @@ func TestWorkflowActionRouteUsesReviewVerdicts(t *testing.T) {
 	if changes.StageStatus != "passed" || changes.Event != "changes_requested" || changes.NextStageID != "targeted_rework" {
 		t.Fatalf("changes-requested review route = %+v", changes)
 	}
+}
+
+func TestWorkflowActionRouteDoesNotAutoAdvanceFailedActions(t *testing.T) {
+	workflow := map[string]any{"states": []any{
+		map[string]any{
+			"id":          "in_progress",
+			"transitions": map[string]any{"failed": "rework"},
+		},
+	}}
+
+	route := workflowActionRoute(workflow, nil, "in_progress", "git_recovery", "failed")
+	if route.StageStatus != "failed" || route.Event != "failed" || route.NextStageID != "" {
+		t.Fatalf("failed action should block without queuing the next stage: %+v", route)
+	}
+}
+
+func TestDevFlowGitHubRecoveryScopeIsLimited(t *testing.T) {
+	if !devFlowGitHubRecoveryAllowed("in_progress", "publish_pull_request", "ensure_pr", devFlowGitRecoveryAgentID) {
+		t.Fatal("publish pull request should allow git recovery")
+	}
+	if !devFlowGitHubRecoveryAllowed("rework", "update_pull_request", "ensure_pr", devFlowGitRecoveryAgentID) {
+		t.Fatal("rework PR update should allow git recovery")
+	}
+	for _, testCase := range []struct {
+		stage  string
+		action string
+		agent  string
+	}{
+		{stage: "todo", action: "capture_requirement", agent: devFlowGitRecoveryAgentID},
+		{stage: "in_progress", action: "implement_change", agent: devFlowGitRecoveryAgentID},
+		{stage: "in_progress", action: "publish_pull_request", agent: "coding"},
+		{stage: "merging", action: "merge_pull_request", agent: devFlowGitRecoveryAgentID},
+	} {
+		if devFlowGitHubRecoveryAllowed(testCase.stage, testCase.action, "ensure_pr", testCase.agent) {
+			t.Fatalf("git recovery should not be allowed for %+v", testCase)
+		}
+	}
+}
+
+func TestDevFlowGitHubRecoveryAgentRepairsPRDelivery(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCommand(repo, "git", "init"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCommand(repo, "git", "config", "user.email", "omega-test@example.local"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCommand(repo, "git", "config", "user.name", "Omega Test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCommand(repo, "git", "add", "README.md"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCommand(repo, "git", "commit", "-m", "init"); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "pr-ready")
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ghPath := filepath.Join(binDir, "gh")
+	ghScript := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  if [ -f %q ]; then
+    printf 'https://github.com/acme/demo/pull/7\n'
+  fi
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  if [ -f %q ]; then
+    printf 'https://github.com/acme/demo/pull/7\n'
+    exit 0
+  fi
+  printf 'GraphQL: The omega/demo branch has no history in common with main\n' >&2
+  exit 1
+fi
+exit 0
+`, marker, marker)
+	if err := os.WriteFile(ghPath, []byte(ghScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	server := NewServer(filepath.Join(root, "omega.db"), filepath.Join(root, "workspace"), filepath.Join(root, "openapi.yaml"))
+	profile := defaultAgentProfile("project_omega", "repo_demo")
+	template := findPipelineTemplate("devflow-pr")
+	runner := fakeGitRecoveryRunner{run: func(request AgentTurnRequest) AgentTurnResult {
+		if request.StageID != "in_progress" || request.Role != devFlowGitRecoveryAgentID || request.Sandbox != devFlowGitRecoverySandbox {
+			t.Fatalf("unexpected request = %+v", request)
+		}
+		if !strings.Contains(request.Prompt, "in_progress/publish_pull_request") || !strings.Contains(request.Prompt, "Keep the branch name") {
+			t.Fatalf("prompt missing recovery policy:\n%s", request.Prompt)
+		}
+		if err := os.WriteFile(marker, []byte("ready"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(request.OutputPath, []byte("Status: recovered\nPull request: https://github.com/acme/demo/pull/7\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return AgentTurnResult{Status: "passed", Process: map[string]any{"runner": "fake", "status": "passed"}}
+	}}
+
+	result, err := runDevFlowGitHubRecoveryAgent(devFlowGitHubRecoveryInput{
+		Server:              server,
+		Context:             context.Background(),
+		Template:            template,
+		Profile:             profile,
+		Agent:               agentProfileForRole(profile, devFlowGitRecoveryAgentID),
+		Runner:              runner,
+		RunnerID:            "fake",
+		Pipeline:            map[string]any{"id": "pipeline_demo"},
+		Item:                map[string]any{"id": "item_demo", "key": "OMG-1", "title": "Demo"},
+		RepositoryWorkspace: repo,
+		Repository:          "acme/demo",
+		BranchName:          "omega/demo",
+		BaseBranch:          "main",
+		PullRequestTitle:    "OMG-1 Demo",
+		PullRequestBody:     "body",
+		ProofDir:            filepath.Join(root, "proof"),
+		AttemptID:           "attempt_demo",
+		StageID:             "in_progress",
+		ActionID:            "publish_pull_request",
+		ActionType:          "ensure_pr",
+		InitialError:        fmt.Errorf("create pull request: no history in common"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PullRequestURL != "https://github.com/acme/demo/pull/7" || text(result.Process, "verifiedPullRequestUrl") != result.PullRequestURL {
+		t.Fatalf("recovery result = %+v", result)
+	}
+}
+
+type fakeGitRecoveryRunner struct {
+	run func(AgentTurnRequest) AgentTurnResult
+}
+
+func (runner fakeGitRecoveryRunner) RunTurn(_ context.Context, request AgentTurnRequest) AgentTurnResult {
+	return runner.run(request)
 }
 
 func TestWorkflowActionRouteUsesReworkAndMergingStateTransitions(t *testing.T) {

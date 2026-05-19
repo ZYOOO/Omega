@@ -2,6 +2,31 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-19: Coding / Rework Agent 被要求写 repo 外 proof 路径
+
+### 现象
+
+对照 Symphony 权限模型时发现，Omega 的 Coding / Rework 阶段 cwd 锁定在 repository checkout，沙箱是 `workspace-write`，但 prompt 仍要求 Agent 把 completion note 写到 attempt workspace 外层的 `.omega/proof/*.md`。这类阶段需要真实改代码，但不应该因为 proof 路径在 repo cwd 外而失败，或诱导 Agent 试图越界写文件。
+
+### 原因
+
+之前只修了 read-only 阶段的 final answer capture：Requirement / Master / Architect 等会先写 runtime 临时文件再复制到 proof。workspace-write 阶段仍把 `--output-last-message` 指向 repo cwd 外的 proof 路径，同时 workflow template 里还保留“write note to path”的指令，职责和权限边界不一致。
+
+### 修复
+
+- Codex runner 在 `workspace-write` 且 output path 不在当前 workspace 内时，改为先捕获到 repo cwd 内的 `.omega/agent-output/`，再由 Omega runtime 复制到 attempt `.omega/proof/`。
+- Coding / Rework prompt 与内置 workflow template 改为要求 Agent 在 final answer 返回 completion note，不再要求它直接写 proof 文件。
+- 保留 repository edit 边界：Agent 仍只能在锁定的 repo checkout 内改源码；`.omega/.codex/.claude/.opencode/.trae` 在提交时继续排除。
+- 更新 DevFlow Agent 执行边界文档，明确 read-only / workspace-write / Git Recovery 的不同权限层级。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestCodex(ReadOnly|WorkspaceWrite)SandboxCapturesOutput' -count=1 -timeout=60s
+go test ./services/local-runtime/internal/omegalocal -run 'TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestSaaSLaunchTemplateLoadsWorkflowMarkdownContract' -count=1 -timeout=90s
+git diff --check
+```
+
 ## 2026-05-09: Workboard 行内重试按钮没有运行过渡态
 
 ### 现象
@@ -2992,4 +3017,168 @@ git diff --check
 go test ./services/local-runtime/internal/omegalocal -run 'TestCreateWorkItemStoresMasterRequirementDispatch|TestCreateWorkItemRejectsUnknownRepositoryTarget|TestCreateWorkItemUsesRepositoryTargetProject' -count=1 -timeout=120s
 npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "creates app requirements" --testTimeout=60000
 git diff --check
+```
+
+## 2026-05-18: Work Item 阻塞后看不出停在哪个阶段
+
+### 现象
+
+Work Item 进入 Blocked / failed 后，顶部只展示阻塞原因和 attempt id，交付流程卡片仍沿用原始 stage 状态。用户需要从 timeline 或日志里推断到底是重试前信息还是当前 attempt，以及当前停在 implementation、review 还是其他阶段。
+
+### 原因
+
+详情页已经从 attempt / pipeline / operation 中拿到了 `failureStageId`、`currentStageId`、`finishedAt`、runner `startedAt` / `finishedAt` 等数据，但 UI 没有把这些字段显式呈现出来。`Feedback route` 卡片也和 `Blocked reason` 同样使用黄色提示样式，语义上容易被误解为重复的错误信息。
+
+### 修复
+
+- 阻塞提示增加停住阶段和时间，例如 `停在 Implementation and PR · 05/18 15:28`。
+- 交付流程在 failed / stalled / canceled / paused attempt 中，用 attempt 的 `failureStageId` / `currentStageId` 将对应阶段高亮为黄色，并展示 `停在这里`。
+- Agent 阶段详情弹窗展示每条 Agent 运行的开始 / 结束 / 更新时间，方便区分旧运行和当前重试。
+- `Feedback route` 改名为 `Recovery route` / `恢复路径`，明确它描述的是下一次 retry / rework 如何复用上方阻塞与反馈，而不是又一个错误原因。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=60000
+npm run lint
+git diff --check
+```
+
+## 2026-05-18: Work Item 阻塞原因优先级显示错误
+
+### 现象
+
+OMG-8 的当前 attempt 实际阻塞在 `gh pr create`：GitHub 返回 `The omega/OMG-8-devflow branch has no history in common with main`。但 Work Item 详情顶部只显示泛化的 `Workflow contract implementation action failed.`，恢复路径和 attempt 的 Action Plan 还显示上一轮 requirement runner 失败的旧 retry reason。
+
+### 原因
+
+Run Workpad 已经记录了完整 blockers，但前端直接取第一条 blocker。当前数据里第一条是 workflow contract 的总括错误，第二条才是具体 PR 创建错误。同时恢复路径和 Action Plan 优先读取 `reworkChecklist.retryReason` / `actionPlan.retry.reason`，这些字段可能来自上一轮 retry，不一定代表当前失败点。
+
+### 修复
+
+- 新增 failure signal 排序：优先展示 PR / GraphQL / exit status / permission / timeout 等具体失败，弱化 `Workflow contract ... failed`、`Pipeline is failed` 这类泛化提示。
+- 顶部阻塞原因、恢复路径、Run Workpad Blockers、Retry Reason、Rework checklist preview 共用同一条主 failure signal。
+- Attempt 的 Action Plan 在存在当前 blocker 时展示 `Current blocker`，不再让旧 retry reason 覆盖当前失败。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=60000
+npm run lint
+git diff --check
+```
+
+## 2026-05-18: Work Item 阻塞原因与恢复路径重复展示
+
+### 现象
+
+失败或暂停的 Work Item 详情页顶部已经展示了当前阻塞原因，但下方 `Recovery route` / `恢复路径` 也会把同一条 blocker 再展示一次。用户看到两个黄色提示框时，很难判断它们是否代表两个不同问题。
+
+### 原因
+
+`ReworkReturnSignal` 把 “failed / stalled attempt 可重试” 当作展示条件，并优先复用当前 blocker 作为说明文案。这样即使没有额外的人审反馈、review 退回信息或独立 rework 策略，也会渲染一张与顶部阻塞原因重复的卡片。
+
+### 修复
+
+- `Recovery route` 不再因为 attempt 失败而自动出现。
+- 只有存在不同于当前 blocker 的人工反馈、review 退回说明、rework rationale，或明确的非默认恢复策略时才展示恢复路径。
+- 保留顶部 blocker 与阶段高亮作为失败态的主信息，减少重复黄色提示。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=60000
+npm run lint
+git diff --check
+```
+
+## 2026-05-18: PR 创建 / 更新失败后 DevFlow 直接停住
+
+### 现象
+
+DevFlow 在 Implementation and PR 阶段已经完成代码、测试和 push，但 `gh pr create` 遇到 `branch has no history in common with main` 这类 GitHub / Git 拓扑错误后，runtime 直接把 attempt 标成 stalled / failed。Agent 已经知道上下文和目标分支，却没有机会修复远端分支、rebase/cherry-pick 或补建 PR。
+
+### 原因
+
+PR 创建 / 更新之前一直由 workflow action executor 的确定性代码直接执行。这个路径适合 happy path 和最终校验，但不适合处理多样的 Git/GitHub 状态：远端分支漂移、历史不一致、已有 PR 元数据异常、fork/head 组合错误等都需要上下文判断。继续把这些修复策略硬写在 runtime 里，会让错误覆盖不完整，也会让 Requirement / Architect / Testing 等 Agent Profile 配置失去边界。
+
+### 修复
+
+- 新增 `git_recovery` Agent Profile，默认可以单独配置 runner / model / skills / MCP。
+- runtime 只在 `in_progress/publish_pull_request` 和 `rework/update_pull_request` 失败时触发 Git Recovery，传入失败原因、目标 branch/base、PR body、changed files、测试输出和 git/gh 诊断。
+- Git Recovery 只能在锁定的 repository workspace 中使用 git / gh 修复 PR delivery：fetch、merge-base 检查、rebase、cherry-pick、format-patch/apply、同名分支重建、push、PR create/update。
+- 禁止 Git Recovery 修改需求、跳过 review、人审 approve、merge PR、发布不同分支或触碰其他仓库。
+- Agent 完成后，runtime 会再次执行 PR 校验；只有拿到真实 PR URL 才记录恢复成功。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestDevFlowGitHubRecovery|TestDevFlowTemplateLoadsWorkflowMarkdownContract' -count=1 -timeout=120s
+git diff --check
+```
+
+## 2026-05-19: Git Recovery Agent 触发后仍无法修复 PR 分支
+
+### 现象
+
+OMG-8 retry 已经跑到 Implementation and PR，并触发了 `git_recovery` Agent。Agent 判断出 `omega/OMG-8-devflow` 与 `origin/main` 没有共同历史，需要重建同名交付分支。但它最终输出 `blocked`，PR 仍未创建。
+
+### 原因
+
+有两个问题叠在一起：
+
+- Codex runner 的 `workspace-write` 沙箱不能写 `.git/FETCH_HEAD`，`git fetch origin main omega/OMG-8-devflow` 会失败为 `Operation not permitted`。普通 shell 和 Codex `danger-full-access` 均可正常 fetch。
+- workflow action route 对 `failed` transition 仍会读取模板里的 `failed: rework`，导致失败后把后续 Review / Rework 阶段误标成 passed / running，看起来像失败后还继续排队执行。
+
+### 修复
+
+- `git_recovery` 使用单独的 `danger-full-access` 沙箱，只允许在 `in_progress/publish_pull_request` 和 `rework/update_pull_request` 触发。
+- `failed` action 不再自动推进到模板里的下一阶段；失败保持当前阶段 blocked，由 retry / recovery path 决定下一步。
+- 测试覆盖 Git Recovery 的 runner role / sandbox，以及 failed action 不应自动排队下一阶段。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestDevFlowGitHubRecovery|TestWorkflowActionRouteDoesNotAutoAdvanceFailedActions|TestRunDevFlowContractState' -count=1 -timeout=120s
+git diff --check
+```
+
+## 2026-05-19: Page Pilot 启动 DemoRepo 预览失败
+
+### 现象
+
+从 Page Pilot 启动 `ZYOOO/DemoRepo` 时，Preview Runtime Agent 返回启动失败。运行记录里显示 Omega 等待 `http://127.0.0.1:3009/`，但实际 `npm run dev` 输出为 `python3 -m http.server 4173 -d .`。重复启动后还会出现 `OSError: [Errno 48] Address already in use`。
+
+### 原因
+
+Preview Runtime 只在 Vite / Next 这类脚本中追加或推断端口。对于 `python3 -m http.server 4173 -d .`、`serve -l 4173`、`--port 4173` 等脚本自带端口的情况，runtime 仍使用默认 `3009` 做健康检查和旧进程清理。结果是服务真实监听在 `4173`，健康检查却打到 `3009`；第二次启动时又会撞上旧的 `4173` 进程。
+
+Electron direct pilot 还叠加了一个只在桌面路径出现的问题：`buildPreviewRuntimeProfile` 会把默认 `3009` 写回 `OMEGA_PREVIEW_URL`，导致下游误以为用户显式指定了 `3009`，从而跳过脚本端口推断。
+
+### 修复
+
+- Go local runtime 和 Electron desktop supervisor 都会解析 package script 中的显式端口。
+- 当用户没有手动指定 preview URL 时，Preview Runtime 的 preview URL、健康检查和 stale listener 清理都会跟随脚本端口。
+- 用户显式输入的 preview URL 仍保持优先，不会被脚本端口覆盖。
+- Electron direct pilot 不再把默认 `3009` 当作用户显式输入，避免覆盖脚本中的真实端口。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotPreviewRuntimeUsesScriptPort|TestPagePilotPreviewRuntimeStartPersistsGoProfile' -count=1 -timeout=120s
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=60000
+node --check apps/desktop/src/process-supervisor.cjs
+node - <<'NODE'
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { buildPreviewRuntimePlan } = require('./apps/desktop/src/process-supervisor.cjs');
+const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'omega-preview-'));
+fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ scripts: { dev: 'python3 -m http.server 4173 -d .' } }));
+const plan = buildPreviewRuntimePlan({ env: { OMEGA_PREVIEW_REPO_PATH: repo } });
+if (plan.previewUrl !== 'http://127.0.0.1:4173/') throw new Error(JSON.stringify(plan));
+NODE
 ```

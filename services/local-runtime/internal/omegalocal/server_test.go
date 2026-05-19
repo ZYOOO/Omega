@@ -385,7 +385,7 @@ func TestDevFlowTemplateLoadsWorkflowMarkdownContract(t *testing.T) {
 	if template.Runtime.MaxReviewCycles != 3 || template.Runtime.RunnerHeartbeatSeconds != 10 || template.Runtime.AttemptTimeoutMinutes != 30 || template.Runtime.MaxRetryAttempts != 2 || template.Runtime.RetryBackoffSeconds != 300 || template.Runtime.CleanupRetentionSeconds != 86400 || template.Runtime.MaxContinuationTurns != 2 || len(template.Transitions) == 0 {
 		t.Fatalf("workflow runtime/transitions should come from markdown: runtime=%+v transitions=%+v", template.Runtime, template.Transitions)
 	}
-	for _, section := range []string{"requirement", "architect", "coding", "testing", "rework", "review", "delivery"} {
+	for _, section := range []string{"requirement", "architect", "coding", "testing", "rework", "review", "delivery", "git_recovery"} {
 		if !strings.Contains(template.PromptSections[section], "{{") {
 			t.Fatalf("workflow prompt section %s missing variables: prompts=%+v", section, template.PromptSections)
 		}
@@ -8319,6 +8319,26 @@ func TestPagePilotPreviewRuntimeStartPersistsGoProfile(t *testing.T) {
 	}
 	if text(mapValue(stored["profile"]), "workingDirectory") != targetRepo {
 		t.Fatalf("stored preview runtime = %+v", stored)
+	}
+}
+
+func TestPagePilotPreviewRuntimeUsesScriptPort(t *testing.T) {
+	targetRepo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(targetRepo, "package.json"), []byte(`{"scripts":{"dev":"python3 -m http.server 4173 -d ."}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := detectPagePilotPreviewRuntimePlan(targetRepo, pagePilotPreviewRuntimeRequest{})
+	if plan.PreviewURL != "http://127.0.0.1:4173/" {
+		t.Fatalf("preview URL should follow the package script port, got %+v", plan)
+	}
+	if plan.Command != "npm" || strings.Join(plan.Args, " ") != "run dev" || plan.Source != "npm:dev" {
+		t.Fatalf("unexpected plan = %+v", plan)
+	}
+
+	explicit := detectPagePilotPreviewRuntimePlan(targetRepo, pagePilotPreviewRuntimeRequest{PreviewURL: "http://127.0.0.1:3009/"})
+	if explicit.PreviewURL != "http://127.0.0.1:3009/" {
+		t.Fatalf("explicit preview URL should be preserved, got %+v", explicit)
 	}
 }
 

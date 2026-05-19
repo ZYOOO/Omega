@@ -26,6 +26,9 @@ type devFlowReworkActionHandler struct {
 	testingProfile          AgentProfileConfig
 	testingRunner           AgentRunner
 	testingRunnerID         string
+	gitRecoveryProfile      AgentProfileConfig
+	gitRecoveryRunner       AgentRunner
+	gitRecoveryRunnerID     string
 	runnerHeartbeatInterval time.Duration
 	pipeline                map[string]any
 	item                    map[string]any
@@ -34,7 +37,9 @@ type devFlowReworkActionHandler struct {
 	repoWorkspace           string
 	repoSlug                string
 	branchName              string
+	baseBranch              string
 	prURL                   string
+	prURLRef                *string
 	prTitle                 string
 	effectiveDescription    string
 	attemptID               string
@@ -181,14 +186,14 @@ Rules:
 - Address the review feedback with a real code change.
 - Keep the diff minimal and reviewable.
 - Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
-- Write a short completion note to %s with these sections:
+- Return a short completion note in your final answer with these sections:
   - Review feedback addressed
   - What changed
   - Files changed
   - Validation run
   - Remaining risk
-`, handler.repoSlug, handler.repoWorkspace, text(handler.item, "key"), text(handler.item, "title"), handler.prURL, handler.effectiveDescription, handler.roundFeedback, handler.notePath)
-	handler.reworkPrompt = renderWorkflowPromptSection(handler.template, "rework", reworkVariables, reworkFallback) + "\n\n" + agentPolicyBlock(handler.profile, "coding")
+`, handler.repoSlug, handler.repoWorkspace, text(handler.item, "key"), text(handler.item, "title"), handler.prURL, handler.effectiveDescription, handler.roundFeedback)
+	handler.reworkPrompt = renderWorkflowPromptSection(handler.template, "rework", reworkVariables, reworkFallback) + agentArtifactCaptureInstruction(handler.notePath) + "\n\n" + agentPolicyBlock(handler.profile, "coding")
 	if err := os.WriteFile(handler.promptPath, []byte(handler.reworkPrompt), 0o644); err != nil {
 		return err
 	}
@@ -318,7 +323,47 @@ func (handler *devFlowReworkActionHandler) updatePullRequest() error {
 	}
 	reworkPRBody := buildDevFlowPullRequestBody(handler.item, *handler.changedFiles, *handler.testOutput, stringOr(handler.feedback, handler.humanChangeRequest), *handler.diffText)
 	if output, err := updateDevFlowPullRequestDescriptionIfChanged(handler.repoWorkspace, handler.prURL, handler.prTitle, reworkPRBody); err != nil {
-		handler.server.logDebug(handler.ctx, "github.pr.description_update_skipped", "Pull request description update skipped after rework.", map[string]any{"pipelineId": text(handler.pipeline, "id"), "attemptId": handler.attemptID, "pullRequestUrl": handler.prURL, "output": truncateForProof(output+"\n"+err.Error(), 1200)})
+		recovery, recoveryErr := runDevFlowGitHubRecoveryAgent(devFlowGitHubRecoveryInput{
+			Server:              handler.server,
+			Context:             handler.ctx,
+			Template:            handler.template,
+			Profile:             handler.profile,
+			Agent:               handler.gitRecoveryProfile,
+			Runner:              handler.gitRecoveryRunner,
+			RunnerID:            handler.gitRecoveryRunnerID,
+			HeartbeatInterval:   handler.runnerHeartbeatInterval,
+			Pipeline:            handler.pipeline,
+			Item:                handler.item,
+			RepositoryWorkspace: handler.repoWorkspace,
+			Repository:          handler.repoSlug,
+			BranchName:          handler.branchName,
+			BaseBranch:          stringOr(handler.baseBranch, "main"),
+			PullRequestTitle:    handler.prTitle,
+			PullRequestBody:     reworkPRBody,
+			PullRequestURL:      handler.prURL,
+			ChangedFiles:        *handler.changedFiles,
+			TestOutput:          *handler.testOutput,
+			ProofDir:            handler.proofDir,
+			AttemptID:           handler.attemptID,
+			StageID:             handler.stageID,
+			ActionID:            "update_pull_request",
+			ActionType:          "ensure_pr",
+			InitialError:        fmt.Errorf("update pull request description: %w\n%s", err, output),
+			PromptVariables:     handler.promptVariables,
+		})
+		if recoveryErr != nil {
+			handler.recordAgent(handler.stageID, devFlowGitRecoveryAgentID, "failed", recovery.Prompt, filepath.Base(recovery.ArtifactPath), "Git Recovery Agent could not repair pull request update.", []string{recovery.PromptPath, recovery.ArtifactPath}, recovery.Process)
+			handler.server.logDebug(handler.ctx, "github.pr.description_update_skipped", "Pull request description update skipped after rework.", map[string]any{"pipelineId": text(handler.pipeline, "id"), "attemptId": handler.attemptID, "pullRequestUrl": handler.prURL, "output": truncateForProof(output+"\n"+err.Error()+"\n"+recoveryErr.Error(), 1200)})
+		} else {
+			handler.prURL = recovery.PullRequestURL
+			if handler.prURLRef != nil {
+				*handler.prURLRef = recovery.PullRequestURL
+			}
+			handler.recordAgent(handler.stageID, devFlowGitRecoveryAgentID, "passed", recovery.Prompt, filepath.Base(recovery.ArtifactPath), recovery.Summary, []string{recovery.PromptPath, recovery.ArtifactPath}, recovery.Process)
+			if retryOutput, retryErr := updateDevFlowPullRequestDescriptionIfChanged(handler.repoWorkspace, handler.prURL, handler.prTitle, reworkPRBody); retryErr != nil {
+				handler.server.logDebug(handler.ctx, "github.pr.description_update_after_recovery_skipped", "Pull request description update skipped after Git recovery.", map[string]any{"pipelineId": text(handler.pipeline, "id"), "attemptId": handler.attemptID, "pullRequestUrl": handler.prURL, "output": truncateForProof(retryOutput+"\n"+retryErr.Error(), 1200)})
+			}
+		}
 	} else {
 		handler.server.logInfo(handler.ctx, "github.pr.description_updated", "Pull request description updated after rework.", map[string]any{"pipelineId": text(handler.pipeline, "id"), "attemptId": handler.attemptID, "pullRequestUrl": handler.prURL, "output": truncateForProof(output, 1200)})
 	}

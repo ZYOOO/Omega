@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -189,6 +190,7 @@ func (server *Server) startPagePilotPreviewRuntime(ctx context.Context, payload 
 }
 
 func detectPagePilotPreviewRuntimePlan(repoPath string, payload pagePilotPreviewRuntimeRequest) pagePilotPreviewRuntimePlan {
+	explicitPreviewURL := strings.TrimSpace(payload.PreviewURL) != ""
 	previewURL := strings.TrimSpace(payload.PreviewURL)
 	if previewURL == "" {
 		previewURL = "http://127.0.0.1:3009/"
@@ -218,7 +220,10 @@ func detectPagePilotPreviewRuntimePlan(repoPath string, payload pagePilotPreview
 		}
 	}
 	if script != "" {
-		port := pagePilotPreviewPort(previewURL)
+		if port := pagePilotPreviewScriptPort(text(scripts, script)); port != "" && !explicitPreviewURL {
+			plan.PreviewURL = pagePilotPreviewURLWithPort(plan.PreviewURL, port)
+		}
+		port := pagePilotPreviewPort(plan.PreviewURL)
 		manager := pagePilotPreviewPackageManager(repoPath)
 		plan.Command = manager
 		plan.Args = pagePilotPreviewPackageArgs(manager, script, text(scripts, script), port)
@@ -234,6 +239,69 @@ func detectPagePilotPreviewRuntimePlan(repoPath string, payload pagePilotPreview
 	}
 	plan.Reason = "no preview command could be detected"
 	return plan
+}
+
+func pagePilotPreviewScriptPort(scriptCommand string) string {
+	fields := strings.Fields(strings.TrimSpace(scriptCommand))
+	for index, raw := range fields {
+		token := strings.Trim(raw, `"'`)
+		lower := strings.ToLower(token)
+		switch {
+		case lower == "--port" || lower == "-p" || lower == "--listen" || lower == "-l":
+			if index+1 < len(fields) {
+				if port := pagePilotPreviewNormalizePort(fields[index+1]); port != "" {
+					return port
+				}
+			}
+		case strings.HasPrefix(lower, "--port=") || strings.HasPrefix(lower, "--listen=") || strings.HasPrefix(lower, "-p=") || strings.HasPrefix(lower, "-l="):
+			if port := pagePilotPreviewNormalizePort(strings.SplitN(token, "=", 2)[1]); port != "" {
+				return port
+			}
+		case strings.Contains(lower, ":"):
+			if port := pagePilotPreviewNormalizePort(lower[strings.LastIndex(lower, ":")+1:]); port != "" {
+				return port
+			}
+		case lower == "http.server":
+			if index+1 < len(fields) {
+				if port := pagePilotPreviewNormalizePort(fields[index+1]); port != "" {
+					return port
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func pagePilotPreviewNormalizePort(value string) string {
+	trimmed := strings.Trim(strings.TrimSpace(value), `"'`)
+	trimmed = strings.TrimSuffix(strings.TrimSuffix(trimmed, "/"), ",")
+	if strings.Contains(trimmed, ":") {
+		trimmed = trimmed[strings.LastIndex(trimmed, ":")+1:]
+	}
+	port, err := strconv.Atoi(trimmed)
+	if err != nil || port <= 0 || port > 65535 {
+		return ""
+	}
+	return strconv.Itoa(port)
+}
+
+func pagePilotPreviewURLWithPort(rawURL string, port string) string {
+	if strings.TrimSpace(port) == "" {
+		return rawURL
+	}
+	request, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil || request.URL == nil {
+		return rawURL
+	}
+	host := request.URL.Hostname()
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	request.URL.Host = net.JoinHostPort(host, port)
+	if request.URL.Path == "" {
+		request.URL.Path = "/"
+	}
+	return request.URL.String()
 }
 
 func pagePilotPreviewRuntimeProfileFromPlan(plan pagePilotPreviewRuntimePlan, payload pagePilotPreviewRuntimeRequest, target map[string]any) map[string]any {

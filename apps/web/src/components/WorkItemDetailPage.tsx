@@ -334,6 +334,7 @@ export function WorkItemDetailPage({
   const blockedReason = workItem.status === "Blocked"
     ? blockedReasonForDetail({ attempt, failedStages, runWorkpad })
     : "";
+  const stoppedStage = stoppedStageContext({ actionPlan: attemptActionPlan, attempt, pipeline });
 
   return (
     <section className="issue-detail-view work-item-detail-page" aria-label={t("Work item detail")}>
@@ -367,7 +368,15 @@ export function WorkItemDetailPage({
             <div className="detail-blocked-callout" role="status">
               <span>{t("Blocked reason")}</span>
               <strong>{blockedReason}</strong>
-              {attempt?.id ? <small>{t("Attempt")}: {attempt.id}</small> : null}
+              <div className="detail-blocked-meta">
+                {attempt?.id ? <small>{t("Attempt")}: {attempt.id}</small> : null}
+                {stoppedStage ? (
+                  <small>
+                    {t("Stopped at {stage}", { stage: stoppedStage.title })}
+                    {stoppedStage.timeLabel ? ` · ${stoppedStage.timeLabel}` : ""}
+                  </small>
+                ) : null}
+              </div>
             </div>
           ) : null}
         </header>
@@ -377,6 +386,7 @@ export function WorkItemDetailPage({
           <DeliveryFlowGrid
             actionPlan={attemptActionPlan}
             agentShortLabel={agentShortLabel}
+            attempt={attempt}
             operationStatusLabel={operationStatusLabel}
             pipeline={pipeline}
             pipelineStageClassName={pipelineStageClassName}
@@ -425,6 +435,7 @@ export function WorkItemDetailPage({
             failureProofCards={failureProofCards}
             humanReviewArtifacts={humanReviewArtifacts}
             humanReviewEvents={reviewEvents}
+            currentFailureReason={blockedReason}
             onApproveCheckpoint={onApproveCheckpoint}
             onFetchProofPreview={onFetchProofPreview}
             onRequestCheckpointChanges={onRequestCheckpointChanges}
@@ -658,21 +669,60 @@ function blockedReasonForDetail({
   failedStages: StageSummary[];
   runWorkpad?: RunWorkpadRecordInfo;
 }): string {
-  const blockers = runWorkpad?.workpad?.blockers?.map((item) => item.trim()).filter(Boolean) ?? [];
+  const blockers = orderedFailureSignals(runWorkpad?.workpad?.blockers ?? []);
   if (blockers.length > 0) return blockers[0];
   const retryReason = runWorkpad?.workpad?.retryReason?.trim();
   if (retryReason) return retryReason;
-  const attemptReason = [
+  const attemptReason = orderedFailureSignals([
     attempt?.failureReason,
     attempt?.errorMessage,
     attempt?.statusReason
-  ].find((value) => value && value.trim());
-  if (attemptReason) return attemptReason.trim();
+  ])[0];
+  if (attemptReason) return attemptReason;
   const failedStage = failedStages[0];
   if (failedStage) return `${failedStage.title ?? failedStage.id} ${failedStage.status}`;
   if (attempt?.status === "failed") return "The last attempt failed before a detailed reason was captured.";
   if (attempt?.status === "cancelled") return "The last attempt was cancelled.";
   return "This item is blocked. Open the Run Workpad and attempt history for the latest recovery context.";
+}
+
+function orderedFailureSignals(values: Array<string | undefined | null>): string[] {
+  const indexed = values
+    .map((value, index) => ({ index, value: typeof value === "string" ? value.trim() : "" }))
+    .filter((entry) => entry.value);
+  const seen = new Set<string>();
+  const unique = indexed.filter((entry) => {
+    const key = entry.value.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return unique
+    .sort((left, right) => failureSignalScore(right.value) - failureSignalScore(left.value) || left.index - right.index)
+    .map((entry) => entry.value);
+}
+
+function failureSignalScore(value: string): number {
+  let score = 0;
+  if (/GraphQL|No common ancestor|no history in common|create pull request|pull request create failed|gh pr create/i.test(value)) score += 8;
+  if (/failed:|exit status|exit code|EPERM|EACCES|RateLimit|permission|not found|missing|timeout|could not|cannot/i.test(value)) score += 4;
+  if (value.length > 120) score += 1;
+  if (/^Workflow contract .* action failed\.?$/i.test(value)) score -= 7;
+  if (/^Pipeline is (failed|stalled|blocked)\.?$/i.test(value)) score -= 7;
+  if (/^No active local worker host lease/i.test(value)) score -= 4;
+  return score;
+}
+
+function isDistinctRecoverySignal(value: string | undefined | null, blockerReason: string | undefined | null): boolean {
+  const signal = normalizeComparableSignal(value);
+  if (!signal) return false;
+  const blocker = normalizeComparableSignal(blockerReason);
+  if (!blocker) return true;
+  return signal !== blocker && !signal.includes(blocker) && !blocker.includes(signal);
+}
+
+function normalizeComparableSignal(value: string | undefined | null): string {
+  return typeof value === "string" ? value.trim().replace(/\s+/g, " ").toLowerCase() : "";
 }
 
 function workpadFieldToDraft(workpad: RunWorkpadRecordInfo["workpad"] | undefined, field: WorkpadEditableField): string {
@@ -739,6 +789,7 @@ function linesFromDraft(value: string): string[] {
 function DeliveryFlowGrid({
   actionPlan,
   agentShortLabel,
+  attempt,
   operationStatusLabel,
   pipeline,
   pipelineStageClassName,
@@ -746,6 +797,7 @@ function DeliveryFlowGrid({
   stageAgentRuns
 }: Pick<DetailHelpers, "agentShortLabel" | "operationStatusLabel" | "pipelineStageClassName" | "pipelineStageLabel"> & {
   actionPlan?: AttemptActionPlanInfo | null;
+  attempt?: AttemptRecordInfo;
   pipeline?: PipelineRecordInfo;
   stageAgentRuns: Map<string, StageAgentRunSummary>;
 }) {
@@ -759,6 +811,7 @@ function DeliveryFlowGrid({
   const pipelineStages = pipeline?.run?.stages ?? [];
   const planStates = actionPlan?.states?.length ? actionPlan.states : [];
   const stages = pipelineStages.length ? pipelineStages : planStates;
+  const stoppedStage = stoppedStageContext({ actionPlan, attempt, pipeline });
   const reworkRunning = stages.some((stage) => {
     const stageRecord = stage as Record<string, unknown>;
     return recordString(stageRecord, "id") === "rework" && recordString(stageRecord, "status") === "running";
@@ -791,22 +844,30 @@ function DeliveryFlowGrid({
         const summary = stageAgentRuns.get(stageId);
         const runtimeLabel = stageAgentRuntimeLabel(summary, agentIds, agentShortLabel, t);
         const stageTitle = recordString(stageRecord, "title") || recordString(stageRecord, "id") || stageId;
+        const stoppedHere = stoppedStage?.id === stageId;
+        const displayStatus = stoppedHere && status !== "failed" && status !== "blocked" ? "paused" : status;
         return (
-          <article key={stageId} className={`detail-stage-card ${pipelineStageClassName(status)}`}>
+          <article key={stageId} className={`detail-stage-card ${pipelineStageClassName(displayStatus)}${stoppedHere ? " stage-stopped-here" : ""}`}>
             <span className="stage-card-index">{index + 1}</span>
             <div className="stage-card-content">
               <strong>{stageTitle}</strong>
               {participantLabel ? <small>{participantLabel}</small> : null}
               {runtimeLabel ? <small className="stage-agent-runtime">{runtimeLabel}</small> : null}
+              {stoppedHere ? (
+                <small className="stage-card-stop-note">
+                  {t("Stopped here")}
+                  {stoppedStage.timeLabel ? ` · ${stoppedStage.timeLabel}` : ""}
+                </small>
+              ) : null}
               <StageAgentMetrics summary={summary} plannedAgentIds={agentIds} />
             </div>
             <div className="stage-card-actions">
-              <span className="stage-card-status">{pipelineStageLabel(status)}</span>
+              <span className="stage-card-status">{stoppedHere && displayStatus === "paused" ? t("Paused") : pipelineStageLabel(status)}</span>
               <button
                 type="button"
                 className="stage-agent-detail-button"
                 aria-label={`${t("View agents")}: ${stageTitle}`}
-                onClick={() => setActiveStage({ agentIds, stageId, status, title: stageTitle })}
+                onClick={() => setActiveStage({ agentIds, stageId, status: displayStatus, title: stageTitle })}
               >
                 {t("View agents")}
               </button>
@@ -923,21 +984,25 @@ function StageAgentDetailDialog({
           </div>
           {details.length ? (
             <div className="stage-agent-detail-list">
-              {details.map((detail) => (
-                <article key={detail.id} className={`stage-agent-detail-row ${detail.source === "event" ? "is-event" : ""}`}>
-                  <div className="stage-agent-detail-main">
-                    <span>{t(detail.roleLabel)}</span>
-                    <strong>{detail.agentLabel}</strong>
-                    <small>{agentRuntimeMeta(detail) || t("Runtime not captured")}</small>
-                    <p>{shortText(detail.summary, 220)}</p>
-                  </div>
-                  <div className="stage-agent-detail-facts">
-                    <span>{operationStatusLabel(detail.status)}</span>
-                    {typeof detail.durationMs === "number" && detail.durationMs > 0 ? <span>{formatDurationLabel(detail.durationMs)}</span> : null}
-                    {detail.tokenUsage?.total ? <span>{formatTokenUsage(detail.tokenUsage)}</span> : null}
-                  </div>
-                </article>
-              ))}
+              {details.map((detail) => {
+                const timeLabel = agentRunTimeLabel(detail, t);
+                return (
+                  <article key={detail.id} className={`stage-agent-detail-row ${detail.source === "event" ? "is-event" : ""}`}>
+                    <div className="stage-agent-detail-main">
+                      <span>{t(detail.roleLabel)}</span>
+                      <strong>{detail.agentLabel}</strong>
+                      <small>{agentRuntimeMeta(detail) || t("Runtime not captured")}</small>
+                      {timeLabel ? <small className="stage-agent-detail-time">{timeLabel}</small> : null}
+                      <p>{shortText(detail.summary, 220)}</p>
+                    </div>
+                    <div className="stage-agent-detail-facts">
+                      <span>{operationStatusLabel(detail.status)}</span>
+                      {typeof detail.durationMs === "number" && detail.durationMs > 0 ? <span>{formatDurationLabel(detail.durationMs)}</span> : null}
+                      {detail.tokenUsage?.total ? <span>{formatTokenUsage(detail.tokenUsage)}</span> : null}
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           ) : (
             <p className="muted-copy">
@@ -1030,6 +1095,48 @@ function agentRuntimeMeta(detail: StageAgentRunDetail): string {
     .join(" · ");
 }
 
+function agentRunTimeLabel(detail: StageAgentRunDetail, t: (key: string, params?: Record<string, string | number>) => string): string {
+  const started = formatTimestamp(detail.startedAt ?? "");
+  const finished = formatTimestamp(detail.finishedAt ?? "");
+  if (started && finished && started !== finished) return `${t("Started")} ${started} · ${t("Finished")} ${finished}`;
+  if (finished) return `${t("Updated")} ${finished}`;
+  if (started) return `${t("Started")} ${started}`;
+  return "";
+}
+
+function stoppedStageContext({
+  actionPlan,
+  attempt,
+  pipeline
+}: {
+  actionPlan?: AttemptActionPlanInfo | null;
+  attempt?: AttemptRecordInfo;
+  pipeline?: PipelineRecordInfo;
+}): { id: string; timeLabel: string; title: string } | null {
+  const status = (attempt?.status || pipeline?.status || "").toLowerCase();
+  if (!["failed", "stalled", "canceled", "blocked", "paused"].includes(status)) return null;
+  const stages = [
+    ...(pipeline?.run?.stages ?? []),
+    ...(attempt?.stages ?? []),
+    ...(actionPlan?.states ?? [])
+  ];
+  const stageId = attempt?.failureStageId || attempt?.currentStageId || inferStoppedStageId(stages);
+  if (!stageId) return null;
+  const stageRecord = stages.find((stage) => recordString(stage, "id") === stageId);
+  return {
+    id: stageId,
+    timeLabel: formatTimestamp(attempt?.finishedAt || attempt?.stalledAt || attempt?.lastSeenAt || attempt?.updatedAt || pipeline?.updatedAt || ""),
+    title: recordString(stageRecord, "title") || stageId
+  };
+}
+
+function inferStoppedStageId(stages: Array<Record<string, unknown>>): string {
+  const active = stages.find((stage) => /failed|blocked|running|needs-human|waiting-human/i.test(recordString(stage, "status")));
+  if (active) return recordString(active, "id");
+  const progressed = [...stages].reverse().find((stage) => !/^(waiting|ready)?$/i.test(recordString(stage, "status")));
+  return progressed ? recordString(progressed, "id") : "";
+}
+
 function ReworkReturnSignal({
   actionPlan,
   attempt,
@@ -1041,6 +1148,7 @@ function ReworkReturnSignal({
   pipeline?: PipelineRecordInfo;
   runWorkpad?: RunWorkpadRecordInfo;
 }) {
+  const { t } = useI18n();
   const rejectedEvent = pipeline?.run?.events?.find((event) => /rejected|changes requested|request changes/i.test(`${event.type ?? ""} ${event.message ?? ""}`));
   const assessment = recordValue(runWorkpad?.workpad?.reworkAssessment) || recordValue(attempt?.reworkAssessment);
   const checklist = recordValue(runWorkpad?.workpad?.reworkChecklist) || recordValue(attempt?.reworkChecklist);
@@ -1048,30 +1156,40 @@ function ReworkReturnSignal({
   const checklistItems = asStringArray(checklist?.checklist);
   const retryAvailable = recordBool(retry, "available");
   const isRetryableAttempt = attempt ? ["failed", "stalled", "canceled"].includes(attempt.status) : false;
-  const hasFeedbackRoute = Boolean(
-    rejectedEvent ||
-    attempt?.humanChangeRequest ||
-    recordString(assessment, "strategy") ||
-    retryAvailable ||
-    isRetryableAttempt
-  );
-  if (!hasFeedbackRoute) {
+  const route = recordString(assessment, "strategy") || "rework";
+  const blockerReason = orderedFailureSignals([
+    ...asStringArray(runWorkpad?.workpad?.blockers),
+    attempt?.failureReason,
+    attempt?.errorMessage,
+    attempt?.statusReason
+  ])[0];
+  const explicitRecoveryReasons = [
+    recordString(assessment, "rationale"),
+    attempt?.humanChangeRequest,
+    rejectedEvent?.message
+  ];
+  const retryRecoveryReasons = blockerReason ? [] : [
+    retryAvailable || isRetryableAttempt ? recordString(checklist, "retryReason") : "",
+    recordString(retry, "reason")
+  ];
+  const reason = [...explicitRecoveryReasons, ...retryRecoveryReasons].find((value) => isDistinctRecoverySignal(value, blockerReason));
+  const hasSpecificRoute = Boolean(recordString(assessment, "strategy") && !/^rework$/i.test(route));
+  if (!reason && !hasSpecificRoute) {
     return null;
   }
-  const route = recordString(assessment, "strategy") || "rework";
-  const reason =
-    recordString(assessment, "rationale") ||
-    (retryAvailable || isRetryableAttempt ? recordString(checklist, "retryReason") : "") ||
-    recordString(retry, "reason") ||
-    attempt?.humanChangeRequest ||
-    rejectedEvent?.message ||
-    "Human or review feedback will be routed into rework before returning to review.";
   return (
     <aside className="rework-return-signal" aria-label="Rework return signal">
-      <span>Feedback route</span>
+      <span>{t("Recovery route")}</span>
       <strong>{reworkStrategyLabel(route)}</strong>
-      <p>{shortText(reason, 180)}</p>
-      {checklistItems.length ? <small>{checklistItems.length} checklist action{checklistItems.length === 1 ? "" : "s"} captured for the next run.</small> : null}
+      <p>{shortText(reason || t("The next retry or rework will use the blocker above with this recovery route."), 180)}</p>
+      <small>{t("This panel explains how the next retry or rework will use the blocker and feedback above.")}</small>
+      {checklistItems.length ? (
+        <small>
+          {t(checklistItems.length === 1 ? "{count} checklist action captured for the next run." : "{count} checklist actions captured for the next run.", {
+            count: checklistItems.length
+          })}
+        </small>
+      ) : null}
     </aside>
   );
 }
@@ -1110,7 +1228,7 @@ function buildRunWorkpadSections({
   const planProgress = buildPlanProgress({ actionPlan, pipeline, planArtifacts, t });
   const validationOps = operations.filter((operation) => /test|check|validation/i.test(`${operation.stageId ?? ""} ${operation.agentId ?? ""} ${operation.summary ?? ""}`));
   const reviewOps = operations.filter((operation) => /review|rework/i.test(`${operation.stageId ?? ""} ${operation.agentId ?? ""} ${operation.summary ?? ""}`));
-  const recordedBlockers = asStringArray(workpad?.blockers).filter((blocker) => {
+  const recordedBlockers = orderedFailureSignals(asStringArray(workpad?.blockers)).filter((blocker) => {
     if (checkpointActionable && /human review|人工|审批/i.test(blocker)) return false;
     return true;
   });
@@ -1118,12 +1236,12 @@ function buildRunWorkpadSections({
     checkpoint && checkpoint.status === "rejected"
       ? `${checkpoint.title}: ${checkpoint.summary}`
       : "";
-  const blockers = recordedBlockers.length ? recordedBlockers : [
+  const blockers = recordedBlockers.length ? recordedBlockers : orderedFailureSignals([
     attempt?.failureReason,
     attempt?.errorMessage,
     checkpointBlocker,
     pullRequestStatus?.deliveryGate && pullRequestStatus.deliveryGate !== "passed" ? `PR gate: ${pullRequestStatus.deliveryGate}` : ""
-  ].filter(Boolean) as string[];
+  ]);
   const recordedFeedback = asStringArray(workpad?.reviewFeedback);
   const prFeedback = [
     ...feedbackRecordsToStrings(attempt?.pullRequestFeedback),
@@ -1141,7 +1259,7 @@ function buildRunWorkpadSections({
     reviewOps.map((operation) => operation.summary || operation.runnerProcess?.stderr || "").find(Boolean) ||
     reviewEvents.map((event) => event.message).find(Boolean);
   const isRetryableAttempt = attempt ? ["failed", "stalled", "canceled"].includes(attempt.status) : false;
-  const retryReason = isRetryableAttempt ? (workpad?.retryReason || retryReasonForAttempt(attempt)) : "";
+  const retryReason = isRetryableAttempt ? (blockers[0] || workpad?.retryReason || retryReasonForAttempt(attempt)) : "";
   const acceptanceCriteria = asStringArray(workpad?.acceptanceCriteria);
   const criteria = acceptanceCriteria.length
     ? acceptanceCriteria
@@ -1158,17 +1276,20 @@ function buildRunWorkpadSections({
   const rejectedEvent = pipeline?.run?.events?.find((event) => /rejected|changes requested|request changes/i.test(`${event.type ?? ""} ${event.message ?? ""}`));
   const hasFeedbackRoute = Boolean(rejectedEvent || attempt?.humanChangeRequest || reworkStrategy || isRetryableAttempt);
   const shouldShowReworkChecklist = hasFeedbackRoute && runtimeReworkChecklistItems.length > 0;
+  const primaryBlocker = blockers[0] ?? "";
   const sections: WorkpadSection[] = [
     ...(shouldShowReworkChecklist
       ? [{
           id: "rework-checklist",
           label: "Rework checklist",
           title: `${runtimeReworkChecklistItems.length} action${runtimeReworkChecklistItems.length === 1 ? "" : "s"}`,
-          preview: shortText(runtimeReworkChecklistItems[0] ?? recordString(runtimeReworkChecklist, "retryReason"), 120),
+          preview: shortText(primaryBlocker || runtimeReworkChecklistItems[0] || recordString(runtimeReworkChecklist, "retryReason"), 120),
           tone: "warning" as const,
           body: (
             <div className="workpad-rework-assessment">
-              {recordString(runtimeReworkChecklist, "retryReason") ? <p>{shortText(recordString(runtimeReworkChecklist, "retryReason"), 280)}</p> : null}
+              {primaryBlocker || recordString(runtimeReworkChecklist, "retryReason") ? (
+                <p>{shortText(primaryBlocker || recordString(runtimeReworkChecklist, "retryReason"), 280)}</p>
+              ) : null}
               <ul>
                 {runtimeReworkChecklistItems.slice(0, 5).map((item) => <li key={item}>{item}</li>)}
               </ul>

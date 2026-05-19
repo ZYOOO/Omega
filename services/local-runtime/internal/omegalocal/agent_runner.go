@@ -159,13 +159,13 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 		args = append(args, "--model", model)
 	}
 	outputPath := strings.TrimSpace(request.OutputPath)
-	capturePath := outputPath
-	captureDir := ""
-	if outputPath != "" && strings.EqualFold(strings.TrimSpace(sandbox), "read-only") {
-		if dir, err := os.MkdirTemp("", "omega-codex-last-message-*"); err == nil {
-			captureDir = dir
-			capturePath = filepath.Join(dir, filepath.Base(outputPath))
-		}
+	capturePath, captureDir, captureErr := codexOutputCapturePath(request.Workspace, outputPath, sandbox)
+	if captureErr != nil {
+		process := runnerProcessNotAvailable("codex", "codex", request.Workspace, captureErr)
+		process["model"] = model
+		process["effort"] = effort
+		process["sandbox"] = sandbox
+		return AgentTurnResult{Status: "failed", Process: process, Error: captureErr}
 	}
 	if captureDir != "" {
 		defer os.RemoveAll(captureDir)
@@ -189,6 +189,7 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 	)
 	if outputPath != "" {
 		if capturePath != outputPath {
+			process["outputCaptureMode"] = "runner-copy"
 			copyAgentOutputFile(capturePath, outputPath, process)
 		}
 		ensureAgentOutputFile(outputPath, process)
@@ -201,6 +202,36 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 	process["model"] = model
 	process["effort"] = effort
 	return AgentTurnResult{Status: status, Process: process, Error: err}
+}
+
+func codexOutputCapturePath(workspace string, outputPath string, sandbox string) (string, string, error) {
+	outputPath = strings.TrimSpace(outputPath)
+	if outputPath == "" {
+		return "", "", nil
+	}
+	if strings.EqualFold(strings.TrimSpace(sandbox), "read-only") {
+		dir, err := os.MkdirTemp("", "omega-codex-last-message-*")
+		if err != nil {
+			return "", "", err
+		}
+		return filepath.Join(dir, safeAgentOutputBase(outputPath)), dir, nil
+	}
+	if strings.TrimSpace(workspace) != "" && !pathInsideRoot(workspace, outputPath) {
+		captureDir := filepath.Join(workspace, ".omega", "agent-output")
+		if err := os.MkdirAll(captureDir, 0o700); err != nil {
+			return "", "", err
+		}
+		return filepath.Join(captureDir, safeAgentOutputBase(outputPath)), "", nil
+	}
+	return outputPath, "", nil
+}
+
+func safeAgentOutputBase(outputPath string) string {
+	base := strings.TrimSpace(filepath.Base(outputPath))
+	if base == "" || base == "." || base == string(os.PathSeparator) {
+		return "agent-output.md"
+	}
+	return base
 }
 
 type OpenCodeAgentRunner struct{}

@@ -4511,6 +4511,13 @@ kbd {
   font-weight: 700;
 }
 
+.detail-blocked-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  align-items: center;
+}
+
 .detail-breadcrumb {
   display: flex;
   flex-wrap: wrap;
@@ -5703,6 +5710,23 @@ kbd {
   background: rgba(150, 48, 48, 0.15);
 }
 
+.detail-stage-card.stage-paused,
+.detail-stage-card.stage-stopped-here {
+  border-color: rgba(245, 184, 61, 0.88);
+  background: rgba(245, 184, 61, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(245, 184, 61, 0.22);
+}
+
+.detail-stage-card.stage-stopped-here .stage-card-index {
+  background: rgba(245, 184, 61, 0.2);
+  color: #f7c948;
+}
+
+.stage-card-stop-note {
+  color: #f5d36c;
+  font-weight: 850;
+}
+
 .rework-return-signal {
   display: grid;
   gap: 6px;
@@ -6005,6 +6029,11 @@ kbd {
   font-size: 0.78rem;
   line-height: 1.4;
   overflow-wrap: anywhere;
+}
+
+.stage-agent-detail-main .stage-agent-detail-time {
+  color: #c7d2fe;
+  font-weight: 820;
 }
 
 .stage-agent-detail-facts {
@@ -11253,6 +11282,10 @@ kbd,
   color: #7b641d;
 }
 
+.product-shell.theme-light .detail-blocked-meta {
+  color: #7b641d;
+}
+
 .product-shell.theme-light .issue-detail-title {
   border-color: #e7eef7;
 }
@@ -11579,6 +11612,10 @@ kbd,
   color: #2563eb;
 }
 
+.product-shell.theme-light .stage-agent-detail-main .stage-agent-detail-time {
+  color: #315f9c;
+}
+
 .product-shell.theme-light .stage-agent-detail-facts span {
   color: #345173;
 }
@@ -11612,6 +11649,22 @@ kbd,
 .product-shell.theme-light .workpad-card.workpad-warning {
   border-color: #f8cf7a;
   background: #fffaf0;
+}
+
+.product-shell.theme-light .detail-stage-card.stage-paused,
+.product-shell.theme-light .detail-stage-card.stage-stopped-here {
+  border-color: #f5b83d;
+  background: #fff8e5;
+  box-shadow: inset 0 0 0 1px rgba(245, 184, 61, 0.22);
+}
+
+.product-shell.theme-light .detail-stage-card.stage-stopped-here .stage-card-index {
+  background: #fff0bf;
+  color: #9a6700;
+}
+
+.product-shell.theme-light .stage-card-stop-note {
+  color: #8a6400;
 }
 
 .product-shell.theme-light .rework-return-signal {
