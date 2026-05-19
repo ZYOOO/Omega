@@ -3,6 +3,10 @@
   "version": "0.1.1",
   "description": "Local-first AI DevFlow desktop app for repository-bound delivery workflows.",
   "author": "Omega",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZYOOO/Omega.git"
+  },
   "private": true,
   "type": "module",
   "main": "apps/desktop/src/main.cjs",
