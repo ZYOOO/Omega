@@ -2,6 +2,29 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-19: CI coverage 跑轻量测试集却统计 core 覆盖率
+
+### 现象
+
+PR CI 中 `npm run coverage` 的 133 个测试实际通过，但 GitHub Actions 仍失败，原因是覆盖率报告只跑了当前 UI 测试集，却仍按 `src/core/**/*.ts` 统计并要求 80% 全局阈值，最终得到约 40% 行覆盖率。
+
+### 原因
+
+为加快默认前端测试，Vitest 默认 include 被收窄到当前 UI / component 测试；但 coverage 配置的统计目标仍是 `src/core/**/*.ts`。CI 的 coverage 命令没有显式切到完整测试集，导致“统计 core，但没跑 core 单测”。
+
+### 修复
+
+- 恢复 `OMEGA_TEST_SUITE=current|legacy|all` 的 include 选择。
+- 默认 `npm run test` 仍只跑当前轻量测试集。
+- `npm run coverage` 和 `npm run test:all` 显式使用 `OMEGA_TEST_SUITE=all`，让 CI 覆盖率门禁和统计目标一致。
+
+### 验证
+
+```bash
+npm run coverage
+npm run lint
+```
+
 ## 2026-05-19: Coding / Rework Agent 被要求写 repo 外 proof 路径
 
 ### 现象

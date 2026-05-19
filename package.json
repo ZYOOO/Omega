@@ -28,10 +28,10 @@
     "openapi:check": "node scripts/check-openapi-routes.mjs",
     "codex:proof:smoke": "node scripts/codex-proof-smoke.mjs",
     "test": "vitest run --config apps/web/vite.config.ts",
-    "test:all": "vitest run --config apps/web/vite.config.ts --reporter=dot",
+    "test:all": "OMEGA_TEST_SUITE=all vitest run --config apps/web/vite.config.ts --reporter=dot",
     "test:feature-p0": "npm run lint && npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=15000 && node --check apps/desktop/src/process-supervisor.cjs && node --check apps/desktop/src/pilot-preload.cjs && npm run go:test:focused",
     "test:watch": "vitest --config apps/web/vite.config.ts",
-    "coverage": "vitest run --coverage --config apps/web/vite.config.ts",
+    "coverage": "OMEGA_TEST_SUITE=all vitest run --coverage --config apps/web/vite.config.ts",
     "lint": "tsc -b --pretty false"
   },
   "dependencies": {
