@@ -517,6 +517,18 @@ func (server *Server) createWorkItem(response http.ResponseWriter, request *http
 		writeError(response, http.StatusBadRequest, err)
 		return
 	}
+	payload.Item = cloneMap(payload.Item)
+	if targetID := strings.TrimSpace(text(payload.Item, "repositoryTargetId")); targetID != "" {
+		target := findRepositoryTarget(database, targetID)
+		if target == nil {
+			writeJSON(response, http.StatusBadRequest, map[string]any{"error": "repository target not found"})
+			return
+		}
+		if text(payload.Item, "target") == "" || text(payload.Item, "target") == "No target" {
+			payload.Item["target"] = repositoryTargetLabel(target)
+		}
+		payload.Item["projectId"] = workItemProjectID(database, payload.Item)
+	}
 	next := appendWorkItem(database, payload.Item)
 	if err := server.Repo.SaveWorkItemsState(request.Context(), next); err != nil {
 		writeError(response, http.StatusInternalServerError, err)
@@ -2796,6 +2808,11 @@ func (server *Server) completeApprovedDevFlowCheckpointInBackground(checkpointID
 		}
 		checkpoint := cloneMap(database.Tables.Checkpoints[index])
 		if err := server.completeApprovedDevFlowCheckpoint(database, checkpoint, reviewer); err != nil {
+			server.markApprovedDevFlowDeliveryFailed(database, checkpoint, err)
+			touch(database)
+			if saveErr := server.Repo.SaveSupervisorExecutionState(ctx, *database); saveErr != nil {
+				server.logError(ctx, "checkpoint.approve.delivery_save_failed", saveErr.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
+			}
 			server.logError(ctx, "checkpoint.approve.delivery_failed", err.Error(), map[string]any{"entityType": "checkpoint", "entityId": checkpointID, "pipelineId": text(checkpoint, "pipelineId"), "stageId": text(checkpoint, "stageId")})
 			return
 		}
@@ -2985,6 +3002,60 @@ func (server *Server) completeApprovedDevFlowCheckpoint(database *WorkspaceDatab
 		})
 	}
 	return nil
+}
+
+func (server *Server) markApprovedDevFlowDeliveryFailed(database *WorkspaceDatabase, checkpoint map[string]any, failure error) {
+	if database == nil || failure == nil {
+		return
+	}
+	pipelineIndex := findByID(database.Tables.Pipelines, text(checkpoint, "pipelineId"))
+	if pipelineIndex < 0 {
+		return
+	}
+	pipeline := cloneMap(database.Tables.Pipelines[pipelineIndex])
+	mergeRoute := workflowActionRouteFromPipeline(pipeline, "human_review", "human", "passed")
+	mergeStageID := stringOr(mergeRoute.NextStageID, "merging")
+	message := failure.Error()
+	run := mapValue(pipeline["run"])
+	stages := arrayMaps(run["stages"])
+	for _, stage := range stages {
+		if text(stage, "id") == mergeStageID {
+			stage["status"] = "failed"
+			stage["errorMessage"] = truncateForProof(message, 1200)
+			stage["completedAt"] = nowISO()
+			stage["notes"] = "Merge failed after human approval; operator retry is required after resolving the PR state."
+		}
+	}
+	run["stages"] = stages
+	appendRunEvent(run, "delivery.merge.failed", "Pull request merge failed after human approval.", mergeStageID, "delivery")
+	pipeline["run"] = run
+	pipeline["status"] = "failed"
+	pipeline["updatedAt"] = nowISO()
+	database.Tables.Pipelines[pipelineIndex] = pipeline
+	if item := findWorkItem(*database, text(pipeline, "workItemId")); item != nil {
+		*database = updateWorkItem(*database, text(item, "id"), map[string]any{"status": "Blocked", "stageId": mergeStageID})
+	}
+	if attemptIndex := attemptIndexForApprovedDevFlowDelivery(*database, checkpoint); attemptIndex >= 0 {
+		attempt := database.Tables.Attempts[attemptIndex]
+		next, _ := failAttemptRecord(*database, text(attempt, "id"), pipeline, message, map[string]any{
+			"failureStageId": mergeStageID,
+			"failureAgentId": "delivery",
+			"failureReason":  "Pull request merge failed after human approval.",
+			"failureDetail":  message,
+			"workspacePath":  text(attempt, "workspacePath"),
+			"branchName":     text(attempt, "branchName"),
+			"pullRequestUrl": text(attempt, "pullRequestUrl"),
+		})
+		*database = next
+		upsertRunWorkpad(database, text(attempt, "id"))
+	}
+	if checkpointIndex := findByID(database.Tables.Checkpoints, text(checkpoint, "id")); checkpointIndex >= 0 {
+		nextCheckpoint := cloneMap(database.Tables.Checkpoints[checkpointIndex])
+		nextCheckpoint["deliveryStatus"] = "failed"
+		nextCheckpoint["deliveryError"] = truncateForProof(message, 1200)
+		nextCheckpoint["updatedAt"] = nowISO()
+		database.Tables.Checkpoints[checkpointIndex] = nextCheckpoint
+	}
 }
 
 func linkCheckpointToAttempt(database *WorkspaceDatabase, checkpointID string, attemptID string) {

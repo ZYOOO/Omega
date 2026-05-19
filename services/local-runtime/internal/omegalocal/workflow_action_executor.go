@@ -130,7 +130,6 @@ func workflowActionRoute(workflow map[string]any, template *PipelineTemplate, st
 	case "failed":
 		result.StageStatus = "failed"
 		result.Event = "failed"
-		result.NextStageID = workflowActionTransitionTo(workflow, template, stageID, result.Event, "")
 		return result
 	case "changes-requested", "changes_requested":
 		result.StageStatus = "passed"

@@ -2,6 +2,184 @@
 
 本文记录开发过程中遇到并修复的实现问题。产品功能记录继续写入 `docs/feature-implementation-log.md`；这里专门保留 bug、原因、修复和验证。
 
+## 2026-05-19: CI coverage 跑轻量测试集却统计 core 覆盖率
+
+### 现象
+
+PR CI 中 `npm run coverage` 的 133 个测试实际通过，但 GitHub Actions 仍失败，原因是覆盖率报告只跑了当前 UI 测试集，却仍按 `src/core/**/*.ts` 统计并要求 80% 全局阈值，最终得到约 40% 行覆盖率。
+
+### 原因
+
+为加快默认前端测试，Vitest 默认 include 被收窄到当前 UI / component 测试；但 coverage 配置的统计目标仍是 `src/core/**/*.ts`。CI 的 coverage 命令没有显式切到完整测试集，导致“统计 core，但没跑 core 单测”。
+
+### 修复
+
+- 恢复 `OMEGA_TEST_SUITE=current|legacy|all` 的 include 选择。
+- 默认 `npm run test` 仍只跑当前轻量测试集。
+- `npm run coverage` 和 `npm run test:all` 显式使用 `OMEGA_TEST_SUITE=all`，让 CI 覆盖率门禁和统计目标一致。
+
+### 验证
+
+```bash
+npm run coverage
+npm run lint
+```
+
+## 2026-05-19: Coding / Rework Agent 被要求写 repo 外 proof 路径
+
+### 现象
+
+对照 Symphony 权限模型时发现，Omega 的 Coding / Rework 阶段 cwd 锁定在 repository checkout，沙箱是 `workspace-write`，但 prompt 仍要求 Agent 把 completion note 写到 attempt workspace 外层的 `.omega/proof/*.md`。这类阶段需要真实改代码，但不应该因为 proof 路径在 repo cwd 外而失败，或诱导 Agent 试图越界写文件。
+
+### 原因
+
+之前只修了 read-only 阶段的 final answer capture：Requirement / Master / Architect 等会先写 runtime 临时文件再复制到 proof。workspace-write 阶段仍把 `--output-last-message` 指向 repo cwd 外的 proof 路径，同时 workflow template 里还保留“write note to path”的指令，职责和权限边界不一致。
+
+### 修复
+
+- Codex runner 在 `workspace-write` 且 output path 不在当前 workspace 内时，改为先捕获到 repo cwd 内的 `.omega/agent-output/`，再由 Omega runtime 复制到 attempt `.omega/proof/`。
+- Coding / Rework prompt 与内置 workflow template 改为要求 Agent 在 final answer 返回 completion note，不再要求它直接写 proof 文件。
+- 保留 repository edit 边界：Agent 仍只能在锁定的 repo checkout 内改源码；`.omega/.codex/.claude/.opencode/.trae` 在提交时继续排除。
+- 更新 DevFlow Agent 执行边界文档，明确 read-only / workspace-write / Git Recovery 的不同权限层级。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestCodex(ReadOnly|WorkspaceWrite)SandboxCapturesOutput' -count=1 -timeout=60s
+go test ./services/local-runtime/internal/omegalocal -run 'TestDevFlowTemplateLoadsWorkflowMarkdownContract|TestSaaSLaunchTemplateLoadsWorkflowMarkdownContract' -count=1 -timeout=90s
+git diff --check
+```
+
+## 2026-05-09: Workboard 行内重试按钮没有运行过渡态
+
+### 现象
+
+Workboard 的受阻 Work Item 行内 `Retry` 按钮点击后没有立即进入提交中状态，用户只能等待列表刷新，容易误以为没有响应并重复点击。
+
+### 原因
+
+此前只给详情页的 `Retry attempt` 接入了 `retryingAttemptId`，Workboard 行内按钮仍然直接调用 `runItem(item)`。这既没有复用 attempt retry API，也没有把当前行映射为 in-flight 进度。
+
+### 修复
+
+- 新增可复用的 `retryWorkItemAttemptForItem`，Workboard 能基于最近失败 / stalled / canceled attempt 发起真实 retry。
+- Workboard 行内按钮点击后立即显示 `Retrying...`、禁用并展示 spinner，避免重复触发。
+- 对应行的进度条同步切到 running 动效，失败项重试时不再停留在静态 blocked 视觉状态。
+
+### 验证
+
+```bash
+npm run lint
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "shows in-flight feedback when retrying a blocked workboard item" --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+git diff --check
+```
+
+## 2026-05-09: Retry attempt 点击后没有过渡态，容易重复触发
+
+### 现象
+
+Work Item 详情页里失败 attempt 的 `Retry attempt` 按钮点击后没有立即切到 loading / disabled 状态。后端创建 retry attempt 需要一点时间，用户会看到按钮仍可点击，容易连续触发。
+
+### 原因
+
+前端只复用了 `runningWorkItemId` 作为宽泛运行态，没有记录“当前正在提交 retry 的 attempt id”。Work Item 详情页组件也没有接收 retry in-flight 状态，因此按钮无法展示提交中反馈。
+
+### 修复
+
+- App 增加 `retryingAttemptId` 和 ref guard，提交 retry 请求期间直接阻止重复点击。
+- Work Item 详情页把 retry in-flight 状态传到 attempt panel，按钮显示 `Retrying...`、`aria-busy=true` 并禁用。
+- 按钮增加轻量 spinner 和 attempt card 聚焦状态，保留 light / dark 可读性。
+
+### 验证
+
+```bash
+npm run lint
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+git diff --check
+```
+
+## 2026-05-09: Codex read-only 阶段仍把 final answer capture 指向 proof 路径
+
+### 现象
+
+Requirement / Master / Architect 等只读 Agent 阶段失败时，UI 展示 `--sandbox read-only --output-last-message .../.omega/proof/*.md`，并进入 `Why retry is needed`。这类阶段本应允许读取仓库并产出 proof，不应因为 proof 写入路径和只读沙箱冲突而失败。
+
+### 原因
+
+前一次修复已经把 prompt 改成“Agent 只返回最终内容，由 Omega 持久化 artifact”，但 Codex runner 命令仍把 `--output-last-message` 直接指向 attempt workspace 的 `.omega/proof` 路径。这个路径显示上也容易让人误以为 Agent 仍在只读沙箱内直接写 proof。
+
+### 修复
+
+- Codex read-only 阶段的 final answer 先写入 Omega runtime 管理的临时 capture 文件。
+- runner 退出后由 Omega runtime 复制到 `.omega/proof/*.md`；如果 capture 为空，再回退到 stdout/stderr。
+- workspace-write 阶段继续使用原有输出路径，避免影响 Coding / Page Pilot 等可写场景。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run TestCodexReadOnlySandboxCapturesOutputOutsideWorkspace -count=1 -timeout=30s
+go test ./services/local-runtime/internal/omegalocal -run 'TestRunDevFlowPRCycleCreatesBranchPRAndMergeProof|TestRunDevFlowContractState' -count=1 -timeout=120s
+git diff --check
+```
+
+## 2026-05-09: 旧 TypeScript/Node 架构残留拖慢维护与测试
+
+### 现象
+
+- 前端代码里仍保留早期 Mission Control Node runner、mock connector、file repository 和 legacy test suite，当前产品实际已经由 Go local runtime、workflow contract state runner 和 scoped read model 驱动。
+- 这些旧入口没有参与真实执行链路，但仍暴露脚本和导出，容易让后续改动误接回 full snapshot / Node runner 原型，也让测试命令看起来需要维护两套架构。
+
+### 原因
+
+- 早期为了快速跑通 Demo，把 local runner API、connector mock、SQLite/file repository helper 放在 `apps/web/src` 下；后来后端迁移到 Go runtime 后，只删除了部分入口，类型、脚本和测试仍留在仓库中。
+- 部分内部 helper 被公开导出，静态检查会把它们当成可复用 API，实际没有任何生产消费者。
+
+### 修复
+
+- 删除旧 `apps/web/src/local`、`apps/web/src/integrations`、`scripts/local-runner-*.mjs`、`missionControlApiClient` 和对应 legacy tests。
+- 删除旧 core 原型模块：`accessControl`、`projectHierarchy`、`releaseAudit`、`missionControl`、`missionRepository`、`workItemProjection`、`masterAgent`。
+- 收窄无消费者导出，移除旧 workspace database mutation helper，只保留当前 session load/save 兼容层。
+- 移除 `npm run test:legacy`，让默认前端测试集只覆盖当前产品主链路。
+
+### 验证
+
+```bash
+npx --yes knip --use-tsconfig-files --include exports --reporter compact --no-exit-code
+npm run lint
+npm run test -- --reporter=dot
+npm run go:test:focused
+git diff --check
+```
+
+## 2026-05-08: 飞书审批后本地状态滞后，Rework 运行态弱化
+
+### 现象
+
+- 在飞书 Task 里完成审批后，本地 Workboard / Work Item 详情页经常要等一段时间才从 Human Review 继续往后走。
+- 进入 Rework 后，实际运行的是 coding + testing，但前面的 Implementation card 已经显示为 passed，Workboard / 详情页缺少“正在返工实施”的动态反馈。
+
+### 原因
+
+- 飞书卡片 callback 会直接进入 checkpoint decision path，但飞书 Task completion 需要 `feishu review task bridge` 同步。之前主要依赖 JobSupervisor 30s tick，前端 live refresh 不会主动触发该同步，所以用户刚在飞书点完后会看到本地状态停留。
+- Work Item 状态投影在 pipeline running 且旧 item status 为 Human Review 时，会继续保留 Human Review，没有根据当前 pipeline stage 判断是否已经离开人工审核。
+- Rework 在 canonical pipeline 里是独立阶段。后端把 Implementation 标成 passed、Rework 标成 running 是正确的，但 UI 没把“Rework 正在跑 code/test”映射回用户理解里的 Implementation 运行态。
+
+### 修复
+
+- 前端 live refresh 发现 pending checkpoint 带有 Feishu review task 时，会以 6s 节流主动调用 `/feishu/review-task/bridge/tick`；一旦同步到 approved，会立即重拉 attempts、run workpads、pipelines 和 checkpoints。
+- Work Item runtime status 改为读取当前 pipeline stage：只有当前 stage 仍是 `human_review` 且状态为 `needs-human` / `waiting-human` 时才展示 Human Review；审批后进入 merge/rework/后续执行时展示 In Review。
+- Work Item 详情页在 Rework running 时，让 Implementation card 同步显示 running；Workboard stage running 轨道补充轻量 pulse/sweep 动效，避免返工阶段看起来没有运行反馈。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/omegaControlApiClient.test.ts --testTimeout=30000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+go test ./services/local-runtime/internal/omegalocal -run 'TestFeishuReviewCallbackApprovesCheckpointThroughSharedDecisionPath|TestJobSupervisorQueuesApprovedDevFlowDeliveryContinuation|TestCheckpointApproveAsyncDeliveryReturnsImmediately' -count=1 -timeout=120s
+git diff --check
+```
+
 ## 2026-05-06: macOS 安装包启动后白屏
 
 ### 现象
@@ -243,7 +421,7 @@ npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "renders Go 
 npm run lint
 npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx apps/web/src/components/__tests__/WorkspaceAgentStudio.test.tsx --testTimeout=60000
 npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx --testTimeout=60000
-npm run test:legacy -- apps/web/src/core/__tests__/masterAgent.test.ts apps/web/src/core/__tests__/pipeline.test.ts --testTimeout=30000
+npm run test -- apps/web/src/core/__tests__/pipeline.test.ts --testTimeout=30000
 ```
 
 ## 2026-05-06: 进入 Page Pilot 后滚动和右下角交互卡顿
@@ -2306,7 +2484,7 @@ Workboard 中 `Blocked` 分组使用灰色状态点，并排在 `Done` 后面。
 ### 验证
 
 ```bash
-npm run test -- apps/web/src/core/__tests__/workboard.test.ts apps/web/src/core/__tests__/workItemProjection.test.ts --testTimeout=20000
+npm run test -- apps/web/src/core/__tests__/workboard.test.ts --testTimeout=20000
 npm run lint
 git diff --check
 ```
@@ -2695,4 +2873,335 @@ Agent profile 中的 `workflowTemplate` 和 `workflowMarkdown` 是两份字段�
 
 ```bash
 go test ./services/local-runtime/internal/omegalocal -run 'TestAgentProfileTemplateSelectionReplacesStaleWorkflowMarkdown|TestSaaSLaunchTemplateLoadsWorkflowMarkdownContract|TestDevFlowTemplateLoadsWorkflowMarkdownContract' -count=1 -timeout=90s
+```
+
+## 2026-05-07: Import sample template 在文档迁移后找不到内置样例
+
+### 现象
+
+Settings / Agent Studio 的 `Import sample template` 入口本应导入内置 workflow / prompts / stage policy 样例，但开发过程文档整理后，后端仍然读取旧的 `docs/test-workflow-fixtures` 路径。用户在演示准备时看到 template 下拉与编辑区内容不一致，且必须反复点击导入按钮才像是刷新了配置。
+
+### 原因
+
+内部开发过程文档已迁移到 `docs/internal-dev-notes/`，测试 workflow fixtures 也随之移动到 `docs/internal-dev-notes/test-workflow-fixtures/`；`agentProfileImportBasePath` 和 `omegaProjectRoot` 仍把旧路径当作唯一判定条件，导致内置样例路径解析不稳定。前端切换 template 时也只更新 `workflowTemplate`，没有同步使用模板自带 `workflowMarkdown` 更新编辑区即时状态。
+
+### 修复
+
+- 内置 sample import 改为优先读取 `docs/internal-dev-notes/test-workflow-fixtures`，并保留旧 `docs/test-workflow-fixtures` fallback。
+- `omegaProjectRoot` 只负责定位项目根目录，fixture 目录选择交给单独 helper，避免文档目录再次调整时影响根目录识别。
+- Agent Studio workflow template 下拉切换时，如果当前模板响应里带有 `workflowMarkdown`，同步更新 markdown 编辑区，前端即时状态和保存后的后端归一化保持一致。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestImportAgentProfileTemplateFromFixturesUsesInternalDevNotesDirectory|TestOmegaWorkflowFixturePathFindsInternalDevNotes|TestAgentProfileTemplateSelectionReplacesStaleWorkflowMarkdown' -count=1 -timeout=90s
+npm run test -- apps/web/src/components/__tests__/WorkspaceAgentStudio.test.tsx --testTimeout=30000
+```
+
+## 2026-05-07: PR merge 失败后 approved delivery 被后台反复重试
+
+### 现象
+
+5/6-5/7 结构化 runtime log 中，同一个 TestRepo PR #43 的 `github.pr.merge_failed` / `checkpoint.approve.delivery_failed` 出现超过两千次。错误本身是 PR 不可合并或 GitHub API 临时失败，但 JobSupervisor 会在下一轮 tick 再次发现同一个 approved Human Review checkpoint，然后继续触发 merge。
+
+### 原因
+
+Human Review approve 进入 async delivery 后，失败路径只写 runtime log，没有把 Pipeline / Attempt / Work Item / checkpoint delivery 状态持久化为失败。JobSupervisor 扫描 approved checkpoint 时只排除了 done attempt，没有排除已经失败的 delivery attempt，因此同一个 merge conflict 会被当成“仍待继续的 approved delivery”重复执行。
+
+### 修复
+
+- approved delivery background job 在 merge/action 失败时会把 merging stage 标为 failed，Pipeline 标为 failed，Work Item 标为 Blocked，Attempt 记录 `failureStageId=merging`、`failureAgentId=delivery` 和 failure detail。
+- checkpoint 增加 `deliveryStatus=failed` / `deliveryError`，Run Workpad 会收到失败 attempt 的阻塞信息。
+- JobSupervisor approved delivery scan 跳过 `failed` / `canceled` / `stalled` attempt，避免同一 PR merge failure 被自动重复触发；后续需要用户解决 PR 状态后显式 Retry。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestApprovedDevFlowDeliveryMergeFailurePersistsBlockedState|TestJobSupervisorQueuesApprovedDevFlowDeliveryContinuation' -count=1 -timeout=120s
+```
+
+## 2026-05-07: Page Pilot 可能打开到另一个 Repository Workspace
+
+### 现象
+
+Page Pilot 已经选择了当前 Repository Workspace，但打开目标页面后偶尔看到的是上一轮或另一个 workspace 的页面内容。表现上像仓库选择没有生效，实际常伴随 `127.0.0.1:3009` 上已有旧预览进程。
+
+### 原因
+
+Desktop Preview Runtime 和 Go Web fallback 都先探测默认预览端口，只要 `http://127.0.0.1:3009/` 返回 2xx 就直接复用为 `external/already running`。这一步发生在校验端口监听进程 cwd 之前，因此另一个 Omega 管理的 Page Pilot workspace dev server 会被当成当前 workspace 的预览服务。
+
+### 修复
+
+- Desktop `preview-runtime` 在复用端口前先检查监听进程 cwd 是否等于当前选中的 repository workspace。
+- 如果端口来自 Omega 管理的其他 Page Pilot workspace，则先停止旧监听并重新在当前 workspace 启动预览。
+- 如果端口来自用户自己的无关进程，则返回明确错误，要求停止该进程或选择其他 preview URL，避免静默打开错仓库。
+- Go Preview Runtime fallback 同步相同策略；仅用户显式输入的外部 preview URL 可以继续按 external URL 处理。
+- Page Pilot 启动器的 preview URL localStorage 改为按 `repositoryTargetId` 分作用域；切换仓库时不会继承上一个 workspace 的 dev-server URL、profile 或 embedded preview。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/PagePilotPreview.test.tsx --testTimeout=60000
+go test ./services/local-runtime/internal/omegalocal -run TestPagePilotPreviewRuntimeStartPersistsGoProfile -count=1 -timeout=60s
+node --check apps/desktop/src/process-supervisor.cjs
+```
+
+## 2026-05-08: 飞书 Human Review 通知缺少 Solution Plan
+
+### 现象
+
+DevFlow 已经由 Architect Agent 生成 `solution-plan.md`，Work Item 详情页也能围绕 Plan / TODO 做复核，但飞书 Human Review 通知只展示需求、PR、风险、Review Packet 和 TODO 复核。审核人离开 Omega 页面时，无法直接看到“这次打算怎么做、改动边界是什么”。
+
+### 原因
+
+`attempt-review-packet.json` 没有保存 `PlanOutput` 的正文摘要；飞书发送时也只读取 attempt 上的 `reviewPacket`，没有从 `.omega/proof/solution-plan.md` 回读历史 proof。
+
+### 修复
+
+- Review Packet 增加 `solutionPlan` 字段，包含 summary、excerpt、functional/project TODO。
+- 飞书发送链路在构造 packet 时优先使用 review packet 中的 solution plan；如果没有，则从 attempt workspace 的 `.omega/proof/solution-plan.md` 回读。
+- interactive card、review doc preview、普通 text fallback 和 Task description 都加入 Solution Plan 摘要；普通文本仍会去除 Markdown 符号。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRenderFeishuReviewTextUsesPlainFeishuText|TestFeishuReviewPacketReadsSolutionPlanArtifact|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding' -count=1 -timeout=120s
+git diff --check
+```
+
+## 2026-05-08: Human Review 缺少 Agent 整理后的审核简报
+
+### 现象
+
+Human Review 阶段虽然会调用 Delivery Agent 写 `delivery-handoff.md`，但飞书通知和 review packet 只展示结构化字段。审核人可以看到需求、PR、风险和 TODO，却看不到 Agent 基于这些证据整理后的“应该重点验什么”。
+
+### 原因
+
+Delivery Agent 的产物只留在 proof 文件里，没有回填到 `attempt-review-packet.json`。飞书渲染链路也没有读取 `delivery-handoff.md`，导致 Human Review Agent 的实际作用没有体现在外部审核入口。
+
+### 修复
+
+- Delivery Agent prompt 增加明确边界：只能使用 Omega 已捕获的 requirement、solution plan、review packet、PR、测试 / CI 和 changed files 证据；不能虚构通过状态、风险、审批或部署结论。
+- Delivery Agent 完成后，runtime 将 `delivery-handoff.md` / `delivery-handoff-fast-rework.md` 摘要回填到 review packet 的 `humanReviewBrief`。
+- 飞书卡片、飞书文档、普通 text fallback 和 Task description 都展示 Human Review Brief；历史 attempt 可从 proof 目录回读。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestRenderFeishuReviewTextUsesPlainFeishuText|TestFeishuReviewPacketReadsSolutionPlanArtifact|TestFeishuReviewPacketReadsHumanReviewBriefArtifact|TestFeishuReviewSurfacesBriefAndSolutionPlanAcrossReviewFormats|TestFeishuReviewRequestSendsInteractiveWebhookCard|TestFeishuReviewRequestCreatesTaskReviewWithStrongBinding' -count=1 -timeout=120s
+git diff --check
+```
+
+## 2026-05-08: Auto Run 开关缺少明确后端执行反馈
+
+### 现象
+
+用户在 Workspace controls 里打开 Auto run 后，UI 只显示开关状态变化，很难判断是否真的扫描了 Not Started Work Item 或 GitHub ready issue。很多时候看起来像“按钮点了没反应”，尤其是没有立即进入 Running 的场景。
+
+### 原因
+
+Auto run 开关会调用 `PUT /orchestrator/watchers/{repositoryTargetId}`，后端保存 watcher 后会尝试 tick 一次；但前端没有显式展示 tick 结果，也没有一个直接触发 `/orchestrator/tick` 的操作入口。执行型动作和配置型动作混在一起，反馈不够清晰。
+
+### 修复
+
+- Workspace controls 增加 `Run now` / `立即运行` 按钮，点击后前端直接 POST `/orchestrator/tick`。
+- 开启 Auto run 后，前端也会主动 POST `/orchestrator/tick`，并把 `accepted-ready-work`、`accepted`、`claimed`、`locked`、`idle` 等后端结果转成可见提示。
+- Auto run busy 状态独立于 GitHub issue sync，避免用 repository label / id 混用导致按钮反馈不稳定。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "marks not-started" --testTimeout=60000
+go test ./services/local-runtime/internal/omegalocal -run 'TestOrchestratorTickAutoRunsExistingNotStartedWorkItem|TestOrchestratorWatcherPersistsAndScansReadyIssues|TestActiveOrchestratorWatcherRunsAfterRuntimeStart' -count=1 -timeout=120s
+git diff --check
+```
+
+## 2026-05-08: Work Item 创建和 Provider 按钮仍有本地状态遗留
+
+### 现象
+
+继续复查“按钮点了没反应 / 看起来只是改本地状态”的问题时，发现两个同类遗留点：手动创建 Requirement 时前端会先生成 `item_manual_N` / `OMG-N` 并在创建后选中这个旧 id；如果后端为了去重改写 id/key，详情选中就可能落空。Provider Access 里的 CI / GitHub disconnect 等按钮也会修改前端连接状态，但不代表本机 `gh`、CI checks 或飞书配置真实变化。
+
+### 原因
+
+早期 UI 为了快速跑通，把“表单草稿”和“已落库事实”混在一起处理。Work Item 创建 API 虽然会做 normalized table 写入，但前端仍假定自己生成的 id 就是最终 id；Provider 连接模型也保留了 demo 时代的 `grantProviderConnection` / `revokeProviderConnection` 本地状态分支。
+
+### 修复
+
+- `POST /work-items` 会校验 `repositoryTargetId` 必须真实存在；如果绑定 Repository Workspace，会由后端补齐 target label 和 project ownership。
+- Work Item 创建后，前端从后端返回的 session 中反查真正新增的 Work Item，再选中真实 id，避免后端去重后 UI 指向不存在的记录。
+- Provider Access 不再对 CI、本机 GitHub CLI 或其他未接后端命令的 provider 做假连接 / 假断开：CI 明确说明来自 GitHub checks，GitHub disconnect 提示使用 `gh auth logout` 后再检查状态。
+- 前端删除未使用的 `saveWorkspaceSessionViaApi` / `persistWorkspaceSession` full snapshot 写入 helper，保留后端兼容层但不再给新 UI 留误用入口。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestCreateWorkItemStoresMasterRequirementDispatch|TestCreateWorkItemRejectsUnknownRepositoryTarget|TestCreateWorkItemUsesRepositoryTargetProject' -count=1 -timeout=120s
+npm run test -- apps/web/src/__tests__/App.operatorView.test.tsx -t "creates app requirements" --testTimeout=60000
+git diff --check
+```
+
+## 2026-05-18: Work Item 阻塞后看不出停在哪个阶段
+
+### 现象
+
+Work Item 进入 Blocked / failed 后，顶部只展示阻塞原因和 attempt id，交付流程卡片仍沿用原始 stage 状态。用户需要从 timeline 或日志里推断到底是重试前信息还是当前 attempt，以及当前停在 implementation、review 还是其他阶段。
+
+### 原因
+
+详情页已经从 attempt / pipeline / operation 中拿到了 `failureStageId`、`currentStageId`、`finishedAt`、runner `startedAt` / `finishedAt` 等数据，但 UI 没有把这些字段显式呈现出来。`Feedback route` 卡片也和 `Blocked reason` 同样使用黄色提示样式，语义上容易被误解为重复的错误信息。
+
+### 修复
+
+- 阻塞提示增加停住阶段和时间，例如 `停在 Implementation and PR · 05/18 15:28`。
+- 交付流程在 failed / stalled / canceled / paused attempt 中，用 attempt 的 `failureStageId` / `currentStageId` 将对应阶段高亮为黄色，并展示 `停在这里`。
+- Agent 阶段详情弹窗展示每条 Agent 运行的开始 / 结束 / 更新时间，方便区分旧运行和当前重试。
+- `Feedback route` 改名为 `Recovery route` / `恢复路径`，明确它描述的是下一次 retry / rework 如何复用上方阻塞与反馈，而不是又一个错误原因。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=60000
+npm run lint
+git diff --check
+```
+
+## 2026-05-18: Work Item 阻塞原因优先级显示错误
+
+### 现象
+
+OMG-8 的当前 attempt 实际阻塞在 `gh pr create`：GitHub 返回 `The omega/OMG-8-devflow branch has no history in common with main`。但 Work Item 详情顶部只显示泛化的 `Workflow contract implementation action failed.`，恢复路径和 attempt 的 Action Plan 还显示上一轮 requirement runner 失败的旧 retry reason。
+
+### 原因
+
+Run Workpad 已经记录了完整 blockers，但前端直接取第一条 blocker。当前数据里第一条是 workflow contract 的总括错误，第二条才是具体 PR 创建错误。同时恢复路径和 Action Plan 优先读取 `reworkChecklist.retryReason` / `actionPlan.retry.reason`，这些字段可能来自上一轮 retry，不一定代表当前失败点。
+
+### 修复
+
+- 新增 failure signal 排序：优先展示 PR / GraphQL / exit status / permission / timeout 等具体失败，弱化 `Workflow contract ... failed`、`Pipeline is failed` 这类泛化提示。
+- 顶部阻塞原因、恢复路径、Run Workpad Blockers、Retry Reason、Rework checklist preview 共用同一条主 failure signal。
+- Attempt 的 Action Plan 在存在当前 blocker 时展示 `Current blocker`，不再让旧 retry reason 覆盖当前失败。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=60000
+npm run lint
+git diff --check
+```
+
+## 2026-05-18: Work Item 阻塞原因与恢复路径重复展示
+
+### 现象
+
+失败或暂停的 Work Item 详情页顶部已经展示了当前阻塞原因，但下方 `Recovery route` / `恢复路径` 也会把同一条 blocker 再展示一次。用户看到两个黄色提示框时，很难判断它们是否代表两个不同问题。
+
+### 原因
+
+`ReworkReturnSignal` 把 “failed / stalled attempt 可重试” 当作展示条件，并优先复用当前 blocker 作为说明文案。这样即使没有额外的人审反馈、review 退回信息或独立 rework 策略，也会渲染一张与顶部阻塞原因重复的卡片。
+
+### 修复
+
+- `Recovery route` 不再因为 attempt 失败而自动出现。
+- 只有存在不同于当前 blocker 的人工反馈、review 退回说明、rework rationale，或明确的非默认恢复策略时才展示恢复路径。
+- 保留顶部 blocker 与阶段高亮作为失败态的主信息，减少重复黄色提示。
+
+### 验证
+
+```bash
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPage.test.tsx --testTimeout=60000
+npm run test -- apps/web/src/components/__tests__/WorkItemDetailPanels.test.tsx --testTimeout=60000
+npm run lint
+git diff --check
+```
+
+## 2026-05-18: PR 创建 / 更新失败后 DevFlow 直接停住
+
+### 现象
+
+DevFlow 在 Implementation and PR 阶段已经完成代码、测试和 push，但 `gh pr create` 遇到 `branch has no history in common with main` 这类 GitHub / Git 拓扑错误后，runtime 直接把 attempt 标成 stalled / failed。Agent 已经知道上下文和目标分支，却没有机会修复远端分支、rebase/cherry-pick 或补建 PR。
+
+### 原因
+
+PR 创建 / 更新之前一直由 workflow action executor 的确定性代码直接执行。这个路径适合 happy path 和最终校验，但不适合处理多样的 Git/GitHub 状态：远端分支漂移、历史不一致、已有 PR 元数据异常、fork/head 组合错误等都需要上下文判断。继续把这些修复策略硬写在 runtime 里，会让错误覆盖不完整，也会让 Requirement / Architect / Testing 等 Agent Profile 配置失去边界。
+
+### 修复
+
+- 新增 `git_recovery` Agent Profile，默认可以单独配置 runner / model / skills / MCP。
+- runtime 只在 `in_progress/publish_pull_request` 和 `rework/update_pull_request` 失败时触发 Git Recovery，传入失败原因、目标 branch/base、PR body、changed files、测试输出和 git/gh 诊断。
+- Git Recovery 只能在锁定的 repository workspace 中使用 git / gh 修复 PR delivery：fetch、merge-base 检查、rebase、cherry-pick、format-patch/apply、同名分支重建、push、PR create/update。
+- 禁止 Git Recovery 修改需求、跳过 review、人审 approve、merge PR、发布不同分支或触碰其他仓库。
+- Agent 完成后，runtime 会再次执行 PR 校验；只有拿到真实 PR URL 才记录恢复成功。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestDevFlowGitHubRecovery|TestDevFlowTemplateLoadsWorkflowMarkdownContract' -count=1 -timeout=120s
+git diff --check
+```
+
+## 2026-05-19: Git Recovery Agent 触发后仍无法修复 PR 分支
+
+### 现象
+
+OMG-8 retry 已经跑到 Implementation and PR，并触发了 `git_recovery` Agent。Agent 判断出 `omega/OMG-8-devflow` 与 `origin/main` 没有共同历史，需要重建同名交付分支。但它最终输出 `blocked`，PR 仍未创建。
+
+### 原因
+
+有两个问题叠在一起：
+
+- Codex runner 的 `workspace-write` 沙箱不能写 `.git/FETCH_HEAD`，`git fetch origin main omega/OMG-8-devflow` 会失败为 `Operation not permitted`。普通 shell 和 Codex `danger-full-access` 均可正常 fetch。
+- workflow action route 对 `failed` transition 仍会读取模板里的 `failed: rework`，导致失败后把后续 Review / Rework 阶段误标成 passed / running，看起来像失败后还继续排队执行。
+
+### 修复
+
+- `git_recovery` 使用单独的 `danger-full-access` 沙箱，只允许在 `in_progress/publish_pull_request` 和 `rework/update_pull_request` 触发。
+- `failed` action 不再自动推进到模板里的下一阶段；失败保持当前阶段 blocked，由 retry / recovery path 决定下一步。
+- 测试覆盖 Git Recovery 的 runner role / sandbox，以及 failed action 不应自动排队下一阶段。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestDevFlowGitHubRecovery|TestWorkflowActionRouteDoesNotAutoAdvanceFailedActions|TestRunDevFlowContractState' -count=1 -timeout=120s
+git diff --check
+```
+
+## 2026-05-19: Page Pilot 启动 DemoRepo 预览失败
+
+### 现象
+
+从 Page Pilot 启动 `ZYOOO/DemoRepo` 时，Preview Runtime Agent 返回启动失败。运行记录里显示 Omega 等待 `http://127.0.0.1:3009/`，但实际 `npm run dev` 输出为 `python3 -m http.server 4173 -d .`。重复启动后还会出现 `OSError: [Errno 48] Address already in use`。
+
+### 原因
+
+Preview Runtime 只在 Vite / Next 这类脚本中追加或推断端口。对于 `python3 -m http.server 4173 -d .`、`serve -l 4173`、`--port 4173` 等脚本自带端口的情况，runtime 仍使用默认 `3009` 做健康检查和旧进程清理。结果是服务真实监听在 `4173`，健康检查却打到 `3009`；第二次启动时又会撞上旧的 `4173` 进程。
+
+Electron direct pilot 还叠加了一个只在桌面路径出现的问题：`buildPreviewRuntimeProfile` 会把默认 `3009` 写回 `OMEGA_PREVIEW_URL`，导致下游误以为用户显式指定了 `3009`，从而跳过脚本端口推断。
+
+### 修复
+
+- Go local runtime 和 Electron desktop supervisor 都会解析 package script 中的显式端口。
+- 当用户没有手动指定 preview URL 时，Preview Runtime 的 preview URL、健康检查和 stale listener 清理都会跟随脚本端口。
+- 用户显式输入的 preview URL 仍保持优先，不会被脚本端口覆盖。
+- Electron direct pilot 不再把默认 `3009` 当作用户显式输入，避免覆盖脚本中的真实端口。
+
+### 验证
+
+```bash
+go test ./services/local-runtime/internal/omegalocal -run 'TestPagePilotPreviewRuntimeUsesScriptPort|TestPagePilotPreviewRuntimeStartPersistsGoProfile' -count=1 -timeout=120s
+npm run test -- apps/web/src/__tests__/desktopProcessSupervisor.test.ts --testTimeout=60000
+node --check apps/desktop/src/process-supervisor.cjs
+node - <<'NODE'
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { buildPreviewRuntimePlan } = require('./apps/desktop/src/process-supervisor.cjs');
+const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'omega-preview-'));
+fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ scripts: { dev: 'python3 -m http.server 4173 -d .' } }));
+const plan = buildPreviewRuntimePlan({ env: { OMEGA_PREVIEW_REPO_PATH: repo } });
+if (plan.previewUrl !== 'http://127.0.0.1:4173/') throw new Error(JSON.stringify(plan));
+NODE
 ```

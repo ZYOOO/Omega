@@ -197,6 +197,7 @@ func ensureDevFlowReviewPacket(input devFlowRunReportInput) map[string]any {
 	risk := devFlowRiskSummary(input, testPreview, checkPreview)
 	actions := devFlowRecommendedActions(input, testPreview, checkPreview, risk)
 	todoCompletion := devFlowTodoCompletion(input, testPreview, checkPreview)
+	solutionPlan := devFlowSolutionPlanPreview(input.PlanOutput)
 	return map[string]any{
 		"schemaVersion":      1,
 		"generatedAt":        nowISO(),
@@ -210,9 +211,67 @@ func ensureDevFlowReviewPacket(input devFlowRunReportInput) map[string]any {
 		"testPreview":        testPreview,
 		"checkPreview":       checkPreview,
 		"risk":               risk,
+		"solutionPlan":       solutionPlan,
 		"todoCompletion":     todoCompletion,
 		"recommendedActions": actions,
 		"reviewFeedback":     devFlowPacketReviewFeedback(input),
+	}
+}
+
+func devFlowSolutionPlanPreview(plan string) map[string]any {
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return map[string]any{}
+	}
+	functional, project := devFlowParsePlanTodos(plan)
+	return map[string]any{
+		"source":          "solution-plan",
+		"summary":         devFlowSolutionPlanSummary(plan),
+		"excerpt":         truncateForProof(plan, 2400),
+		"functionalTodos": functional,
+		"projectTodos":    project,
+	}
+}
+
+func devFlowSolutionPlanSummary(plan string) string {
+	lines := []string{}
+	for _, line := range strings.Split(plan, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "- [") || strings.HasPrefix(trimmed, "* [") {
+			continue
+		}
+		lines = append(lines, trimmed)
+		if len(strings.Join(lines, " ")) >= 260 {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		return "Solution plan captured for Human Review."
+	}
+	return truncateForProof(oneLine(strings.Join(lines, " ")), 420)
+}
+
+func attachDevFlowHumanReviewBrief(reviewPacket map[string]any, path string) map[string]any {
+	packet := cloneMap(reviewPacket)
+	raw, err := os.ReadFile(path)
+	if err != nil || strings.TrimSpace(string(raw)) == "" {
+		return packet
+	}
+	brief := devFlowHumanReviewBriefPreview(string(raw))
+	brief["sourcePath"] = path
+	packet["humanReviewBrief"] = brief
+	return packet
+}
+
+func devFlowHumanReviewBriefPreview(markdown string) map[string]any {
+	markdown = strings.TrimSpace(markdown)
+	if markdown == "" {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"source":  "delivery-agent",
+		"summary": devFlowSolutionPlanSummary(markdown),
+		"excerpt": truncateForProof(markdown, 2200),
 	}
 }
 

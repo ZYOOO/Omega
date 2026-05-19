@@ -4,7 +4,8 @@ import type {
   AgentRunnerPreflightResult,
   LocalCapabilityInfo,
   PipelineTemplateInfo,
-  RunnerCredentialInfo
+  RunnerCredentialInfo,
+  WorkflowTemplateRecordInfo
 } from "../omegaControlApiClient";
 
 export type AgentConfigTab = "workflow" | "prompts" | "agents" | "runtime";
@@ -98,6 +99,7 @@ type WorkspaceAgentStudioProps = {
   agentRunnerOptions: AgentRunnerOption[];
   localCapabilities: LocalCapabilityInfo[];
   pipelineTemplates: PipelineTemplateInfo[];
+  workflowTemplates: WorkflowTemplateRecordInfo[];
   primaryProjectName: string;
   runnerCredentials: RunnerCredentialInfo[];
   agentPreflightResults: Record<string, AgentRunnerPreflightResult>;
@@ -304,6 +306,68 @@ function defaultStagePolicyHintForStage(stage: WorkflowStageModel) {
   return defaultStagePolicyHints[stagePolicyKey(stage.title)] ?? defaultStagePolicyHints[stagePolicyKey(stage.id)] ?? "";
 }
 
+type WorkflowTemplateOption = {
+  id: string;
+  label: string;
+  workflowMarkdown: string;
+  source: string;
+};
+
+function workflowTemplateMarkdownFromRecord(record: WorkflowTemplateRecordInfo) {
+  return record.workflowMarkdown ?? record.markdown ?? "";
+}
+
+function workflowTemplateRecordRank(record: WorkflowTemplateRecordInfo, draft: AgentConfigurationDraft) {
+  let rank = 0;
+  if (!record.default) rank += 20;
+  if (record.repositoryTargetId && record.repositoryTargetId === draft.repositoryTargetId) rank += 40;
+  if (!record.repositoryTargetId && record.projectId && record.projectId === draft.projectId) rank += 25;
+  if (record.projectId && record.projectId !== draft.projectId) rank -= 20;
+  if (record.repositoryTargetId && record.repositoryTargetId !== draft.repositoryTargetId) rank -= 30;
+  if (record.scope === "repository") rank += 6;
+  if (record.scope === "project") rank += 3;
+  return rank;
+}
+
+function workflowTemplateOptions(
+  pipelineTemplates: PipelineTemplateInfo[],
+  workflowTemplates: WorkflowTemplateRecordInfo[],
+  draft: AgentConfigurationDraft
+): WorkflowTemplateOption[] {
+  const byID = new Map<string, WorkflowTemplateOption>();
+  for (const template of pipelineTemplates) {
+    byID.set(template.id, {
+      id: template.id,
+      label: template.name || template.id,
+      workflowMarkdown: template.workflowMarkdown ?? "",
+      source: "built-in"
+    });
+  }
+  const sortedRecords = [...workflowTemplates].sort(
+    (left, right) => workflowTemplateRecordRank(left, draft) - workflowTemplateRecordRank(right, draft)
+  );
+  for (const record of sortedRecords) {
+    const templateID = record.templateId || record.id;
+    if (!templateID) continue;
+    const markdown = workflowTemplateMarkdownFromRecord(record);
+    const existing = byID.get(templateID);
+    byID.set(templateID, {
+      id: templateID,
+      label: record.name || existing?.label || templateID,
+      workflowMarkdown: markdown || existing?.workflowMarkdown || "",
+      source: record.source || record.scope || existing?.source || "workflow-template"
+    });
+  }
+  if (!byID.has("devflow-pr")) {
+    byID.set("devflow-pr", { id: "devflow-pr", label: "devflow-pr", workflowMarkdown: "", source: "built-in" });
+  }
+  return [...byID.values()].sort((left, right) => {
+    if (left.id === "devflow-pr") return -1;
+    if (right.id === "devflow-pr") return 1;
+    return left.label.localeCompare(right.label);
+  });
+}
+
 export function WorkspaceAgentStudio({
   activeRepositoryWorkspaceLabel,
   agentConfigDraft,
@@ -313,6 +377,7 @@ export function WorkspaceAgentStudio({
   agentRunnerOptions,
   localCapabilities,
   pipelineTemplates,
+  workflowTemplates,
   primaryProjectName,
   runnerCredentials,
   agentPreflightResults,
@@ -329,6 +394,10 @@ export function WorkspaceAgentStudio({
   onUpdateAgentProfile,
   onUpdateDraft
 }: WorkspaceAgentStudioProps) {
+  const availableWorkflowTemplates = useMemo(
+    () => workflowTemplateOptions(pipelineTemplates, workflowTemplates, agentConfigDraft),
+    [agentConfigDraft, pipelineTemplates, workflowTemplates]
+  );
   const workflowStages = useMemo(() => parseWorkflowStages(agentConfigDraft.workflowMarkdown), [agentConfigDraft.workflowMarkdown]);
   const promptSections = useMemo(
     () => parseWorkflowPromptSections(agentConfigDraft.workflowMarkdown),
@@ -583,20 +652,24 @@ export function WorkspaceAgentStudio({
                           <span>Template</span>
                           <select
                             value={agentConfigDraft.workflowTemplate}
-                            onChange={(event) => onUpdateDraft({ workflowTemplate: event.currentTarget.value })}
+                            onChange={(event) => {
+                              const workflowTemplate = event.currentTarget.value;
+                              const selectedTemplate = availableWorkflowTemplates.find((template) => template.id === workflowTemplate);
+                              onUpdateDraft({
+                                workflowTemplate,
+                                ...(selectedTemplate?.workflowMarkdown ? { workflowMarkdown: selectedTemplate.workflowMarkdown } : {})
+                              });
+                            }}
                           >
-                            <option value="devflow-pr">devflow-pr</option>
-                            {pipelineTemplates
-                              .filter((template) => template.id !== "devflow-pr")
-                              .map((template) => (
-                                <option key={template.id} value={template.id}>
-                                  {template.name}
-                                </option>
-                              ))}
+                            {availableWorkflowTemplates.map((template) => (
+                              <option key={template.id} value={template.id}>
+                                {template.label}
+                              </option>
+                            ))}
                           </select>
                         </label>
                         <p className="workflow-template-help">
-                          Default contract content is edited below. Stage rules are edited one stage at a time.
+                          Selecting a template loads its contract into the editor below. Stage rules are parsed from the current content.
                         </p>
                         <textarea
                           className="workflow-contract-textarea"
@@ -803,7 +876,7 @@ export function WorkspaceAgentStudio({
                     </div>
                     <button
                       type="button"
-                      className="secondary-action compact-action"
+                      className="secondary-action compact-action agent-test-action"
                       disabled={testingAgentProfileId === selectedAgentProfile.id}
                       onClick={() => onTestAgentProfile(selectedAgentProfile)}
                     >

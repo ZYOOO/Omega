@@ -57,6 +57,8 @@ const zhCN: Record<string, string> = {
   "Operations": "操作",
   "Auto scan": "自动扫描",
   "Auto run": "自动运行",
+  "Run now": "立即运行",
+  "Scanning...": "扫描中...",
   "On · ready issues can start": "开启 · ready issue 可自动启动",
   "On · Not Started and ready issues can run": "开启 · 未开始工作项和 ready issue 会自动运行",
   "On · Not Started items can run": "开启 · 未开始工作项会自动运行",
@@ -171,6 +173,7 @@ const zhCN: Record<string, string> = {
   "Run": "运行",
   "Rerun": "重新运行",
   "Retry": "重试",
+  "Retrying...": "重试中...",
   "Running...": "运行中...",
   "Planning...": "规划中...",
   "Creating...": "创建中...",
@@ -227,6 +230,9 @@ const zhCN: Record<string, string> = {
   "Check the local runtime, then reload Omega. The UI is not using cached work item data as a fallback.": "请检查本地 runtime 后再刷新 Omega。UI 不会再用缓存的工作项数据兜底。",
   "Blocked reason": "阻塞原因",
   "Attempt": "Attempt",
+  "Stopped at {stage}": "停在 {stage}",
+  "Stopped here": "停在这里",
+  "Paused": "已暂停",
   "Night": "夜间",
   "Day": "日间",
   "Switch to night mode": "切换到夜间模式",
@@ -328,6 +334,9 @@ const zhCN: Record<string, string> = {
   "Not captured": "未采集",
   "Runtime not captured": "运行时未采集",
   "Planned agents": "计划 Agent",
+  "Started": "开始",
+  "Finished": "结束",
+  "Updated": "更新",
   "Orchestration": "编排",
   "Code": "编码",
   "Test": "测试",
@@ -448,6 +457,9 @@ const zhCN: Record<string, string> = {
   "No field patch recorded.": "还没有字段补丁记录。",
   "Diff, validation, checks and risk preview.": "Diff、验证、检查和风险预览。",
   "Feedback route": "反馈路径",
+  "Recovery route": "恢复路径",
+  "The next retry or rework will use the blocker above with this recovery route.": "下一次 retry 或 rework 会按这条恢复路径复用上方阻塞信息。",
+  "This panel explains how the next retry or rework will use the blocker and feedback above.": "这里说明下一次 retry 或 rework 会如何使用上面的阻塞与反馈信息。",
   "Human or review feedback will be routed into rework before returning to review.": "人工或 review 反馈会先进入返工，再回到 review。",
   "{count} checklist action captured for the next run.": "已为下一次运行记录 {count} 条 checklist 操作。",
   "{count} checklist actions captured for the next run.": "已为下一次运行记录 {count} 条 checklist 操作。",
@@ -530,7 +542,7 @@ const dictionaries: Record<UiLanguage, Record<string, string>> = {
   "zh-CN": zhCN
 };
 
-export function normalizeUiLanguage(value: string | undefined | null): UiLanguage {
+function normalizeUiLanguage(value: string | undefined | null): UiLanguage {
   return value === "zh-CN" || value === "zh" || value === "zh_CN" ? "zh-CN" : "en";
 }
 

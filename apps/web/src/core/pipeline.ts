@@ -1,5 +1,5 @@
 import { agentDefinitions, hasCapability } from "./agents";
-import { capabilityCatalog, findCapability } from "./catalog";
+import { findCapability } from "./catalog";
 import type {
   AgentId,
   DeliveryRequirement,
@@ -39,7 +39,7 @@ function makeEvent(
   };
 }
 
-export function createDefaultStages(): PipelineStage[] {
+function createDefaultStages(): PipelineStage[] {
   return [
     {
       id: "intake",
@@ -286,19 +286,4 @@ export class PipelineEngine {
     this.run.updatedAt = now();
     return this.snapshot();
   }
-}
-
-export function capabilityRiskCount(run: PipelineRun): Record<string, number> {
-  return Object.values(run.selectedCapabilities)
-    .flat()
-    .reduce<Record<string, number>>(
-      (counts, capabilityId) => {
-        const capability = capabilityCatalog.find((candidate) => candidate.id === capabilityId);
-        if (capability) {
-          counts[capability.risk] += 1;
-        }
-        return counts;
-      },
-      { read: 0, write: 0, admin: 0 }
-    );
 }

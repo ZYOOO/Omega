@@ -98,7 +98,7 @@ export function createInitialConnectionState(): ConnectionState {
   ) as ConnectionState;
 }
 
-export function getConnectionProvider(providerId: ProviderId): ConnectionProvider {
+function getConnectionProvider(providerId: ProviderId): ConnectionProvider {
   const provider = connectionProviders.find((candidate) => candidate.id === providerId);
 
   if (!provider) {
@@ -137,16 +137,6 @@ export function grantProviderConnection(
       status: "connected",
       connectedAs,
       grantedPermissions: provider.permissions.map((permission) => permission.id)
-    }
-  };
-}
-
-export function revokeProviderConnection(state: ConnectionState, providerId: ProviderId): ConnectionState {
-  return {
-    ...state,
-    [providerId]: {
-      status: "not-connected",
-      grantedPermissions: []
     }
   };
 }

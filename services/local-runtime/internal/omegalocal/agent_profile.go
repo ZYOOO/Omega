@@ -60,6 +60,7 @@ func defaultAgentProfileConfigs() []AgentProfileConfig {
 		{ID: "coding", Label: "Coding", Runner: "codex", Model: "", Skills: "playwright\nsecurity-best-practices", MCP: "omega-filesystem\nomega-git\nomega-puppeteer", StageNotes: "Edit only inside the locked repository workspace.", CodexPolicy: "workspace-write only; emit diff and summary", ClaudePolicy: "preserve existing project style"},
 		{ID: "testing", Label: "Testing", Runner: "codex", Model: "", Skills: "playwright\ngh-fix-ci", MCP: "omega-filesystem\nomega-puppeteer\nomega-git", StageNotes: "Run focused tests and capture output.", CodexPolicy: "capture test-report.md", ClaudePolicy: "summarize validation evidence"},
 		{ID: "review", Label: "Review", Runner: "codex", Model: "", Skills: "gh-address-comments\ngh-fix-ci\nsecurity-best-practices", MCP: "omega-git\nomega-filesystem", StageNotes: "Review correctness, safety, tests, and contract drift.", CodexPolicy: "do not edit files; issue explicit verdict", ClaudePolicy: "return verdict and required fixes"},
+		{ID: "git_recovery", Label: "Git Recovery", Runner: "codex", Model: "", Skills: "gh-address-comments\ngh-fix-ci", MCP: "omega-git\nomega-filesystem\nomega-sequential-thinking", StageNotes: "Diagnose and repair Git/GitHub delivery failures only when a PR publish/update action invokes recovery.", CodexPolicy: "danger-full-access is used only for git metadata and gh repair inside the locked repository workspace; keep the same Omega branch; no product edits except conflict resolution; never merge", ClaudePolicy: "repair branch/PR delivery inside the locked repository workspace only"},
 		{ID: "delivery", Label: "Delivery", Runner: "codex", Model: "", Skills: "yeet\ngh-address-comments", MCP: "omega-git\nomega-filesystem", StageNotes: "Prepare handoff after human approval.", CodexPolicy: "require human gate approval before delivery action", ClaudePolicy: "summarize shipped changes and caveats"},
 	}
 }
@@ -84,6 +85,7 @@ stages:
 			"Testing: run focused validation first, then broader checks when shared contracts, delivery, or UI behavior changed.",
 			"Review: changes_requested must route to Rework with a checklist; review feedback should not be treated as an infrastructure failure.",
 			"Rework: reuse the existing implementation workspace, apply the checklist, update PR notes when the behavior changed, and return to review.",
+			"Git Recovery: only the git_recovery Agent may repair Git/GitHub delivery failures, and only for in_progress/publish_pull_request or rework/update_pull_request.",
 			"Human Review: stop delivery until explicit approval; request changes becomes first-class feedback for the next rework attempt.",
 			"Delivery: after approval, run merge/check actions separately and record PR/check/proof output in the Run Workpad.",
 		}, "\n"),

@@ -158,13 +158,27 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 	if model != "" {
 		args = append(args, "--model", model)
 	}
+	outputPath := strings.TrimSpace(request.OutputPath)
+	capturePath, captureDir, captureErr := codexOutputCapturePath(request.Workspace, outputPath, sandbox)
+	if captureErr != nil {
+		process := runnerProcessNotAvailable("codex", "codex", request.Workspace, captureErr)
+		process["model"] = model
+		process["effort"] = effort
+		process["sandbox"] = sandbox
+		return AgentTurnResult{Status: "failed", Process: process, Error: captureErr}
+	}
+	if captureDir != "" {
+		defer os.RemoveAll(captureDir)
+	}
 	args = append(args,
 		"-c", "model_reasoning_effort=\""+effort+"\"",
 		"--skip-git-repo-check",
 		"--sandbox", sandbox,
-		"--output-last-message", request.OutputPath,
-		"-",
 	)
+	if capturePath != "" {
+		args = append(args, "--output-last-message", capturePath)
+	}
+	args = append(args, "-")
 	process, err := runSupervisedCommandContextWithOptions(
 		ctx,
 		SupervisedCommandOptions{HeartbeatInterval: request.HeartbeatInterval, OnEvent: request.OnProcessEvent, Env: request.Env},
@@ -173,8 +187,12 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 		"codex",
 		args...,
 	)
-	if request.OutputPath != "" {
-		ensureAgentOutputFile(request.OutputPath, process)
+	if outputPath != "" {
+		if capturePath != outputPath {
+			process["outputCaptureMode"] = "runner-copy"
+			copyAgentOutputFile(capturePath, outputPath, process)
+		}
+		ensureAgentOutputFile(outputPath, process)
 	}
 	status := "passed"
 	if err != nil {
@@ -184,6 +202,36 @@ func (runner CodexExecAgentRunner) RunTurn(ctx context.Context, request AgentTur
 	process["model"] = model
 	process["effort"] = effort
 	return AgentTurnResult{Status: status, Process: process, Error: err}
+}
+
+func codexOutputCapturePath(workspace string, outputPath string, sandbox string) (string, string, error) {
+	outputPath = strings.TrimSpace(outputPath)
+	if outputPath == "" {
+		return "", "", nil
+	}
+	if strings.EqualFold(strings.TrimSpace(sandbox), "read-only") {
+		dir, err := os.MkdirTemp("", "omega-codex-last-message-*")
+		if err != nil {
+			return "", "", err
+		}
+		return filepath.Join(dir, safeAgentOutputBase(outputPath)), dir, nil
+	}
+	if strings.TrimSpace(workspace) != "" && !pathInsideRoot(workspace, outputPath) {
+		captureDir := filepath.Join(workspace, ".omega", "agent-output")
+		if err := os.MkdirAll(captureDir, 0o700); err != nil {
+			return "", "", err
+		}
+		return filepath.Join(captureDir, safeAgentOutputBase(outputPath)), "", nil
+	}
+	return outputPath, "", nil
+}
+
+func safeAgentOutputBase(outputPath string) string {
+	base := strings.TrimSpace(filepath.Base(outputPath))
+	if base == "" || base == "." || base == string(os.PathSeparator) {
+		return "agent-output.md"
+	}
+	return base
 }
 
 type OpenCodeAgentRunner struct{}
@@ -567,7 +615,22 @@ func ensureAgentOutputFile(outputPath string, process map[string]any) {
 		fallback = strings.TrimSpace(stringOr(process["stderr"], ""))
 	}
 	if fallback != "" {
+		_ = os.MkdirAll(filepath.Dir(outputPath), 0o755)
 		_ = os.WriteFile(outputPath, []byte(fallback), 0o644)
+	}
+}
+
+func copyAgentOutputFile(sourcePath string, outputPath string, process map[string]any) {
+	raw, err := os.ReadFile(sourcePath)
+	if err != nil || strings.TrimSpace(string(raw)) == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		process["outputCaptureError"] = err.Error()
+		return
+	}
+	if err := os.WriteFile(outputPath, raw, 0o644); err != nil {
+		process["outputCaptureError"] = err.Error()
 	}
 }
 

@@ -12,7 +12,12 @@ const legacyTestInclude = [
   "src/integrations/__tests__/**/*.test.ts",
   "src/local/__tests__/**/*.test.ts"
 ];
-const testInclude = testSuite === "legacy" ? legacyTestInclude : testSuite === "all" ? [...currentTestInclude, ...legacyTestInclude] : currentTestInclude;
+const testInclude =
+  testSuite === "legacy"
+    ? legacyTestInclude
+    : testSuite === "all"
+      ? [...currentTestInclude, ...legacyTestInclude]
+      : currentTestInclude;
 
 export default defineConfig({
   root: "apps/web",

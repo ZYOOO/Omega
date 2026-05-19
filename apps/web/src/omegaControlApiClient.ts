@@ -1,4 +1,4 @@
-import type { MissionControlRunnerPreset } from "./missionControlApiClient";
+import type { RunnerPreset } from "./runnerTypes";
 import type { UiLanguage } from "./i18n";
 
 export interface ObservabilitySummary {
@@ -221,6 +221,7 @@ export interface PipelineTemplateInfo {
   id: string;
   name: string;
   description: string;
+  workflowMarkdown?: string;
   stages: Array<{
     id: string;
     title: string;
@@ -773,8 +774,16 @@ export interface CheckpointRecordInfo {
   title: string;
   summary: string;
   decisionNote?: string;
+  feishuReview?: Record<string, unknown>;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface FeishuReviewTaskBridgeTickResult {
+  status: string;
+  synced?: Array<Record<string, unknown>>;
+  skipped?: number;
+  createdAt?: string;
 }
 
 export interface RunCurrentStageResult {
@@ -802,11 +811,6 @@ export interface RunDevFlowCycleResult {
   proofFiles?: string[];
   pipeline?: PipelineRecordInfo;
   attempt?: AttemptRecordInfo;
-}
-
-export interface CancelAttemptResult {
-  attempt: AttemptRecordInfo;
-  cancelSignalSent: boolean;
 }
 
 export interface RetryAttemptResult {
@@ -1399,6 +1403,19 @@ export async function sendFeishuNotification(
   return postJson<FeishuNotificationResult>(apiUrl, "/feishu/notify", { chatId, text }, fetchImpl);
 }
 
+export async function tickFeishuReviewTaskBridge(
+  apiUrl: string,
+  checkpointId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<FeishuReviewTaskBridgeTickResult> {
+  return postJson<FeishuReviewTaskBridgeTickResult>(
+    apiUrl,
+    "/feishu/review-task/bridge/tick",
+    { checkpointId, limit: 1 },
+    fetchImpl
+  );
+}
+
 export async function startGitHubOAuth(
   apiUrl: string,
   fetchImpl: typeof fetch = fetch
@@ -1610,15 +1627,6 @@ export async function patchRunWorkpad(
   return response.json() as Promise<RunWorkpadRecordInfo>;
 }
 
-export async function cancelAttempt(
-  apiUrl: string,
-  attemptId: string,
-  reason = "Canceled by operator.",
-  fetchImpl: typeof fetch = fetch
-): Promise<CancelAttemptResult> {
-  return postJson<CancelAttemptResult>(apiUrl, `/attempts/${encodeURIComponent(attemptId)}/cancel`, { reason }, fetchImpl);
-}
-
 export async function retryAttempt(
   apiUrl: string,
   attemptId: string,
@@ -1742,7 +1750,7 @@ export async function startPipeline(
 export async function runCurrentPipelineStage(
   apiUrl: string,
   pipelineId: string,
-  runner: MissionControlRunnerPreset = "local-proof",
+  runner: RunnerPreset = "local-proof",
   fetchImpl: typeof fetch = fetch
 ): Promise<RunCurrentStageResult> {
   return postJson<RunCurrentStageResult>(apiUrl, `/pipelines/${pipelineId}/run-current-stage`, { runner }, fetchImpl);
@@ -1803,28 +1811,12 @@ export async function discardPagePilotRun(
   return postJson<PagePilotRunInfo>(apiUrl, `/page-pilot/runs/${encodeURIComponent(runId)}/discard`, {}, fetchImpl);
 }
 
-export async function resolvePagePilotPreviewRuntime(
-  apiUrl: string,
-  input: PagePilotPreviewRuntimeInput,
-  fetchImpl: typeof fetch = fetch
-): Promise<PagePilotPreviewRuntimeResult> {
-  return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/resolve", input, fetchImpl);
-}
-
 export async function startPagePilotPreviewRuntime(
   apiUrl: string,
   input: PagePilotPreviewRuntimeInput,
   fetchImpl: typeof fetch = fetch
 ): Promise<PagePilotPreviewRuntimeResult> {
   return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/start", input, fetchImpl);
-}
-
-export async function restartPagePilotPreviewRuntime(
-  apiUrl: string,
-  input: PagePilotPreviewRuntimeInput,
-  fetchImpl: typeof fetch = fetch
-): Promise<PagePilotPreviewRuntimeResult> {
-  return postJson<PagePilotPreviewRuntimeResult>(apiUrl, "/page-pilot/preview-runtime/restart", input, fetchImpl);
 }
 
 export interface OrchestratorTickInput {

@@ -2578,6 +2578,135 @@ describe("App operator view", () => {
     );
   });
 
+  it("shows in-flight feedback when retrying a blocked workboard item", async () => {
+    vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
+    window.location.hash = "#workboard";
+    const now = new Date().toISOString();
+    const workspace = {
+      schemaVersion: 1,
+      savedAt: now,
+      tables: {
+        projects: [{
+          id: "project_omega",
+          name: "Omega",
+          description: "",
+          team: "Omega",
+          status: "Active",
+          repositoryTargets: [{ id: "repo_demo", kind: "github", owner: "ZYOOO", repo: "DemoRepo", defaultBranch: "main" }],
+          defaultRepositoryTargetId: "repo_demo",
+          labels: [],
+          createdAt: now,
+          updatedAt: now
+        }],
+        requirements: [],
+        workItems: [{
+          id: "item_retry_board",
+          projectId: "project_omega",
+          repositoryTargetId: "repo_demo",
+          key: "OMG-8",
+          title: "Build a revenue command center",
+          description: "",
+          status: "Ready",
+          priority: "Medium",
+          assignee: "requirement",
+          labels: [],
+          team: "Omega",
+          stageId: "intake",
+          target: "ZYOOO/DemoRepo",
+          createdAt: now,
+          updatedAt: now
+        }],
+        missionControlStates: [],
+        missionEvents: [],
+        syncIntents: [],
+        connections: [],
+        uiPreferences: [],
+        pipelines: [],
+        attempts: [],
+        checkpoints: [],
+        missions: [],
+        operations: [],
+        proofRecords: []
+      }
+    };
+    const failedPipeline = {
+      id: "pipeline_retry_board",
+      workItemId: "item_retry_board",
+      runId: "run_retry_board",
+      status: "failed",
+      templateId: "devflow-pr",
+      run: {
+        stages: [
+          { id: "todo", title: "Todo intake", status: "failed", agentId: "requirement" }
+        ]
+      }
+    };
+    const failedAttempt = {
+      id: "attempt_retry_board",
+      itemId: "item_retry_board",
+      pipelineId: "pipeline_retry_board",
+      repositoryTargetId: "repo_demo",
+      status: "failed",
+      trigger: "operator",
+      startedAt: now,
+      finishedAt: now,
+      failureReason: "Workflow contract requirement action failed."
+    };
+    let resolveRetry: (response: Response) => void = () => {};
+    const retryPromise = new Promise<Response>((resolve) => {
+      resolveRetry = resolve;
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/workspace?scope=session")) return Promise.resolve(jsonResponse(workspace));
+      if (url.includes("/observability")) {
+        return Promise.resolve(jsonResponse({
+          counts: { workItems: 1, pipelines: 1, checkpoints: 0, missions: 0, operations: 0, proofRecords: 0, events: 0 },
+          pipelineStatus: { failed: 1 },
+          checkpointStatus: {},
+          operationStatus: {},
+          workItemStatus: { Blocked: 1 },
+          attention: { waitingHuman: 0, failed: 1, blocked: 0 }
+        }));
+      }
+      if (url.endsWith("/llm-provider-selection")) {
+        return Promise.resolve(jsonResponse({ providerId: "openai", model: "", reasoningEffort: "medium" }));
+      }
+      if (url.endsWith("/ui/language")) {
+        return Promise.resolve(jsonResponse({ language: "en", updatedAt: now }));
+      }
+      if (url.endsWith("/pipelines")) return Promise.resolve(jsonResponse([failedPipeline]));
+      if (url.endsWith("/attempts")) return Promise.resolve(jsonResponse([failedAttempt]));
+      if (url.endsWith("/attempts/attempt_retry_board/retry") && init?.method === "POST") {
+        return retryPromise;
+      }
+      if (url.endsWith("/llm-providers") || url.endsWith("/pipeline-templates") || url.endsWith("/agent-definitions") || url.endsWith("/requirements") || url.endsWith("/proof-records") || url.endsWith("/run-workpads") || url.endsWith("/checkpoints") || url.endsWith("/operations") || url.includes("/runtime-logs") || url.endsWith("/runner-credentials") || url.endsWith("/execution-locks") || url.endsWith("/orchestrator/watchers") || url.endsWith("/local-capabilities")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    }) as unknown as typeof fetch;
+
+    vi.stubGlobal("fetch", fetchMock);
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    const retryButton = await screen.findByRole("button", { name: "Retry" });
+    fireEvent.click(retryButton);
+
+    const retryingButton = await screen.findByRole("button", { name: "Retrying..." });
+    expect(retryingButton).toBeDisabled();
+    expect(retryingButton).toHaveAttribute("aria-busy", "true");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:3888/attempts/attempt_retry_board/retry",
+      expect.objectContaining({ method: "POST" })
+    );
+
+    resolveRetry(jsonResponse({
+      attempt: { ...failedAttempt, id: "attempt_retry_board_2", status: "running", startedAt: now, finishedAt: undefined }
+    }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:3888/workspace?scope=session"));
+  });
+
   it("ignores stale local workspace cache when the Go runtime is connected", async () => {
     vi.stubEnv("VITE_MISSION_CONTROL_API_URL", "http://127.0.0.1:3888");
     window.location.hash = "#workboard";

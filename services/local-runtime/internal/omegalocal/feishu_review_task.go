@@ -172,6 +172,14 @@ func renderFeishuReviewTaskDescriptionForLanguage(packet map[string]any, nonce s
 	if summary := text(reviewPacket, "summary"); summary != "" {
 		lines = append(lines, "", feishuLabel(lang, "🧾 Review packet", "🧾 审核包摘要"), truncateForProof(summary, 700))
 	}
+	if briefLines := renderFeishuHumanReviewBriefPlain(feishuHumanReviewBriefFromPacket(packet), lang, 900); len(briefLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, briefLines...)
+	}
+	if solutionLines := renderFeishuSolutionPlanPlain(feishuSolutionPlanFromPacket(packet), lang, 900); len(solutionLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, solutionLines...)
+	}
 	if riskLines := renderFeishuRiskBasisPlain(reviewPacket, lang, 4); len(riskLines) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, riskLines...)

@@ -1132,6 +1132,8 @@ func (server *Server) executeDevFlowPRCycle(ctx context.Context, pipeline map[st
 	testingRunner, testingRunnerID := runnerRegistry.Resolve(testingProfile.Runner)
 	reviewProfile := agentProfileForRole(profile, "review")
 	reviewRunner, reviewRunnerID := runnerRegistry.Resolve(reviewProfile.Runner)
+	gitRecoveryProfile := agentProfileForRole(profile, devFlowGitRecoveryAgentID)
+	gitRecoveryRunner, gitRecoveryRunnerID := runnerRegistry.Resolve(gitRecoveryProfile.Runner)
 	deliveryProfile := agentProfileForRole(profile, "delivery")
 	deliveryRunner, deliveryRunnerID := runnerRegistry.Resolve(deliveryProfile.Runner)
 
@@ -1387,14 +1389,14 @@ Rules:
 - Address the human feedback with a real code change.
 - Keep the diff minimal and reviewable.
 - Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
-- Write a short completion note to %s with these sections:
+- Return a short completion note in your final answer with these sections:
   - Human feedback addressed
   - What changed
   - Files changed
   - Validation run
   - Remaining risk
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, reworkFeedbackInput, notePath)
-		reworkPrompt := renderWorkflowPromptSection(template, "rework", reworkVariables, reworkFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), prURL, effectiveDescription, reworkFeedbackInput)
+		reworkPrompt := renderWorkflowPromptSection(template, "rework", reworkVariables, reworkFallback) + agentArtifactCaptureInstruction(notePath) + "\n\n" + agentPolicyBlock(profile, "coding")
 		if err := os.WriteFile(promptPath, []byte(reworkPrompt), 0o644); err != nil {
 			return nil, err
 		}
@@ -1684,6 +1686,12 @@ Include:
 - validation and review evidence
 - remaining human gate decision
 - risks or blocked assumptions
+
+Rules:
+- Use only the requirement, solution plan, review packet, PR, test/check output, and changed-file evidence already captured by Omega.
+- Do not invent passed checks, hidden risks, user approval, deployment status, or product scope.
+- Do not change the risk level or TODO status; explain what the reviewer should verify.
+- Keep it concise and reviewer-facing.
 `, filepath.Join(proofDir, "handoff-bundle.json")) + agentArtifactCaptureInstruction(deliveryHandoffPath) + "\n\n" + agentPolicyBlock(profile, "delivery")
 		deliveryTurn := runProfileAgent("delivery", deliveryRunner, deliveryRunnerID, deliveryProfile, "delivery", "done", workspace, deliveryAgentPrompt, deliveryHandoffPath, "read-only", "medium")
 		if deliveryTurn.Error != nil {
@@ -1691,6 +1699,33 @@ Include:
 			return failureResult("done", "delivery", "Delivery agent failed while preparing the human handoff after fast rework.", deliveryTurn.Error.Error(), humanChangeRequest), deliveryTurn.Error
 		}
 		recordAgent("done", "delivery", "waiting-human", deliveryAgentPrompt, filepath.Base(deliveryHandoffPath), "Delivery agent prepared the handoff and is waiting for the human review checkpoint after fast rework.", []string{filepath.Join(proofDir, "handoff-bundle.json"), deliveryHandoffPath}, deliveryTurn.Process)
+		reviewPacket = attachDevFlowHumanReviewBrief(reviewPacket, deliveryHandoffPath)
+		if err := writeJSONFile(reviewPacketPath, reviewPacket); err != nil {
+			return nil, err
+		}
+		updatedAt := nowISO()
+		if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{
+			"pipelineId":         text(pipeline, "id"),
+			"workItemId":         text(item, "id"),
+			"workItemKey":        text(item, "key"),
+			"repositoryTargetId": text(target, "id"),
+			"repositoryTarget":   repoSlug,
+			"workspacePath":      workspace,
+			"repositoryPath":     repoWorkspace,
+			"branchName":         branchName,
+			"pullRequestUrl":     prURL,
+			"merged":             false,
+			"humanGate":          "pending",
+			"reworkAssessment":   reworkAssessment,
+			"reviewPacket":       reviewPacket,
+			"changedFiles":       changedFiles,
+			"artifacts":          stageArtifacts,
+			"agentInvocations":   agentInvocations,
+			"createdAt":          updatedAt,
+			"updatedAt":          updatedAt,
+		}); err != nil {
+			return nil, err
+		}
 		recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review after fast rework.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 		proofFiles, _ := collectFiles(proofDir)
 		return map[string]any{
@@ -1884,13 +1919,14 @@ Rules:
 - Add or update tests or runnable examples when the requirement asks for them.
 - Keep the diff minimal and reviewable.
 - Do not commit, push, or create a pull request. Omega will handle git delivery after you finish editing.
-- Write a short completion note to %s with these sections:
+- Return a short completion note in your final answer with these sections:
   - What changed
   - Files changed
   - Validation run
   - Known follow-up or risk
-`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), effectiveDescription, filepath.Join(proofDir, "coding-agent-note.md"))
-		codingPrompt := renderWorkflowPromptSection(template, "coding", promptVariables, codingFallback) + "\n\n" + agentPolicyBlock(profile, "coding")
+`, repoSlug, repoWorkspace, text(item, "key"), text(item, "title"), effectiveDescription)
+		codingNotePath := filepath.Join(proofDir, "coding-agent-note.md")
+		codingPrompt := renderWorkflowPromptSection(template, "coding", promptVariables, codingFallback) + agentArtifactCaptureInstruction(codingNotePath) + "\n\n" + agentPolicyBlock(profile, "coding")
 		if err := os.WriteFile(filepath.Join(proofDir, "coding-prompt.md"), []byte(codingPrompt), 0o644); err != nil {
 			return err
 		}
@@ -1905,7 +1941,7 @@ Rules:
 			Runner:            codingRunnerID,
 			Workspace:         repoWorkspace,
 			Prompt:            codingPrompt,
-			OutputPath:        filepath.Join(proofDir, "coding-agent-note.md"),
+			OutputPath:        codingNotePath,
 			Sandbox:           "workspace-write",
 			Model:             codingModel,
 			Env:               mergeEnvMaps(agentCapabilityEnv(profile, "coding"), codingEnv),
@@ -2006,7 +2042,43 @@ Validation failure summary:
 		var err error
 		prURL, err = ensureDevFlowPullRequest(repoWorkspace, repoSlug, branchName, baseBranch, prTitle, prBody)
 		if err != nil {
-			return fmt.Errorf("create pull request: %w", err)
+			recovery, recoveryErr := runDevFlowGitHubRecoveryAgent(devFlowGitHubRecoveryInput{
+				Server:              server,
+				Context:             ctx,
+				Template:            template,
+				Profile:             profile,
+				Agent:               gitRecoveryProfile,
+				Runner:              gitRecoveryRunner,
+				RunnerID:            gitRecoveryRunnerID,
+				HeartbeatInterval:   runnerHeartbeatInterval,
+				Pipeline:            pipeline,
+				Item:                item,
+				RepositoryWorkspace: repoWorkspace,
+				Repository:          repoSlug,
+				BranchName:          branchName,
+				BaseBranch:          baseBranch,
+				PullRequestTitle:    prTitle,
+				PullRequestBody:     prBody,
+				PullRequestURL:      prURL,
+				ChangedFiles:        changedFiles,
+				TestOutput:          testOutput,
+				ProofDir:            proofDir,
+				AttemptID:           attemptID,
+				StageID:             "in_progress",
+				ActionID:            "publish_pull_request",
+				ActionType:          "ensure_pr",
+				InitialError:        err,
+				PromptVariables:     promptVariables,
+			})
+			if recoveryErr != nil {
+				recordAgent("in_progress", devFlowGitRecoveryAgentID, "failed", recovery.Prompt, filepath.Base(recovery.ArtifactPath), "Git Recovery Agent could not repair pull request delivery.", []string{recovery.PromptPath, recovery.ArtifactPath}, recovery.Process)
+				return fmt.Errorf("create pull request: %w; git recovery failed: %v", err, recoveryErr)
+			}
+			prURL = recovery.PullRequestURL
+			recordAgent("in_progress", devFlowGitRecoveryAgentID, "passed", recovery.Prompt, filepath.Base(recovery.ArtifactPath), recovery.Summary, []string{recovery.PromptPath, recovery.ArtifactPath}, recovery.Process)
+			if output, updateErr := updateDevFlowPullRequestDescriptionIfChanged(repoWorkspace, prURL, prTitle, prBody); updateErr != nil {
+				server.logDebug(ctx, "github.pr.description_update_after_recovery_skipped", "Pull request description update skipped after Git recovery.", map[string]any{"pipelineId": text(pipeline, "id"), "attemptId": attemptID, "pullRequestUrl": prURL, "output": truncateForProof(output+"\n"+updateErr.Error(), 1200)})
+			}
 		}
 		if humanChangeRequest != "" {
 			if output, err := updateDevFlowPullRequestDescriptionIfChanged(repoWorkspace, prURL, prTitle, prBody); err != nil {
@@ -2077,6 +2149,9 @@ Validation failure summary:
 			testingProfile:          testingProfile,
 			testingRunner:           testingRunner,
 			testingRunnerID:         testingRunnerID,
+			gitRecoveryProfile:      gitRecoveryProfile,
+			gitRecoveryRunner:       gitRecoveryRunner,
+			gitRecoveryRunnerID:     gitRecoveryRunnerID,
 			runnerHeartbeatInterval: runnerHeartbeatInterval,
 			pipeline:                pipeline,
 			item:                    item,
@@ -2085,7 +2160,9 @@ Validation failure summary:
 			repoWorkspace:           repoWorkspace,
 			repoSlug:                repoSlug,
 			branchName:              branchName,
+			baseBranch:              baseBranch,
 			prURL:                   prURL,
+			prURLRef:                &prURL,
 			prTitle:                 prTitle,
 			effectiveDescription:    effectiveDescription,
 			attemptID:               attemptID,
@@ -2319,6 +2396,12 @@ Include:
 - validation and review evidence
 - remaining human gate decision
 - risks or blocked assumptions
+
+Rules:
+- Use only the requirement, solution plan, review packet, PR, test/check output, and changed-file evidence already captured by Omega.
+- Do not invent passed checks, hidden risks, user approval, deployment status, or product scope.
+- Do not change the risk level or TODO status; explain what the reviewer should verify.
+- Keep it concise and reviewer-facing.
 `, filepath.Join(proofDir, "handoff-bundle.json")) + agentArtifactCaptureInstruction(deliveryHandoffPath) + "\n\n" + agentPolicyBlock(profile, "delivery")
 	deliveryTurn := runProfileAgent("delivery", deliveryRunner, deliveryRunnerID, deliveryProfile, "delivery", "done", workspace, deliveryAgentPrompt, deliveryHandoffPath, "read-only", "medium")
 	if deliveryTurn.Error != nil {
@@ -2326,6 +2409,32 @@ Include:
 		return failureResult("done", "delivery", "Delivery agent failed while preparing the human handoff.", deliveryTurn.Error.Error(), humanChangeRequest), deliveryTurn.Error
 	}
 	recordAgent("done", "delivery", "waiting-human", deliveryAgentPrompt, "delivery-handoff.md", "Delivery agent prepared the handoff and is waiting for the human review checkpoint.", []string{filepath.Join(proofDir, "handoff-bundle.json"), deliveryHandoffPath}, deliveryTurn.Process)
+	reviewPacket = attachDevFlowHumanReviewBrief(reviewPacket, deliveryHandoffPath)
+	if err := writeJSONFile(reviewPacketPath, reviewPacket); err != nil {
+		return nil, err
+	}
+	updatedAt := nowISO()
+	if err := writeJSONFile(filepath.Join(proofDir, "handoff-bundle.json"), map[string]any{
+		"pipelineId":         text(pipeline, "id"),
+		"workItemId":         text(item, "id"),
+		"workItemKey":        text(item, "key"),
+		"repositoryTargetId": text(target, "id"),
+		"repositoryTarget":   repoSlug,
+		"workspacePath":      workspace,
+		"repositoryPath":     repoWorkspace,
+		"branchName":         branchName,
+		"pullRequestUrl":     prURL,
+		"merged":             merged,
+		"humanGate":          "pending",
+		"reviewPacket":       reviewPacket,
+		"changedFiles":       changedFiles,
+		"artifacts":          stageArtifacts,
+		"agentInvocations":   agentInvocations,
+		"createdAt":          updatedAt,
+		"updatedAt":          updatedAt,
+	}); err != nil {
+		return nil, err
+	}
 	recordGitHubOutboundSync("human_review.waiting", "waiting-human", "human_review", "Pull request is ready for human review.", prURL, checksOutput, changedFiles, "", "", reviewPacket)
 	proofFiles, _ := collectFiles(proofDir)
 	return map[string]any{

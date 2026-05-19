@@ -273,6 +273,7 @@ describe("WorkItemDetailPage", () => {
     expect(screen.getByLabelText("Stage statistics")).toBeInTheDocument();
     expect(screen.getAllByText("Architect agent wrote the plan and TODO list.").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Testing agent ran focused validation.").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Started 05\/05/).length).toBeGreaterThan(0);
     expect(screen.getByText(/in 2\.1k tokens/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(screen.getByText("1 planned agent(s) · review")).toBeInTheDocument();
@@ -373,6 +374,113 @@ describe("WorkItemDetailPage", () => {
     expect(screen.queryByText("Rework checklist")).not.toBeInTheDocument();
     expect(screen.getByText("No active blockers")).toBeInTheDocument();
     expect(screen.getByText("No retry needed")).toBeInTheDocument();
+  });
+
+  it("marks the stopped stage and timestamps the blocker on failed attempts", () => {
+    const workItem: WorkItem = {
+      id: "item_manual_blocked",
+      key: "OMG-blocked",
+      title: "Blocked implementation",
+      description: "Need a retry.",
+      status: "Blocked" as const,
+      priority: "High" as const,
+      assignee: "coding",
+      labels: [],
+      team: "Omega",
+      stageId: "coding",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: [],
+      blockedByItemIds: []
+    };
+
+    const { container } = render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[{
+          id: "attempt_blocked:workpad",
+          attemptId: "attempt_blocked",
+          pipelineId: "pipeline_blocked",
+          workItemId: "item_manual_blocked",
+          repositoryTargetId: "repo_test",
+          status: "failed",
+          workpad: {
+            blockers: [
+              "Workflow contract implementation action failed.",
+              "create pull request failed: GraphQL: The omega/OMG-8-devflow branch has no history in common with main (createPullRequest)",
+              "Pipeline is failed."
+            ],
+            retryReason: "old requirement agent failed before producing the handoff"
+          }
+        }]}
+        pipeline={{
+          id: "pipeline_blocked",
+          workItemId: "item_manual_blocked",
+          runId: "run_blocked",
+          status: "failed",
+          updatedAt: "2026-05-05T11:30:00Z",
+          run: {
+            stages: [
+              { id: "todo", title: "Todo intake", status: "passed", agentIds: ["requirement"] },
+              { id: "implementation", title: "Implementation and PR", status: "passed", agentIds: ["architect", "coding", "testing"] },
+              { id: "human_review", title: "Human Review", status: "waiting", agentIds: ["human"] }
+            ]
+          }
+        }}
+        attempts={[{
+          id: "attempt_blocked",
+          itemId: "item_manual_blocked",
+          pipelineId: "pipeline_blocked",
+          status: "failed",
+          currentStageId: "implementation",
+          failureStageId: "implementation",
+          failureReason: "Workflow contract implementation action failed.",
+          finishedAt: "2026-05-05T11:31:00Z"
+        }]}
+        attemptActionPlan={{
+          attemptId: "attempt_blocked",
+          pipelineId: "pipeline_blocked",
+          currentAction: { id: "publish_pull_request", title: "Publish pull request", status: "failed" },
+          retry: {
+            available: true,
+            recommendedAction: "retry-with-clean-worker",
+            reason: "old requirement agent failed before producing the handoff"
+          },
+          states: [
+            { id: "todo", title: "Todo intake", status: "passed" },
+            { id: "implementation", title: "Implementation and PR", status: "passed" }
+          ]
+        }}
+        checkpoints={[]}
+        operations={[]}
+        proofRecords={[]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    const stoppedCard = screen
+      .getAllByText("Implementation and PR")
+      .map((element) => element.closest(".detail-stage-card"))
+      .find(Boolean);
+
+    expect(stoppedCard).toHaveClass("stage-stopped-here");
+    expect(container.querySelector(".detail-blocked-callout")).toHaveTextContent("Stopped at Implementation and PR");
+    expect(container.querySelector(".detail-blocked-callout")).toHaveTextContent("no history in common with main");
+    expect(screen.getAllByText(/Current blocker: .*no history in common with main/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/old requirement agent failed before producing the handoff/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Rework return signal")).not.toBeInTheDocument();
+    expect(screen.getByText(/Stopped here · 05\/05/)).toBeInTheDocument();
   });
 
   it("renders delivery flow from the canonical backend pipeline snapshot instead of action plan states", () => {
@@ -532,6 +640,81 @@ describe("WorkItemDetailPage", () => {
 
     expect(container.querySelectorAll(".detail-stage-grid .stage-running")).toHaveLength(1);
     expect(container.querySelectorAll(".detail-stage-grid .stage-waiting")).toHaveLength(1);
+  });
+
+  it("keeps the implementation stage visibly running while rework runs code and test agents", () => {
+    const workItem: WorkItem = {
+      id: "item_manual_35",
+      key: "OMG-35",
+      title: "返工实施",
+      description: "Rework the implementation after review feedback.",
+      status: "In Review" as const,
+      priority: "High" as const,
+      assignee: "coding",
+      labels: [],
+      team: "Omega",
+      stageId: "rework",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: [],
+      blockedByItemIds: []
+    };
+
+    const { container } = render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[]}
+        pipeline={{
+          id: "pipeline_35",
+          workItemId: "item_manual_35",
+          runId: "run_35",
+          status: "running",
+          run: {
+            stages: [
+              { id: "requirement", title: "Todo intake", status: "passed", agentIds: ["requirement"] },
+              { id: "implementation", title: "Implementation and PR", status: "passed", agentIds: ["architect", "coding", "testing"] },
+              { id: "rework", title: "Rework", status: "running", agentIds: ["coding", "testing"] },
+              { id: "human_review", title: "Human Review", status: "waiting", agentIds: ["human"] }
+            ]
+          }
+        }}
+        attempts={[{
+          id: "attempt_35",
+          itemId: "item_manual_35",
+          pipelineId: "pipeline_35",
+          status: "running",
+          currentStageId: "rework"
+        }]}
+        checkpoints={[]}
+        operations={[]}
+        proofRecords={[]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    const implementationStageCard = screen
+      .getAllByText("Implementation and PR")
+      .map((element) => element.closest(".detail-stage-card"))
+      .find(Boolean);
+    const reworkStageCard = screen
+      .getAllByText("Rework")
+      .map((element) => element.closest(".detail-stage-card"))
+      .find(Boolean);
+
+    expect(implementationStageCard).toHaveClass("stage-running");
+    expect(reworkStageCard).toHaveClass("stage-running");
+    expect(container.querySelectorAll(".detail-stage-grid .stage-running")).toHaveLength(2);
   });
 
   it("hides human approval actions after the current human review checkpoint is approved", () => {
@@ -861,5 +1044,59 @@ describe("WorkItemDetailPage", () => {
         workItemId: "item_manual_22"
       }
     });
+  });
+
+  it("shows retry progress and disables the retry button while a retry is starting", () => {
+    const workItem: WorkItem = {
+      id: "item_retry_ui",
+      key: "OMG-retry-ui",
+      title: "Retry UI feedback",
+      description: "Need visible retry feedback.",
+      status: "Blocked" as const,
+      priority: "Medium" as const,
+      assignee: "coding",
+      labels: [],
+      team: "Omega",
+      stageId: "todo",
+      target: "ZYOOO/TestRepo",
+      source: "manual" as const,
+      repositoryTargetId: "repo_test",
+      acceptanceCriteria: [],
+      blockedByItemIds: []
+    };
+
+    render(
+      <WorkItemDetailPage
+        {...helpers}
+        workItem={workItem}
+        workItems={[workItem]}
+        requirements={[]}
+        repositoryTargets={[{ id: "repo_test", kind: "github", owner: "ZYOOO", repo: "TestRepo", defaultBranch: "main" }]}
+        repositoryLabel="ZYOOO/TestRepo"
+        runWorkpads={[]}
+        pipeline={undefined}
+        attempts={[{
+          id: "attempt_retry_ui",
+          itemId: "item_retry_ui",
+          pipelineId: "pipeline_retry_ui",
+          status: "failed",
+          currentStageId: "todo"
+        }]}
+        retryingAttemptId="attempt_retry_ui"
+        checkpoints={[]}
+        operations={[]}
+        proofRecords={[]}
+        attemptTimeline={null}
+        pullRequestStatus={null}
+        onOpenPagePilot={vi.fn()}
+        onApproveCheckpoint={vi.fn()}
+        onRequestCheckpointChanges={vi.fn()}
+        onRetryAttempt={vi.fn()}
+      />
+    );
+
+    const retryButton = screen.getByRole("button", { name: "Retrying..." });
+    expect(retryButton).toBeDisabled();
+    expect(retryButton).toHaveAttribute("aria-busy", "true");
   });
 });

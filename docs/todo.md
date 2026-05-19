@@ -16,11 +16,20 @@ Requirement 需求源
 
 近期完成：
 
+- [x] 旧架构残留清理：删除前端 TypeScript/Node Mission Control runner 原型、mock connector/integration 层、旧 repository/demo write helper 和 `test:legacy` 测试入口；保留 Go local runtime、scoped read model 与 `/operations/run` 兼容链路，避免误删仍在兜底的执行路径。
+- [x] 飞书 Task 审批后的本地状态同步加速：详情页 live refresh 会主动 tick review task bridge，审批同步后立即重拉 scoped execution records；同时修复 pipeline running 时旧 Human Review 状态投影滞留的问题。
+- [x] Rework 运行态可视化补强：Rework 正在跑 coding/testing 时，Implementation stage 也显示运行反馈，Workboard running 轨道补充轻量动画，避免返工阶段看起来没有执行中状态。
+- [x] 继续清理按钮本地状态遗留：手动 Requirement 创建后按后端返回的真实 Work Item id 选中；后端校验 Repository Workspace 绑定并归一化 project ownership；Provider Access 不再对 CI / GitHub CLI / 未接后端命令的 provider 做假连接或假断开；前端删除未使用的 full `/workspace` 保存 helper，避免新代码误接回 full snapshot。
+- [x] Auto Run 交互补强：Workspace controls 增加 `Run now`，前端会显式 POST `/orchestrator/tick` 扫描 Not Started Work Item 和 GitHub ready issue；开启 Auto run 后也会立即扫描并展示 accepted / idle / locked 等后端结果，避免看起来只是本地开关状态变化。
+- [x] Workspace Agent Studio 的 workflow template 下拉支持自动加载解析：选择不同模板时会合并内置模板、项目级记录和仓库级 override，优先加载当前 Repository Workspace 的 contract markdown，并立即刷新内容编辑区和 stage 解析。
+- [x] Human Review 增加 Delivery Agent 审核简报：Delivery Agent 会基于已有 requirement、solution plan、review packet、PR、测试/CI 和 changed files 证据生成 `delivery-handoff.md`，Omega 将摘要回填到 review packet，并同步展示在飞书卡片、文档、普通 text fallback 和 Task description 中。
+- [x] Feishu Human Review 通知补齐 Solution Plan：卡片、普通 text fallback、Task description 和飞书 review doc preview 都会展示方案计划摘要；历史 attempt 会从 `.omega/proof/solution-plan.md` 回读，不要求重跑。
+- [x] 5/6-5/7 运行日志复盘与稳定性修复：修复内置 sample template 目录迁移后导入失败、Agent Studio 切换 workflow template 后 markdown 不同步、Human Review approve 后 PR merge 失败被 JobSupervisor 反复重试的问题；新增内部日志复盘文档。
 - [x] 演示前 release refresh：README 改为开源项目结构，最新版 CLI / runtime binary 和 `Omega-0.1.0-arm64.dmg` 已重新构建，CLI `--help` smoke test 已修复。
 - [x] DevFlow 角色型阶段真实使用 AI Agent：Requirement / Master / Architect / Coding / Testing / Review / Delivery 均调用对应 Agent Profile，runtime 只保留确定性控制动作，并新增职责边界文档。
 - [x] Desktop release packaging dry-run：新增 Electron builder 配置、release binaries 构建脚本、macOS dmg/zip 打包命令和 release packaging 文档；本机已生成 ad-hoc signed macOS arm64 产物。
 - [x] Work Item 详情页性能复测与 compact 执行列表：普通刷新改用 compact attempts / run-workpads / operations，详情页按 Work Item 收缩补全完整记录，Review packet 和 Agent statistics 点击响应实测约 50-100ms。
-- [x] 默认测试集收敛：`npm run test` 聚焦当前产品主链路，旧前端 Mission Control 原型测试移到 `npm run test:legacy`，P0 脚本改用定向 Go runtime 回归。
+- [x] 默认测试集收敛：`npm run test` 聚焦当前产品主链路，旧前端 Mission Control 原型测试和 Node runner 原型已移除，P0 脚本改用定向 Go runtime 回归。
 - [x] Review packet 风险分级证据化：缺验证 / 缺远端 checks 不再直接 high，只有明确阻塞信号才 high，并在详情页、proof、飞书里展示 risk basis。
 - [x] Human Review 显式展示 Plan/TODO 复核结果：review packet、run report、human-review-request、Work Item 详情页和飞书审核内容都展示 Functional / Project TODO 的 verified / pending / attention 状态。
 - [x] Work Item 详情页按阶段新增 Agent 统计与明细：阶段卡片展示 run 数、耗时、可用 token 和状态计数，`View agents` 弹窗展示每个 Agent 的角色、runner/model、耗时、token 和产出摘要。
@@ -104,6 +113,7 @@ Item
 - [x] 扩展 runtime log 查询：补齐 Requirement 维度、cursor pagination、全文搜索和导出。
 - [x] Operator UI 增加 Run Timeline 基础版：`GET /attempts/{id}/timeline` 聚合 runtime log、attempt events、stage status、operation、proof、checkpoint decision，并在 Work Item 详情页展示。
 - [ ] 暂缓：扩展 Run Timeline：补齐 cursor pagination、runner stdout/stderr 摘要展开、GitHub checks/rebase/conflict 事件和按 stage/agent 过滤。
+- [ ] 性能治理：给 `/github/status`、`/observability`、`/attempts/{id}/timeline`、`/attempts/{id}/action-plan` 增加更细的超时、缓存和分页预算；5/6 日志里这些接口出现 30-55s 级别响应，5/7 日志里 `/github/status` 最高超过 150s。
 - [x] 增加数据分析指标基础版：`/observability.dashboard` 返回 Attempt 成功率、失败原因分布、慢阶段、待人工队列、活跃运行和推荐动作。
 - [x] 扩展数据分析指标：继续补 stage 平均耗时、runner 使用次数、checkpoint 等待时长、PR 创建/合并数量和趋势统计。
 - [x] 扩展 `/observability` dashboard 基础版：保留旧 summary 字段，并新增 dashboard data，供 UI/CLI 后续消费。
@@ -533,6 +543,7 @@ Item
 - [x] Stage 级 Skills / MCP 真实物化：Agent Profile 保存后，runner 启动前写入 `.omega/agent-capabilities.*`、`.codex/OMEGA.md`、`.claude/CLAUDE.md`，注入 `OMEGA_AGENT_*` 环境变量，并用 fake runner 测试证明 Agent 进程可读取。
 - [x] 项目内置 Skills fallback：runner workspace 会生成 `.omega/skills/<skill>/SKILL.md` 和 `.omega/agent-skill-manifest.json`；本机已安装时复制宿主 `SKILL.md`，未安装时写入 Omega fallback，避免用户没装 skill 就只剩 UI 标签。
 - [x] Master / Architect / Testing 执行链路对齐 Agent Profile：Master 写 dispatch，Architect 写 plan/todo，Testing 在本地验证后由 Testing Agent 复核 test report；详情页不再把这些阶段误呈现为纯 local action。
+- [x] GitHub PR delivery failure 对齐 Agent 化恢复：`git_recovery` 只在 PR publish/update action 失败时启动，负责受限 git/gh 修复；runtime 负责仓库边界、触发范围和 PR URL 最终校验。
 - [x] 本机 Skills / MCP 安装与映射文档：安装 stage 适用 Skills / MCP server，并在 `docs/agent-skills-and-mcp.md` 记录安装位置、默认 stage 映射和验证方式。
 - [x] GitHub Actions CI 进入默认 DevFlow：PR publish/update 后执行 `run_ci_checks`，采集 checks 和 failed run logs，写入 CI proof，并将 failed/missing required checks 输入 Rework / Review / Workpad。
 - [x] DevFlow Plan/TODO 显式化：Architect action 作为 Plan 等价阶段，输出 technical plan、functional todo list、project todo list，Review prompt 按清单核对 diff / validation / CI。

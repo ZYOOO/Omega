@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -28,7 +28,7 @@ const {
     source?: string;
     previewUrl: string;
   };
-  buildPreviewRuntimeProfile: (input: { env: Record<string, string | undefined>; repoPath?: string; repositoryTargetId?: string; intent?: string }) => {
+  buildPreviewRuntimeProfile: (input: { env: Record<string, string | undefined>; repoPath?: string; repositoryTargetId?: string; intent?: string; previewUrl?: string }) => {
     plan: { enabled: boolean; command?: string; args?: string[]; source?: string; previewUrl: string };
     profile: {
       agentId: string;
@@ -67,6 +67,7 @@ const {
     repoPath?: string;
     previewUrl?: string;
     profile?: { source?: string; workingDirectory?: string; previewUrl?: string; intent?: string };
+    child?: { stop?: () => void };
   }>;
 };
 
@@ -95,6 +96,34 @@ describe("desktop process supervisor", () => {
       expect(plan.command).toBe("pnpm");
       expect(plan.args).toEqual(["run", "dev", "--", "--host", "127.0.0.1", "--port", "6199"]);
       expect(plan.source).toBe("pnpm:dev");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("uses package script ports for preview runtime when no URL is explicit", () => {
+    const repo = mkdtempSync(path.join(tmpdir(), "omega-preview-agent-"));
+    try {
+      writeFileSync(path.join(repo, "package.json"), JSON.stringify({ scripts: { dev: "python3 -m http.server 4173 -d ." } }));
+
+      const result = buildPreviewRuntimeProfile({
+        repoPath: repo,
+        repositoryTargetId: "repo_local",
+        env: {},
+      });
+
+      expect(result.plan.previewUrl).toBe("http://127.0.0.1:4173/");
+      expect(result.profile.previewUrl).toBe("http://127.0.0.1:4173/");
+      expect(result.profile.devCommand).toBe("npm run dev");
+
+      const explicit = buildPreviewRuntimeProfile({
+        repoPath: repo,
+        repositoryTargetId: "repo_local",
+        previewUrl: "http://127.0.0.1:3009/",
+        env: {},
+      });
+      expect(explicit.plan.previewUrl).toBe("http://127.0.0.1:3009/");
+      expect(explicit.profile.previewUrl).toBe("http://127.0.0.1:3009/");
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -272,4 +301,70 @@ describe("desktop process supervisor", () => {
       });
     }
   });
+
+  it("does not reuse a default preview listener from another managed workspace", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "omega-preview-workspaces-"));
+    const staleRepo = path.join(root, "StaleRepo");
+    const selectedRepo = path.join(root, "SelectedRepo");
+    const serverScript = path.join(root, "server.cjs");
+    const probe = createServer((_request, response) => response.end("reserved"));
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const address = probe.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const previewUrl = `http://127.0.0.1:${port}/`;
+    let staleChild: ReturnType<typeof spawn> | undefined;
+    try {
+      mkdirSync(staleRepo, { recursive: true });
+      mkdirSync(selectedRepo, { recursive: true });
+      writeFileSync(path.join(staleRepo, "index.html"), "stale workspace");
+      writeFileSync(path.join(selectedRepo, "index.html"), "selected workspace");
+      writeFileSync(serverScript, [
+        "const fs = require('node:fs');",
+        "const http = require('node:http');",
+        "const path = require('node:path');",
+        "const port = Number(process.argv[2]);",
+        "http.createServer((_request, response) => response.end(fs.readFileSync(path.join(process.cwd(), 'index.html')))).listen(port, '127.0.0.1');",
+      ].join("\n"));
+      staleChild = spawn(process.execPath, [serverScript, String(port)], {
+        cwd: staleRepo,
+        stdio: "ignore",
+      });
+      await waitForPreviewBody(previewUrl, "stale workspace");
+
+      const result = await startRepositoryPreviewRuntime(
+        { id: "repo_selected", kind: "local", path: selectedRepo, defaultBranch: "main" },
+        { repositoryTargetId: "repo_selected" },
+        {
+          OMEGA_PAGE_PILOT_WORKSPACE_ROOT: root,
+          OMEGA_PREVIEW_URL: previewUrl,
+          OMEGA_PREVIEW_COMMAND: `${process.execPath} ${serverScript} ${port}`,
+        },
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.repoPath).toBe(selectedRepo);
+      await expect(waitForPreviewBody(previewUrl, "selected workspace")).resolves.toBe("selected workspace");
+      result.child?.stop?.();
+    } finally {
+      staleChild?.kill("SIGKILL");
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
+
+async function waitForPreviewBody(url: string, expected: string) {
+  const startedAt = Date.now();
+  let last = "";
+  while (Date.now() - startedAt < 5000) {
+    try {
+      const response = await fetch(url);
+      last = await response.text();
+      if (last.includes(expected)) return expected;
+    } catch {
+      // Wait for the listener to come up or switch workspaces.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`preview body did not contain ${expected}; last body: ${last}`);
+}

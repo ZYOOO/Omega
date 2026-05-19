@@ -1,7 +1,7 @@
 import { createPipelineRun } from "./pipeline";
 import type { DeliveryRequirement } from "./types";
 
-export const sampleRequirement: DeliveryRequirement = {
+const sampleRequirement: DeliveryRequirement = {
   id: "req_omega_001",
   identifier: "OMEGA-1",
   title: "Make testing, review, and delivery explicit AI workflow stages",

@@ -92,6 +92,33 @@ func TestImportAgentProfileTemplateFromRepositoryOmega(t *testing.T) {
 	}
 }
 
+func TestImportAgentProfileTemplateFromFixturesUsesInternalDevNotesDirectory(t *testing.T) {
+	api, _ := newTestAPI(t)
+	var imported agentProfileImportResponse
+	decode(t, requestJSON(t, http.MethodPost, api.URL+"/agent-profile/import-template", map[string]any{
+		"projectId": "project_omega",
+		"source":    "fixtures",
+	}), &imported)
+
+	if !strings.Contains(imported.Profile.WorkflowMarkdown, "devflow-pr-test") {
+		t.Fatalf("fixture workflow was not imported from internal dev notes: %s", imported.Profile.WorkflowMarkdown)
+	}
+	files := arrayMaps(imported.Summary["files"])
+	if len(files) == 0 || !strings.Contains(text(files[0], "path"), filepath.Join("docs", "internal-dev-notes", "test-workflow-fixtures")) {
+		t.Fatalf("fixture import summary should point at internal dev notes: %+v", imported.Summary)
+	}
+}
+
+func TestOmegaWorkflowFixturePathFindsInternalDevNotes(t *testing.T) {
+	path, ok := omegaWorkflowFixturePath()
+	if !ok {
+		t.Fatal("fixture path was not found")
+	}
+	if !strings.Contains(path, filepath.Join("docs", "internal-dev-notes", "test-workflow-fixtures")) {
+		t.Fatalf("fixture path should prefer internal dev notes, got %s", path)
+	}
+}
+
 func writeImportFixture(t *testing.T, dir string) {
 	t.Helper()
 	files := map[string]string{

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -142,6 +143,15 @@ func (server *Server) startPagePilotPreviewRuntime(ctx context.Context, payload 
 	if payload.Restart {
 		server.stopPagePilotPreviewRuntimeSession(key)
 	}
+	if strings.TrimSpace(payload.PreviewURL) == "" && !payload.Restart {
+		if err := reconcilePagePilotPreviewListeners(plan); err != nil {
+			resolved["ok"] = false
+			resolved["status"] = "failed"
+			resolved["error"] = err.Error()
+			_ = server.persistPagePilotPreviewRuntime(ctx, payload.RepositoryTargetID, resolved)
+			return resolved, nil
+		}
+	}
 	if health := probePagePilotPreviewURL(ctx, server, plan.PreviewURL, 900*time.Millisecond); health["ok"] == true && !payload.Restart {
 		resolved["ok"] = true
 		resolved["status"] = "external"
@@ -180,6 +190,7 @@ func (server *Server) startPagePilotPreviewRuntime(ctx context.Context, payload 
 }
 
 func detectPagePilotPreviewRuntimePlan(repoPath string, payload pagePilotPreviewRuntimeRequest) pagePilotPreviewRuntimePlan {
+	explicitPreviewURL := strings.TrimSpace(payload.PreviewURL) != ""
 	previewURL := strings.TrimSpace(payload.PreviewURL)
 	if previewURL == "" {
 		previewURL = "http://127.0.0.1:3009/"
@@ -209,7 +220,10 @@ func detectPagePilotPreviewRuntimePlan(repoPath string, payload pagePilotPreview
 		}
 	}
 	if script != "" {
-		port := pagePilotPreviewPort(previewURL)
+		if port := pagePilotPreviewScriptPort(text(scripts, script)); port != "" && !explicitPreviewURL {
+			plan.PreviewURL = pagePilotPreviewURLWithPort(plan.PreviewURL, port)
+		}
+		port := pagePilotPreviewPort(plan.PreviewURL)
 		manager := pagePilotPreviewPackageManager(repoPath)
 		plan.Command = manager
 		plan.Args = pagePilotPreviewPackageArgs(manager, script, text(scripts, script), port)
@@ -225,6 +239,69 @@ func detectPagePilotPreviewRuntimePlan(repoPath string, payload pagePilotPreview
 	}
 	plan.Reason = "no preview command could be detected"
 	return plan
+}
+
+func pagePilotPreviewScriptPort(scriptCommand string) string {
+	fields := strings.Fields(strings.TrimSpace(scriptCommand))
+	for index, raw := range fields {
+		token := strings.Trim(raw, `"'`)
+		lower := strings.ToLower(token)
+		switch {
+		case lower == "--port" || lower == "-p" || lower == "--listen" || lower == "-l":
+			if index+1 < len(fields) {
+				if port := pagePilotPreviewNormalizePort(fields[index+1]); port != "" {
+					return port
+				}
+			}
+		case strings.HasPrefix(lower, "--port=") || strings.HasPrefix(lower, "--listen=") || strings.HasPrefix(lower, "-p=") || strings.HasPrefix(lower, "-l="):
+			if port := pagePilotPreviewNormalizePort(strings.SplitN(token, "=", 2)[1]); port != "" {
+				return port
+			}
+		case strings.Contains(lower, ":"):
+			if port := pagePilotPreviewNormalizePort(lower[strings.LastIndex(lower, ":")+1:]); port != "" {
+				return port
+			}
+		case lower == "http.server":
+			if index+1 < len(fields) {
+				if port := pagePilotPreviewNormalizePort(fields[index+1]); port != "" {
+					return port
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func pagePilotPreviewNormalizePort(value string) string {
+	trimmed := strings.Trim(strings.TrimSpace(value), `"'`)
+	trimmed = strings.TrimSuffix(strings.TrimSuffix(trimmed, "/"), ",")
+	if strings.Contains(trimmed, ":") {
+		trimmed = trimmed[strings.LastIndex(trimmed, ":")+1:]
+	}
+	port, err := strconv.Atoi(trimmed)
+	if err != nil || port <= 0 || port > 65535 {
+		return ""
+	}
+	return strconv.Itoa(port)
+}
+
+func pagePilotPreviewURLWithPort(rawURL string, port string) string {
+	if strings.TrimSpace(port) == "" {
+		return rawURL
+	}
+	request, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil || request.URL == nil {
+		return rawURL
+	}
+	host := request.URL.Hostname()
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	request.URL.Host = net.JoinHostPort(host, port)
+	if request.URL.Path == "" {
+		request.URL.Path = "/"
+	}
+	return request.URL.String()
 }
 
 func pagePilotPreviewRuntimeProfileFromPlan(plan pagePilotPreviewRuntimePlan, payload pagePilotPreviewRuntimeRequest, target map[string]any) map[string]any {
@@ -413,6 +490,48 @@ func stopStalePagePilotPreviewListeners(plan pagePilotPreviewRuntimePlan) {
 	}
 }
 
+func reconcilePagePilotPreviewListeners(plan pagePilotPreviewRuntimePlan) error {
+	port := pagePilotPreviewPort(plan.PreviewURL)
+	if port == "" || plan.RepoPath == "" || !isPagePilotLocalPreviewURL(plan.PreviewURL) {
+		return nil
+	}
+	output, err := exec.Command("lsof", "-nP", "-tiTCP:"+port, "-sTCP:LISTEN").Output()
+	if err != nil {
+		return nil
+	}
+	expected := comparablePagePilotPreviewPath(plan.RepoPath)
+	managedRoot := comparablePagePilotPreviewPath(os.Getenv("OMEGA_PAGE_PILOT_WORKSPACE_ROOT"))
+	if managedRoot == "" {
+		home, _ := os.UserHomeDir()
+		if home != "" {
+			managedRoot = comparablePagePilotPreviewPath(filepath.Join(home, "Omega", "workspaces", "page-pilot"))
+		}
+	}
+	for _, rawPID := range strings.Fields(string(output)) {
+		pid, err := strconv.Atoi(strings.TrimSpace(rawPID))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		cwd := pagePilotPreviewProcessCwd(pid)
+		comparableCwd := comparablePagePilotPreviewPath(cwd)
+		if comparableCwd != "" && comparableCwd == expected {
+			continue
+		}
+		if comparableCwd != "" && managedRoot != "" && pagePilotPreviewPathWithin(comparableCwd, managedRoot) {
+			if process, err := os.FindProcess(pid); err == nil {
+				_ = process.Kill()
+				continue
+			}
+			return fmt.Errorf("preview port %s is used by another Page Pilot workspace and could not be stopped: %s", port, cwd)
+		}
+		if cwd != "" {
+			return fmt.Errorf("preview port %s is already used by another process in %s; stop it or choose another preview URL before opening Page Pilot", port, cwd)
+		}
+		return fmt.Errorf("preview port %s is already used by another process; stop it or choose another preview URL before opening Page Pilot", port)
+	}
+	return nil
+}
+
 func isPagePilotLocalPreviewURL(rawURL string) bool {
 	request, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil || request.URL == nil {
@@ -423,29 +542,43 @@ func isPagePilotLocalPreviewURL(rawURL string) bool {
 }
 
 func pagePilotPreviewProcessOwnsWorkspace(pid int, repoPath string) bool {
-	output, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
-	if err != nil {
-		return false
-	}
-	cwd := ""
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.HasPrefix(line, "n") {
-			cwd = strings.TrimPrefix(line, "n")
-			break
-		}
-	}
+	cwd := pagePilotPreviewProcessCwd(pid)
 	if cwd == "" {
 		return false
 	}
-	workspace, err := filepath.EvalSymlinks(repoPath)
+	return comparablePagePilotPreviewPath(cwd) == comparablePagePilotPreviewPath(repoPath)
+}
+
+func pagePilotPreviewProcessCwd(pid int) string {
+	output, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
 	if err != nil {
-		workspace = filepath.Clean(repoPath)
+		return ""
 	}
-	processCwd, err := filepath.EvalSymlinks(cwd)
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(line, "n") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "n"))
+		}
+	}
+	return ""
+}
+
+func comparablePagePilotPreviewPath(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(value)
 	if err != nil {
-		processCwd = filepath.Clean(cwd)
+		return filepath.Clean(value)
 	}
-	return processCwd == workspace
+	return resolved
+}
+
+func pagePilotPreviewPathWithin(candidate string, root string) bool {
+	if candidate == "" || root == "" {
+		return false
+	}
+	relative, err := filepath.Rel(root, candidate)
+	return err == nil && (relative == "." || (relative != "" && !strings.HasPrefix(relative, "..") && !filepath.IsAbs(relative)))
 }
 
 func pagePilotPreviewRuntimeKey(repositoryTargetID string) string {
